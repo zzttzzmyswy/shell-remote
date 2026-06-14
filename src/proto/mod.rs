@@ -66,6 +66,56 @@ pub struct McpResultPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecStartPayload {
+    pub cmd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _mcp_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecInputPayload {
+    pub exec_id: String,
+    pub data_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _mcp_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecClosePayload {
+    pub exec_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _mcp_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecListPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _mcp_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecResultPayload {
+    pub exec_id: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _mcp_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecSessionInfo {
+    pub exec_id: String,
+    pub cmd: String,
+    pub status: String,
+    pub started_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserInfo {
     pub user_id: String,
     pub permission: Permission,
@@ -91,6 +141,10 @@ pub const WRITE_TYPES: &[&str] = &[
     "fs:delete",
     "fs:rename",
     "mcp:exec",
+    "mcp:exec_start",
+    "mcp:exec_input",
+    "mcp:exec_close",
+    "mcp:exec_list",
 ];
 
 pub fn requires_write(msg_type: &str) -> bool {
@@ -217,5 +271,79 @@ mod tests {
         let decoded: McpResultPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.stdout, "file.txt");
         assert_eq!(decoded.exit_code, 0);
+    }
+
+    #[test]
+    fn test_exec_start_roundtrip() {
+        let payload = ExecStartPayload {
+            cmd: "sudo apt update".to_string(),
+            _mcp_request_id: Some("req-1".to_string()),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded: ExecStartPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.cmd, "sudo apt update");
+        assert_eq!(decoded._mcp_request_id, Some("req-1".to_string()));
+    }
+
+    #[test]
+    fn test_exec_result_roundtrip() {
+        let payload = ExecResultPayload {
+            exec_id: "abc123".to_string(),
+            stdout: "output".to_string(),
+            stderr: String::new(),
+            status: "running".to_string(),
+            exit_code: None,
+            error: None,
+            _mcp_request_id: None,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded: ExecResultPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.exec_id, "abc123");
+        assert_eq!(decoded.status, "running");
+        assert_eq!(decoded.exit_code, None);
+    }
+
+    #[test]
+    fn test_exec_result_exited_roundtrip() {
+        let payload = ExecResultPayload {
+            exec_id: "abc123".to_string(),
+            stdout: "done\n".to_string(),
+            stderr: String::new(),
+            status: "exited".to_string(),
+            exit_code: Some(0),
+            error: None,
+            _mcp_request_id: None,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded: ExecResultPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.status, "exited");
+        assert_eq!(decoded.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_exec_session_info_roundtrip() {
+        let info = ExecSessionInfo {
+            exec_id: "abc123".to_string(),
+            cmd: "sleep 10".to_string(),
+            status: "running".to_string(),
+            started_at: 1718300000,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: ExecSessionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.exec_id, "abc123");
+        assert_eq!(decoded.cmd, "sleep 10");
+        assert_eq!(decoded.status, "running");
+    }
+
+    #[test]
+    fn test_exec_start_cmd_only() {
+        let payload = ExecStartPayload {
+            cmd: "ls".to_string(),
+            _mcp_request_id: None,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("_mcp_request_id"));
+        let decoded: ExecStartPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.cmd, "ls");
     }
 }
