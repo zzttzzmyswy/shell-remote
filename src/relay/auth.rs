@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 /// Extracts the `token` parameter value from a URL query string.
 pub fn extract_token_from_query(query: &str) -> Option<String> {
     if query.is_empty() {

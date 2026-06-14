@@ -8,6 +8,7 @@ use crate::proto::Permission;
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub tokens: Vec<(String, Permission)>,
+    #[allow(dead_code)]
     pub fixed_key: Option<String>,
     pub is_temporary: bool,
 }

@@ -152,7 +152,7 @@ pub async fn start(
                                     .as_str()
                                     .map(|s| s.to_string());
 
-                                let mut result = fs::delete_path(&root_path, path);
+                                let result = fs::delete_path(&root_path, path);
                                 let mut payload = serde_json::to_value(&result).unwrap();
                                 if let (Some(req_id), serde_json::Value::Object(ref mut map)) =
                                     (mcp_request_id, &mut payload)
@@ -175,7 +175,7 @@ pub async fn start(
                                     .as_str()
                                     .map(|s| s.to_string());
 
-                                let mut result = fs::rename_path(&root_path, from, to);
+                                let result = fs::rename_path(&root_path, from, to);
                                 let mut payload = serde_json::to_value(&result).unwrap();
                                 if let (Some(req_id), serde_json::Value::Object(ref mut map)) =
                                     (mcp_request_id, &mut payload)
