@@ -11,3 +11,4 @@
 {"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410547771}
 {"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410548813}
 {"type":"screen-added","file":"/home/zzt/workspace/ssh-remote/.superpowers/brainstorm/480765-1781410482/content/waiting.html"}
+{"type":"server-stopped","reason":"idle timeout"}
