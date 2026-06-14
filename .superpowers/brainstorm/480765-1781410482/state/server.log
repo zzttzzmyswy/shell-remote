@@ -1,0 +1,13 @@
+{"type":"server-started","port":52830,"host":"0.0.0.0","url_host":"100.79.70.75","url":"http://100.79.70.75:52830","screen_dir":"/home/zzt/workspace/ssh-remote/.superpowers/brainstorm/480765-1781410482/content","state_dir":"/home/zzt/workspace/ssh-remote/.superpowers/brainstorm/480765-1781410482/state"}
+{"type":"screen-added","file":"/home/zzt/workspace/ssh-remote/.superpowers/brainstorm/480765-1781410482/content/layout.html"}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410541839}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410545918}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410546098}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410546271}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410546669}
+{"source":"user-event","type":"click","text":"B\n    \n      左右分屏\n      终端和文件管理器始终并排显示。适合频繁在两者之间切换的场景，但各自空间被压缩。","choice":"b","id":null,"timestamp":1781410546991}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410547336}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410547621}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410547771}
+{"source":"user-event","type":"click","text":"A\n    \n      侧边抽屉\n      终端全屏占据主区域，文件管理器从侧边滑出，类似 VS Code 的文件浏览器。空间利用率高，文件操作不打断终端工作流。","choice":"a","id":null,"timestamp":1781410548813}
+{"type":"screen-added","file":"/home/zzt/workspace/ssh-remote/.superpowers/brainstorm/480765-1781410482/content/waiting.html"}
