@@ -66,6 +66,35 @@ ldd target/x86_64-unknown-linux-musl/release/ssh-remote
 
 产物可直接 `scp` 到任意同架构 Linux 机器运行，无需安装任何依赖。
 
+### Docker 部署
+
+```bash
+# 构建镜像
+docker build -t ssh-remote .
+
+# 启动 Relay（中转服务器）
+docker run -d --name ssh-remote-relay -p 3000:3000 ssh-remote relay --dev --bind 0.0.0.0:3000
+
+# 查看 Agent Token（Relay 容器内运行 Agent）
+docker exec ssh-remote-relay ssh-remote agent --relay-url ws://localhost:3000/ws
+```
+
+如果需要将 Agent 部署到独立容器或不同机器：
+
+```bash
+# 在目标机器上运行 Agent 容器
+docker run -d --name ssh-remote-agent \
+  --pid=host --network=host \
+  ssh-remote agent \
+  --relay-url ws://<relay-ip>:3000/ws \
+  --root /host
+```
+
+选项说明：
+- `--pid=host`：Agent 需要访问宿主机的进程命名空间以创建 PTY
+- `--network=host`：Agent 通过 Host 网络直接连接 Relay（生产环境建议用 Docker 网络）
+- `--root /host`：若需操作宿主机文件，挂载 `-v /:/host:rw`
+
 ### 启动 Relay（中转服务器）
 
 在最外层可访问的机器上：
