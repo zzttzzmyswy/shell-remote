@@ -1,6 +1,7 @@
 pub mod client;
 pub mod fs;
 pub mod shell;
+pub mod exec_sessions;
 
 use std::path::PathBuf;
 use std::process::Stdio;
