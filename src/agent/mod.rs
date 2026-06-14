@@ -8,7 +8,7 @@ use std::process::Stdio;
 
 use crate::agent::client::RelayClient;
 use crate::agent::shell::Shell;
-use crate::proto::{Message, McpResultPayload};
+use crate::proto::{ExecResultPayload, Message, McpResultPayload};
 
 pub async fn start(
     relay_url: String,
@@ -26,6 +26,7 @@ pub async fn start(
     let root_path = PathBuf::from(&root);
 
     let mut shell = Shell::spawn(80, 24)?;
+    let exec_sessions = crate::agent::exec_sessions::ExecSessionManager::new();
 
     loop {
         tokio::select! {
@@ -199,7 +200,7 @@ pub async fn start(
                                     .map(|s| s.to_string());
 
                                 let (stdout, stderr, exit_code) =
-                                    execute_command(cmd);
+                                    execute_command(cmd).await;
 
                                 let result = McpResultPayload {
                                     stdout,
@@ -217,6 +218,80 @@ pub async fn start(
                                     msg_type: "mcp:result".to_string(),
                                     session_id: client.session_id.clone(),
                                     payload,
+                                };
+                                let _ = client.send(&resp).await;
+                            }
+
+                            "mcp:exec_start" => {
+                                let cmd = msg.payload["cmd"].as_str().unwrap_or("");
+                                let mcp_request_id = msg.payload["_mcp_request_id"]
+                                    .as_str()
+                                    .map(|s| s.to_string());
+
+                                let mut result = match exec_sessions.spawn(cmd).await {
+                                    Ok(r) => r,
+                                    Err(r) => r,
+                                };
+                                result._mcp_request_id = mcp_request_id;
+                                let resp = Message {
+                                    msg_type: "mcp:exec_result".to_string(),
+                                    session_id: client.session_id.clone(),
+                                    payload: serde_json::to_value(&result).unwrap(),
+                                };
+                                let _ = client.send(&resp).await;
+                            }
+
+                            "mcp:exec_input" => {
+                                let exec_id = msg.payload["exec_id"].as_str().unwrap_or("");
+                                let data_b64 = msg.payload["data_b64"].as_str().unwrap_or("");
+                                let data = fs::decode_b64(data_b64).unwrap_or_default();
+                                let mcp_request_id = msg.payload["_mcp_request_id"]
+                                    .as_str()
+                                    .map(|s| s.to_string());
+
+                                let mut result = match exec_sessions.write_stdin(exec_id, &data).await {
+                                    Ok(r) => r,
+                                    Err(r) => r,
+                                };
+                                result._mcp_request_id = mcp_request_id;
+                                let resp = Message {
+                                    msg_type: "mcp:exec_result".to_string(),
+                                    session_id: client.session_id.clone(),
+                                    payload: serde_json::to_value(&result).unwrap(),
+                                };
+                                let _ = client.send(&resp).await;
+                            }
+
+                            "mcp:exec_close" => {
+                                let exec_id = msg.payload["exec_id"].as_str().unwrap_or("");
+                                let mcp_request_id = msg.payload["_mcp_request_id"]
+                                    .as_str()
+                                    .map(|s| s.to_string());
+
+                                let mut result = match exec_sessions.close(exec_id).await {
+                                    Ok(r) => r,
+                                    Err(r) => r,
+                                };
+                                result._mcp_request_id = mcp_request_id;
+                                let resp = Message {
+                                    msg_type: "mcp:exec_result".to_string(),
+                                    session_id: client.session_id.clone(),
+                                    payload: serde_json::to_value(&result).unwrap(),
+                                };
+                                let _ = client.send(&resp).await;
+                            }
+
+                            "mcp:exec_list" => {
+                                let mcp_request_id = msg.payload["_mcp_request_id"]
+                                    .as_str()
+                                    .map(|s| s.to_string());
+
+                                let mut result = exec_sessions.list().await;
+                                result._mcp_request_id = mcp_request_id;
+                                let resp = Message {
+                                    msg_type: "mcp:exec_result".to_string(),
+                                    session_id: client.session_id.clone(),
+                                    payload: serde_json::to_value(&result).unwrap(),
                                 };
                                 let _ = client.send(&resp).await;
                             }
@@ -249,23 +324,29 @@ pub async fn start(
     Ok(())
 }
 
-fn execute_command(cmd: &str) -> (String, String, i32) {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+async fn execute_command(cmd: &str) -> (String, String, i32) {
+    let cmd = cmd.to_string();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
 
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            let exit_code = out.status.code().unwrap_or(-1);
-            (stdout, stderr, exit_code)
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let exit_code = out.status.code().unwrap_or(-1);
+                (stdout, stderr, exit_code)
+            }
+            Err(e) => {
+                (String::new(), format!("Failed to execute command: {}", e), -1)
+            }
         }
-        Err(e) => {
-            (String::new(), format!("Failed to execute command: {}", e), -1)
-        }
-    }
+    })
+    .await
+    .unwrap_or_else(|_| (String::new(), "Command execution panicked".to_string(), -1))
 }
