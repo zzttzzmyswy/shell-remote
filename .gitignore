@@ -1,1 +1,4 @@
 target/
+.superpowers/
+docs/superpowers/
+releases/

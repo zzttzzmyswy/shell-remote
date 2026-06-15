@@ -1,4 +1,4 @@
-# ssh-remote
+# shell-remote
 
 [English](README.md) | 简体中文
 
@@ -40,25 +40,25 @@
 
 ```bash
 # 需 Rust 1.75+
-git clone https://github.com/zzttzzmyswy/ssh-remote.git && cd ssh-remote
+git clone https://github.com/zzttzzmyswy/shell-remote.git && cd shell-remote
 cargo build --release
 ```
 
-产物为 `target/release/ssh-remote` 单个静态二进制。
+产物为 `target/release/shell-remote` 单个静态二进制。
 
 ### 下载预编译二进制
 
-[GitHub Releases](https://github.com/zzttzzmyswy/ssh-remote/releases) 提供三种架构的 musl 静态编译二进制：
+[GitHub Releases](https://github.com/zzttzzmyswy/shell-remote/releases) 提供三种架构的 musl 静态编译二进制：
 
 ```bash
 # x86_64 (Intel/AMD)
-curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-x86_64 && chmod +x ssh-remote-x86_64
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-x86_64 && chmod +x shell-remote-x86_64
 
 # aarch64 (ARM 64位, 树莓派4/5)
-curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-aarch64 && chmod +x ssh-remote-aarch64
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-aarch64 && chmod +x shell-remote-aarch64
 
 # armv7 (ARM 32位, 树莓派2/3)
-curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-armv7 && chmod +x ssh-remote-armv7
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-armv7 && chmod +x shell-remote-armv7
 ```
 
 或访问任意运行中的 Relay 的 `/download` 页面，提供平台检测和可复制的 curl 命令。
@@ -68,14 +68,14 @@ curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh
 ### Docker
 
 ```bash
-docker build -t ssh-remote .
-docker run -d --name ssh-remote-relay -p 3000:3000 ssh-remote relay --dev --bind 0.0.0.0:3000
+docker build -t shell-remote .
+docker run -d --name shell-remote-relay -p 3000:3000 shell-remote relay --dev --bind 0.0.0.0:3000
 ```
 
 ### 启动 Relay
 
 ```bash
-./ssh-remote relay --dev --bind 0.0.0.0:3000
+./shell-remote relay --dev --bind 0.0.0.0:3000
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -90,7 +90,7 @@ docker run -d --name ssh-remote-relay -p 3000:3000 ssh-remote relay --dev --bind
 ### 启动 Agent
 
 ```bash
-./ssh-remote agent --relay-url ws://<relay-ip>:3000/ws --root /home/user
+./shell-remote agent --relay-url ws://<relay-ip>:3000/ws --root /home/user
 ```
 
 | 参数 | 默认值 | 说明 |

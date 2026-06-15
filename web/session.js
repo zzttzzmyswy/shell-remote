@@ -1,6 +1,6 @@
 (function() {
-    const token = sessionStorage.getItem('ssh-remote-token');
-    const permission = sessionStorage.getItem('ssh-remote-permission') || 'rw';
+    const token = sessionStorage.getItem('shell-remote-token');
+    const permission = sessionStorage.getItem('shell-remote-permission') || 'rw';
 
     if (!token) {
         window.location.href = '/';
@@ -204,7 +204,7 @@
 
     ws.onOpen = function() {
         disconnectOverlay.classList.add('hidden');
-        const serverAuth = sessionStorage.getItem('ssh-remote-server-auth') || '';
+        const serverAuth = sessionStorage.getItem('shell-remote-server-auth') || '';
         ws.send(JSON.stringify({
             type: 'browser:join',
             payload: { token: token, permission: userPermission, server_auth: serverAuth }

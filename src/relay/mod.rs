@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         assert!(body.len() > 0);
-        assert!(std::str::from_utf8(&body).unwrap().contains("ssh-remote"));
+        assert!(std::str::from_utf8(&body).unwrap().contains("shell-remote"));
     }
 
     #[tokio::test]
@@ -256,7 +256,7 @@ pub async fn bin_handler(
     }
 
     let bin_dir = state.bin_dir.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let filename = format!("ssh-remote-{}", arch);
+    let filename = format!("shell-remote-{}", arch);
     let filepath = std::path::Path::new(bin_dir).join(&filename);
     if !filepath.is_file() {
         return Err(StatusCode::NOT_FOUND);

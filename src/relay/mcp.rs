@@ -50,8 +50,8 @@ pub async fn sse_handler(
             "result": {
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
-                    "name": "ssh-remote",
-                    "version": "0.1.0"
+                    "name": "shell-remote",
+                                        "version": "0.1.3"
                 },
                 "capabilities": {
                     "tools": {}
@@ -94,8 +94,8 @@ pub async fn messages_handler(
             "result": {
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
-                    "name": "ssh-remote",
-                    "version": "0.1.0"
+                    "name": "shell-remote",
+                                        "version": "0.1.3"
                 },
                 "capabilities": {
                     "tools": {}

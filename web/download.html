@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Download — ssh-remote</title>
+<title>Download — shell-remote</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body {
@@ -88,14 +88,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #f0f6fc; }
 </style>
 </head>
 <body>
-<h1>Download ssh-remote</h1>
+<h1>Download shell-remote</h1>
 <div class="version">v<span id="ver"></span></div>
 
 <div class="cards" id="cards"></div>
 
 <div class="info">
   <p>Binaries are <b>musl-static</b> — no runtime dependencies. Works on any Linux kernel 3.2+.</p>
-  <p>Start with: <code>./ssh-remote-{arch} relay --bind 0.0.0.0:3000</code></p>
+  <p>Start with: <code>./shell-remote-{arch} relay --bind 0.0.0.0:3000</code></p>
 </div>
 
 <script>
@@ -124,7 +124,7 @@ const ARCHS = [
   const ver = document.getElementById('ver');
   const cards = document.getElementById('cards');
 
-  let version = '0.1.0';
+  let version = '0.1.3';
   let hasLocal = false;
 
   try {
@@ -150,10 +150,10 @@ const ARCHS = [
     let downloadUrl, curlCmd;
     if (hasLocal) {
       downloadUrl = `/bin/${a.id}`;
-      curlCmd = `curl -fLO ${host}/bin/${a.id} && chmod +x ssh-remote-${a.id}`;
+      curlCmd = `curl -fLO ${host}/bin/${a.id} && chmod +x shell-remote-${a.id}`;
     } else {
-      downloadUrl = `https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-${a.id}`;
-      curlCmd = `curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-${a.id} && chmod +x ssh-remote-${a.id}`;
+      downloadUrl = `https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-${a.id}`;
+      curlCmd = `curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-${a.id} && chmod +x shell-remote-${a.id}`;
     }
 
     c.innerHTML = `<h2>${a.name}</h2>

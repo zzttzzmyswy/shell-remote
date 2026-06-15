@@ -6,7 +6,7 @@ mod relay;
 mod web;
 
 #[derive(Parser)]
-#[command(name = "ssh-remote", about = "Collaborative remote SSH tool")]
+#[command(name = "shell-remote", about = "Collaborative remote shell tool")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let version = env!("CARGO_PKG_VERSION");
-    eprintln!("ssh-remote v{}", version);
+    eprintln!("shell-remote v{}", version);
 
     match cli.command {
         Command::Relay {

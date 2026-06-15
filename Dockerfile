@@ -13,15 +13,15 @@ COPY src/ src/
 COPY web/ web/
 
 RUN cargo build --release && \
-    strip target/release/ssh-remote
+    strip target/release/shell-remote
 
 # Stage 2: Runtime
 FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates tzdata
 
-COPY --from=builder /app/target/release/ssh-remote /usr/local/bin/ssh-remote
+COPY --from=builder /app/target/release/shell-remote /usr/local/bin/shell-remote
 
 EXPOSE 3000
 
-ENTRYPOINT ["/usr/local/bin/ssh-remote"]
+ENTRYPOINT ["/usr/local/bin/shell-remote"]

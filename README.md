@@ -1,4 +1,4 @@
-# ssh-remote
+# shell-remote
 
 English | [简体中文](README_zh.md)
 
@@ -40,11 +40,11 @@ Browser (xterm.js + File UI)
 
 ```bash
 # Requires Rust 1.75+
-git clone https://github.com/zzttzzmyswy/ssh-remote.git && cd ssh-remote
+git clone https://github.com/zzttzzmyswy/shell-remote.git && cd shell-remote
 cargo build --release
 ```
 
-Produces a single static binary at `target/release/ssh-remote`.
+Produces a single static binary at `target/release/shell-remote`.
 
 #### Static Linking (cross-platform distribution)
 
@@ -58,23 +58,23 @@ cargo build --release --target x86_64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 
 # Verify
-ldd target/x86_64-unknown-linux-musl/release/ssh-remote
+ldd target/x86_64-unknown-linux-musl/release/shell-remote
 # → statically linked
 ```
 
 ### Download Pre-built
 
-Pre-built musl-static binaries for three architectures are available on [GitHub Releases](https://github.com/zzttzzmyswy/ssh-remote/releases).
+Pre-built musl-static binaries for three architectures are available on [GitHub Releases](https://github.com/zzttzzmyswy/shell-remote/releases).
 
 ```bash
 # x86_64 (Intel/AMD)
-curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-x86_64 && chmod +x ssh-remote-x86_64
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-x86_64 && chmod +x shell-remote-x86_64
 
 # aarch64 (ARM 64-bit, Raspberry Pi 4/5)
-curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-aarch64 && chmod +x ssh-remote-aarch64
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-aarch64 && chmod +x shell-remote-aarch64
 
 # armv7 (ARM 32-bit, Raspberry Pi 2/3)
-curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-armv7 && chmod +x ssh-remote-armv7
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-armv7 && chmod +x shell-remote-armv7
 ```
 
 Or visit `/download` on any running relay for a download page with platform detection and copyable curl commands.
@@ -82,16 +82,16 @@ Or visit `/download` on any running relay for a download page with platform dete
 ### Docker
 
 ```bash
-docker build -t ssh-remote .
-docker run -d --name ssh-remote-relay -p 3000:3000 ssh-remote relay --dev --bind 0.0.0.0:3000
+docker build -t shell-remote .
+docker run -d --name shell-remote-relay -p 3000:3000 shell-remote relay --dev --bind 0.0.0.0:3000
 ```
 
 For agent on target machine:
 
 ```bash
-docker run -d --name ssh-remote-agent \
+docker run -d --name shell-remote-agent \
   --pid=host --network=host \
-  ssh-remote agent \
+  shell-remote agent \
   --relay-url ws://<relay-ip>:3000/ws \
   --root /host
 ```
@@ -99,7 +99,7 @@ docker run -d --name ssh-remote-agent \
 ### Start Relay
 
 ```bash
-./ssh-remote relay --dev --bind 0.0.0.0:3000
+./shell-remote relay --dev --bind 0.0.0.0:3000
 ```
 
 Options:
@@ -122,7 +122,7 @@ Relay server listening on 0.0.0.0:3000
 ### Start Agent
 
 ```bash
-./ssh-remote agent --relay-url ws://<relay-ip>:3000/ws --root /home/user
+./shell-remote agent --relay-url ws://<relay-ip>:3000/ws --root /home/user
 ```
 
 Options:

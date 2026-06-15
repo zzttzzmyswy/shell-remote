@@ -3,12 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ssh-remote — 连接</title>
+    <title>shell-remote — 连接</title>
     <link rel="stylesheet" href="/style.css">
 </head>
 <body class="connect-page">
     <div class="connect-container">
-        <h1>ssh-remote</h1>
+        <h1>shell-remote</h1>
         <p class="subtitle">远程协作终端</p>
         <div class="connect-form">
             <label for="auth-input">服务器密码</label>
@@ -34,9 +34,9 @@
                 showError('请输入会话密钥');
                 return;
             }
-            sessionStorage.setItem('ssh-remote-token', token);
-            sessionStorage.setItem('ssh-remote-permission', permission);
-            sessionStorage.setItem('ssh-remote-server-auth', serverAuth);
+            sessionStorage.setItem('shell-remote-token', token);
+            sessionStorage.setItem('shell-remote-permission', permission);
+            sessionStorage.setItem('shell-remote-server-auth', serverAuth);
             window.location.href = '/session';
         }
 

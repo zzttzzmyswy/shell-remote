@@ -42,12 +42,12 @@ CC=arm-linux-gnueabihf-gcc cargo build --release --target armv7-unknown-linux-mu
 ```bash
 mkdir -p releases
 
-cp target/x86_64-unknown-linux-musl/release/ssh-remote releases/ssh-remote-x86_64
-cp target/aarch64-unknown-linux-musl/release/ssh-remote releases/ssh-remote-aarch64
-cp target/armv7-unknown-linux-musleabihf/release/ssh-remote releases/ssh-remote-armv7
+cp target/x86_64-unknown-linux-musl/release/shell-remote releases/shell-remote-x86_64
+cp target/aarch64-unknown-linux-musl/release/shell-remote releases/shell-remote-aarch64
+cp target/armv7-unknown-linux-musleabihf/release/shell-remote releases/shell-remote-armv7
 
 # Verify they are static
-file releases/ssh-remote-*
+file releases/shell-remote-*
 ```
 
 ## One-Command Build Script
@@ -70,7 +70,7 @@ CC_MAP=(
 mkdir -p releases
 
 cargo build --release --target x86_64-unknown-linux-musl
-cp target/x86_64-unknown-linux-musl/release/ssh-remote releases/ssh-remote-x86_64
+cp target/x86_64-unknown-linux-musl/release/shell-remote releases/shell-remote-x86_64
 
 for target in aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
   cc=""
@@ -81,7 +81,7 @@ for target in aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
   done
   env CC="$cc" cargo build --release --target "$target"
   bin_name="${target%%-unknown-linux-musl*}"
-  cp "target/$target/release/ssh-remote" "releases/ssh-remote-${bin_name}"
+  cp "target/$target/release/shell-remote" "releases/shell-remote-${bin_name}"
 done
 
 echo "Built:"
@@ -94,7 +94,7 @@ file releases/*
 Start the relay with `--bin-dir` to serve the binaries directly:
 
 ```bash
-./ssh-remote relay --bin-dir ./releases
+./shell-remote relay --bin-dir ./releases
 ```
 
 Then visit `http://<relay>:3000/download` to download any architecture.

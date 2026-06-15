@@ -151,7 +151,7 @@ class FileManager {
     }
 
     uploadFile(file) {
-        const token = sessionStorage.getItem('ssh-remote-token') || '';
+        const token = sessionStorage.getItem('shell-remote-token') || '';
         const fullPath = this.currentPath.endsWith('/')
             ? this.currentPath + file.name
             : this.currentPath + '/' + file.name;
