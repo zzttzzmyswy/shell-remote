@@ -502,4 +502,63 @@ mod tests {
         let sessions: Vec<ExecSessionInfo> = serde_json::from_slice(&decoded).unwrap();
         assert!(sessions.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_write_stdin_to_running() {
+        let mgr = ExecSessionManager::new();
+        let r = mgr.spawn("cat").await.unwrap();
+        let result = mgr.write_stdin(&r.exec_id, b"hello\n").await.unwrap();
+        assert_eq!(result.status, "running");
+        // After close, check output
+        let close = mgr.close(&r.exec_id).await.unwrap();
+        let decoded = fs::decode_b64(&close.stdout).unwrap();
+        let s = String::from_utf8_lossy(&decoded);
+        assert!(s.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_write_stdin_to_nonexistent() {
+        let mgr = ExecSessionManager::new();
+        let result = mgr.write_stdin("nonexistent", b"data").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().error.unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_write_stdin_to_exited() {
+        let mgr = ExecSessionManager::new();
+        let r = mgr.spawn("true").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let result = mgr.write_stdin(&r.exec_id, b"data").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.status == "exited" || err.status == "killed");
+    }
+
+    #[tokio::test]
+    async fn test_close_nonexistent_session() {
+        let mgr = ExecSessionManager::new();
+        let result = mgr.close("nonexistent").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().error.unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_close_already_exited() {
+        let mgr = ExecSessionManager::new();
+        let r = mgr.spawn("true").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let result = mgr.close(&r.exec_id).await.unwrap();
+        assert_eq!(result.status, "exited");
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_invalid_command() {
+        let mgr = ExecSessionManager::new();
+        let r = mgr.spawn("nonexistent_command_xyz_123").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let result = mgr.close(&r.exec_id).await.unwrap();
+        assert!(result.status == "exited" || result.status == "killed");
+    }
 }

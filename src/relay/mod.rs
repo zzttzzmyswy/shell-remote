@@ -90,7 +90,7 @@ async fn static_handler(uri: Uri) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request;
+    use axum::http::{HeaderMap, Request};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -185,6 +185,43 @@ mod tests {
             .with_state(state);
 
         let _ = app;
+    }
+
+    #[tokio::test]
+    async fn test_upload_handler_unauthorized_no_token() {
+        let state = Arc::new(SharedState::new("".into(), None));
+        let headers = HeaderMap::new();
+        let params = HashMap::new();
+        let body = Body::from("test content");
+        let result = upload_handler(State(state), headers, Query(params), body).await;
+        assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn test_upload_handler_readonly_token_forbidden() {
+        let state = Arc::new(SharedState::new("".into(), None));
+        let (_sid, tokens) = state.sessions.register(None, "ro").await;
+        let token = &tokens[0].0;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "/tmp/test".to_string());
+        let body = Body::from("test content");
+        let result = upload_handler(State(state), headers, Query(params), body).await;
+        assert_eq!(result, Err(StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn test_upload_handler_missing_path() {
+        let state = Arc::new(SharedState::new("".into(), None));
+        let (_sid, tokens) = state.sessions.register(None, "rw").await;
+        let token = &tokens[0].0;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        let params = HashMap::new();
+        let body = Body::from("test content");
+        let result = upload_handler(State(state), headers, Query(params), body).await;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
     }
 }
 
@@ -292,10 +329,12 @@ pub async fn start(
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/ws", get(ws::ws_handler))
-        .route("/upload", axum::routing::post(upload_handler).layer(axum::extract::DefaultBodyLimit::disable()))
-        .route("/mcp/sse", get(mcp::sse_handler))
-        .route("/mcp/messages", axum::routing::post(mcp::messages_handler))
+        .route("/agent", get(ws::ws_handler))
+        .route("/agent/send", axum::routing::post(ws::agent_send_handler))
+        .route("/agent/events", get(ws::agent_events_handler))
+        .route("/agent/upload", axum::routing::post(upload_handler).layer(axum::extract::DefaultBodyLimit::disable()))
+        .route("/agent/mcp/sse", get(mcp::sse_handler))
+        .route("/agent/mcp/messages", axum::routing::post(mcp::messages_handler))
         .route("/download", get(static_handler))
         .route("/bin/{arch}", get(bin_handler))
         .route("/", get(static_handler))

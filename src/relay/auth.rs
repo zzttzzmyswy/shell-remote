@@ -64,6 +64,7 @@ fn hex_digit(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
 
     #[test]
     fn test_extract_token_from_query_present() {
@@ -93,5 +94,81 @@ mod tests {
     fn test_extract_token_from_query_url_encoded() {
         let result = extract_token_from_query("token=abc%20123");
         assert_eq!(result, Some("abc 123".to_string()));
+    }
+
+    // ── extract_bearer_token ────────────────────────────────────────
+
+    #[test]
+    fn test_extract_bearer_token_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer abc123".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_bearer_token_missing_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_bearer_token_not_bearer_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Basic dGVzdA==".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_bearer_token_empty_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_bearer_token_case_insensitive_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer token123".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), Some("token123".to_string()));
+    }
+
+    // ── extract_token_from_headers_or_query ────────────────────────
+
+    #[test]
+    fn test_extract_token_from_headers_or_query_header_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer header_token".parse().unwrap());
+        let query_token = Some("query_token".to_string());
+        assert_eq!(
+            extract_token_from_headers_or_query(&headers, query_token.as_ref()),
+            Some("header_token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_token_from_headers_or_query_fallback() {
+        let headers = HeaderMap::new();
+        let query_token = Some("query_token".to_string());
+        assert_eq!(
+            extract_token_from_headers_or_query(&headers, query_token.as_ref()),
+            Some("query_token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_token_from_headers_or_query_both_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_token_from_headers_or_query(&headers, None), None);
+    }
+
+    #[test]
+    fn test_extract_token_from_headers_or_query_header_empty_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        let query_token = Some("fallback".to_string());
+        assert_eq!(
+            extract_token_from_headers_or_query(&headers, query_token.as_ref()),
+            Some("fallback".to_string())
+        );
     }
 }

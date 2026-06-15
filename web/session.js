@@ -211,7 +211,7 @@
         }));
     };
 
-    const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+    const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/agent';
     ws.connect(wsUrl);
 
     document.getElementById('copy-token-btn').addEventListener('click', () => {

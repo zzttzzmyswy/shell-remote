@@ -107,3 +107,33 @@ impl Shell {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_spawn() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let shell = Shell::spawn(80, 24, "/bin/sh", "test-tab", tx);
+        assert!(shell.is_ok());
+    }
+
+    #[test]
+    fn test_shell_write_input() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut shell = Shell::spawn(80, 24, "/bin/sh", "test-tab", tx).unwrap();
+        let result = shell.write_input(b"echo hello\n");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_shell_resize() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut shell = Shell::spawn(80, 24, "/bin/sh", "test-tab", tx).unwrap();
+        let result = shell.resize(120, 40);
+        assert!(result.is_ok());
+        assert_eq!(shell.cols, 120);
+        assert_eq!(shell.rows, 40);
+    }
+}

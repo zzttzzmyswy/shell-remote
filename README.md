@@ -122,14 +122,14 @@ Relay server listening on 0.0.0.0:3000
 ### Start Agent
 
 ```bash
-./shell-remote agent --relay-url ws://<relay-ip>:3000/ws --root /home/user
+./shell-remote agent --relay-url ws://<relay-ip>:3000 --root /home/user
 ```
 
 Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--relay-url` | `ws://localhost:3000/ws` | Relay WebSocket URL |
+| `--relay-url` | `ws://localhost:3000` | Relay URL (ws:// or https:// for SSE+POST mode) |
 | `--key` | — | Fixed auth key (random if omitted) |
 | `--root` | `$HOME` | Root directory for file browser |
 | `--token-type` | `rw` | `rw`, `ro`, or `both` |

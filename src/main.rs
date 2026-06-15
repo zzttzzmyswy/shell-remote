@@ -44,7 +44,7 @@ enum Command {
     /// Run in agent mode (connects to a relay)
     Agent {
         /// WebSocket URL of the relay server
-        #[arg(long, default_value = "ws://localhost:3000/ws")]
+        #[arg(long, default_value = "ws://localhost:3000")]
         relay_url: String,
 
         /// Fixed authentication key (optional, random token used if omitted)

@@ -35,9 +35,9 @@ pub async fn sse_handler(
 
     let stream = async_stream::stream! {
         let endpoint_url = if let Some(ref t) = token {
-            format!("/mcp/messages?token={}", t)
+            format!("/agent/mcp/messages?token={}", t)
         } else {
-            "/mcp/messages".to_string()
+            "/agent/mcp/messages".to_string()
         };
 
         yield Ok::<_, Infallible>(Event::default()
@@ -598,5 +598,219 @@ pub async fn messages_handler(
             }
         }))
         .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::session::SessionRegistry;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn make_state() -> Arc<SharedState> {
+        Arc::new(SharedState {
+            sessions: SessionRegistry::new(),
+            agent_broadcast: RwLock::new(HashMap::new()),
+            pending_mcp: RwLock::new(HashMap::new()),
+            last_activity: RwLock::new(HashMap::new()),
+            server_auth: String::new(),
+            bin_dir: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_messages_handler_initialize() {
+        let state = make_state();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize"
+        });
+        let response = messages_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["result"]["protocolVersion"], "2024-11-05");
+    }
+
+    #[tokio::test]
+    async fn test_messages_handler_tools_list() {
+        let state = make_state();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+        let response = messages_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        let tools = result["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_messages_handler_unknown_method() {
+        let state = make_state();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "unknown"
+        });
+        let response = messages_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn test_sse_handler_valid_token_returns_200() {
+        let state = make_state();
+        let response = sse_handler(
+            State(state),
+            Query(HashMap::from([("token".to_string(), "".to_string())])),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_sse_handler_invalid_token_returns_error_sse() {
+        let state = make_state();
+        let (_session_id, _tokens) = state.sessions.register(None, "rw").await;
+        let response = sse_handler(
+            State(state),
+            Query(HashMap::from([(
+                "token".to_string(),
+                "wrong_token".to_string(),
+            )])),
+        )
+        .await
+        .into_response();
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_handler_exec_remote_without_agent() {
+        let state = make_state();
+        let (_session_id, tokens) = state.sessions.register(None, "rw").await;
+        let valid_token = tokens[0].0.clone();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "exec_remote",
+                "arguments": {
+                    "cmd": "echo hello",
+                    "token": valid_token
+                }
+            }
+        });
+        let response = messages_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            Query(HashMap::from([("token".to_string(), valid_token)])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = result["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("No agent connected"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_handler_file_remote_read_without_agent() {
+        let state = make_state();
+        let (_session_id, tokens) = state.sessions.register(None, "rw").await;
+        let valid_token = tokens[0].0.clone();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "file_remote_read",
+                "arguments": {
+                    "path": "/etc/hostname",
+                    "token": valid_token
+                }
+            }
+        });
+        let response = messages_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            Query(HashMap::from([("token".to_string(), valid_token)])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = result["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("No agent connected"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_handler_invalid_token_returns_error() {
+        let state = make_state();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "exec_remote",
+                "arguments": {
+                    "cmd": "echo hello",
+                    "token": "nonexistent_token"
+                }
+            }
+        });
+        let response = messages_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            Query(HashMap::from([(
+                "token".to_string(),
+                "nonexistent_token".to_string(),
+            )])),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["error"]["code"], -32001);
+        assert_eq!(result["error"]["message"], "Invalid token");
     }
 }

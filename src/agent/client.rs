@@ -1,13 +1,25 @@
 use anyhow::{bail, Context};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use crate::proto::Message as ProtoMessage;
 
+enum Transport {
+    Ws {
+        ws: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    },
+    Http {
+        client: reqwest::Client,
+        send_url: String,
+        events_rx: mpsc::UnboundedReceiver<String>,
+        _task: tokio::task::JoinHandle<()>,
+    },
+}
+
 pub struct RelayClient {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    transport: Transport,
     pub session_id: String,
     pub tokens: Vec<(String, String)>,
 }
@@ -18,10 +30,23 @@ impl RelayClient {
         fixed_key: Option<String>,
         token_type: &str,
     ) -> anyhow::Result<Self> {
-        let url = if let Some(key) = &fixed_key {
-            format!("{}?key={}&token_type={}", relay_url, key, token_type)
+        if relay_url.starts_with("ws://") || relay_url.starts_with("wss://") {
+            Self::connect_ws(relay_url, fixed_key, token_type).await
         } else {
-            format!("{}?token_type={}", relay_url, token_type)
+            Self::connect_http(relay_url, fixed_key, token_type).await
+        }
+    }
+
+    async fn connect_ws(
+        relay_url: &str,
+        fixed_key: Option<String>,
+        token_type: &str,
+    ) -> anyhow::Result<Self> {
+        let url = format!("{}/agent", relay_url.trim_end_matches('/'));
+        let url = if let Some(key) = &fixed_key {
+            format!("{}?key={}&token_type={}", url, key, token_type)
+        } else {
+            format!("{}?token_type={}", url, token_type)
         };
 
         let (ws, _) = connect_async(&url)
@@ -29,7 +54,7 @@ impl RelayClient {
             .context("Failed to connect to relay WebSocket")?;
 
         let mut client = Self {
-            ws,
+            transport: Transport::Ws { ws },
             session_id: String::new(),
             tokens: Vec::new(),
         };
@@ -38,51 +63,118 @@ impl RelayClient {
             "type": "agent:register",
             "key": fixed_key,
             "token_type": token_type
-        })
-        .to_string();
+        }).to_string();
 
-        client
-            .ws
-            .send(Message::Text(register_msg))
+        client.send_raw(&register_msg).await?;
+
+        let response_text = client.recv_raw().await
+            .context("Failed to receive register response")?;
+        let response: serde_json::Value = serde_json::from_str(&response_text)
+            .context("Failed to parse register response")?;
+
+        Self::handle_register_response(&mut client, &response)?;
+        Ok(client)
+    }
+
+    async fn connect_http(
+        relay_url: &str,
+        fixed_key: Option<String>,
+        token_type: &str,
+    ) -> anyhow::Result<Self> {
+        let base = relay_url.trim_end_matches('/');
+        let send_url = format!("{}/agent/send", base);
+
+        let http_client = reqwest::Client::new();
+
+        let register_msg = json!({
+            "type": "agent:register",
+            "key": fixed_key,
+            "token_type": token_type
+        });
+
+        let resp = http_client.post(&send_url)
+            .json(&register_msg)
+            .send()
             .await
-            .context("Failed to send register message")?;
+            .context("Failed to POST register message")?;
 
-        match client.ws.next().await {
-            Some(Ok(Message::Text(text))) => {
-                let response: serde_json::Value = serde_json::from_str(&text)
-                    .context("Failed to parse register response")?;
+        let response: serde_json::Value = resp.json()
+            .await
+            .context("Failed to parse register response")?;
 
-                let msg_type = response["type"].as_str().unwrap_or("");
-                if msg_type != "agent:registered" {
-                    bail!("Unexpected register response type: {}", msg_type);
+        let session_id = response["session_id"].as_str()
+            .context("Missing session_id in register response")?.to_string();
+
+        let events_url = format!("{}/agent/events?session={}", base, session_id);
+
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+
+        let sse_client = http_client.clone();
+        let sse_task = tokio::spawn(async move {
+            let mut stream = match sse_client.get(&events_url).send().await {
+                Ok(resp) => resp.bytes_stream(),
+                Err(e) => {
+                    tracing::error!("SSE connection failed: {}", e);
+                    return;
                 }
+            };
 
-                client.session_id = response["session_id"]
-                    .as_str()
-                    .context("Missing session_id")?
-                    .to_string();
-
-                let payload = &response["payload"];
-                if let Some(tokens_array) = payload["tokens"].as_array() {
-                    for t in tokens_array {
-                        let token = t["token"]
-                            .as_str()
-                            .context("Missing token in tokens array")?
-                            .to_string();
-                        let permission = t["permission"]
-                            .as_str()
-                            .context("Missing permission in tokens array")?
-                            .to_string();
-                        client.tokens.push((token, permission));
+            let mut buf = String::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buf.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(pos) = buf.find("\n\n") {
+                            let event_str = buf[..pos].to_string();
+                            buf = buf[pos + 2..].to_string();
+                            for line in event_str.lines() {
+                                if let Some(data) = line.strip_prefix("data:") {
+                                    let _ = tx.send(data.trim().to_string());
+                                }
+                            }
+                        }
                     }
+                    Err(_) => break,
                 }
             }
-            Some(Ok(_)) => bail!("Unexpected message type on register"),
-            Some(Err(e)) => bail!("WebSocket error during register: {}", e),
-            None => bail!("WebSocket closed during register"),
+        });
+
+        let mut client = Self {
+            transport: Transport::Http {
+                client: http_client,
+                send_url,
+                events_rx: rx,
+                _task: sse_task,
+            },
+            session_id: String::new(),
+            tokens: Vec::new(),
+        };
+
+        Self::handle_register_response(&mut client, &response)?;
+        Ok(client)
+    }
+
+    fn handle_register_response(client: &mut Self, response: &serde_json::Value) -> anyhow::Result<()> {
+        let msg_type = response["type"].as_str().unwrap_or("");
+        if msg_type != "agent:registered" {
+            bail!("Unexpected register response type: {}", msg_type);
         }
 
-        Ok(client)
+        client.session_id = response["session_id"].as_str()
+            .context("Missing session_id")?.to_string();
+
+        let payload = &response["payload"];
+        if let Some(tokens_array) = payload["tokens"].as_array() {
+            for t in tokens_array {
+                let token = t["token"].as_str()
+                    .context("Missing token in tokens array")?.to_string();
+                let permission = t["permission"].as_str()
+                    .context("Missing permission in tokens array")?.to_string();
+                client.tokens.push((token, permission));
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn connect_with_retry(
@@ -103,9 +195,7 @@ impl RelayClient {
                     }
                     tracing::warn!(
                         "Connection attempt {} failed: {}. Retrying in {:?}...",
-                        attempt + 1,
-                        e,
-                        delay
+                        attempt + 1, e, delay
                     );
                     tokio::time::sleep(delay).await;
                     delay = std::cmp::min(delay * 2, max_delay);
@@ -116,19 +206,62 @@ impl RelayClient {
         anyhow::bail!("Failed to connect after {} retries", max_retries)
     }
 
+    async fn send_raw(&mut self, text: &str) -> anyhow::Result<()> {
+        match &mut self.transport {
+            Transport::Ws { ws } => {
+                ws.send(Message::Text(text.to_string()))
+                    .await
+                    .context("Failed to send WebSocket message")?;
+            }
+            Transport::Http { client, send_url, .. } => {
+                let body: serde_json::Value = serde_json::from_str(text)
+                    .context("Failed to parse outgoing message")?;
+                client.post(send_url.as_str())
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("Failed to POST agent message")?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn send(&mut self, msg: &ProtoMessage) -> anyhow::Result<()> {
         let text = serde_json::to_string(msg).context("Failed to serialize message")?;
-        self.ws
-            .send(Message::Text(text))
-            .await
-            .context("Failed to send WebSocket message")?;
-        Ok(())
+        self.send_raw(&text).await
+    }
+
+    async fn recv_raw(&mut self) -> Option<String> {
+        match &mut self.transport {
+            Transport::Ws { ws } => {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => return Some(text.to_string()),
+                        Some(Ok(Message::Close(_))) => return None,
+                        Some(Ok(Message::Ping(data))) => {
+                            if ws.send(Message::Pong(data)).await.is_err() {
+                                return None;
+                            }
+                        }
+                        Some(Ok(_)) => continue,
+                        Some(Err(e)) => {
+                            tracing::warn!("WebSocket error: {}", e);
+                            return None;
+                        }
+                        None => return None,
+                    }
+                }
+            }
+            Transport::Http { events_rx, .. } => {
+                events_rx.recv().await
+            }
+        }
     }
 
     pub async fn recv(&mut self) -> Option<ProtoMessage> {
         loop {
-            match self.ws.next().await {
-                Some(Ok(Message::Text(text))) => {
+            match self.recv_raw().await {
+                Some(text) => {
                     match serde_json::from_str::<ProtoMessage>(&text) {
                         Ok(msg) => return Some(msg),
                         Err(e) => {
@@ -137,19 +270,16 @@ impl RelayClient {
                         }
                     }
                 }
-                Some(Ok(Message::Close(_))) => return None,
-                Some(Ok(Message::Ping(data))) => {
-                    if self.ws.send(Message::Pong(data)).await.is_err() {
-                        return None;
-                    }
-                }
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => {
-                    tracing::warn!("WebSocket error: {}", e);
-                    return None;
-                }
                 None => return None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_placeholder() {
+        assert!(true);
     }
 }
