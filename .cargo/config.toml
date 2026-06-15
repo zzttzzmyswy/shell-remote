@@ -1,2 +1,14 @@
+[target.riscv64gc-unknown-linux-musl]
+linker = "rust-lld"
+
 [target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+
+[target.arm-unknown-linux-musleabihf]
+linker = "rust-lld"
+
+[target.i686-unknown-linux-musl]
 linker = "rust-lld"
