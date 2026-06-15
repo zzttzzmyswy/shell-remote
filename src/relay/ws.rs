@@ -17,7 +17,9 @@ pub async fn ws_handler(
     State(state): State<Arc<SharedState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, params))
+    ws.max_message_size(256 * 1024 * 1024)
+        .max_frame_size(64 * 1024 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, state, params))
 }
 
 async fn handle_socket(
@@ -63,8 +65,7 @@ async fn handle_socket(
                             "message":format!("Unknown role: {}", other)
                         }
                     })
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await;
         }
@@ -103,14 +104,13 @@ async fn handle_agent(
         "type": "agent:registered",
         "session_id": session_id,
         "payload": {
-            "session_id": session_id,
             "tokens": tokens_json
         }
     }))
     .unwrap_or_default();
 
     if sender
-        .send(axum::extract::ws::Message::Text(registered_msg.into()))
+        .send(axum::extract::ws::Message::Text(registered_msg))
         .await
         .is_err()
     {
@@ -146,7 +146,7 @@ async fn handle_agent(
         let entry = broadcast
             .entry(session_id.clone())
             .or_insert_with(ChannelMap::new);
-        entry.senders.push(agent_tx.clone());
+        entry.agent = Some(agent_tx.clone());
     }
 
     let state_clone = state.clone();
@@ -155,7 +155,7 @@ async fn handle_agent(
     let sender_task = tokio::spawn(async move {
         while let Some(msg) = agent_rx.recv().await {
             if sender
-                .send(axum::extract::ws::Message::Text(msg.into()))
+                .send(axum::extract::ws::Message::Text(msg))
                 .await
                 .is_err()
             {
@@ -173,14 +173,21 @@ async fn handle_agent(
 
                 if let Ok(proto_msg) = serde_json::from_str::<ProtoMessage>(&text_str) {
                     if proto_msg.msg_type == "session:users"
+                        || proto_msg.msg_type == "session:tab_list"
+                        || proto_msg.msg_type == "session:tab_switched"
                         || proto_msg.msg_type == "terminal:output"
                         || proto_msg.msg_type == "fs:result"
+                        || proto_msg.msg_type == "fs:mkdir"
                         || proto_msg.msg_type == "mcp:result"
                     {
                         let broadcast = state_clone.agent_broadcast.read().await;
                         if let Some(channel_map) = broadcast.get(&session_id_clone) {
-                            for tx in &channel_map.senders {
-                                if !tx.same_channel(&agent_tx) {
+                            let target_user = proto_msg.payload
+                                .get("_target_user_id")
+                                .and_then(|v| v.as_str());
+
+                            for (uid, tx) in &channel_map.browsers {
+                                if target_user.map_or(true, |t| t == uid.as_str()) {
                                     let _ = tx.send(text_str.clone());
                                 }
                             }
@@ -259,7 +266,7 @@ async fn handle_agent(
         })
         .to_string();
         if let Some(channel_map) = broadcast.get(&session_id) {
-            for tx in &channel_map.senders {
+            for tx in channel_map.browsers.values() {
                 let _ = tx.send(disconnect_msg.clone());
             }
         }
@@ -279,6 +286,21 @@ async fn handle_browser(
     join_msg: serde_json::Value,
 ) {
     let token = join_msg["payload"]["token"].as_str().unwrap_or("");
+    let server_password = join_msg["payload"]["server_auth"].as_str().unwrap_or("");
+
+    if !state.server_auth.is_empty() && server_password != state.server_auth {
+        let error_msg = serde_json::to_string(&json!({
+            "type": "error",
+            "session_id": "",
+            "payload": {
+                "code": "AUTH_INVALID_PASSWORD",
+                "message": "Invalid server password"
+            }
+        }))
+        .unwrap_or_default();
+        let _ = sender.send(axum::extract::ws::Message::Text(error_msg)).await;
+        return;
+    }
 
     let (session_id, permission) = match state.sessions.authenticate(token).await {
         Some(result) => result,
@@ -293,7 +315,7 @@ async fn handle_browser(
             }))
             .unwrap_or_default();
             let _ = sender
-                .send(axum::extract::ws::Message::Text(error_msg.into()))
+                .send(axum::extract::ws::Message::Text(error_msg))
                 .await;
             return;
         }
@@ -319,7 +341,7 @@ async fn handle_browser(
         let broadcast = state.agent_broadcast.read().await;
         broadcast
             .get(&session_id)
-            .and_then(|cm| cm.senders.first().cloned())
+            .and_then(|cm| cm.agent.clone())
     };
 
     if let Some(ref tx) = agent_tx {
@@ -337,7 +359,7 @@ async fn handle_browser(
     .unwrap_or_default();
 
     if sender
-        .send(axum::extract::ws::Message::Text(welcome_msg.into()))
+        .send(axum::extract::ws::Message::Text(welcome_msg))
         .await
         .is_err()
     {
@@ -354,7 +376,28 @@ async fn handle_browser(
     {
         let mut broadcast = state.agent_broadcast.write().await;
         if let Some(channel_map) = broadcast.get_mut(&session_id) {
-            channel_map.senders.push(browser_tx.clone());
+            channel_map.browsers.insert(user_id.clone(), browser_tx.clone());
+        }
+    }
+
+    let browser_count = {
+        let broadcast = state.agent_broadcast.read().await;
+        broadcast
+            .get(&session_id)
+            .map(|cm| cm.browsers.len())
+            .unwrap_or(0)
+    };
+    let users_msg = serde_json::to_string(&json!({
+        "type": "session:users",
+        "session_id": session_id,
+        "payload": { "count": browser_count }
+    })).unwrap_or_default();
+    {
+        let broadcast = state.agent_broadcast.read().await;
+        if let Some(channel_map) = broadcast.get(&session_id) {
+            for tx in channel_map.browsers.values() {
+                let _ = tx.send(users_msg.clone());
+            }
         }
     }
 
@@ -364,7 +407,7 @@ async fn handle_browser(
     let sender_task = tokio::spawn(async move {
         while let Some(msg) = browser_rx.recv().await {
             if sender
-                .send(axum::extract::ws::Message::Text(msg.into()))
+                .send(axum::extract::ws::Message::Text(msg))
                 .await
                 .is_err()
             {
@@ -423,7 +466,25 @@ async fn handle_browser(
     {
         let mut broadcast = state_clone.agent_broadcast.write().await;
         if let Some(channel_map) = broadcast.get_mut(&session_clone2) {
-            channel_map.senders.retain(|tx| !tx.same_channel(&browser_tx));
+            channel_map.browsers.remove(&user_id_clone);
+        }
+    }
+
+    {
+        let broadcast = state_clone.agent_broadcast.read().await;
+        let count = broadcast
+            .get(&session_clone2)
+            .map(|cm| cm.browsers.len())
+            .unwrap_or(0);
+        let users_msg = serde_json::to_string(&json!({
+            "type": "session:users",
+            "session_id": session_clone2,
+            "payload": { "count": count }
+        })).unwrap_or_default();
+        if let Some(channel_map) = broadcast.get(&session_clone2) {
+            for tx in channel_map.browsers.values() {
+                let _ = tx.send(users_msg.clone());
+            }
         }
     }
 

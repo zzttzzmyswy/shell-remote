@@ -10,23 +10,31 @@ pub fn resolve_path(root: &Path, user_path: &str) -> Option<PathBuf> {
         Err(_) => return None,
     };
 
-    let combined = root.join(user_path.trim_start_matches('/'));
+    let user_path_buf = PathBuf::from(user_path);
+    if user_path_buf.is_absolute() {
+        if let Ok(canon) = user_path_buf.canonicalize() {
+            return Some(canon);
+        }
+        // File doesn't exist yet (e.g., pending write) — check parent directory
+        if let Some(parent) = user_path_buf.parent() {
+            if parent.canonicalize().is_ok() {
+                return Some(user_path_buf);
+            }
+        }
+        return None;
+    }
 
+    let combined = root.join(user_path.trim_start_matches('/'));
     let resolved = match combined.canonicalize() {
         Ok(r) => r,
         Err(_) => {
             match combined.parent().and_then(|p| p.canonicalize().ok()) {
-                Some(parent) if parent.starts_with(&root) => combined,
+                Some(_parent) => combined,
                 _ => return None,
             }
         }
     };
-
-    if resolved.starts_with(&root) {
-        Some(resolved)
-    } else {
-        None
-    }
+    Some(resolved)
 }
 
 pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
@@ -61,6 +69,7 @@ pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
                 };
 
                 let mode = format_mode(&metadata);
+                let owner = get_owner(&metadata);
 
                 file_entries.push(FileEntry {
                     name: entry.file_name().to_string_lossy().to_string(),
@@ -68,6 +77,7 @@ pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
                     entry_type: entry_type.to_string(),
                     size: metadata.len(),
                     mode,
+                    owner,
                 });
             }
 
@@ -84,7 +94,7 @@ pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
                 error: None,
                 entries: Some(file_entries),
                 content: None,
-                path: Some(user_path.to_string()),
+                path: Some(path.to_string_lossy().to_string()),
                 new_path: None,
             }
         }
@@ -320,6 +330,29 @@ pub fn decode_b64(encoded: &str) -> Option<Vec<u8>> {
     BASE64.decode(encoded).ok()
 }
 
+fn get_owner(metadata: &std::fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        format!("{}:{}", metadata.uid(), metadata.gid())
+    }
+    #[cfg(not(unix))]
+    {
+        "0:0".to_string()
+    }
+}
+
+pub fn create_dir(root: &Path, user_path: &str) -> FsResultPayload {
+    let path = match resolve_path(root, user_path) {
+        Some(p) => p,
+        None => return FsResultPayload { success: false, error: Some("Path invalid or escapes sandbox".into()), entries: None, content: None, path: Some(user_path.to_string()), new_path: None },
+    };
+    match fs::create_dir_all(&path) {
+        Ok(()) => FsResultPayload { success: true, error: None, entries: None, content: None, path: Some(user_path.to_string()), new_path: None },
+        Err(e) => FsResultPayload { success: false, error: Some(format!("{}", e)), entries: None, content: None, path: Some(user_path.to_string()), new_path: None },
+    }
+}
+
 #[cfg(unix)]
 fn format_mode(metadata: &std::fs::Metadata) -> String {
     use std::os::unix::fs::PermissionsExt;
@@ -392,8 +425,9 @@ mod tests {
         let root = dir.path().join("sandbox");
         std::fs::create_dir_all(&root).unwrap();
 
+        // "../outside" resolves to dir.path(); canonicalize resolves '..' correctly
         let resolved = resolve_path(&root, "../outside");
-        assert!(resolved.is_none());
+        assert!(resolved.is_some());
     }
 
     #[test]
@@ -402,8 +436,9 @@ mod tests {
         let root = dir.path().join("sandbox");
         std::fs::create_dir_all(&root).unwrap();
 
+        // Absolute paths are now allowed (no sandbox restriction)
         let resolved = resolve_path(&root, "/etc/passwd");
-        assert!(resolved.is_none());
+        assert!(resolved.is_some());
     }
 
     #[test]
@@ -431,8 +466,9 @@ mod tests {
         let root = dir.path().join("sandbox");
         std::fs::create_dir_all(&root).unwrap();
 
+        // Outside sandbox is now allowed — resolves to the parent directory
         let result = list_dir(&root, "../");
-        assert!(!result.success);
+        assert!(result.success);
     }
 
     #[test]
@@ -477,8 +513,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let content_b64 = encode_b64(b"escape");
 
+        // Outside sandbox write is now allowed — writes to parent directory
         let result = write_file(&root, "../outside.txt", &content_b64);
-        assert!(!result.success);
+        assert!(result.success);
     }
 
     #[test]
@@ -519,8 +556,9 @@ mod tests {
         let root = dir.path().join("sandbox");
         std::fs::create_dir_all(&root).unwrap();
 
+        // Outside sandbox delete is now allowed (resolves to parent)
         let result = delete_path(&root, "../");
-        assert!(!result.success);
+        assert!(result.success);
     }
 
     #[test]
@@ -552,8 +590,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("file.txt"), b"x").unwrap();
 
+        // Outside sandbox rename is now allowed
         let result = rename_path(&root, "file.txt", "../outside.txt");
-        assert!(!result.success);
+        assert!(result.success);
     }
 
     #[test]

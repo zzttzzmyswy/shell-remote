@@ -31,6 +31,10 @@ enum Command {
         /// Run in development mode (no TLS, plaintext WebSocket)
         #[arg(long, default_value_t = false)]
         dev: bool,
+
+        /// Server access password (default: password)
+        #[arg(long, default_value = "password")]
+        auth: String,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -50,6 +54,10 @@ enum Command {
         /// Token type: rw, ro, or both
         #[arg(long, default_value = "rw")]
         token_type: String,
+
+        /// Shell path (e.g., /bin/bash, /usr/bin/zsh)
+        #[arg(long, env = "SHELL", default_value = "/bin/bash")]
+        shell: String,
     },
 }
 
@@ -64,22 +72,27 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    let version = env!("CARGO_PKG_VERSION");
+    eprintln!("ssh-remote v{}", version);
+
     match cli.command {
         Command::Relay {
             bind,
             tls_cert,
             tls_key,
             dev,
+            auth,
         } => {
-            relay::start(bind, tls_cert, tls_key, dev).await?;
+            relay::start(bind, tls_cert, tls_key, dev, auth).await?;
         }
         Command::Agent {
             relay_url,
             key,
             root,
             token_type,
+            shell,
         } => {
-            agent::start(relay_url, key, root, token_type).await?;
+            agent::start(relay_url, key, root, token_type, shell).await?;
         }
     }
 

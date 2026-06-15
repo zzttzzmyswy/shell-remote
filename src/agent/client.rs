@@ -43,7 +43,7 @@ impl RelayClient {
 
         client
             .ws
-            .send(Message::Text(register_msg.into()))
+            .send(Message::Text(register_msg))
             .await
             .context("Failed to send register message")?;
 
@@ -57,12 +57,12 @@ impl RelayClient {
                     bail!("Unexpected register response type: {}", msg_type);
                 }
 
-                let payload = &response["payload"];
-                client.session_id = payload["session_id"]
+                client.session_id = response["session_id"]
                     .as_str()
-                    .context("Missing session_id in register response")?
+                    .context("Missing session_id")?
                     .to_string();
 
+                let payload = &response["payload"];
                 if let Some(tokens_array) = payload["tokens"].as_array() {
                     for t in tokens_array {
                         let token = t["token"]
@@ -92,7 +92,7 @@ impl RelayClient {
         max_retries: u32,
     ) -> anyhow::Result<Self> {
         let mut delay = tokio::time::Duration::from_secs(1);
-        let max_delay = tokio::time::Duration::from_secs(30);
+        let max_delay = tokio::time::Duration::from_secs(300);
 
         for attempt in 0..=max_retries {
             match Self::connect(relay_url, fixed_key.clone(), token_type).await {
@@ -119,7 +119,7 @@ impl RelayClient {
     pub async fn send(&mut self, msg: &ProtoMessage) -> anyhow::Result<()> {
         let text = serde_json::to_string(msg).context("Failed to serialize message")?;
         self.ws
-            .send(Message::Text(text.into()))
+            .send(Message::Text(text))
             .await
             .context("Failed to send WebSocket message")?;
         Ok(())

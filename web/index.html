@@ -1,37 +1,43 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SSH Remote - Connect</title>
+    <title>ssh-remote — 连接</title>
     <link rel="stylesheet" href="/style.css">
 </head>
 <body class="connect-page">
     <div class="connect-container">
         <h1>ssh-remote</h1>
-        <p class="subtitle">Collaborative Remote Terminal</p>
+        <p class="subtitle">远程协作终端</p>
         <div class="connect-form">
-            <label for="token-input">Session Token</label>
-            <input type="text" id="token-input" placeholder="Paste your session token..." autocomplete="off">
+            <label for="auth-input">服务器密码</label>
+            <input type="password" id="auth-input" placeholder="服务器访问密码..." autocomplete="off">
+            <label for="token-input">会话密钥</label>
+            <input type="text" id="token-input" placeholder="粘贴会话密钥..." autocomplete="off">
             <div class="button-row">
-                <button id="connect-rw" class="btn btn-primary">Connect (Read-Write)</button>
-                <button id="connect-ro" class="btn btn-secondary">Connect Read-Only</button>
+                <button id="connect-rw" class="btn btn-primary">读写连接</button>
+                <button id="connect-ro" class="btn btn-secondary">只读连接</button>
             </div>
             <div id="connect-error" class="error-message hidden"></div>
         </div>
     </div>
     <script>
+        const authInput = document.getElementById('auth-input');
         const tokenInput = document.getElementById('token-input');
         const errorDiv = document.getElementById('connect-error');
 
         function connect(permission) {
+            const serverAuth = authInput.value.trim();
             const token = tokenInput.value.trim();
             if (!token) {
-                showError('Please enter a session token');
+                showError('请输入会话密钥');
                 return;
             }
-            const params = new URLSearchParams({ token: token, permission: permission });
-            window.location.href = '/session?' + params.toString();
+            sessionStorage.setItem('ssh-remote-token', token);
+            sessionStorage.setItem('ssh-remote-permission', permission);
+            sessionStorage.setItem('ssh-remote-server-auth', serverAuth);
+            window.location.href = '/session';
         }
 
         function showError(msg) {

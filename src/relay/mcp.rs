@@ -18,11 +18,10 @@ pub async fn sse_handler(
     State(state): State<Arc<SharedState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let token = params.get("token").cloned().unwrap_or_default();
+    let token = params.get("token").cloned();
 
-    let (_session_id, _permission) = match state.sessions.authenticate(&token).await {
-        Some(result) => result,
-        None => {
+    if let Some(ref t) = token {
+        if !t.is_empty() && state.sessions.authenticate(t).await.is_none() {
             return Sse::new(
                 futures_util::stream::once(std::future::ready(Ok::<_, Infallible>(
                     Event::default()
@@ -32,12 +31,18 @@ pub async fn sse_handler(
             )
             .into_response();
         }
-    };
+    }
 
     let stream = async_stream::stream! {
+        let endpoint_url = if let Some(ref t) = token {
+            format!("/mcp/messages?token={}", t)
+        } else {
+            "/mcp/messages".to_string()
+        };
+
         yield Ok::<_, Infallible>(Event::default()
             .event("endpoint")
-            .data(format!("/mcp/messages?token={}", token)));
+            .data(endpoint_url));
 
         let init_result = json!({
             "jsonrpc": "2.0",
@@ -76,22 +81,7 @@ pub async fn messages_handler(
     Query(params): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let token = params.get("token").map(|s| s.as_str()).unwrap_or("");
-
-    let (session_id, _permission) = match state.sessions.authenticate(token).await {
-        Some(result) => result,
-        None => {
-            return Json(json!({
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "error": {
-                    "code": -32001,
-                    "message": "Invalid token"
-                }
-            }))
-            .into_response();
-        }
-    };
+    let url_token = params.get("token").cloned();
 
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let request_id = body.get("id").cloned().unwrap_or(Value::Null);
@@ -237,6 +227,38 @@ pub async fn messages_handler(
                 .unwrap_or("");
             let arguments = params_obj.get("arguments").unwrap_or(&Value::Null);
 
+            let auth = {
+                let mut result = None;
+                if let Some(ref t) = url_token {
+                    if !t.is_empty() {
+                        result = state.sessions.authenticate(t).await;
+                    }
+                }
+                if result.is_none() {
+                    if let Some(t) = arguments.get("token").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            result = state.sessions.authenticate(t).await;
+                        }
+                    }
+                }
+                result
+            };
+
+            let (session_id, _permission) = match auth {
+                Some(result) => result,
+                None => {
+                    return Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32001,
+                            "message": "Invalid token"
+                        }
+                    }))
+                    .into_response();
+                }
+            };
+
             if matches!(tool_name, "exec_remote_start" | "exec_remote_input" | "exec_remote_close" | "exec_remote_list") {
                 let request_id = Uuid::new_v4().to_string();
 
@@ -308,7 +330,7 @@ pub async fn messages_handler(
                         let broadcast = state.agent_broadcast.read().await;
                         broadcast
                             .get(&session_id)
-                            .and_then(|cm| cm.senders.first().cloned())
+                            .and_then(|cm| cm.agent.clone())
                     };
 
                     match agent_tx_option {
@@ -488,12 +510,12 @@ pub async fn messages_handler(
             let sent = {
                 let broadcast = state.agent_broadcast.read().await;
                 if let Some(channel_map) = broadcast.get(&session_id) {
-                    let mut sent = false;
-                    for tx in &channel_map.senders {
-                        let _ = tx.send(mcp_request_msg.clone());
-                        sent = true;
+                    if let Some(agent_tx) = &channel_map.agent {
+                        let _ = agent_tx.send(mcp_request_msg.clone());
+                        true
+                    } else {
+                        false
                     }
-                    sent
                 } else {
                     false
                 }

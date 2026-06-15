@@ -1,10 +1,12 @@
 class TerminalManager {
     constructor(containerId) {
         this.container = document.getElementById(containerId);
+        this._observer = null;
+
         this.term = new Terminal({
             cursorBlink: true,
             fontSize: 14,
-            fontFamily: "'SF Mono', 'Fira Code', 'Consolas', monospace",
+            fontFamily: "'Sarasa Term SC', 'Sarasa Mono SC', 'Noto Sans Mono CJK SC', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
             theme: {
                 background: '#1e1e1e',
                 foreground: '#d4d4d4',
@@ -40,9 +42,21 @@ class TerminalManager {
         }
 
         this.term.open(this.container);
-        this.fitAddon.fit();
 
-        window.addEventListener('resize', () => this.resize());
+        const doFit = () => {
+            try { this.fitAddon.fit(); } catch (e) { console.warn('Fit error:', e); }
+        };
+
+        // Wait for fonts to load before first fit (ensures correct char dimensions)
+        document.fonts.ready.then(() => doFit());
+
+        // ResizeObserver catches ALL size changes (drawer open/close, window resize, manual drag)
+        let debounceTimer = null;
+        this._observer = new ResizeObserver(() => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => doFit(), 50);
+        });
+        this._observer.observe(this.container);
 
         this.term.onResize(({ cols, rows }) => {
             if (this.onResizeCallback) {
@@ -73,13 +87,7 @@ class TerminalManager {
     }
 
     resize() {
-        if (this.fitAddon) {
-            try {
-                this.fitAddon.fit();
-            } catch (e) {
-                console.warn('Fit error:', e);
-            }
-        }
+        try { this.fitAddon.fit(); } catch (e) { console.warn('Fit error:', e); }
     }
 
     getCols() {
@@ -92,5 +100,9 @@ class TerminalManager {
 
     focus() {
         this.term.focus();
+    }
+
+    clear() {
+        this.term.clear();
     }
 }

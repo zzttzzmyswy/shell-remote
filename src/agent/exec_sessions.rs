@@ -414,6 +414,7 @@ impl ExecSessionManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn shutdown_all(&self) {
         let exec_ids: Vec<String> = {
             let sessions = self.sessions.read().await;

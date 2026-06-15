@@ -8,7 +8,7 @@ pub fn extract_token_from_query(query: &str) -> Option<String> {
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         match (parts.next(), parts.next()) {
-            (Some(key), Some(value)) if key == "token" => {
+            (Some("token"), Some(value)) => {
                 return Some(url_decode(value));
             }
             _ => continue,

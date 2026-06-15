@@ -1,49 +1,57 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SSH Remote - Session</title>
+    <title>ssh-remote — 会话</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 </head>
 <body class="session-page">
     <div id="toolbar">
         <div class="toolbar-left">
-            <span id="session-name">Session</span>
-            <span id="online-count" class="badge">0 online</span>
+            <span id="session-name">会话</span>
+            <span id="online-count" class="badge">0 在线</span>
         </div>
         <div class="toolbar-right">
-            <button id="copy-token-btn" class="btn btn-small" title="Copy token">Copy Token</button>
-            <button id="toggle-files-btn" class="btn btn-small">Files</button>
+            <button id="copy-token-btn" class="btn btn-small" title="复制密钥">复制密钥</button>
+            <button id="toggle-files-btn" class="btn btn-small">文件</button>
         </div>
+    </div>
+    <div id="tab-bar">
+        <div id="tab-list"></div>
+        <button id="tab-new-btn" class="tab-new-btn" title="新建标签">+</button>
     </div>
     <div class="main-content">
         <div id="terminal-container"></div>
+        <div id="file-resizer" class="file-resizer"></div>
         <div id="file-drawer" class="file-drawer hidden">
             <div class="file-drawer-header">
-                <span>File Manager</span>
-                <button id="close-files-btn" class="btn btn-small">&times;</button>
-            </div>
-            <div id="file-tree" class="file-tree"></div>
-            <div id="file-editor" class="file-editor hidden">
-                <div class="file-editor-header">
-                    <span id="editor-filename"></span>
-                    <div>
-                        <button id="editor-save-btn" class="btn btn-small btn-primary">Save</button>
-                        <button id="editor-close-btn" class="btn btn-small">Close</button>
-                    </div>
+                <span>文件管理</span>
+                <div class="file-drawer-toolbar">
+                    <button id="file-new-folder-btn" class="btn-icon" title="新建文件夹">
+                        <svg width="14" height="14" viewBox="0 0 16 16"><path fill="currentColor" d="m.5 3 .04.87a1.99 1.99 0 0 0-.342 1.311l.637 7A2 2 0 0 0 2.826 14H9v-1H2.826a1 1 0 0 1-.995-.91l-.637-7A1 1 0 0 1 2.19 4h11.62a1 1 0 0 1 .996 1.09L14.54 8h1.005l.256-2.819A2 2 0 0 0 13.81 3H9.828a2 2 0 0 1-1.414-.586l-.828-.828A2 2 0 0 0 6.172 1H2.5a2 2 0 0 0-2 2zm5.672-1a1 1 0 0 1 .707.293L7.586 3H2.19c-.24 0-.47.042-.683.12L1.5 2.98a1 1 0 0 1 1-.98h3.672z"/><path fill="currentColor" d="M13.5 10a.5.5 0 0 1 .5.5V12h1.5a.5.5 0 1 1 0 1H14v1.5a.5.5 0 1 1-1 0V13h-1.5a.5.5 0 0 1 0-1H13v-1.5a.5.5 0 0 1 .5-.5z"/></svg>
+                    </button>
+                    <label for="file-upload-input" class="btn-icon" title="上传文件">
+                        <svg width="14" height="14" viewBox="0 0 16 16"><path fill="currentColor" d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/><path fill="currentColor" d="M7.646 1.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1-.708.708L8.5 2.707V11.5a.5.5 0 0 1-1 0V2.707L5.354 4.854a.5.5 0 1 1-.708-.708l3-3z"/></svg>
+                    </label>
+                    <input type="file" id="file-upload-input" class="file-input-hidden" multiple>
+                    <button id="file-refresh-btn" class="btn-icon" title="刷新">
+                        <svg width="14" height="14" viewBox="0 0 16 16"><path fill="currentColor" fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2z"/><path fill="currentColor" d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466"/></svg>
+                    </button>
+                    <button id="close-files-btn" class="btn-icon" title="关闭">&times;</button>
                 </div>
-                <textarea id="editor-content" spellcheck="false"></textarea>
             </div>
+            <div id="upload-progress" class="upload-progress hidden"></div>
+            <div id="file-tree" class="file-tree"></div>
         </div>
     </div>
     <div id="toast" class="toast hidden"></div>
     <div id="disconnect-overlay" class="disconnect-overlay hidden">
         <div class="disconnect-message">
-            <h2>Agent Disconnected</h2>
-            <p id="disconnect-text">The remote session has ended.</p>
-            <button id="disconnect-ok-btn" class="btn btn-primary">OK</button>
+            <h2>连接断开</h2>
+            <p id="disconnect-text">远程会话已结束</p>
+            <button id="disconnect-ok-btn" class="btn btn-primary">确定</button>
         </div>
     </div>
 

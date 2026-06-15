@@ -13,17 +13,23 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TerminalInputPayload {
     pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TerminalOutputPayload {
     pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TerminalResizePayload {
     pub cols: u16,
     pub rows: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -34,6 +40,7 @@ pub struct FileEntry {
     pub entry_type: String,
     pub size: u64,
     pub mode: String,
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -145,6 +152,10 @@ pub const WRITE_TYPES: &[&str] = &[
     "mcp:exec_input",
     "mcp:exec_close",
     "mcp:exec_list",
+    "fs:mkdir",
+    "session:tab_create",
+    "session:tab_close",
+    "session:tab_switch",
 ];
 
 pub fn requires_write(msg_type: &str) -> bool {
@@ -176,6 +187,7 @@ mod tests {
     fn test_terminal_output_roundtrip() {
         let output = TerminalOutputPayload {
             data: "SGVsbG8gV29ybGQ=".to_string(),
+            tab_id: Some("tab-1".to_string()),
         };
         let msg = Message {
             msg_type: "terminal:output".to_string(),
@@ -197,6 +209,7 @@ mod tests {
             entry_type: "file".to_string(),
             size: 1024,
             mode: "-rw-r--r--".to_string(),
+            owner: "1000:1000".to_string(),
         };
         let result = FsResultPayload {
             success: true,

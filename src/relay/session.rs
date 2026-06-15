@@ -1,7 +1,6 @@
 use rand::Rng;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::proto::Permission;
 
@@ -31,8 +30,6 @@ impl SessionRegistry {
         fixed_key: Option<String>,
         token_type: &str,
     ) -> (String, Vec<(String, Permission)>) {
-        let session_id = Uuid::new_v4().to_string();
-
         let tokens: Vec<(String, Permission)> = if let Some(ref key) = fixed_key {
             let mut result = vec![(key.clone(), Permission::ReadWrite)];
             if token_type == "both" {
@@ -54,6 +51,7 @@ impl SessionRegistry {
             result
         };
 
+        let session_id = generate_session_id();
         let is_temporary = fixed_key.is_none();
 
         {
@@ -111,6 +109,12 @@ fn generate_token() -> String {
     hex::encode(bytes)
 }
 
+fn generate_session_id() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 4] = rng.gen();
+    hex::encode(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,19 +122,16 @@ mod tests {
     #[tokio::test]
     async fn test_register_temporary() {
         let registry = SessionRegistry::new();
-        let (session_id, tokens) = registry.register(None, "rw").await;
-
-        assert!(!session_id.is_empty());
+        let (_session_id, tokens) = registry.register(None, "rw").await;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].1, Permission::ReadWrite);
-        assert!(registry.is_temporary(&session_id).await);
+        assert!(registry.is_temporary(&_session_id).await);
     }
 
     #[tokio::test]
     async fn test_register_both_token_types() {
         let registry = SessionRegistry::new();
         let (_session_id, tokens) = registry.register(None, "both").await;
-
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].1, Permission::ReadWrite);
         assert_eq!(tokens[1].1, Permission::ReadOnly);
@@ -150,7 +151,6 @@ mod tests {
         let registry = SessionRegistry::new();
         let (_session_id, tokens) =
             registry.register(Some("my-secret-key".to_string()), "rw").await;
-
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].0, "my-secret-key");
         assert_eq!(tokens[0].1, Permission::ReadWrite);
@@ -161,7 +161,6 @@ mod tests {
         let registry = SessionRegistry::new();
         let (_session_id, tokens) =
             registry.register(Some("my-secret-key".to_string()), "both").await;
-
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].0, "my-secret-key");
         assert_eq!(tokens[0].1, Permission::ReadWrite);
@@ -172,12 +171,11 @@ mod tests {
     #[tokio::test]
     async fn test_authenticate_valid_token() {
         let registry = SessionRegistry::new();
-        let (session_id, tokens) = registry.register(None, "rw").await;
-
+        let (_session_id, tokens) = registry.register(None, "rw").await;
         let result = registry.authenticate(&tokens[0].0).await;
         assert!(result.is_some());
         let (sid, perm) = result.unwrap();
-        assert_eq!(sid, session_id);
+        assert_eq!(sid, _session_id);
         assert_eq!(perm, Permission::ReadWrite);
     }
 
@@ -192,7 +190,6 @@ mod tests {
     async fn test_authenticate_ro_token() {
         let registry = SessionRegistry::new();
         let (_session_id, tokens) = registry.register(None, "both").await;
-
         let result = registry.authenticate(&tokens[1].0).await;
         assert!(result.is_some());
         let (_sid, perm) = result.unwrap();
@@ -203,9 +200,7 @@ mod tests {
     async fn test_remove_session() {
         let registry = SessionRegistry::new();
         let (session_id, tokens) = registry.register(None, "rw").await;
-
         registry.remove(&session_id).await;
-
         let result = registry.authenticate(&tokens[0].0).await;
         assert!(result.is_none());
         assert!(!registry.is_temporary(&session_id).await);
