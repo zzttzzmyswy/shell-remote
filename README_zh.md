@@ -48,15 +48,22 @@ cargo build --release
 
 ### 下载预编译二进制
 
-[GitHub Releases](https://github.com/zzttzzmyswy/ssh-remote/releases) 提供多架构 musl 静态编译二进制：
+[GitHub Releases](https://github.com/zzttzzmyswy/ssh-remote/releases) 提供三种架构的 musl 静态编译二进制：
 
-| 架构 | 文件 | 大小 | 适用设备 |
-|------|------|------|----------|
-| x86_64 | `ssh-remote-x86_64` | ~2.4M | Intel/AMD Linux |
-| aarch64 | `ssh-remote-aarch64` | ~2.0M | ARM64 (树莓派4/5, 云服务器) |
-| i686 | `ssh-remote-i686` | ~2.1M | 32位 x86 |
-| armv7 | `ssh-remote-armv7` | ~1.9M | ARM 32位 (树莓派2/3) |
-| arm | `ssh-remote-arm` | ~1.9M | 老款 ARM 32位 |
+```bash
+# x86_64 (Intel/AMD)
+curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-x86_64 && chmod +x ssh-remote-x86_64
+
+# aarch64 (ARM 64位, 树莓派4/5)
+curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-aarch64 && chmod +x ssh-remote-aarch64
+
+# armv7 (ARM 32位, 树莓派2/3)
+curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-armv7 && chmod +x ssh-remote-armv7
+```
+
+或访问任意运行中的 Relay 的 `/download` 页面，提供平台检测和可复制的 curl 命令。
+
+跨平台编译指南见 [BUILD.md](BUILD.md)（支持 x86_64、aarch64、armv7 三架构）。
 
 ### Docker
 
@@ -76,6 +83,7 @@ docker run -d --name ssh-remote-relay -p 3000:3000 ssh-remote relay --dev --bind
 | `--bind` | `0.0.0.0:3000` | 监听地址 |
 | `--dev` | false | 开发模式（明文 WebSocket） |
 | `--auth` | `password` | 服务器访问密码 |
+| `--bin-dir` | — | 预编译二进制文件目录（供 /download 页面使用） |
 | `--tls-cert` | — | TLS 证书路径 |
 | `--tls-key` | — | TLS 私钥路径 |
 

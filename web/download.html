@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Download — ssh-remote</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #0d1117;
+  color: #c9d1d9;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+}
+h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #f0f6fc; }
+.version { color: #8b949e; margin-bottom: 2rem; font-family: monospace; }
+.cards { display: flex; gap: 1.5rem; flex-wrap: wrap; justify-content: center; max-width: 900px; }
+.card {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 1.5rem;
+  width: 260px;
+  display: flex;
+  flex-direction: column;
+}
+.card.current { border-color: #58a6ff; }
+.card h2 { font-size: 1rem; color: #f0f6fc; margin-bottom: 0.3rem; font-family: monospace; }
+.card .desc { font-size: 0.8rem; color: #8b949e; margin-bottom: 1rem; flex: 1; }
+.card .badge {
+  display: inline-block;
+  background: #1f6feb22;
+  color: #58a6ff;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  margin-bottom: 0.8rem;
+}
+.card .btn {
+  display: block;
+  text-align: center;
+  padding: 8px 0;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  margin-bottom: 0.6rem;
+}
+.btn-primary { background: #238636; color: #fff; border: none; }
+.btn-primary:hover { background: #2ea043; }
+.btn-secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+.btn-secondary:hover { background: #30363d; }
+.curl-box {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: 'CaskaydiaCove Nerd Font Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 0.72rem;
+  color: #7ee787;
+  position: relative;
+  overflow-x: auto;
+  white-space: nowrap;
+  margin-top: 0.5rem;
+}
+.curl-box span { color: #c9d1d9; }
+.copy-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: #30363d;
+  border: none;
+  color: #c9d1d9;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.65rem;
+  cursor: pointer;
+}
+.copy-btn.copied { color: #7ee787; }
+.info { margin-top: 2rem; font-size: 0.8rem; color: #8b949e; text-align: center; line-height: 1.6; }
+.info code { background: #161b22; padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; }
+</style>
+</head>
+<body>
+<h1>Download ssh-remote</h1>
+<div class="version">v<span id="ver"></span></div>
+
+<div class="cards" id="cards"></div>
+
+<div class="info">
+  <p>Binaries are <b>musl-static</b> — no runtime dependencies. Works on any Linux kernel 3.2+.</p>
+  <p>Start with: <code>./ssh-remote-{arch} relay --bind 0.0.0.0:3000</code></p>
+</div>
+
+<script>
+const ARCHS = [
+  {
+    id: 'x86_64',
+    name: 'x86_64',
+    desc: 'Intel / AMD 64-bit Linux systems. Most desktops, servers, and cloud VMs.',
+    tags: ['Desktop', 'Server', 'VM']
+  },
+  {
+    id: 'aarch64',
+    name: 'AArch64',
+    desc: 'ARM 64-bit — Raspberry Pi 4/5, AWS Graviton, Apple Silicon VMs, ARM cloud servers.',
+    tags: ['Raspberry Pi 4/5', 'Cloud ARM']
+  },
+  {
+    id: 'armv7',
+    name: 'ARMv7',
+    desc: 'ARM 32-bit — Raspberry Pi 2/3, older ARM boards, embedded systems.',
+    tags: ['Raspberry Pi 2/3', 'Embedded']
+  }
+];
+
+(async () => {
+  const ver = document.getElementById('ver');
+  const cards = document.getElementById('cards');
+
+  let version = '0.1.0';
+  let hasLocal = false;
+
+  try {
+    const r = await fetch('/bin/x86_64', { method: 'HEAD' });
+    hasLocal = r.ok;
+  } catch (_) {}
+
+  const ua = navigator.userAgent || '';
+  let currentArch = '';
+  if (ua.includes('x86_64') || ua.includes('x86-64') || ua.includes('amd64')) currentArch = 'x86_64';
+  else if (ua.includes('aarch64') || ua.includes('arm64') || ua.includes('armv8')) currentArch = 'aarch64';
+  else if (ua.includes('armv7') || ua.includes('armv7l')) currentArch = 'armv7';
+
+  ver.textContent = version;
+
+  const host = location.origin;
+
+  for (const a of ARCHS) {
+    const isCurrent = a.id === currentArch;
+    const c = document.createElement('div');
+    c.className = 'card' + (isCurrent ? ' current' : '');
+
+    let downloadUrl, curlCmd;
+    if (hasLocal) {
+      downloadUrl = `/bin/${a.id}`;
+      curlCmd = `curl -fLO ${host}/bin/${a.id} && chmod +x ssh-remote-${a.id}`;
+    } else {
+      downloadUrl = `https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-${a.id}`;
+      curlCmd = `curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-${a.id} && chmod +x ssh-remote-${a.id}`;
+    }
+
+    c.innerHTML = `<h2>${a.name}</h2>
+      <div class="badge">${a.tags.join(' · ')}</div>
+      <div class="desc">${a.desc}</div>
+      <a class="btn btn-primary" href="${downloadUrl}" download>Download</a>
+      <div class="curl-box" style="padding-right:50px">
+        <span>$</span> ${curlCmd}
+        <button class="copy-btn">copy</button>
+      </div>`;
+
+    c.querySelector('.copy-btn').onclick = (e) => {
+      e.preventDefault();
+      navigator.clipboard.writeText(curlCmd).then(() => {
+        const btn = e.target;
+        btn.textContent = 'copied!';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 2000);
+      });
+    };
+
+    cards.appendChild(c);
+  }
+})();
+</script>
+</body>
+</html>

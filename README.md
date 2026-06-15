@@ -48,6 +48,8 @@ Produces a single static binary at `target/release/ssh-remote`.
 
 #### Static Linking (cross-platform distribution)
 
+See [BUILD.md](BUILD.md) for detailed cross-compilation instructions (x86_64, aarch64, armv7).
+
 ```bash
 rustup target add x86_64-unknown-linux-musl
 rustup target add aarch64-unknown-linux-musl
@@ -59,6 +61,23 @@ cargo build --release --target aarch64-unknown-linux-musl
 ldd target/x86_64-unknown-linux-musl/release/ssh-remote
 # → statically linked
 ```
+
+### Download Pre-built
+
+Pre-built musl-static binaries for three architectures are available on [GitHub Releases](https://github.com/zzttzzmyswy/ssh-remote/releases).
+
+```bash
+# x86_64 (Intel/AMD)
+curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-x86_64 && chmod +x ssh-remote-x86_64
+
+# aarch64 (ARM 64-bit, Raspberry Pi 4/5)
+curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-aarch64 && chmod +x ssh-remote-aarch64
+
+# armv7 (ARM 32-bit, Raspberry Pi 2/3)
+curl -fLO https://github.com/zzttzzmyswy/ssh-remote/releases/latest/download/ssh-remote-armv7 && chmod +x ssh-remote-armv7
+```
+
+Or visit `/download` on any running relay for a download page with platform detection and copyable curl commands.
 
 ### Docker
 
@@ -90,6 +109,7 @@ Options:
 | `--bind` | `0.0.0.0:3000` | Listen address |
 | `--dev` | false | Development mode (plaintext WebSocket) |
 | `--auth` | `password` | Server access password for the web UI |
+| `--bin-dir` | — | Path to directory with pre-built binaries (for /download page) |
 | `--tls-cert` | — | TLS certificate path |
 | `--tls-key` | — | TLS private key path |
 

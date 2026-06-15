@@ -33,16 +33,18 @@ pub struct SharedState {
     pub pending_mcp: RwLock<HashMap<String, (String, oneshot::Sender<String>)>>,
     pub last_activity: RwLock<HashMap<String, Instant>>,
     pub server_auth: String,
+    pub bin_dir: Option<String>,
 }
 
 impl SharedState {
-    pub fn new(server_auth: String) -> Self {
+    pub fn new(server_auth: String, bin_dir: Option<String>) -> Self {
         Self {
             sessions: SessionRegistry::new(),
             agent_broadcast: RwLock::new(HashMap::new()),
             pending_mcp: RwLock::new(HashMap::new()),
             last_activity: RwLock::new(HashMap::new()),
             server_auth,
+            bin_dir,
         }
     }
 }
@@ -161,7 +163,7 @@ mod tests {
         use axum::Router;
         use tower_http::cors::{Any, CorsLayer};
 
-        let state = Arc::new(SharedState::new("test".into()));
+        let state = Arc::new(SharedState::new("test".into(), None));
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -242,18 +244,47 @@ pub async fn upload_handler(
     Ok(StatusCode::OK)
 }
 
+pub async fn bin_handler(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path(arch): axum::extract::Path<String>,
+) -> Result<Response, StatusCode> {
+    use axum::response::IntoResponse;
+
+    let valid_arches = ["x86_64", "aarch64", "armv7"];
+    if !valid_arches.contains(&arch.as_str()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let bin_dir = state.bin_dir.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let filename = format!("ssh-remote-{}", arch);
+    let filepath = std::path::Path::new(bin_dir).join(&filename);
+    if !filepath.is_file() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let data = tokio::fs::read(&filepath).await.map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let headers = [
+        (header::CONTENT_TYPE, "application/octet-stream"),
+        (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", filename)),
+    ];
+
+    Ok((StatusCode::OK, headers, data).into_response())
+}
+
 pub async fn start(
     bind: String,
     _tls_cert: Option<String>,
     _tls_key: Option<String>,
     _dev: bool,
     server_auth: String,
+    bin_dir: Option<String>,
 ) -> anyhow::Result<()> {
     use axum::routing::get;
     use axum::Router;
     use tower_http::cors::{Any, CorsLayer};
 
-    let state = Arc::new(SharedState::new(server_auth));
+    let state = Arc::new(SharedState::new(server_auth, bin_dir.clone()));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -265,6 +296,8 @@ pub async fn start(
         .route("/upload", axum::routing::post(upload_handler).layer(axum::extract::DefaultBodyLimit::disable()))
         .route("/mcp/sse", get(mcp::sse_handler))
         .route("/mcp/messages", axum::routing::post(mcp::messages_handler))
+        .route("/download", get(static_handler))
+        .route("/bin/{arch}", get(bin_handler))
         .route("/", get(static_handler))
         .route("/session", get(static_handler))
         .route("/style.css", get(static_handler))

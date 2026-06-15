@@ -35,6 +35,10 @@ enum Command {
         /// Server access password (default: password)
         #[arg(long, default_value = "password")]
         auth: String,
+
+        /// Directory containing pre-built binaries for /download page
+        #[arg(long)]
+        bin_dir: Option<String>,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -82,8 +86,9 @@ async fn main() -> anyhow::Result<()> {
             tls_key,
             dev,
             auth,
+            bin_dir,
         } => {
-            relay::start(bind, tls_cert, tls_key, dev, auth).await?;
+            relay::start(bind, tls_cert, tls_key, dev, auth, bin_dir).await?;
         }
         Command::Agent {
             relay_url,
