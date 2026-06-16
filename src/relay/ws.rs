@@ -246,6 +246,172 @@ pub async fn agent_events_handler(
     response
 }
 
+// ── Browser SSE handler ────────────────────────────────────────────
+
+pub async fn browser_sse_handler(
+    State(state): State<Arc<SharedState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let token = match params.get("token") {
+        Some(t) => t.clone(),
+        None => return (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({"error": "Missing token"}))).into_response(),
+    };
+
+    let session_id = match params.get("session") {
+        Some(s) => s.clone(),
+        None => return (axum::http::StatusCode::BAD_REQUEST, "Missing session").into_response(),
+    };
+
+    let (auth_session_id, permission) = match state.sessions.authenticate(&token).await {
+        Some(r) => r,
+        None => return (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({"error": "Invalid token"}))).into_response(),
+    };
+
+    if auth_session_id != session_id {
+        return (axum::http::StatusCode::FORBIDDEN, "Token does not belong to this session").into_response();
+    }
+
+    let user_id = Uuid::new_v4().to_string();
+    let sse_sid = format!("bs_{}", Uuid::new_v4());
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
+
+    {
+        state.sse_sessions.write().await.insert(sse_sid.clone(), tx);
+    }
+
+    let perm_str = match permission { Permission::ReadWrite => "rw", Permission::ReadOnly => "ro" };
+
+    {
+        let mut broadcast = state.agent_broadcast.write().await;
+        if let Some(cm) = broadcast.get_mut(&session_id) {
+            cm.browser_sessions.insert(user_id.clone(), sse_sid.clone());
+        }
+    }
+
+    // Send session:join to agent
+    let join_msg = json!({
+        "type": "session:join",
+        "session_id": session_id,
+        "payload": { "user_id": user_id, "permission": perm_str }
+    }).to_string();
+    {
+        let broadcast = state.agent_broadcast.read().await;
+        if let Some(cm) = broadcast.get(&session_id) {
+            if let Some(ref agent_tx) = cm.agent {
+                let _ = agent_tx.send(join_msg);
+            }
+        }
+    }
+
+    // Broadcast updated user count to all browsers
+    {
+        let sse_sessions = state.sse_sessions.read().await;
+        let broadcast = state.agent_broadcast.read().await;
+        if let Some(cm) = broadcast.get(&session_id) {
+            let count = cm.browser_sessions.len();
+            let users_msg = json!({
+                "type": "session:users",
+                "session_id": session_id,
+                "payload": { "count": count }
+            }).to_string();
+            for sse_sid_val in cm.browser_sessions.values() {
+                if let Some(stx) = sse_sessions.get(sse_sid_val) {
+                    let _ = stx.send(users_msg.clone());
+                }
+            }
+        }
+    }
+
+    let state_clone = state.clone();
+    let sid_clone = session_id.clone();
+    let uid_clone = user_id.clone();
+    let sse_sid_clone = sse_sid.clone();
+    let perm_clone = perm_str.to_string();
+
+    // connected event data
+    let connected_data = json!({
+        "type": "browser:connected",
+        "session_id": session_id,
+        "payload": { "user_id": user_id, "permission": perm_str }
+    });
+
+    let stream = crate::relay::mcp::SseCleanup {
+        inner: UnboundedReceiverStream::new(rx),
+        state: state.clone(),
+        sid: sse_sid.clone(),
+        on_drop: Some(Box::new(move || {
+            let s = state_clone.clone();
+            let sid = sid_clone.clone();
+            let uid = uid_clone.clone();
+            let sse = sse_sid_clone.clone();
+            let perm = perm_clone.clone();
+            tokio::spawn(async move {
+                let count = {
+                    let mut broadcast = s.agent_broadcast.write().await;
+                    if let Some(cm) = broadcast.get_mut(&sid) {
+                        cm.browser_sessions.remove(&uid);
+                        cm.browser_sessions.len()
+                    } else {
+                        0
+                    }
+                };
+
+                // Broadcast updated count to remaining browsers
+                let users_msg = json!({
+                    "type": "session:users",
+                    "session_id": sid,
+                    "payload": { "count": count }
+                }).to_string();
+                {
+                    let sse_sessions = s.sse_sessions.read().await;
+                    let broadcast = s.agent_broadcast.read().await;
+                    if let Some(cm) = broadcast.get(&sid) {
+                        for sse_sid_val in cm.browser_sessions.values() {
+                            if let Some(stx) = sse_sessions.get(sse_sid_val) {
+                                let _ = stx.send(users_msg.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Send session:leave to agent
+                let leave_msg = json!({
+                    "type": "session:leave",
+                    "session_id": sid,
+                    "payload": { "user_id": uid, "permission": perm }
+                }).to_string();
+                let broadcast = s.agent_broadcast.read().await;
+                if let Some(cm) = broadcast.get(&sid) {
+                    if let Some(ref agent_tx) = cm.agent {
+                        let _ = agent_tx.send(leave_msg);
+                    }
+                }
+            });
+        })),
+    };
+
+    let sse_stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(axum::response::sse::Event::default()
+            .event("connected")
+            .data(serde_json::to_string(&connected_data).unwrap_or_default()));
+
+        let mut inner_stream = stream;
+        while let Some(msg) = tokio_stream::StreamExt::next(&mut inner_stream).await {
+            yield Ok::<_, Infallible>(axum::response::sse::Event::default()
+                .data(msg));
+        }
+    };
+
+    use axum::response::sse::KeepAlive;
+    let mut response = Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5)))
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-accel-buffering"),
+        axum::http::header::HeaderValue::from_static("no"),
+    );
+    response
+}
 
 
 #[cfg(test)]
