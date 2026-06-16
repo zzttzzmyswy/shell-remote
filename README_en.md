@@ -10,7 +10,7 @@ Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust 
 - **Multi-Tab Shells** — Each user independently switches between multiple PTY shells; tab changes never affect others
 - **File Manager** — Side panel with breadcrumb navigation, upload, download, delete, rename, mkdir, refresh
 - **MCP Server** — AI agents (Claude, etc.) execute commands on remote machines via standard MCP SSE Transport
-- **Dual Transport** — Agent connects via WebSocket (`ws://`) or HTTP SSE+POST (`https://`) — fully HTTP/1.1/2/3 compatible
+- **SSE+POST Transport** — Full-stack HTTP SSE push + POST send; no WebSocket dependency, works behind any proxy
 - **Single Binary** — All web assets embedded via `rust-embed`; zero external file dependencies
 - **Token Authentication** — Random temporary tokens or fixed keys; read-write and read-only permission levels
 - **Server Password** — Relay-level access password (`--auth`), required unless `--dev` mode
@@ -19,17 +19,17 @@ Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust 
 
 ```
 Browser (xterm.js + File UI)
-        │ WebSocket /agent
-        ▼
-┌───────────────┐     WS or HTTP (SSE+POST)    ┌──────────────┐
-│   Relay       │ ◄───────────────────────────► │   Agent      │
-│   Route + Auth │                               │   Shell + FS │
-│   Static + MCP│                               │   (target)   │
-└───────────────┘                               └──────────────┘
-        ▲
-        │ MCP (/agent/mcp/sse + /agent/mcp/messages)
-        │
-  AI Agent (Claude, etc.)
+         │ SSE + POST /agent/session/sse + /agent/session/send
+         ▼
+┌───────────────┐   HTTP SSE+POST (/agent/events + /agent/send)   ┌──────────────┐
+│   Relay       │ ◄─────────────────────────────────────────────► │   Agent      │
+│   Route + Auth │                                                  │   Shell + FS │
+│   Static + MCP│                                                  │   (target)   │
+└───────────────┘                                                  └──────────────┘
+         ▲
+         │ MCP (/agent/mcp/sse + /agent/mcp/messages)
+         │
+   AI Agent (Claude, etc.)
 ```
 
 ## Quick Start
@@ -76,16 +76,13 @@ cargo build --release
 ### Start Agent
 
 ```bash
-# WebSocket mode (real-time, lowest latency)
-./shell-remote agent --relay-url ws://<relay-ip>:3000
-
 # HTTP SSE+POST mode (works behind any reverse proxy)
 ./shell-remote agent --relay-url https://<relay-ip>
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--relay-url` | `ws://localhost:3000` | Relay URL. `ws://`=WebSocket, `https://`=SSE+POST |
+| `--relay-url` | `https://localhost:3000` | Relay URL (SSE+POST protocol) |
 | `--key` | — | Fixed auth key (random if omitted) |
 | `--root` | `$HOME` | File manager default directory |
 | `--token-type` | `rw` | Token type: `rw`, `ro`, or `both` |
@@ -106,9 +103,10 @@ Open `http://<relay-ip>:3000`, enter server password and token. Main area: xterm
 
 | Path | Method | Description |
 |------|--------|-------------|
-| `/agent` | GET → WS | WebSocket for browser and agent |
-| `/agent/events` | GET → SSE | Agent receive stream (HTTP mode) |
-| `/agent/send` | POST | Agent send messages (HTTP mode) |
+| `/agent/session/sse` | GET → SSE | Browser receive stream |
+| `/agent/session/send` | POST | Browser send messages |
+| `/agent/events` | GET → SSE | Agent receive stream |
+| `/agent/send` | POST | Agent send messages |
 | `/agent/upload` | POST | File upload |
 | `/agent/mcp/sse` | GET → SSE | MCP SSE Transport endpoint |
 | `/agent/mcp/messages` | POST | MCP JSON-RPC messages |
@@ -166,7 +164,7 @@ Token is passed in arguments, not in URL or headers. Commands execute via `sh -c
 | Layer | Technology |
 |-------|-----------|
 | Runtime | Rust + Tokio async |
-| HTTP/WS | Axum |
+| HTTP | Axum |
 | Terminal | portable-pty + xterm.js |
 | Embedding | rust-embed |
 | Frontend | Vanilla HTML/CSS/JS |
@@ -176,7 +174,7 @@ Token is passed in arguments, not in URL or headers. Commands execute via `sh -c
 
 ```bash
 cargo test
-# 104 passed; 0 failed (including integration test)
+# 106 passed; 0 failed (including integration test)
 ```
 
 ## License

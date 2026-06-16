@@ -10,7 +10,7 @@
 - **多 Tab 独立** — 每位用户独立切换多个 PTY Shell 标签页，互不干扰
 - **文件管理器** — 侧栏面板，面包屑导航、上传、下载、删除、重命名、新建文件夹、刷新
 - **MCP 服务器** — AI Agent（Claude 等）通过标准 MCP SSE Transport 协议在远程机器上执行命令
-- **双传输协议** — Agent 使用 HTTP SSE+POST (`https://`) 与 Relay 通信
+- **SSE+POST 协议** — 全链路使用 HTTP SSE 推送 + POST 发送，兼容性好，不依赖 WebSocket
 - **单二进制** — 所有 Web 资源通过 `rust-embed` 编译嵌入，零外部文件依赖
 - **Token 鉴权** — 随机临时 Token 或固定密钥；支持读写和只读两种权限
 - **服务器密码** — Relay 可配置访问密码（`--auth`），非 `--dev` 模式必填
@@ -211,7 +211,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 104 passed; 0 failed (含集成测试)
+# 106 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证
