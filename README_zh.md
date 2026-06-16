@@ -10,6 +10,7 @@
 - **多 Tab 独立** — 每位用户独立切换多个 PTY Shell 标签页，互不干扰
 - **文件管理器** — 侧栏面板，面包屑导航、上传（HTTP 流式，无大小限制）、下载、删除、重命名、新建文件夹、刷新
 - **MCP 服务器** — AI Agent（Claude 等）通过标准 MCP 协议在远程机器上执行命令、管理文件
+- **双传输协议** — Agent 支持 WebSocket (`ws://`) 和 HTTP SSE+POST (`https://`) 两种模式，兼容任意 HTTP/1.1/2/3 反向代理
 - **单二进制** — 所有 Web 资源通过 `rust-embed` 编译嵌入，零外部文件依赖
 - **Token 鉴权** — 随机临时 Token（默认）或固定密钥；支持读写和只读两种权限
 - **服务器密码** — Relay 可配置访问密码（`--auth`），保护 Web 界面
@@ -18,21 +19,21 @@
 
 ```
 浏览器 (xterm.js + 文件管理UI)
-        │ WebSocket
+        │ WebSocket /agent
         ▼
-┌───────────────┐          WebSocket          ┌──────────────┐
-│   Relay       │ ◄─────────────────────────► │   Agent      │
-│   路由 + 鉴权  │                              │   Shell + FS │
-│   静态 + MCP  │                              │   (目标机器)  │
-└───────────────┘                              └──────────────┘
+┌───────────────┐   WS (/agent) 或 HTTP (SSE+POST)   ┌──────────────┐
+│   Relay       │ ◄─────────────────────────────────► │   Agent      │
+│   路由 + 鉴权  │                                      │   Shell + FS │
+│   静态 + MCP  │                                      │   (目标机器)  │
+└───────────────┘                                      └──────────────┘
         ▲
-        │ MCP (HTTP SSE + JSON-RPC)
+        │ MCP (/agent/mcp/sse + /agent/mcp/messages)
         │
   AI Agent (Claude 等)
 ```
 
 - **Relay**：无状态消息路由器，连接各方并执行权限检查；嵌入 Web 前端
-- **Agent**：在目标机器上运行，管理 PTY Shell 和文件系统；通过 WebSocket 连接 Relay
+- **Agent**：在目标机器上运行，管理 PTY Shell 和文件系统；支持 WebSocket 和 HTTP SSE+POST 两种传输
 
 ## 快速开始
 
@@ -90,12 +91,16 @@ docker run -d --name shell-remote-relay -p 3000:3000 shell-remote relay --dev --
 ### 启动 Agent
 
 ```bash
-./shell-remote agent --relay-url ws://<relay-ip>:3000/ws --root /home/user
+# WebSocket 模式（实时双向，延迟最低）
+./shell-remote agent --relay-url ws://<relay-ip>:3000 --root /home/user
+
+# HTTP SSE+POST 模式（兼容 HTTP/2/3 和任意反向代理）
+./shell-remote agent --relay-url https://<relay-ip> --root /home/user
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--relay-url` | `ws://localhost:3000/ws` | Relay WebSocket 地址 |
+| `--relay-url` | `ws://localhost:3000` | Relay 地址。`ws://`=WebSocket，`https://`=SSE+POST |
 | `--key` | — | 固定鉴权密钥（不指定则随机生成） |
 | `--root` | `$HOME` | 文件浏览器起始目录 |
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
@@ -120,12 +125,25 @@ session: a1b2c3d4
 
 多位用户使用相同 Token 可同时加入同一会话，实时共享终端输出，各自独立切换 Tab。
 
+## API 端点
+
+所有客户端端点统一在 `/agent` 路径下：
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/agent` | GET → WS | 浏览器和 Agent WebSocket 连接 |
+| `/agent/events` | GET → SSE | Agent 接收消息流（HTTP 模式） |
+| `/agent/send` | POST | Agent 发送消息（HTTP 模式） |
+| `/agent/upload` | POST | 文件上传（Bearer Token 鉴权） |
+| `/agent/mcp/sse` | GET → SSE | MCP SSE 端点 |
+| `/agent/mcp/messages` | POST | MCP JSON-RPC 消息 |
+
 ## AI Agent 接入 (MCP)
 
-Relay 同时暴露 MCP 协议端点：
+Relay 暴露 MCP 协议端点：
 
-- SSE：`http://<relay-ip>:3000/mcp/sse?token=<token>`
-- 消息：`http://<relay-ip>:3000/mcp/messages`（Token 通过 `Authorization: Bearer <token>` 请求头传递，query 参数 `?token=` 作为降级兼容）
+- SSE：`http://<relay-ip>:3000/agent/mcp/sse?token=<token>`
+- 消息：`http://<relay-ip>:3000/agent/mcp/messages`（Token 通过 `Authorization: Bearer <token>` 头传递，query 参数 `?token=` 作为降级兼容）
 
 ### MCP 工具列表
 
@@ -155,7 +173,7 @@ Relay 同时暴露 MCP 协议端点：
 ## 文件管理器
 
 - 面包屑路径导航，每级可点击跳转
-- 上传通过 HTTP POST（`/upload?path=...` + `Authorization: Bearer <token>` 请求头），流式传输，无大小限制
+- 上传通过 HTTP POST 到 `/agent/upload`（`Authorization: Bearer <token>` 请求头），流式传输，无大小限制
 - 下载通过 WebSocket，`_mcp_request_id` 路由分发
 - 删除、重命名、新建文件夹、刷新
 - 侧栏宽度可拖拽调整
@@ -177,7 +195,7 @@ Relay 同时暴露 MCP 协议端点：
 
 ```bash
 cargo test
-# 59 passed; 0 failed
+# 100 passed; 0 failed
 ```
 
 ## 许可证

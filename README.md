@@ -10,6 +10,7 @@ Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust 
 - **Multi-Tab Shells** — Each user independently switches between multiple PTY shells; one user's tab switch never affects others
 - **File Manager** — Side panel with breadcrumb navigation, upload (HTTP streaming, no file size limit), download, delete, rename, mkdir, and refresh
 - **MCP Server** — AI agents (Claude, etc.) execute commands and manage files on remote machines via standard MCP protocol
+- **Dual Transport** — Agent connects via WebSocket (`ws://`) or HTTP SSE+POST (`https://`) — fully HTTP/1.1/2/3 compatible
 - **Single Binary** — All web assets embedded via `rust-embed`; zero external file dependencies
 - **Token Authentication** — Random temporary tokens or fixed keys; read-write and read-only permission levels
 - **Server Password** — Optional relay-level access password (`--auth`) to protect the web UI
@@ -18,21 +19,21 @@ Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust 
 
 ```
 Browser (xterm.js + File UI)
-        │ WebSocket
+        │ WebSocket /agent
         ▼
-┌───────────────┐          WebSocket          ┌──────────────┐
-│   Relay       │ ◄─────────────────────────► │   Agent      │
-│   Route + Auth │                              │   Shell + FS │
-│   Static + MCP│                              │   (target)   │
-└───────────────┘                              └──────────────┘
+┌───────────────┐     WS (/agent) or HTTP (SSE+POST)    ┌──────────────┐
+│   Relay       │ ◄───────────────────────────────────► │   Agent      │
+│   Route + Auth │                                        │   Shell + FS │
+│   Static + MCP│                                        │   (target)   │
+└───────────────┘                                        └──────────────┘
         ▲
-        │ MCP (HTTP SSE + JSON-RPC)
+        │ MCP (/agent/mcp/sse + /agent/mcp/messages)
         │
   AI Agent (Claude, etc.)
 ```
 
 - **Relay**: Stateless message router that connects all parties and enforces permissions; embeds the web frontend
-- **Agent**: Runs on the target machine, manages PTY shells and filesystem, connects to relay via WebSocket
+- **Agent**: Runs on the target machine, manages PTY shells and filesystem; supports both WebSocket and HTTP SSE+POST transport
 
 ## Quick Start
 
@@ -49,18 +50,6 @@ Produces a single static binary at `target/release/shell-remote`.
 #### Static Linking (cross-platform distribution)
 
 See [BUILD.md](BUILD.md) for detailed cross-compilation instructions (x86_64, aarch64, armv7).
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-rustup target add aarch64-unknown-linux-musl
-
-cargo build --release --target x86_64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl
-
-# Verify
-ldd target/x86_64-unknown-linux-musl/release/shell-remote
-# → statically linked
-```
 
 ### Download Pre-built
 
@@ -92,7 +81,7 @@ For agent on target machine:
 docker run -d --name shell-remote-agent \
   --pid=host --network=host \
   shell-remote agent \
-  --relay-url ws://<relay-ip>:3000/ws \
+  --relay-url ws://<relay-ip>:3000 \
   --root /host
 ```
 
@@ -113,23 +102,21 @@ Options:
 | `--tls-cert` | — | TLS certificate path |
 | `--tls-key` | — | TLS private key path |
 
-Output:
-
-```
-Relay server listening on 0.0.0.0:3000
-```
-
 ### Start Agent
 
 ```bash
+# WebSocket mode (real-time, best latency)
 ./shell-remote agent --relay-url ws://<relay-ip>:3000 --root /home/user
+
+# HTTP SSE+POST mode (HTTP/2/3 compatible, works behind any reverse proxy)
+./shell-remote agent --relay-url https://<relay-ip> --root /home/user
 ```
 
 Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--relay-url` | `ws://localhost:3000` | Relay URL (ws:// or https:// for SSE+POST mode) |
+| `--relay-url` | `ws://localhost:3000` | Relay URL. `ws://`=WebSocket, `https://`=SSE+POST |
 | `--key` | — | Fixed auth key (random if omitted) |
 | `--root` | `$HOME` | Root directory for file browser |
 | `--token-type` | `rw` | `rw`, `ro`, or `both` |
@@ -154,12 +141,25 @@ Open `http://<relay-ip>:3000`, enter the server password (if configured) and ses
 
 Multiple users with the same token join the same session and share real-time terminal output. Each user independently switches tabs without affecting others.
 
+## API Endpoints
+
+All client-facing endpoints are under `/agent`:
+
+| Path | Method | Description |
+|------|--------|-------------|
+| `/agent` | GET → WS | WebSocket for browser and agent (WS mode) |
+| `/agent/events` | GET → SSE | Agent receive stream (HTTP mode) |
+| `/agent/send` | POST | Agent send messages (HTTP mode) |
+| `/agent/upload` | POST | File upload (Bearer token auth) |
+| `/agent/mcp/sse` | GET → SSE | MCP SSE endpoint |
+| `/agent/mcp/messages` | POST | MCP JSON-RPC messages |
+
 ## AI Agent Integration (MCP)
 
 Relay exposes MCP protocol endpoints:
 
-- SSE: `http://<relay-ip>:3000/mcp/sse?token=<token>`
-- Messages: `http://<relay-ip>:3000/mcp/messages` (token via `Authorization: Bearer <token>` header, query parameter `?token=` as fallback)
+- SSE: `http://<relay-ip>:3000/agent/mcp/sse?token=<token>`
+- Messages: `http://<relay-ip>:3000/agent/mcp/messages` (token via `Authorization: Bearer <token>` header, query parameter `?token=` as fallback)
 
 ### MCP Tools
 
@@ -189,7 +189,7 @@ All tools prefixed with `remote_` to avoid conflicts with the AI agent's own too
 ## File Manager
 
 - Breadcrumb path navigation with clickable segments
-- Upload via HTTP POST (`/upload?path=...` + `Authorization: Bearer <token>` header), streaming body (no file size limit)
+- Upload via HTTP POST to `/agent/upload` (`Authorization: Bearer <token>` header), streaming body (no file size limit)
 - Download via WebSocket with `_mcp_request_id` routing
 - Delete, rename, mkdir, refresh
 - Drag-to-resize side panel
@@ -211,7 +211,7 @@ All tools prefixed with `remote_` to avoid conflicts with the AI agent's own too
 
 ```bash
 cargo test
-# 61 passed; 0 failed
+# 100 passed; 0 failed
 ```
 
 ## License

@@ -51,7 +51,7 @@ pub async fn sse_handler(
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
                     "name": "shell-remote",
-                                        "version": "0.1.3"
+                                        "version": "0.1.4"
                 },
                 "capabilities": {
                     "tools": {}
@@ -95,7 +95,7 @@ pub async fn messages_handler(
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
                     "name": "shell-remote",
-                                        "version": "0.1.3"
+                                        "version": "0.1.4"
                 },
                 "capabilities": {
                     "tools": {}
