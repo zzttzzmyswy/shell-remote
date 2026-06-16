@@ -5,14 +5,42 @@ use axum::Json;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt as _;
+use tokio_stream::Stream;
 use uuid::Uuid;
 
 use crate::proto::{Message as ProtoMessage, Permission};
 use crate::relay::SharedState;
+
+/// Wraps an SSE receiver stream so that when the stream is dropped
+/// (SSE client disconnects), the MCP session is cleaned up.
+struct SseCleanup {
+    inner: UnboundedReceiverStream<String>,
+    state: Arc<SharedState>,
+    sid: String,
+}
+
+impl tokio_stream::Stream for SseCleanup {
+    type Item = String;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<String>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl Drop for SseCleanup {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let sid = self.sid.clone();
+        tokio::spawn(async move {
+            state.mcp_sse_channels.write().await.remove(&sid);
+        });
+    }
+}
 
 pub async fn sse_handler(
     State(state): State<Arc<SharedState>>,
@@ -52,23 +80,20 @@ pub async fn sse_handler(
             .event("endpoint")
             .data(format!("/agent/mcp/messages?sessionId={}", sid_for_stream)));
 
-        // Send a connected event to confirm the SSE stream is alive
         yield Ok::<_, Infallible>(Event::default()
             .event("connected")
             .data("{}"));
 
-        let mut rx_stream = UnboundedReceiverStream::new(rx);
+        let rx_stream = SseCleanup {
+            inner: UnboundedReceiverStream::new(rx),
+            state: state.clone(),
+            sid: mcp_session_id,
+        };
+        let mut rx_stream = rx_stream;
         while let Some(msg) = tokio_stream::StreamExt::next(&mut rx_stream).await {
             yield Ok::<_, Infallible>(Event::default().event("message").data(msg));
         }
     };
-
-    let state_clone = state.clone();
-    let sid = mcp_session_id.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        state_clone.mcp_sse_channels.write().await.remove(&sid);
-    });
 
     let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5)))
@@ -134,11 +159,10 @@ pub async fn messages_handler(
 
     let state_clone = state.clone();
     let body_clone = body.clone();
-    let headers_clone = headers.clone();
     let url_token = params.get("token").cloned();
 
     tokio::spawn(async move {
-        let result = process_mcp_request(&state_clone, &headers_clone, url_token, &body_clone).await;
+        let result = process_mcp_request(&state_clone, url_token, &body_clone).await;
         let response_text = serde_json::to_string(&result).unwrap_or_default();
         let _ = sse_tx.send(response_text);
     });
@@ -148,7 +172,6 @@ pub async fn messages_handler(
 
 async fn process_mcp_request(
     state: &Arc<SharedState>,
-    headers: &axum::http::HeaderMap,
     url_token: Option<String>,
     body: &Value,
 ) -> Value {

@@ -128,12 +128,8 @@ mod integration_tests {
             .unwrap_or_default();
         assert!(!session_id.is_empty(), "Should have sessionId: {}", sse_text);
         eprintln!("  [4a] SSE sessionId={}", session_id);
-        drop(body_stream); // close SSE connection
 
-        // Small delay to ensure sessionId is registered in mcp_sse_channels
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // POST to messages with sessionId
+        // POST to messages with sessionId (keep SSE alive during POST)
         let resp = client
             .post(format!("{}/agent/mcp/messages?sessionId={}", relay_url, session_id))
             .header("x-auth", server_auth)
@@ -141,6 +137,8 @@ mod integration_tests {
             .send().await.unwrap();
         assert_eq!(resp.status(), 202, "MCP messages should return 202 Accepted");
         eprintln!("  [4] MCP messages returns 202, SSE push flow works");
+
+        drop(body_stream); // close SSE connection after POST
 
         // ── 5. Auth rejection ─────────────────────────────────────
         let resp = client
