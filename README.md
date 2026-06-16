@@ -1,143 +1,169 @@
 # shell-remote
 
-[简体中文](README_zh.md) | English
+简体中文 | [English](README_en.md)
 
-Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust binary to share terminal sessions via browser, manage remote files, and expose MCP protocol endpoints for AI agents.
+自托管、轻量级的远程服务器协作工具。单个 Rust 二进制文件，即可通过浏览器共享终端会话、管理远程文件，并为 AI Agent 暴露 MCP 协议接口。
 
-## Features
+## 功能
 
-- **Collaborative Terminal** — Multiple users view and interact with the same shell session simultaneously (xterm.js + WebGL)
-- **Multi-Tab Shells** — Each user independently switches between multiple PTY shells; tab changes never affect others
-- **File Manager** — Side panel with breadcrumb navigation, upload, download, delete, rename, mkdir, refresh
-- **MCP Server** — AI agents (Claude, etc.) execute commands on remote machines via standard MCP SSE Transport
-- **Dual Transport** — Agent connects via WebSocket (`ws://`) or HTTP SSE+POST (`https://`) — fully HTTP/1.1/2/3 compatible
-- **Single Binary** — All web assets embedded via `rust-embed`; zero external file dependencies
-- **Token Authentication** — Random temporary tokens or fixed keys; read-write and read-only permission levels
-- **Server Password** — Relay-level access password (`--auth`), required unless `--dev` mode
+- **协同终端** — 多人通过浏览器同时查看和操作同一个 Shell 会话（xterm.js + WebGL 渲染）
+- **多 Tab 独立** — 每位用户独立切换多个 PTY Shell 标签页，互不干扰
+- **文件管理器** — 侧栏面板，面包屑导航、上传、下载、删除、重命名、新建文件夹、刷新
+- **MCP 服务器** — AI Agent（Claude 等）通过标准 MCP SSE Transport 协议在远程机器上执行命令
+- **双传输协议** — Agent 支持 WebSocket (`ws://`) 和 HTTP SSE+POST (`https://`) 两种模式
+- **单二进制** — 所有 Web 资源通过 `rust-embed` 编译嵌入，零外部文件依赖
+- **Token 鉴权** — 随机临时 Token 或固定密钥；支持读写和只读两种权限
+- **服务器密码** — Relay 可配置访问密码（`--auth`），非 `--dev` 模式必填
 
-## Architecture
+## 架构
 
 ```
-Browser (xterm.js + File UI)
+浏览器 (xterm.js + 文件管理UI)
         │ WebSocket /agent
         ▼
-┌───────────────┐     WS or HTTP (SSE+POST)    ┌──────────────┐
-│   Relay       │ ◄───────────────────────────► │   Agent      │
-│   Route + Auth │                               │   Shell + FS │
-│   Static + MCP│                               │   (target)   │
-└───────────────┘                               └──────────────┘
+┌───────────────┐   WS (/agent) 或 HTTP (SSE+POST)   ┌──────────────┐
+│   Relay       │ ◄─────────────────────────────────► │   Agent      │
+│   路由 + 鉴权  │                                      │   Shell + FS │
+│   静态 + MCP  │                                      │   (目标机器)  │
+└───────────────┘                                      └──────────────┘
         ▲
         │ MCP (/agent/mcp/sse + /agent/mcp/messages)
         │
-  AI Agent (Claude, etc.)
+  AI Agent (Claude 等)
 ```
 
-## Quick Start
+- **Relay**：消息路由中心，连接各方并执行权限检查；嵌入 Web 前端
+- **Agent**：在目标机器上运行，管理 PTY Shell 和文件系统
 
-### Download
+## 快速开始
+
+### 下载预编译二进制
+
+[GitHub Releases](https://github.com/zzttzzmyswy/shell-remote/releases) 提供三种架构的 musl 静态编译二进制：
 
 ```bash
 # x86_64 (Intel/AMD)
 curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-x86_64 && chmod +x shell-remote-x86_64
 
-# aarch64 (ARM 64-bit, Raspberry Pi 4/5, cloud)
+# aarch64 (ARM 64位, 树莓派4/5, 云服务器)
 curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-aarch64 && chmod +x shell-remote-aarch64
 
-# armv7 (ARM 32-bit, Raspberry Pi 2/3)
+# armv7 (ARM 32位, 树莓派2/3)
 curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-armv7 && chmod +x shell-remote-armv7
 ```
 
-### Build
+### 编译
 
 ```bash
 git clone https://github.com/zzttzzmyswy/shell-remote.git && cd shell-remote
 cargo build --release
 ```
 
-### Start Relay
+### 启动 Relay
 
 ```bash
-# Development mode
+# 开发模式（--dev 允许无密码）
 ./shell-remote relay --dev --auth password --bind 0.0.0.0:3000
 
-# Production mode (--auth required)
+# 生产模式（--auth 必填）
 ./shell-remote relay --auth YourStrongPassword --bind 0.0.0.0:3000
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--bind` | `0.0.0.0:3000` | Listen address |
-| `--dev` | false | Development mode (no TLS, allows no --auth) |
-| `--auth` | none | Server password (required unless --dev) |
-| `--bin-dir` | — | Path to pre-built binaries |
-| `--tls-cert` | — | TLS certificate path |
-| `--tls-key` | — | TLS private key path |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--bind` | `0.0.0.0:3000` | 监听地址 |
+| `--dev` | false | 开发模式（允许无 --auth，无 TLS） |
+| `--auth` | 无默认值 | 服务器密码。非 --dev 模式必填 |
+| `--bin-dir` | — | 预编译二进制文件目录（供下载页面） |
+| `--tls-cert` | — | TLS 证书路径 |
+| `--tls-key` | — | TLS 私钥路径 |
 
-### Start Agent
+### 启动 Agent
 
 ```bash
-# WebSocket mode (real-time, lowest latency)
+# WebSocket 模式（实时双向）
 ./shell-remote agent --relay-url ws://<relay-ip>:3000
 
-# HTTP SSE+POST mode (works behind any reverse proxy)
+# HTTP SSE+POST 模式（兼容反向代理）
 ./shell-remote agent --relay-url https://<relay-ip>
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--relay-url` | `ws://localhost:3000` | Relay URL. `ws://`=WebSocket, `https://`=SSE+POST |
-| `--key` | — | Fixed auth key (random if omitted) |
-| `--root` | `$HOME` | File manager default directory |
-| `--token-type` | `rw` | Token type: `rw`, `ro`, or `both` |
-| `--shell` | `/bin/bash` | Shell binary path |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--relay-url` | `ws://localhost:3000` | Relay 地址。`ws://`=WebSocket，`https://`=SSE+POST |
+| `--key` | — | 固定鉴权密钥（不指定则随机生成临时 Token） |
+| `--root` | `$HOME` | 文件管理器默认目录 |
+| `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
+| `--shell` | `/bin/bash` | Shell 路径 |
 
-Output:
+输出示例：
 
 ```
 session: a1b2c3d4
   rw: 5fe42fc877b0a721157508c67fd19633c9c03cc97aaa2d5af0ced67cd3980d90
 ```
 
-### Browser Access
+- `session:` — 8 位会话 ID（仅用于日志）
+- `rw:` / `ro:` — Token（浏览器登录或 MCP 调用使用）
 
-Open `http://<relay-ip>:3000`, enter server password and token. Main area: xterm.js terminal. Right drawer: file manager.
+### 浏览器访问
 
-## API Endpoints
+打开 `http://<relay-ip>:3000`，输入服务器密码及 Token 即可连接。主区域为 xterm.js 终端，右侧为文件管理器。
 
-| Path | Method | Description |
-|------|--------|-------------|
-| `/agent` | GET → WS | WebSocket for browser and agent |
-| `/agent/events` | GET → SSE | Agent receive stream (HTTP mode) |
-| `/agent/send` | POST | Agent send messages (HTTP mode) |
-| `/agent/upload` | POST | File upload |
-| `/agent/mcp/sse` | GET → SSE | MCP SSE Transport endpoint |
-| `/agent/mcp/messages` | POST | MCP JSON-RPC messages |
+## API 端点
 
-## AI Agent Integration (MCP)
+所有端点统一在 `/agent` 路径下：
 
-### Configuration
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/agent` | GET → WS | 浏览器和 Agent WebSocket 连接 |
+| `/agent/events` | GET → SSE | Agent 接收消息流（HTTP 模式） |
+| `/agent/send` | POST | Agent 发送消息（HTTP 模式） |
+| `/agent/upload` | POST | 文件上传 |
+| `/agent/mcp/sse` | GET → SSE | MCP SSE Transport 端点 |
+| `/agent/mcp/messages` | POST | MCP JSON-RPC 消息 |
+
+## AI Agent 接入 (MCP)
+
+### 配置模板
 
 ```json
 {
   "transport": "sse",
   "url": "https://<relay-host>/agent/mcp/sse",
-  "headers": { "X-Auth": "your-server-password" },
+  "headers": { "X-Auth": "你的服务器密码" },
   "timeout": 60,
   "sse_read_timeout": 300
 }
 ```
 
-Protocol flow: `GET /sse` → `endpoint` event → `POST /messages` → `202 Accepted` → SSE `message` response.
+- `url`：只需要路径，无需查询参数
+- `X-Auth` header：服务器密码（对应 relay 的 `--auth`）
+- Token 在每次工具调用时通过 arguments 动态传入
 
-### Tool: exec_remote
+### 协议流程
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `token` | string | Yes | Agent session token |
-| `cmd` | string | Yes | Shell command to execute |
-| `timeout_ms` | number | No | Timeout in milliseconds (default 30000, max 300000) |
+```
+GET  /agent/mcp/sse
+  ← event: endpoint  /agent/mcp/messages?sessionId=xxx
 
-Example call:
+POST /agent/mcp/messages?sessionId=xxx
+  ← HTTP 202 Accepted
+
+SSE  ← event: message  {JSON-RPC 响应}
+```
+
+符合 MCP SSE Transport 规范。
+
+### 唯一工具：exec_remote
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `token` | string | 是 | Agent 会话 Token |
+| `cmd` | string | 是 | 要执行的 Shell 命令 |
+| `timeout_ms` | number | 否 | 超时毫秒数（默认 30000，最大 300000） |
+
+调用示例：
 
 ```json
 {
@@ -152,33 +178,45 @@ Example call:
 }
 ```
 
-Token is passed in arguments, not in URL or headers. Commands execute via `sh -c`.
+- `token` 在 arguments 中传入，不在 URL 或 Header
+- `cmd` 通过 `sh -c` 执行，支持管道、重定向等完整 Shell 语法
+- 返回 stdout、stderr 和 exit code
 
-## Token Permissions
+## Token 权限模型
 
-| Token Type | Terminal Input | File Ops | MCP Exec |
-|-----------|---------------|----------|----------|
+| Token 类型 | 终端输入 | 文件操作 | MCP 执行 |
+|-----------|---------|---------|----------|
 | ReadWrite | ✅ | ✅ | ✅ |
-| ReadOnly | ❌ | list/read | ❌ |
+| ReadOnly | ❌ | 列表/读取 | ❌ |
 
-## Tech Stack
+- **临时 Token**：Agent 断开即失效
+- **固定密钥**：通过 `--key` 指定，Agent 重连后仍可使用
 
-| Layer | Technology |
-|-------|-----------|
-| Runtime | Rust + Tokio async |
+## 文件管理器
+
+- 面包屑路径导航
+- 上传（流式传输，默认 100MB 上限）
+- 下载、删除、重命名、新建文件夹、刷新
+- 侧栏宽度可拖拽调整
+
+## 技术栈
+
+| 层 | 技术 |
+|----|------|
+| 运行时 | Rust + Tokio 异步 |
 | HTTP/WS | Axum |
-| Terminal | portable-pty + xterm.js |
-| Embedding | rust-embed |
-| Frontend | Vanilla HTML/CSS/JS |
+| 终端 | portable-pty + xterm.js |
+| 静态嵌入 | rust-embed |
+| 前端 | 原生 HTML/CSS/JS |
 | MCP | SSE Transport + JSON-RPC |
 
-## Tests
+## 测试
 
 ```bash
 cargo test
-# 104 passed; 0 failed (including integration test)
+# 104 passed; 0 failed (含集成测试)
 ```
 
-## License
+## 许可证
 
 MIT
