@@ -192,18 +192,27 @@ pub async fn agent_send_handler(
         })).into_response();
     }
 
-    // All other message types require server auth
+    // All other message types require server auth, unless they carry a valid session_id
     if !state.server_auth.is_empty() {
-        let auth_header = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        let body_auth = body["auth"].as_str().unwrap_or("");
-        if !crate::relay::auth::constant_time_eq(auth_header, &state.server_auth)
-            && !crate::relay::auth::constant_time_eq(body_auth, &state.server_auth)
-        {
-            return (axum::http::StatusCode::UNAUTHORIZED, "Invalid server password").into_response();
+        let session_for_auth = body["session_id"].as_str().unwrap_or("");
+        let has_valid_session = if !session_for_auth.is_empty() {
+            let broadcasts = state.agent_broadcast.read().await;
+            broadcasts.contains_key(session_for_auth)
+        } else {
+            false
+        };
+        if !has_valid_session {
+            let auth_header = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or("");
+            let body_auth = body["auth"].as_str().unwrap_or("");
+            if !crate::relay::auth::constant_time_eq(auth_header, &state.server_auth)
+                && !crate::relay::auth::constant_time_eq(body_auth, &state.server_auth)
+            {
+                return (axum::http::StatusCode::UNAUTHORIZED, "Invalid server password").into_response();
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 @font-face {
     font-family: "Sarasa Term SC";
-    src: url("https://cdn.jsdelivr.net/gh/be5invis/Sarasa-Gothic@1.0.33/SarasaTermSC-Regular.ttf") format("truetype");
+    src: local("Sarasa Term SC"), local("Sarasa Mono SC"), local("Noto Sans Mono CJK SC");
     font-weight: normal;
     font-style: normal;
     font-display: block;
