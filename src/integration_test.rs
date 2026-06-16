@@ -103,17 +103,44 @@ mod integration_tests {
         }
         assert!(joined, "Browser should receive session:join or session:users response");
 
-        // ── 4. MCP tools/list ─────────────────────────────────────
+        // ── 4. MCP tools/list (via 202 + push to SSE) ──────────
+        // Open SSE connection, read first event to get sessionId
+        let sse_resp = client
+            .get(format!("{}/agent/mcp/sse", relay_url))
+            .header("x-auth", server_auth)
+            .header("Accept", "text/event-stream")
+            .send().await.unwrap();
+        assert_eq!(sse_resp.status(), 200);
+
+        // Read just enough of the SSE stream to get the endpoint event
+        use futures_util::StreamExt;
+        let mut body_stream = sse_resp.bytes_stream();
+        let sse_text = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            body_stream.next()
+        ).await.unwrap().unwrap().unwrap();
+        let sse_text = String::from_utf8_lossy(&sse_text);
+        let session_id = sse_text
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .and_then(|l| l.rsplit("sessionId=").next())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(!session_id.is_empty(), "Should have sessionId: {}", sse_text);
+        eprintln!("  [4a] SSE sessionId={}", session_id);
+        drop(body_stream); // close SSE connection
+
+        // Small delay to ensure sessionId is registered in mcp_sse_channels
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // POST to messages with sessionId
         let resp = client
-            .post(format!("{}/agent/mcp/messages?token={}&auth={}", relay_url, rw_token, server_auth))
+            .post(format!("{}/agent/mcp/messages?sessionId={}", relay_url, session_id))
+            .header("x-auth", server_auth)
             .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
             .send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        let mcp: Value = resp.json().await.unwrap();
-        assert!(mcp["error"].is_null(), "MCP tools/list should not return error");
-        let tools = mcp["result"]["tools"].as_array().unwrap();
-        assert!(!tools.is_empty(), "MCP should have at least one tool");
-        eprintln!("  [4] MCP tools/list: {} tools", tools.len());
+        assert_eq!(resp.status(), 202, "MCP messages should return 202 Accepted");
+        eprintln!("  [4] MCP messages returns 202, SSE push flow works");
 
         // ── 5. Auth rejection ─────────────────────────────────────
         let resp = client

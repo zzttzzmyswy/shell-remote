@@ -37,6 +37,7 @@ pub struct SharedState {
     pub agent_event_buffers: RwLock<HashMap<String, EventBuffer>>,
     pub rate_limiter: RwLock<RateLimiter>,
     pub max_upload_size: u64,
+    pub mcp_sse_channels: RwLock<HashMap<String, mpsc::UnboundedSender<String>>>,
 }
 
 pub struct RateLimiter {
@@ -106,6 +107,7 @@ impl SharedState {
             agent_event_buffers: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter::new()),
             max_upload_size,
+            mcp_sse_channels: RwLock::new(HashMap::new()),
         }
     }
 

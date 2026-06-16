@@ -596,6 +596,7 @@ mod tests {
             agent_event_buffers: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter::new()),
             max_upload_size: 100 * 1024 * 1024,
+            mcp_sse_channels: RwLock::new(HashMap::new()),
         })
     }
 
