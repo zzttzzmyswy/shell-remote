@@ -1,6 +1,5 @@
 class FileManager {
-    constructor(wsClient, containerId) {
-        this.ws = wsClient;
+    constructor(containerId) {
         this.container = document.getElementById(containerId);
         this.currentPath = '.';
         this._pendingDownloads = {};
@@ -11,7 +10,7 @@ class FileManager {
 
     loadDirectory(path) {
         this.currentPath = path;
-        this.ws.send({ type: 'fs:list', session_id: '', payload: { path: path } });
+        window.shellRemote.send('fs:list', { path: path });
     }
 
     navigateTo(path) {
@@ -189,7 +188,7 @@ class FileManager {
         const dlId = 'dl-' + Date.now();
         this._pendingDownloads[dlId] = { name };
         this._showToast('下载中: ' + name);
-        this.ws.send({ type: 'fs:read', session_id: '', payload: { path: path, _mcp_request_id: dlId } });
+        window.shellRemote.send('fs:read', { path: path, _mcp_request_id: dlId });
     }
 
     handleDownloadResult(requestId, payload) {
@@ -225,13 +224,13 @@ class FileManager {
         const name = prompt('文件夹名称:');
         if (name) {
             const fp = this.currentPath === '/' ? '/' + name : this.currentPath + '/' + name;
-            this.ws.send({ type: 'fs:mkdir', session_id: '', payload: { path: fp } });
+            window.shellRemote.send('fs:mkdir', { path: fp });
         }
     }
 
     deletePath(path) {
         if (confirm('确定删除 ' + path + ' ？')) {
-            this.ws.send({ type: 'fs:delete', session_id: '', payload: { path: path } });
+            window.shellRemote.send('fs:delete', { path: path });
         }
     }
 
@@ -257,7 +256,7 @@ class FileManager {
             const nn = prompt('新名称:', entry.name);
             if (nn && nn !== entry.name) {
                 const np = entry.path.replace(/[^/]+$/, nn);
-                this.ws.send({ type: 'fs:rename', session_id: '', payload: { from: entry.path, to: np } });
+                window.shellRemote.send('fs:rename', { from: entry.path, to: np });
             }
         });
         add('删除', () => this.deletePath(entry.path), true);
