@@ -306,7 +306,14 @@ pub async fn agent_events_handler(
         }
     };
 
-    Sse::new(stream).into_response()
+    let mut response = axum::response::sse::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-accel-buffering"),
+        axum::http::header::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 // ── WebSocket agent handler ──────────────────────────────────────────

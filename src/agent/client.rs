@@ -118,32 +118,53 @@ impl RelayClient {
 
         let sse_client = http_client.clone();
         let sse_task = tokio::spawn(async move {
-            let mut stream = match sse_client.get(&events_url).send().await {
-                Ok(resp) => resp.bytes_stream(),
+            let mut stream = match sse_client.get(&events_url)
+                .header("Accept", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .send().await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let ct = resp.headers().get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    eprintln!("[agent] SSE connected: status={}, content-type={}", status, ct);
+                    resp.bytes_stream()
+                }
                 Err(e) => {
-                    tracing::error!("SSE connection failed: {}", e);
+                    eprintln!("[agent] SSE connection failed: {}", e);
                     return;
                 }
             };
 
             let mut buf = String::new();
+            let mut event_count: u64 = 0;
             while let Some(chunk) = stream.next().await {
                 match chunk {
-                    Ok(bytes) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
+                    Ok(chunk_bytes) => {
+                        let text = String::from_utf8_lossy(&chunk_bytes);
+                        buf.push_str(&text);
                         while let Some(pos) = buf.find("\n\n") {
                             let event_str = buf[..pos].to_string();
                             buf = buf[pos + 2..].to_string();
                             for line in event_str.lines() {
                                 if let Some(data) = line.strip_prefix("data:") {
+                                    event_count += 1;
+                                    if event_count <= 3 {
+                                        eprintln!("[agent] SSE event #{}: {}", event_count, data.trim());
+                                    }
                                     let _ = tx.send(data.trim().to_string());
                                 }
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        eprintln!("[agent] SSE stream error after {} events", event_count);
+                        break;
+                    }
                 }
             }
+            eprintln!("[agent] SSE stream ended, {} events received", event_count);
         });
 
         let mut client = Self {

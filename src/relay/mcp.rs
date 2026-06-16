@@ -74,7 +74,7 @@ pub async fn sse_handler(
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
                     "name": "shell-remote",
-                                        "version": "0.1.10"
+                                        "version": "0.1.11"
                 },
                 "capabilities": {
                     "tools": {}
@@ -94,9 +94,14 @@ pub async fn sse_handler(
         }
     };
 
-    Sse::new(stream)
+    let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::default())
-        .into_response()
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-accel-buffering"),
+        axum::http::header::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 pub async fn messages_handler(
@@ -144,7 +149,7 @@ pub async fn messages_handler(
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
                     "name": "shell-remote",
-                                        "version": "0.1.10"
+                                        "version": "0.1.11"
                 },
                 "capabilities": {
                     "tools": {}
