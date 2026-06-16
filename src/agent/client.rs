@@ -1,22 +1,16 @@
 use anyhow::{bail, Context};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use crate::proto::Message as ProtoMessage;
 
-enum Transport {
-    Ws {
-        ws: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    },
-    Http {
-        client: reqwest::Client,
-        send_url: String,
-        events_rx: mpsc::UnboundedReceiver<String>,
-        last_event_id: Option<u64>,
-        _task: tokio::task::JoinHandle<()>,
-    },
+struct Transport {
+    client: reqwest::Client,
+    send_url: String,
+    events_rx: mpsc::UnboundedReceiver<String>,
+    last_event_id: Option<u64>,
+    _task: tokio::task::JoinHandle<()>,
 }
 
 pub struct RelayClient {
@@ -26,57 +20,6 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
-    pub async fn connect(
-        relay_url: &str,
-        fixed_key: Option<String>,
-        token_type: &str,
-    ) -> anyhow::Result<Self> {
-        if relay_url.starts_with("ws://") || relay_url.starts_with("wss://") {
-            Self::connect_ws(relay_url, fixed_key, token_type).await
-        } else {
-            Self::connect_http(relay_url, fixed_key, token_type).await
-        }
-    }
-
-    async fn connect_ws(
-        relay_url: &str,
-        fixed_key: Option<String>,
-        token_type: &str,
-    ) -> anyhow::Result<Self> {
-        let url = format!("{}/agent", relay_url.trim_end_matches('/'));
-        let url = if let Some(key) = &fixed_key {
-            format!("{}?key={}&token_type={}", url, key, token_type)
-        } else {
-            format!("{}?token_type={}", url, token_type)
-        };
-
-        let (ws, _) = connect_async(&url)
-            .await
-            .context("Failed to connect to relay WebSocket")?;
-
-        let mut client = Self {
-            transport: Transport::Ws { ws },
-            session_id: String::new(),
-            tokens: Vec::new(),
-        };
-
-        let register_msg = json!({
-            "type": "agent:register",
-            "key": fixed_key,
-            "token_type": token_type
-        }).to_string();
-
-        client.send_raw(&register_msg).await?;
-
-        let response_text = client.recv_raw().await
-            .context("Failed to receive register response")?;
-        let response: serde_json::Value = serde_json::from_str(&response_text)
-            .context("Failed to parse register response")?;
-
-        Self::handle_register_response(&mut client, &response)?;
-        Ok(client)
-    }
-
     async fn connect_http(
         relay_url: &str,
         fixed_key: Option<String>,
@@ -168,7 +111,7 @@ impl RelayClient {
         });
 
         let mut client = Self {
-            transport: Transport::Http {
+            transport: Transport {
                 client: http_client,
                 send_url,
                 events_rx: rx,
@@ -212,11 +155,12 @@ impl RelayClient {
         token_type: &str,
         max_retries: u32,
     ) -> anyhow::Result<Self> {
+        let relay_url = relay_url.trim_end_matches('/');
         let mut delay = tokio::time::Duration::from_secs(1);
         let max_delay = tokio::time::Duration::from_secs(300);
 
         for attempt in 0..=max_retries {
-            match Self::connect(relay_url, fixed_key.clone(), token_type).await {
+            match Self::connect_http(relay_url, fixed_key.clone(), token_type).await {
                 Ok(client) => return Ok(client),
                 Err(e) => {
                     if attempt == max_retries {
@@ -236,26 +180,18 @@ impl RelayClient {
     }
 
     async fn send_raw(&mut self, text: &str) -> anyhow::Result<()> {
-        match &mut self.transport {
-            Transport::Ws { ws } => {
-                ws.send(Message::Text(text.to_string()))
-                    .await
-                    .context("Failed to send WebSocket message")?;
-            }
-            Transport::Http { client, send_url, .. } => {
-                let body: serde_json::Value = serde_json::from_str(text)
-                    .context("Failed to parse outgoing message")?;
-                let resp = client.post(send_url.as_str())
-                    .json(&body)
-                    .send()
-                    .await
-                    .context("Failed to POST agent message")?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    tracing::warn!("Agent POST failed ({}): {}", status, &body[..body.len().min(200)]);
-                }
-            }
+        let body: serde_json::Value = serde_json::from_str(text)
+            .context("Failed to parse outgoing message")?;
+        let resp = self.transport.client
+            .post(&self.transport.send_url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to POST agent message")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("Agent POST failed ({}): {}", status, &body[..body.len().min(200)]);
         }
         Ok(())
     }
@@ -266,30 +202,7 @@ impl RelayClient {
     }
 
     async fn recv_raw(&mut self) -> Option<String> {
-        match &mut self.transport {
-            Transport::Ws { ws } => {
-                loop {
-                    match ws.next().await {
-                        Some(Ok(Message::Text(text))) => return Some(text.to_string()),
-                        Some(Ok(Message::Close(_))) => return None,
-                        Some(Ok(Message::Ping(data))) => {
-                            if ws.send(Message::Pong(data)).await.is_err() {
-                                return None;
-                            }
-                        }
-                        Some(Ok(_)) => continue,
-                        Some(Err(e)) => {
-                            tracing::warn!("WebSocket error: {}", e);
-                            return None;
-                        }
-                        None => return None,
-                    }
-                }
-            }
-            Transport::Http { events_rx, .. } => {
-                events_rx.recv().await
-            }
-        }
+        self.transport.events_rx.recv().await
     }
 
     pub async fn recv(&mut self) -> Option<ProtoMessage> {
