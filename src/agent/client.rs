@@ -224,11 +224,16 @@ impl RelayClient {
             Transport::Http { client, send_url, .. } => {
                 let body: serde_json::Value = serde_json::from_str(text)
                     .context("Failed to parse outgoing message")?;
-                client.post(send_url.as_str())
+                let resp = client.post(send_url.as_str())
                     .json(&body)
                     .send()
                     .await
                     .context("Failed to POST agent message")?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!("Agent POST failed ({}): {}", status, &body[..body.len().min(200)]);
+                }
             }
         }
         Ok(())
