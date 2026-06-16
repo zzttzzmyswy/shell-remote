@@ -255,14 +255,10 @@ async fn process_mcp_request(
                     let exit_code = value.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
                     let mut text = String::new();
                     if !stdout.is_empty() {
-                        if let Some(decoded) = crate::agent::fs::decode_b64(stdout) {
-                            if let Ok(s) = String::from_utf8(decoded) { text.push_str(&s); }
-                        }
+                        text.push_str(stdout);
                     }
                     if !stderr.is_empty() {
-                        if let Some(decoded) = crate::agent::fs::decode_b64(stderr) {
-                            if let Ok(s) = String::from_utf8(decoded) { text.push_str(&format!("\n[stderr]\n{}", s)); }
-                        }
+                        text.push_str(&format!("\n[stderr]\n{}", stderr));
                     }
                     if text.is_empty() { text = format!("Exit code: {}", exit_code); }
                     json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":text.trim()}]}})
