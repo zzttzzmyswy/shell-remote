@@ -124,7 +124,7 @@ use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::Response;
-use futures_util::StreamExt;
+use tokio_stream::StreamExt;
 
 async fn static_handler(uri: Uri) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');

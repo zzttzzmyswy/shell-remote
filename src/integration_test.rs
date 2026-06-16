@@ -24,6 +24,7 @@ mod integration_tests {
 
         let app = Router::new()
             .route("/agent/session/sse", get(ws::browser_sse_handler))
+            .route("/agent/session/send", axum::routing::post(ws::browser_send_handler))
             .route("/agent/send", axum::routing::post(ws::agent_send_handler))
             .route("/agent/events", get(ws::agent_events_handler))
             .route("/agent/mcp/sse", get(mcp::sse_handler))
@@ -63,46 +64,25 @@ mod integration_tests {
         assert_eq!(resp.status(), 200);
         eprintln!("  [2] events stream connected");
 
-        // ── 3. Browser joins via WebSocket ────────────────────────
-        let ws_url = format!("ws://127.0.0.1:{}/agent", port);
-        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await
-            .expect("WS connection should succeed");
+        // ── 3. Browser connects via SSE+POST ──────────────────
+        let resp = client
+            .get(format!("{}/agent/session/sse?token={}&session={}", relay_url, rw_token, session_id))
+            .header("Accept", "text/event-stream")
+            .send().await.unwrap();
+        assert_eq!(resp.status(), 200, "Browser SSE connection should return 200");
+        eprintln!("  [3a] browser SSE stream connected");
 
-        use tokio_tungstenite::tungstenite::Message;
-        use futures_util::SinkExt;
-
-        let join_msg = json!({
-            "type": "browser:join",
-            "payload": {
+        let resp = client
+            .post(format!("{}/agent/session/send", relay_url))
+            .json(&json!({
+                "type": "terminal:input",
+                "session_id": session_id,
                 "token": rw_token,
-                "server_auth": server_auth
-            }
-        }).to_string();
-
-        ws.send(Message::Text(join_msg)).await.unwrap();
-        eprintln!("  [3] browser:join sent");
-
-        // Wait briefly for the server to process
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Receive response (may contain session:users broadcast first)
-        let mut joined = false;
-        for _ in 0..20 {
-            match tokio::time::timeout(Duration::from_secs(2), futures_util::StreamExt::next(&mut ws)).await {
-                Ok(Some(Ok(Message::Text(text)))) => {
-                    eprintln!("  WS recv: {}...", &text[..text.len().min(120)]);
-                    if text.contains("user_id") {
-                        joined = true;
-                        break;
-                    }
-                }
-                Ok(Some(Ok(_))) => { eprintln!("  WS recv: non-text"); }
-                Ok(Some(Err(e))) => { eprintln!("  WS recv error: {}", e); break; }
-                Ok(None) => { eprintln!("  WS recv: stream ended"); break; }
-                Err(_) => { eprintln!("  WS recv: timeout"); }
-            }
-        }
-        assert!(joined, "Browser should receive session:join or session:users response");
+                "payload": {"data": "echo hello"}
+            }))
+            .send().await.unwrap();
+        assert_eq!(resp.status(), 202, "Browser POST should return 202");
+        eprintln!("  [3b] browser POST returns 202");
 
         // ── 4. MCP tools/list (via 202 + push to SSE) ──────────
         // Open SSE connection, read first event to get sessionId
@@ -114,7 +94,7 @@ mod integration_tests {
         assert_eq!(sse_resp.status(), 200);
 
         // Read just enough of the SSE stream to get the endpoint event
-        use futures_util::StreamExt;
+        use tokio_stream::StreamExt;
         let mut body_stream = sse_resp.bytes_stream();
         let sse_text = tokio::time::timeout(
             std::time::Duration::from_secs(3),

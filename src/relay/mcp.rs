@@ -59,11 +59,11 @@ pub async fn sse_handler(
         let auth = if header_auth.is_empty() { query_auth } else { header_auth };
         if !crate::relay::auth::constant_time_eq(auth, &state.server_auth) {
             return Sse::new(
-                futures_util::stream::once(std::future::ready(Ok::<_, Infallible>(
+                tokio_stream::once(Ok::<_, Infallible>(
                     Event::default()
                         .event("error")
                         .data(r#"{"code":"AUTH_INVALID_PASSWORD","message":"Invalid server password"}"#),
-                ))),
+                )),
             )
             .into_response();
         }

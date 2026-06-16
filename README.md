@@ -10,7 +10,7 @@
 - **多 Tab 独立** — 每位用户独立切换多个 PTY Shell 标签页，互不干扰
 - **文件管理器** — 侧栏面板，面包屑导航、上传、下载、删除、重命名、新建文件夹、刷新
 - **MCP 服务器** — AI Agent（Claude 等）通过标准 MCP SSE Transport 协议在远程机器上执行命令
-- **双传输协议** — Agent 支持 WebSocket (`ws://`) 和 HTTP SSE+POST (`https://`) 两种模式
+- **双传输协议** — Agent 使用 HTTP SSE+POST (`https://`) 与 Relay 通信
 - **单二进制** — 所有 Web 资源通过 `rust-embed` 编译嵌入，零外部文件依赖
 - **Token 鉴权** — 随机临时 Token 或固定密钥；支持读写和只读两种权限
 - **服务器密码** — Relay 可配置访问密码（`--auth`），非 `--dev` 模式必填
@@ -19,17 +19,17 @@
 
 ```
 浏览器 (xterm.js + 文件管理UI)
-        │ WebSocket /agent
-        ▼
-┌───────────────┐   WS (/agent) 或 HTTP (SSE+POST)   ┌──────────────┐
-│   Relay       │ ◄─────────────────────────────────► │   Agent      │
-│   路由 + 鉴权  │                                      │   Shell + FS │
-│   静态 + MCP  │                                      │   (目标机器)  │
-└───────────────┘                                      └──────────────┘
-        ▲
-        │ MCP (/agent/mcp/sse + /agent/mcp/messages)
-        │
-  AI Agent (Claude 等)
+         │ SSE + POST /agent/session/sse + /agent/session/send
+         ▼
+┌───────────────┐   HTTP SSE+POST (/agent/events + /agent/send)   ┌──────────────┐
+│   Relay       │ ◄─────────────────────────────────────────────► │   Agent      │
+│   路由 + 鉴权  │                                                  │   Shell + FS │
+│   静态 + MCP  │                                                  │   (目标机器)  │
+└───────────────┘                                                  └──────────────┘
+         ▲
+         │ MCP (/agent/mcp/sse + /agent/mcp/messages)
+         │
+   AI Agent (Claude 等)
 ```
 
 - **Relay**：消息路由中心，连接各方并执行权限检查；嵌入 Web 前端
@@ -81,16 +81,12 @@ cargo build --release
 ### 启动 Agent
 
 ```bash
-# WebSocket 模式（实时双向）
-./shell-remote agent --relay-url ws://<relay-ip>:3000
-
-# HTTP SSE+POST 模式（兼容反向代理）
 ./shell-remote agent --relay-url https://<relay-ip>
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--relay-url` | `ws://localhost:3000` | Relay 地址。`ws://`=WebSocket，`https://`=SSE+POST |
+| `--relay-url` | `https://localhost:3000` | Relay 地址（HTTPS 或 HTTP，使用 SSE+POST 协议） |
 | `--key` | — | 固定鉴权密钥（不指定则随机生成临时 Token） |
 | `--root` | `$HOME` | 文件管理器默认目录 |
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
@@ -116,7 +112,8 @@ session: a1b2c3d4
 
 | 路径 | 方法 | 说明 |
 |------|------|------|
-| `/agent` | GET → WS | 浏览器和 Agent WebSocket 连接 |
+| `/agent/session/sse` | GET → SSE | 浏览器连接 Relay 接收消息流 |
+| `/agent/session/send` | POST | 浏览器发送消息 |
 | `/agent/events` | GET → SSE | Agent 接收消息流（HTTP 模式） |
 | `/agent/send` | POST | Agent 发送消息（HTTP 模式） |
 | `/agent/upload` | POST | 文件上传 |
@@ -204,7 +201,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 | 层 | 技术 |
 |----|------|
 | 运行时 | Rust + Tokio 异步 |
-| HTTP/WS | Axum |
+| HTTP | Axum |
 | 终端 | portable-pty + xterm.js |
 | 静态嵌入 | rust-embed |
 | 前端 | 原生 HTML/CSS/JS |

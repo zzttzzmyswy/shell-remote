@@ -1,5 +1,5 @@
 use anyhow::{bail, Context};
-use futures_util::StreamExt;
+use tokio_stream::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
 
