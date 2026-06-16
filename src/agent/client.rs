@@ -9,6 +9,7 @@ struct Transport {
     client: reqwest::Client,
     send_url: String,
     events_rx: mpsc::UnboundedReceiver<String>,
+    #[allow(dead_code)]
     last_event_id: Option<u64>,
     _task: tokio::task::JoinHandle<()>,
 }

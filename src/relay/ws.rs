@@ -328,7 +328,7 @@ pub async fn browser_sse_handler(
     let state_clone = state.clone();
     let sid_clone = session_id.clone();
     let uid_clone = user_id.clone();
-    let sse_sid_clone = sse_sid.clone();
+    let _sse_sid_clone = sse_sid.clone();
     let perm_clone = perm_str.to_string();
 
     // connected event data
@@ -346,7 +346,6 @@ pub async fn browser_sse_handler(
             let s = state_clone.clone();
             let sid = sid_clone.clone();
             let uid = uid_clone.clone();
-            let sse = sse_sid_clone.clone();
             let perm = perm_clone.clone();
             tokio::spawn(async move {
                 let count = {

@@ -233,7 +233,7 @@ async fn process_mcp_request(
 
             // Token from tool arguments (primary), fallback to query param
             let token = arguments.get("token").and_then(|v| v.as_str())
-                .or_else(|| url_token.as_deref())
+                .or(url_token.as_deref())
                 .unwrap_or("");
 
             let (session_id, permission) = match state.sessions.authenticate(token).await {
