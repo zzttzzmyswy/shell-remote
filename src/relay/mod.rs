@@ -22,7 +22,10 @@ pub struct ChannelMap {
 #[allow(dead_code)]
 impl ChannelMap {
     pub fn new() -> Self {
-        Self { agent: None, browser_sessions: HashMap::new() }
+        Self {
+            agent: None,
+            browser_sessions: HashMap::new(),
+        }
     }
 }
 
@@ -46,7 +49,9 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
-        Self { attempts: HashMap::new() }
+        Self {
+            attempts: HashMap::new(),
+        }
     }
 
     /// Returns true if the request should be allowed (not rate limited)
@@ -73,7 +78,10 @@ pub struct EventBuffer {
 
 impl EventBuffer {
     pub fn new() -> Self {
-        Self { next_id: 0, events: VecDeque::new() }
+        Self {
+            next_id: 0,
+            events: VecDeque::new(),
+        }
     }
 
     pub fn push(&mut self, msg: String) -> u64 {
@@ -87,7 +95,8 @@ impl EventBuffer {
     }
 
     pub fn replay_from(&self, last_id: u64) -> Vec<(u64, String)> {
-        self.events.iter()
+        self.events
+            .iter()
             .filter(|(id, _)| *id > last_id)
             .cloned()
             .collect()
@@ -96,7 +105,6 @@ impl EventBuffer {
 
 impl SharedState {
     pub fn new(server_auth: String, bin_dir: Option<String>, max_upload_size: u64) -> Self {
-
         Self {
             sessions: SessionRegistry::new(),
             agent_broadcast: RwLock::new(HashMap::new()),
@@ -112,7 +120,9 @@ impl SharedState {
     }
 
     pub async fn buffer_agent_event(&self, session_id: &str, msg: &str) -> u64 {
-        self.agent_event_buffers.write().await
+        self.agent_event_buffers
+            .write()
+            .await
             .entry(session_id.to_string())
             .or_insert_with(EventBuffer::new)
             .push(msg.to_string())
@@ -148,12 +158,10 @@ async fn static_handler(uri: Uri) -> Response<Body> {
                 .body(Body::from(content.data.into_owned()))
                 .unwrap()
         }
-        None => {
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("Not Found"))
-                .unwrap()
-        }
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("Not Found"))
+            .unwrap(),
     }
 }
 
@@ -168,7 +176,9 @@ mod tests {
         let uri = "/".parse::<Uri>().unwrap();
         let resp = static_handler(uri).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         assert!(body.len() > 0);
         assert!(std::str::from_utf8(&body).unwrap().contains("shell-remote"));
     }
@@ -178,8 +188,17 @@ mod tests {
         let uri = "/session".parse::<Uri>().unwrap();
         let resp = static_handler(uri).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let content_type = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
-        assert!(content_type.starts_with("text/html"), "Expected text/html, got {}", content_type);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.starts_with("text/html"),
+            "Expected text/html, got {}",
+            content_type
+        );
     }
 
     #[tokio::test]
@@ -212,6 +231,7 @@ mod tests {
             "term.js",
             "files.js",
             "session.js",
+            "install.sh",
         ];
         for name in assets {
             let content = crate::web::WebAssets::get(name);
@@ -232,7 +252,7 @@ mod tests {
         use axum::Router;
         use tower_http::cors::{Any, CorsLayer};
 
-        let state = Arc::new(SharedState::new("test".into(), None, 100*1024*1024));
+        let state = Arc::new(SharedState::new("test".into(), None, 100 * 1024 * 1024));
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -240,9 +260,15 @@ mod tests {
 
         let app: Router = Router::new()
             .route("/agent/session/sse", get(super::ws::browser_sse_handler))
-            .route("/agent/session/send", axum::routing::post(super::ws::browser_send_handler))
+            .route(
+                "/agent/session/send",
+                axum::routing::post(super::ws::browser_send_handler),
+            )
             .route("/mcp/sse", get(super::mcp::sse_handler))
-            .route("/mcp/messages", axum::routing::post(super::mcp::messages_handler))
+            .route(
+                "/mcp/messages",
+                axum::routing::post(super::mcp::messages_handler),
+            )
             .route("/", get(static_handler))
             .route("/session", get(static_handler))
             .route("/style.css", get(static_handler))
@@ -250,6 +276,7 @@ mod tests {
             .route("/term.js", get(static_handler))
             .route("/files.js", get(static_handler))
             .route("/session.js", get(static_handler))
+            .route("/agent/install", get(install_script_handler))
             .fallback(get(static_handler))
             .layer(cors)
             .with_state(state);
@@ -259,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_unauthorized_no_token() {
-        let state = Arc::new(SharedState::new("".into(), None, 100*1024*1024));
+        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
         let headers = HeaderMap::new();
         let params = HashMap::new();
         let body = Body::from("test content");
@@ -269,11 +296,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_readonly_token_forbidden() {
-        let state = Arc::new(SharedState::new("".into(), None, 100*1024*1024));
+        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
         let (_sid, tokens) = state.sessions.register(None, "ro").await;
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let mut params = HashMap::new();
         params.insert("path".to_string(), "/tmp/test".to_string());
         let body = Body::from("test content");
@@ -282,12 +312,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_install_script_handler_returns_script() {
+        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", "example.com:3000".parse().unwrap());
+        let resp = install_script_handler(State(state), headers)
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("RELAY_URL=\"http://example.com:3000\""));
+        assert!(text.contains("agent --relay-url"));
+        assert!(text.contains("#!/bin/sh"));
+    }
+
+    #[tokio::test]
+    async fn test_install_script_handler_https_forwarded() {
+        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", "example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        let resp = install_script_handler(State(state), headers)
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("RELAY_URL=\"https://example.com\""));
+    }
+
+    #[tokio::test]
+    async fn test_install_script_handler_default_host() {
+        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let headers = axum::http::HeaderMap::new();
+        let resp = install_script_handler(State(state), headers)
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("RELAY_URL=\"http://localhost\""));
+    }
+
+    #[tokio::test]
     async fn test_upload_handler_missing_path() {
-        let state = Arc::new(SharedState::new("".into(), None, 100*1024*1024));
+        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
         let (_sid, tokens) = state.sessions.register(None, "rw").await;
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let params = HashMap::new();
         let body = Body::from("test content");
         let result = upload_handler(State(state), headers, Query(params), body).await;
@@ -361,11 +442,14 @@ pub async fn upload_handler(
         }
     }
 
-    let token = crate::relay::auth::extract_token_from_headers_or_query(&headers, params.get("token"))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let token =
+        crate::relay::auth::extract_token_from_headers_or_query(&headers, params.get("token"))
+            .ok_or(StatusCode::UNAUTHORIZED)?;
     let path = params.get("path").ok_or(StatusCode::BAD_REQUEST)?;
 
-    let (session_id, permission) = state.sessions.authenticate(&token)
+    let (session_id, permission) = state
+        .sessions
+        .authenticate(&token)
         .await
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
@@ -379,7 +463,9 @@ pub async fn upload_handler(
     let tmp_name = format!("{}_{}", uuid::Uuid::new_v4(), path.replace('/', "_"));
     let tmp_path = tmp_dir.join(&tmp_name);
 
-    let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut total: u64 = 0;
     let mut stream = body.into_data_stream();
     while let Some(result) = stream.next().await {
@@ -408,7 +494,8 @@ pub async fn upload_handler(
             "temp_path": tmp_path.to_string_lossy(),
             "final_path": path
         }
-    }).to_string();
+    })
+    .to_string();
 
     {
         let broadcast = state.agent_broadcast.read().await;
@@ -419,7 +506,12 @@ pub async fn upload_handler(
         }
     }
 
-    tracing::info!("Upload received: {} ({} bytes) -> {}", path, total, tmp_path.display());
+    tracing::info!(
+        "Upload received: {} ({} bytes) -> {}",
+        path,
+        total,
+        tmp_path.display()
+    );
     Ok(StatusCode::OK)
 }
 
@@ -441,11 +533,16 @@ pub async fn bin_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let data = tokio::fs::read(&filepath).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let data = tokio::fs::read(&filepath)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
 
     let headers = [
         (header::CONTENT_TYPE, "application/octet-stream"),
-        (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", filename)),
+        (
+            header::CONTENT_DISPOSITION,
+            &format!("attachment; filename=\"{}\"", filename),
+        ),
     ];
 
     Ok((StatusCode::OK, headers, data).into_response())
@@ -467,12 +564,16 @@ pub async fn install_script_handler(
         .unwrap_or("http");
     let relay_url = format!("{}://{}", proto, host);
 
-    let script = include_str!("../../web/install.sh")
-        .replace("__RELAY_URL__", &relay_url);
+    let script = include_str!("../../web/install.sh").replace("__RELAY_URL__", &relay_url);
 
-    (axum::http::StatusCode::OK,
-     [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-     script)
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        script,
+    )
 }
 
 pub async fn start(
@@ -502,7 +603,9 @@ pub async fn start(
             anyhow::bail!("Both --tls-cert and --tls-key must be provided together");
         }
         eprintln!("WARNING: Running without TLS. Passwords and tokens will be sent in plaintext.");
-        eprintln!("  Consider using --tls-cert and --tls-key for production, or --dev for development.");
+        eprintln!(
+            "  Consider using --tls-cert and --tls-key for production, or --dev for development."
+        );
     }
 
     use axum::routing::get;
@@ -518,12 +621,21 @@ pub async fn start(
 
     let app = Router::new()
         .route("/agent/session/sse", get(ws::browser_sse_handler))
-        .route("/agent/session/send", axum::routing::post(ws::browser_send_handler))
+        .route(
+            "/agent/session/send",
+            axum::routing::post(ws::browser_send_handler),
+        )
         .route("/agent/send", axum::routing::post(ws::agent_send_handler))
         .route("/agent/events", get(ws::agent_events_handler))
-        .route("/agent/upload", axum::routing::post(upload_handler).layer(axum::extract::DefaultBodyLimit::disable()))
+        .route(
+            "/agent/upload",
+            axum::routing::post(upload_handler).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .route("/agent/mcp/sse", get(mcp::sse_handler))
-        .route("/agent/mcp/messages", axum::routing::post(mcp::messages_handler))
+        .route(
+            "/agent/mcp/messages",
+            axum::routing::post(mcp::messages_handler),
+        )
         .route("/agent/install", get(install_script_handler))
         .route("/download", get(static_handler))
         .route("/bin/{arch}", get(bin_handler))
@@ -566,7 +678,11 @@ pub async fn start(
                         pending.retain(|_rid, (sid, _tx)| sid != &session_id);
                     }
                     state_clone.sessions.remove(&session_id).await;
-                    state_clone.agent_broadcast.write().await.remove(&session_id);
+                    state_clone
+                        .agent_broadcast
+                        .write()
+                        .await
+                        .remove(&session_id);
                     state_clone.last_activity.write().await.remove(&session_id);
                 }
             }
