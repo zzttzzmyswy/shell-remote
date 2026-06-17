@@ -51,6 +51,9 @@
         var data = JSON.parse(e.data);
         userId = data.payload.user_id;
         permission = data.payload.permission;
+        if (handlers['connected']) {
+          handlers['connected'].forEach(function(fn) { fn(data); });
+        }
       } catch(err) {
         console.warn('Failed to parse connected event:', err);
       }
