@@ -528,10 +528,20 @@ async fn run_session(
 async fn execute_command(cmd: &str, timeout_ms: u64) -> (String, String, i32) {
     let cmd = cmd.to_string();
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    let result = tokio::time::timeout(timeout, async {
-        // Use `script` to allocate a PTY so interactive prompts
-        // (e.g. sudo password, gh login) are captured in stdout/stderr
-        // instead of leaking to the agent host terminal via /dev/tty.
+
+    // Prefer `script` for PTY allocation so interactive prompts (sudo, gh, etc.)
+    // are captured instead of leaking to the agent host terminal via /dev/tty.
+    // Fall back to direct `sh -c` if `script` is unavailable (minimal containers).
+    let has_script = tokio::process::Command::new("which")
+        .arg("script")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let output = if has_script {
         tokio::process::Command::new("script")
             .arg("-q")
             .arg("-c")
@@ -542,9 +552,18 @@ async fn execute_command(cmd: &str, timeout_ms: u64) -> (String, String, i32) {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .output()
-            .await
-    })
-    .await;
+    } else {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+    };
+
+    let result = tokio::time::timeout(timeout, output).await;
 
     match result {
         Ok(Ok(out)) => {
