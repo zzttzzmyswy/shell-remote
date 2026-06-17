@@ -64,8 +64,7 @@
     // ── ShellRemote event handlers ─────────────────────────────────────
 
     window.shellRemote.on('connected', function(msg) {
-        var sessionId = window.shellRemote.getSessionId();
-        sessionNameEl.textContent = '会话: ' + sessionId.substring(0, 8);
+        sessionNameEl.textContent = '已连接';
         disconnectOverlay.classList.add('hidden');
         term.focus();
         term.onResize((cols, rows) => {

@@ -1,17 +1,15 @@
 // sse.js - SSE + POST browser client for shell-remote
 
 (function() {
-  var params = new URLSearchParams(window.location.search);
-  var sessionId = params.get('session');
-  var token = params.get('token');
+  var token = sessionStorage.getItem('shell-remote-token');
+  var permission = sessionStorage.getItem('shell-remote-permission') || 'ro';
 
-  if (!sessionId || !token) {
-    document.body.innerHTML = '<div style="padding:2em;color:red">Missing session or token in URL</div>';
+  if (!token) {
+    document.body.innerHTML = '<div style="padding:2em;color:red">Missing token — please go back and enter your session token</div>';
     return;
   }
 
   var userId = null;
-  var permission = 'ro';
   var es = null;
   var handlers = {};
 
@@ -28,7 +26,6 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          session_id: sessionId,
           token: token,
           type: type,
           payload: payload || {}
@@ -42,13 +39,12 @@
       });
     },
     getUserId: function() { return userId; },
-    getPermission: function() { return permission; },
-    getSessionId: function() { return sessionId; }
+    getPermission: function() { return permission; }
   };
 
   function connectSSE() {
     if (es) es.close();
-    es = new EventSource('/agent/session/sse?session=' + encodeURIComponent(sessionId) + '&token=' + encodeURIComponent(token));
+    es = new EventSource('/agent/session/sse?token=' + encodeURIComponent(token));
 
     es.addEventListener('connected', function(e) {
       try {

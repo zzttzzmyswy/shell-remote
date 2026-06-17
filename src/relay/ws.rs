@@ -302,12 +302,7 @@ pub async fn browser_sse_handler(
         }
     };
 
-    let session_id = match params.get("session") {
-        Some(s) => s.clone(),
-        None => return (axum::http::StatusCode::BAD_REQUEST, "Missing session").into_response(),
-    };
-
-    let (auth_session_id, permission) = match state.sessions.authenticate(&token).await {
+    let (session_id, permission) = match state.sessions.authenticate(&token).await {
         Some(r) => r,
         None => {
             return (
@@ -317,14 +312,6 @@ pub async fn browser_sse_handler(
                 .into_response()
         }
     };
-
-    if auth_session_id != session_id {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            "Token does not belong to this session",
-        )
-            .into_response();
-    }
 
     let user_id = Uuid::new_v4().to_string();
     let sse_sid = format!("bs_{}", Uuid::new_v4());
@@ -480,17 +467,6 @@ pub async fn browser_send_handler(
     State(state): State<Arc<SharedState>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let session_id = match body["session_id"].as_str() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                axum::Json(json!({"error": "Missing session_id"})),
-            )
-                .into_response()
-        }
-    };
-
     let token = match body["token"].as_str() {
         Some(t) => t,
         None => {
@@ -502,7 +478,7 @@ pub async fn browser_send_handler(
         }
     };
 
-    let (auth_session_id, permission) = match state.sessions.authenticate(token).await {
+    let (session_id, permission) = match state.sessions.authenticate(token).await {
         Some(r) => r,
         None => {
             return (
@@ -512,14 +488,6 @@ pub async fn browser_send_handler(
                 .into_response()
         }
     };
-
-    if auth_session_id != session_id {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            axum::Json(json!({"error": "Token does not belong to this session"})),
-        )
-            .into_response();
-    }
 
     let msg_type = body["type"].as_str().unwrap_or("");
     if msg_type.is_empty() {
@@ -766,19 +734,9 @@ mod tests {
     // ── browser_send_handler tests ────────────────────────────────────
 
     #[tokio::test]
-    async fn test_browser_send_missing_session_id() {
-        let state = make_state("");
-        let body = json!({"token": "some_token", "type": "terminal:input", "payload": {}});
-        let resp = browser_send_handler(State(state), Json(body))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), 400);
-    }
-
-    #[tokio::test]
     async fn test_browser_send_missing_token() {
         let state = make_state("");
-        let body = json!({"session_id": "sid1", "type": "terminal:input", "payload": {}});
+        let body = json!({"type": "terminal:input", "payload": {}});
         let resp = browser_send_handler(State(state), Json(body))
             .await
             .into_response();
@@ -796,7 +754,7 @@ mod tests {
             .await
             .insert(sid.clone(), ChannelMap::new());
         let body =
-            json!({"session_id": sid, "token": token, "type": "terminal:input", "payload": {}});
+            json!({"token": token, "type": "terminal:input", "payload": {}});
         let resp = browser_send_handler(State(state), Json(body))
             .await
             .into_response();
