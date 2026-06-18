@@ -52,9 +52,9 @@ async fn run_session(
     let mut client =
         RelayClient::connect_with_retry(relay_url, key.clone(), token_type, 10).await?;
 
-    println!("session: {}", client.session_id);
+    tracing::info!(session = %client.session_id, "agent session established");
     for (token, perm) in &client.tokens {
-        println!("  {}: {}", perm, token);
+        tracing::info!(session = %client.session_id, permission = %perm, "token: {}", token);
     }
 
     let root_path = PathBuf::from(root);

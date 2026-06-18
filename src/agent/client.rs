@@ -87,14 +87,15 @@ impl RelayClient {
                         .get("content-type")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
-                    eprintln!(
-                        "[agent] SSE connected: status={}, content-type={}",
-                        status, ct
+                    tracing::debug!(
+                        status = %status,
+                        content_type = %ct,
+                        "agent SSE connected"
                     );
                     resp.bytes_stream()
                 }
                 Err(e) => {
-                    eprintln!("[agent] SSE connection failed: {}", e);
+                    tracing::warn!("agent SSE connection failed: {}", e);
                     return;
                 }
             };
@@ -113,9 +114,9 @@ impl RelayClient {
                                 if let Some(data) = line.strip_prefix("data:") {
                                     event_count += 1;
                                     if event_count <= 3 {
-                                        eprintln!(
-                                            "[agent] SSE event #{}: {}",
-                                            event_count,
+                                        tracing::debug!(
+                                            event = event_count,
+                                            "agent SSE event: {}",
                                             data.trim()
                                         );
                                     }
@@ -125,12 +126,12 @@ impl RelayClient {
                         }
                     }
                     Err(_) => {
-                        eprintln!("[agent] SSE stream error after {} events", event_count);
+                        tracing::warn!("agent SSE stream error after {} events", event_count);
                         break;
                     }
                 }
             }
-            eprintln!("[agent] SSE stream ended, {} events received", event_count);
+            tracing::debug!("agent SSE stream ended, {} events received", event_count);
         });
 
         let mut client = Self {

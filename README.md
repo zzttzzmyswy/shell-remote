@@ -13,7 +13,7 @@
 - **SSE+POST 协议** — 全链路使用 HTTP SSE 推送 + POST 发送，兼容性好，不依赖 WebSocket
 - **单二进制** — 所有 Web 资源通过 `rust-embed` 编译嵌入，零外部文件依赖
 - **Token 鉴权** — 随机临时 Token 或固定密钥；支持读写和只读两种权限
-- **服务器密码** — Relay 可配置访问密码（`--auth`），非 `--dev` 模式必填
+- **服务器密码** — Relay 可配置访问密码（`--auth`），必填
 
 ## 架构
 
@@ -62,21 +62,14 @@ cargo build --release
 ### 启动 Relay
 
 ```bash
-# 开发模式（--dev 允许无密码）
-./shell-remote relay --dev --auth password --bind 0.0.0.0:3000
-
-# 生产模式（--auth 必填）
+# --auth 必填；TLS 由前端反向代理（nginx/caddy）终结
 ./shell-remote relay --auth YourStrongPassword --bind 0.0.0.0:3000
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--bind` | `0.0.0.0:3000` | 监听地址 |
-| `--dev` | false | 开发模式（允许无 --auth，无 TLS） |
-| `--auth` | 无默认值 | 服务器密码。非 --dev 模式必填 |
-| `--bin-dir` | — | 预编译二进制文件目录（供下载页面） |
-| `--tls-cert` | — | TLS 证书路径 |
-| `--tls-key` | — | TLS 私钥路径 |
+| `--auth` | 无默认值 | 服务器密码（必填） |
 
 ### 启动 Agent
 

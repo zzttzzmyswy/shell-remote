@@ -12,8 +12,7 @@ use uuid::Uuid;
 
 use crate::proto::{requires_write, Message as ProtoMessage, Permission, TokenType};
 
-use crate::relay::ChannelMap;
-use crate::relay::SharedState;
+use crate::relay::{ChannelMap, SharedState, MAX_SESSIONS};
 
 // ── Shared agent message routing ─────────────────────────────────────
 
@@ -107,6 +106,32 @@ pub async fn agent_send_handler(
 
     // agent:register is allowed without server auth (agents use keys for identity)
     if msg_type == "agent:register" {
+        // Rate limit registrations per client IP to prevent session-flooding DoS.
+        let client_ip = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        {
+            let mut rl = state.rate_limiter.write().await;
+            if !rl.check(&client_ip, 10, std::time::Duration::from_secs(60)) {
+                return (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "Too many registrations from this address",
+                )
+                    .into_response();
+            }
+        }
+
+        // Hard cap on total sessions.
+        if state.sessions.count().await >= MAX_SESSIONS {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Session limit reached",
+            )
+                .into_response();
+        }
+
         let fixed_key = body["key"].as_str().map(|s| s.to_string());
         let token_type_str = body["token_type"].as_str().unwrap_or("rw");
         let token_type = crate::proto::TokenType::from_str_val(token_type_str)
@@ -131,15 +156,13 @@ pub async fn agent_send_handler(
             .as_ref()
             .map(|k| format!("key:{}", k))
             .unwrap_or_else(|| "temp".to_string());
-        tracing::info!("Session {} created ({}) HTTP-mode", session_id, key_info);
-        println!("Session: {}", session_id);
-        println!("  {}", key_info);
+        tracing::info!(session = %session_id, key = %key_info, "session created (HTTP-mode)");
         for (token, perm) in &tokens {
             let perm_str = match perm {
                 Permission::ReadWrite => "rw",
                 Permission::ReadOnly => "ro",
             };
-            println!("  {} -> {}", perm_str, token);
+            tracing::info!(session = %session_id, permission = perm_str, "token: {}", token);
         }
 
         {
@@ -289,10 +312,16 @@ pub async fn agent_events_handler(
 
 pub async fn browser_sse_handler(
     State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let token = match params.get("token") {
-        Some(t) => t.clone(),
+    // Prefer the Authorization header so tokens don't land in access logs via
+    // the query string; fall back to ?token= for backward compatibility.
+    let token = match crate::relay::auth::extract_token_from_headers_or_query(
+        &headers,
+        params.get("token"),
+    ) {
+        Some(t) => t,
         None => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
@@ -515,7 +544,8 @@ pub async fn browser_send_handler(
         "type": msg_type,
         "session_id": session_id,
         "payload": body["payload"]
-    }).to_string();
+    })
+    .to_string();
 
     {
         let broadcast = state.agent_broadcast.read().await;
@@ -543,7 +573,6 @@ mod tests {
             pending_mcp: RwLock::new(HashMap::new()),
             last_activity: RwLock::new(HashMap::new()),
             server_auth: server_auth.to_string(),
-            bin_dir: None,
             agent_event_buffers: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter::new()),
             max_upload_size: 100 * 1024 * 1024,
@@ -757,8 +786,7 @@ mod tests {
             .write()
             .await
             .insert(sid.clone(), ChannelMap::new());
-        let body =
-            json!({"token": token, "type": "terminal:input", "payload": {}});
+        let body = json!({"token": token, "type": "terminal:input", "payload": {}});
         let resp = browser_send_handler(State(state), Json(body))
             .await
             .into_response();

@@ -98,6 +98,10 @@ impl SessionRegistry {
             .map(|s| s.is_temporary)
             .unwrap_or(false)
     }
+
+    pub async fn count(&self) -> usize {
+        self.sessions.read().await.len()
+    }
 }
 
 fn generate_token() -> String {

@@ -88,13 +88,3 @@ echo "Built:"
 ls -lh releases/
 file releases/*
 ```
-
-## Serve Binaries via Relay
-
-Start the relay with `--bin-dir` to serve the binaries directly:
-
-```bash
-./shell-remote relay --bin-dir ./releases
-```
-
-Then visit `http://<relay>:3000/download` to download any architecture.

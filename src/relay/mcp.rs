@@ -366,7 +366,6 @@ mod tests {
             pending_mcp: RwLock::new(HashMap::new()),
             last_activity: RwLock::new(HashMap::new()),
             server_auth: String::new(),
-            bin_dir: None,
             agent_event_buffers: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter::new()),
             max_upload_size: 100 * 1024 * 1024,

@@ -1,4 +1,8 @@
 // sse.js - SSE + POST browser client for shell-remote
+//
+// Uses a fetch-based streaming reader instead of native EventSource so the
+// session token travels in an Authorization header rather than the URL query
+// string (which would otherwise be written to reverse-proxy access logs).
 
 (function() {
   var token = sessionStorage.getItem('shell-remote-token');
@@ -10,8 +14,11 @@
   }
 
   var userId = null;
-  var es = null;
   var handlers = {};
+
+  var controller = null;          // AbortController for the active fetch
+  var intentionalClose = false;   // true when we deliberately stop the stream
+  var reconnectTimer = null;
 
   window.shellRemote = {
     on: function(type, fn) {
@@ -42,41 +49,117 @@
     getPermission: function() { return permission; }
   };
 
-  function connectSSE() {
-    if (es) es.close();
-    es = new EventSource('/agent/session/sse?token=' + encodeURIComponent(token));
+  function scheduleReconnect() {
+    if (intentionalClose) return;
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(function() {
+      reconnectTimer = null;
+      connectSSE();
+    }, 3000);
+  }
 
-    es.addEventListener('connected', function(e) {
+  // Parse one SSE block (lines separated by \n) and dispatch to handlers.
+  function handleBlock(block) {
+    var eventName = 'message';
+    var dataLines = [];
+    var lines = block.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (line.charAt(0) === ':') continue;            // comment / keep-alive
+      var colon = line.indexOf(':');
+      var field = colon === -1 ? line : line.slice(0, colon);
+      var value = colon === -1 ? '' : line.slice(colon + 1);
+      if (value.charAt(0) === ' ') value = value.slice(1); // leading space per spec
+      if (field === 'event') {
+        eventName = value;
+      } else if (field === 'data') {
+        dataLines.push(value);
+      }
+    }
+    if (dataLines.length === 0) return;
+    var data = dataLines.join('\n');
+
+    var parsed;
+    try {
+      parsed = JSON.parse(data);
+    } catch (err) {
+      console.warn('Failed to parse SSE message:', err);
+      return;
+    }
+
+    if (eventName === 'connected') {
       try {
-        var data = JSON.parse(e.data);
-        userId = data.payload.user_id;
-        permission = data.payload.permission;
-        if (handlers['connected']) {
-          handlers['connected'].forEach(function(fn) { fn(data); });
-        }
-      } catch(err) {
+        userId = parsed.payload.user_id;
+        permission = parsed.payload.permission;
+      } catch (err) {
         console.warn('Failed to parse connected event:', err);
       }
-    });
-
-    es.onmessage = function(e) {
-      try {
-        var msg = JSON.parse(e.data);
-        var type = msg.type;
-        if (handlers[type]) {
-          handlers[type].forEach(function(fn) { fn(msg); });
-        }
-        if (handlers['*']) {
-          handlers['*'].forEach(function(fn) { fn(msg); });
-        }
-      } catch(err) {
-        console.warn('Failed to parse SSE message:', err);
+      if (handlers['connected']) {
+        handlers['connected'].forEach(function(fn) { fn(parsed); });
       }
-    };
+      return;
+    }
 
-    es.onerror = function() {
-      // EventSource auto-reconnects
-    };
+    var type = parsed.type;
+    if (handlers[type]) {
+      handlers[type].forEach(function(fn) { fn(parsed); });
+    }
+    if (handlers['*']) {
+      handlers['*'].forEach(function(fn) { fn(parsed); });
+    }
+  }
+
+  function connectSSE() {
+    if (controller) {
+      intentionalClose = true;
+      controller.abort();
+      intentionalClose = false;
+    }
+    controller = new AbortController();
+    var localController = controller;
+    var buffer = '';
+
+    fetch('/agent/session/sse', {
+      method: 'GET',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Accept': 'text/event-stream',
+        'Cache-Control': 'no-cache'
+      },
+      signal: localController.signal
+    }).then(function(resp) {
+      if (!resp.ok || !resp.body) {
+        if (resp.status === 401 || resp.status === 403) {
+          window.location.href = '/';
+        }
+        throw new Error('SSE HTTP ' + resp.status);
+      }
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder();
+
+      function pump() {
+        return reader.read().then(function(result) {
+          if (localController.signal.aborted) return;
+          if (result.done) {
+            scheduleReconnect();
+            return;
+          }
+          buffer += decoder.decode(result.value, { stream: true });
+          var idx;
+          while ((idx = buffer.indexOf('\n\n')) !== -1) {
+            var block = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            handleBlock(block);
+          }
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function(err) {
+      if (localController.signal.aborted) return;  // deliberate stop
+      console.warn('SSE stream error:', err.message);
+      scheduleReconnect();
+    });
   }
 
   connectSSE();

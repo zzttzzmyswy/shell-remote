@@ -13,7 +13,7 @@ Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust 
 - **SSE+POST Transport** — Full-stack HTTP SSE push + POST send; no WebSocket dependency, works behind any proxy
 - **Single Binary** — All web assets embedded via `rust-embed`; zero external file dependencies
 - **Token Authentication** — Random temporary tokens or fixed keys; read-write and read-only permission levels
-- **Server Password** — Relay-level access password (`--auth`), required unless `--dev` mode
+- **Server Password** — Relay-level access password (`--auth`), required
 
 ## Architecture
 
@@ -57,21 +57,14 @@ cargo build --release
 ### Start Relay
 
 ```bash
-# Development mode
-./shell-remote relay --dev --auth password --bind 0.0.0.0:3000
-
-# Production mode (--auth required)
+# --auth required; TLS is terminated by a fronting reverse proxy (nginx/caddy)
 ./shell-remote relay --auth YourStrongPassword --bind 0.0.0.0:3000
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--bind` | `0.0.0.0:3000` | Listen address |
-| `--dev` | false | Development mode (no TLS, allows no --auth) |
-| `--auth` | none | Server password (required unless --dev) |
-| `--bin-dir` | — | Path to pre-built binaries |
-| `--tls-cert` | — | TLS certificate path |
-| `--tls-key` | — | TLS private key path |
+| `--auth` | none | Server password (required) |
 
 ### Start Agent
 

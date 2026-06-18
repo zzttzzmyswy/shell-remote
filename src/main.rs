@@ -23,25 +23,9 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:3000")]
         bind: String,
 
-        /// Path to TLS certificate file (omit for dev mode)
-        #[arg(long)]
-        tls_cert: Option<String>,
-
-        /// Path to TLS private key file (omit for dev mode)
-        #[arg(long)]
-        tls_key: Option<String>,
-
-        /// Run in development mode (no TLS, plaintext WebSocket)
-        #[arg(long, default_value_t = false)]
-        dev: bool,
-
-        /// Server access password (required unless --dev)
+        /// Server access password (required)
         #[arg(long)]
         auth: Option<String>,
-
-        /// Directory containing pre-built binaries for /download page
-        #[arg(long)]
-        bin_dir: Option<String>,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -79,18 +63,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let version = env!("CARGO_PKG_VERSION");
-    eprintln!("shell-remote v{}", version);
+    tracing::info!("shell-remote v{}", version);
 
     match cli.command {
-        Command::Relay {
-            bind,
-            tls_cert,
-            tls_key,
-            dev,
-            auth,
-            bin_dir,
-        } => {
-            relay::start(bind, tls_cert, tls_key, dev, auth, bin_dir).await?;
+        Command::Relay { bind, auth } => {
+            relay::start(bind, auth).await?;
         }
         Command::Agent {
             relay_url,

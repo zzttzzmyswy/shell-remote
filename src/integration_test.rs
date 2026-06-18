@@ -15,7 +15,6 @@ mod integration_tests {
         let server_auth = "integration-test-pw";
         let state = Arc::new(crate::relay::SharedState::new(
             server_auth.to_string(),
-            None,
             100 * 1024 * 1024,
         ));
 
@@ -80,11 +79,11 @@ mod integration_tests {
         eprintln!("  [2] events stream connected");
 
         // ── 3. Browser connects via SSE+POST ──────────────────
+        // Token travels in the Authorization header (not the query string),
+        // matching the browser client in web/sse.js.
         let resp = client
-            .get(format!(
-                "{}/agent/session/sse?token={}&session={}",
-                relay_url, rw_token, session_id
-            ))
+            .get(format!("{}/agent/session/sse", relay_url))
+            .header("Authorization", format!("Bearer {}", rw_token))
             .header("Accept", "text/event-stream")
             .send()
             .await

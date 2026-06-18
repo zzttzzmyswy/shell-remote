@@ -36,7 +36,6 @@ pub struct SharedState {
     pub pending_mcp: RwLock<HashMap<String, (String, oneshot::Sender<String>)>>,
     pub last_activity: RwLock<HashMap<String, Instant>>,
     pub server_auth: String,
-    pub bin_dir: Option<String>,
     pub agent_event_buffers: RwLock<HashMap<String, EventBuffer>>,
     pub rate_limiter: RwLock<RateLimiter>,
     pub max_upload_size: u64,
@@ -69,6 +68,11 @@ impl RateLimiter {
 }
 
 const MAX_EVENT_BUFFER: usize = 1000;
+
+/// Hard cap on the total number of concurrent sessions a relay will accept.
+/// Guards against unauthenticated `agent:register` flooding the registry and
+/// event buffers with unlimited sessions.
+pub const MAX_SESSIONS: usize = 1000;
 
 #[derive(Clone)]
 pub struct EventBuffer {
@@ -104,14 +108,13 @@ impl EventBuffer {
 }
 
 impl SharedState {
-    pub fn new(server_auth: String, bin_dir: Option<String>, max_upload_size: u64) -> Self {
+    pub fn new(server_auth: String, max_upload_size: u64) -> Self {
         Self {
             sessions: SessionRegistry::new(),
             agent_broadcast: RwLock::new(HashMap::new()),
             pending_mcp: RwLock::new(HashMap::new()),
             last_activity: RwLock::new(HashMap::new()),
             server_auth,
-            bin_dir,
             agent_event_buffers: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter::new()),
             max_upload_size,
@@ -252,7 +255,7 @@ mod tests {
         use axum::Router;
         use tower_http::cors::{Any, CorsLayer};
 
-        let state = Arc::new(SharedState::new("test".into(), None, 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("test".into(), 100 * 1024 * 1024));
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -286,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_unauthorized_no_token() {
-        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
         let headers = HeaderMap::new();
         let params = HashMap::new();
         let body = Body::from("test content");
@@ -296,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_readonly_token_forbidden() {
-        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
         let (_sid, tokens) = state.sessions.register(None, "ro").await;
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
@@ -313,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_returns_script() {
-        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "example.com:3000".parse().unwrap());
         let resp = install_script_handler(State(state), headers)
@@ -331,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_https_forwarded() {
-        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "example.com".parse().unwrap());
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
@@ -347,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_default_host() {
-        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
         let headers = axum::http::HeaderMap::new();
         let resp = install_script_handler(State(state), headers)
             .await
@@ -361,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_missing_path() {
-        let state = Arc::new(SharedState::new("".into(), None, 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
         let (_sid, tokens) = state.sessions.register(None, "rw").await;
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
@@ -515,39 +518,6 @@ pub async fn upload_handler(
     Ok(StatusCode::OK)
 }
 
-pub async fn bin_handler(
-    State(state): State<Arc<SharedState>>,
-    axum::extract::Path(arch): axum::extract::Path<String>,
-) -> Result<Response, StatusCode> {
-    use axum::response::IntoResponse;
-
-    let valid_arches = ["x86_64", "aarch64", "armv7"];
-    if !valid_arches.contains(&arch.as_str()) {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    let bin_dir = state.bin_dir.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let filename = format!("shell-remote-{}", arch);
-    let filepath = std::path::Path::new(bin_dir).join(&filename);
-    if !filepath.is_file() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    let data = tokio::fs::read(&filepath)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-
-    let headers = [
-        (header::CONTENT_TYPE, "application/octet-stream"),
-        (
-            header::CONTENT_DISPOSITION,
-            &format!("attachment; filename=\"{}\"", filename),
-        ),
-    ];
-
-    Ok((StatusCode::OK, headers, data).into_response())
-}
-
 pub async fn install_script_handler(
     State(_state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
@@ -576,43 +546,21 @@ pub async fn install_script_handler(
     )
 }
 
-pub async fn start(
-    bind: String,
-    _tls_cert: Option<String>,
-    _tls_key: Option<String>,
-    dev: bool,
-    server_auth: Option<String>,
-    bin_dir: Option<String>,
-) -> anyhow::Result<()> {
+pub async fn start(bind: String, server_auth: Option<String>) -> anyhow::Result<()> {
     let auth = match server_auth {
-        Some(a) => a,
-        None => {
-            if dev {
-                eprintln!("WARNING: Running in dev mode with no --auth password. Anyone can access this relay.");
-                String::new()
-            } else {
-                eprintln!("ERROR: --auth is required when not running in --dev mode.");
-                eprintln!("  Usage: shell-remote relay --auth YOUR_PASSWORD ...");
-                anyhow::bail!("Missing required --auth password (use --dev to skip)");
-            }
+        Some(a) if !a.is_empty() => a,
+        _ => {
+            tracing::error!("--auth is required.");
+            tracing::error!("  Usage: shell-remote relay --auth YOUR_PASSWORD ...");
+            anyhow::bail!("Missing required --auth password");
         }
     };
-
-    if !dev && (_tls_cert.is_none() || _tls_key.is_none()) {
-        if _tls_cert.is_some() || _tls_key.is_some() {
-            anyhow::bail!("Both --tls-cert and --tls-key must be provided together");
-        }
-        eprintln!("WARNING: Running without TLS. Passwords and tokens will be sent in plaintext.");
-        eprintln!(
-            "  Consider using --tls-cert and --tls-key for production, or --dev for development."
-        );
-    }
 
     use axum::routing::get;
     use axum::Router;
     use tower_http::cors::{Any, CorsLayer};
 
-    let state = Arc::new(SharedState::new(auth, bin_dir.clone(), 100 * 1024 * 1024));
+    let state = Arc::new(SharedState::new(auth, 100 * 1024 * 1024));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -637,8 +585,6 @@ pub async fn start(
             axum::routing::post(mcp::messages_handler),
         )
         .route("/agent/install", get(install_script_handler))
-        .route("/download", get(static_handler))
-        .route("/bin/{arch}", get(bin_handler))
         .route("/", get(static_handler))
         .route("/session", get(static_handler))
         .route("/style.css", get(static_handler))
@@ -684,6 +630,12 @@ pub async fn start(
                         .await
                         .remove(&session_id);
                     state_clone.last_activity.write().await.remove(&session_id);
+                    // Drop the replay buffer so reaped sessions don't leak memory.
+                    state_clone
+                        .agent_event_buffers
+                        .write()
+                        .await
+                        .remove(&session_id);
                 }
             }
         });
