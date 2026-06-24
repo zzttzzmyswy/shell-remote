@@ -27,10 +27,25 @@ pub async fn start(
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_secs(1);
     let max_delay = Duration::from_secs(300);
+    // Tokens obtained on the first successful registration; replayed on every
+    // reconnect so the relay reuses them instead of minting new random ones.
+    let mut cached_tokens: Option<Vec<(String, String)>> = None;
 
     loop {
-        match run_session(&relay_url, &key, &root, &token_type, &shell_path).await {
-            Ok(()) => {
+        match run_session(
+            &relay_url,
+            &key,
+            &root,
+            &token_type,
+            &shell_path,
+            cached_tokens.as_deref(),
+        )
+        .await
+        {
+            Ok(tokens) => {
+                if let Some(t) = tokens {
+                    cached_tokens = Some(t);
+                }
                 tracing::warn!("Agent session ended, reconnecting in {:?}...", delay);
             }
             Err(e) => {
@@ -48,9 +63,11 @@ async fn run_session(
     root: &str,
     token_type: &str,
     shell_path: &str,
-) -> anyhow::Result<()> {
+    cached_tokens: Option<&[(String, String)]>,
+) -> anyhow::Result<Option<Vec<(String, String)>>> {
     let mut client =
-        RelayClient::connect_with_retry(relay_url, key.clone(), token_type, 10).await?;
+        RelayClient::connect_with_retry(relay_url, key.clone(), token_type, cached_tokens, 10)
+            .await?;
 
     tracing::info!(session = %client.session_id, "agent session established");
     for (token, perm) in &client.tokens {
@@ -522,7 +539,8 @@ async fn run_session(
     exec_sessions.shutdown_all().await;
     tabs.clear(); // Drop all tabs - shells kill child processes via Drop
 
-    Ok(())
+    // Return the tokens used this session so `start` can replay them on reconnect.
+    Ok(Some(client.tokens.clone()))
 }
 
 async fn execute_command(cmd: &str, timeout_ms: u64) -> (String, String, i32) {

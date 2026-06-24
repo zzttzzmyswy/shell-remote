@@ -25,17 +25,31 @@ impl RelayClient {
         relay_url: &str,
         fixed_key: Option<String>,
         token_type: &str,
+        cached_tokens: Option<&[(String, String)]>,
     ) -> anyhow::Result<Self> {
         let base = relay_url.trim_end_matches('/');
         let send_url = format!("{}/agent/send", base);
 
         let http_client = reqwest::Client::new();
 
-        let register_msg = json!({
-            "type": "agent:register",
-            "key": fixed_key,
-            "token_type": token_type
-        });
+        // On reconnect, replay the cached tokens so the relay reuses them
+        // instead of minting new random ones (keeps shared tokens stable).
+        let register_msg = if let Some(ct) = cached_tokens {
+            let arr: Vec<serde_json::Value> = ct
+                .iter()
+                .map(|(tok, perm)| json!({"token": tok, "permission": perm}))
+                .collect();
+            json!({
+                "type": "agent:register",
+                "tokens": arr
+            })
+        } else {
+            json!({
+                "type": "agent:register",
+                "key": fixed_key,
+                "token_type": token_type
+            })
+        };
 
         let resp = http_client
             .post(&send_url)
@@ -186,6 +200,7 @@ impl RelayClient {
         relay_url: &str,
         fixed_key: Option<String>,
         token_type: &str,
+        cached_tokens: Option<&[(String, String)]>,
         max_retries: u32,
     ) -> anyhow::Result<Self> {
         let relay_url = relay_url.trim_end_matches('/');
@@ -193,7 +208,8 @@ impl RelayClient {
         let max_delay = tokio::time::Duration::from_secs(300);
 
         for attempt in 0..=max_retries {
-            match Self::connect_http(relay_url, fixed_key.clone(), token_type).await {
+            match Self::connect_http(relay_url, fixed_key.clone(), token_type, cached_tokens).await
+            {
                 Ok(client) => return Ok(client),
                 Err(e) => {
                     if attempt == max_retries {

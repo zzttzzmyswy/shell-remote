@@ -132,14 +132,38 @@ pub async fn agent_send_handler(
                 .into_response();
         }
 
-        let fixed_key = body["key"].as_str().map(|s| s.to_string());
-        let token_type_str = body["token_type"].as_str().unwrap_or("rw");
-        let token_type = crate::proto::TokenType::from_str_val(token_type_str)
-            .unwrap_or(crate::proto::TokenType::Rw);
-        let (session_id, tokens) = state
-            .sessions
-            .register(fixed_key.clone(), token_type.as_str())
-            .await;
+        // If the agent supplied a cached token set (auto-reconnect), reuse
+        // those exact tokens instead of minting fresh random ones.
+        let cached_tokens: Option<Vec<(String, Permission)>> = body
+            .get("tokens")
+            .and_then(|t| t.as_array())
+            .filter(|a| !a.is_empty())
+            .and_then(|arr| {
+                let mut v = Vec::with_capacity(arr.len());
+                for t in arr {
+                    let tok = t.get("token").and_then(|x| x.as_str())?;
+                    let perm = match t.get("permission").and_then(|x| x.as_str())? {
+                        "rw" => Permission::ReadWrite,
+                        "ro" => Permission::ReadOnly,
+                        _ => return None,
+                    };
+                    v.push((tok.to_string(), perm));
+                }
+                Some(v)
+            });
+
+        let (session_id, tokens) = if let Some(ct) = cached_tokens {
+            state.sessions.register_existing(ct).await
+        } else {
+            let fixed_key = body["key"].as_str().map(|s| s.to_string());
+            let token_type_str = body["token_type"].as_str().unwrap_or("rw");
+            let token_type = crate::proto::TokenType::from_str_val(token_type_str)
+                .unwrap_or(crate::proto::TokenType::Rw);
+            state
+                .sessions
+                .register(fixed_key.clone(), token_type.as_str())
+                .await
+        };
 
         let tokens_json: Vec<Value> = tokens
             .iter()
@@ -152,10 +176,14 @@ pub async fn agent_send_handler(
             })
             .collect();
 
-        let key_info = fixed_key
-            .as_ref()
-            .map(|k| format!("key:{}", k))
-            .unwrap_or_else(|| "temp".to_string());
+        let key_info = if body.get("tokens").map(|v| v.is_array()).unwrap_or(false) {
+            "reconnect".to_string()
+        } else {
+            body["key"]
+                .as_str()
+                .map(|k| format!("key:{}", k))
+                .unwrap_or_else(|| "temp".to_string())
+        };
         tracing::info!(session = %session_id, key = %key_info, "session created (HTTP-mode)");
         for (token, perm) in &tokens {
             let perm_str = match perm {
@@ -709,6 +737,36 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_register_reuses_cached_tokens() {
+        let state = make_state("");
+        let body = json!({
+            "type": "agent:register",
+            "tokens": [
+                {"token": "reused-rw", "permission": "rw"},
+                {"token": "reused-ro", "permission": "ro"}
+            ]
+        });
+        let headers = axum::http::HeaderMap::new();
+        let resp = agent_send_handler(State(state.clone()), headers, Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // Returned tokens are exactly the ones supplied
+        let tokens = v["payload"]["tokens"].as_array().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0]["token"], "reused-rw");
+        assert_eq!(tokens[1]["token"], "reused-ro");
+        // They now authenticate against the new session
+        let sid = v["session_id"].as_str().unwrap();
+        let (auth_sid, _) = state.sessions.authenticate("reused-rw").await.unwrap();
+        assert_eq!(auth_sid, sid);
     }
 
     #[tokio::test]

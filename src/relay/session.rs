@@ -81,6 +81,37 @@ impl SessionRegistry {
         tmap.get(token).cloned()
     }
 
+    /// Re-register an agent that already holds a set of tokens (e.g. on
+    /// auto-reconnect). A fresh session_id is issued, but the supplied tokens
+    /// are reused verbatim so clients/browsers that cached them keep working.
+    /// The session is temporary so idle cleanup can still reap it.
+    pub async fn register_existing(
+        &self,
+        tokens: Vec<(String, Permission)>,
+    ) -> (String, Vec<(String, Permission)>) {
+        let session_id = generate_session_id();
+
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionInfo {
+                    tokens: tokens.clone(),
+                    fixed_key: None,
+                    is_temporary: true,
+                },
+            );
+        }
+        {
+            let mut tmap = self.token_map.write().await;
+            for (token, perm) in &tokens {
+                tmap.insert(token.clone(), (session_id.clone(), perm.clone()));
+            }
+        }
+
+        (session_id, tokens)
+    }
+
     pub async fn remove(&self, session_id: &str) {
         let mut sessions = self.sessions.write().await;
         if let Some(info) = sessions.remove(session_id) {
@@ -223,5 +254,41 @@ mod tests {
         let token = &tokens[0].0;
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn test_register_existing_reuses_tokens() {
+        let registry = SessionRegistry::new();
+        let reused = vec![
+            ("cached-rw-token".to_string(), Permission::ReadWrite),
+            ("cached-ro-token".to_string(), Permission::ReadOnly),
+        ];
+        let (sid, tokens) = registry.register_existing(reused.clone()).await;
+        // Tokens come back unchanged
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].0, "cached-rw-token");
+        assert_eq!(tokens[1].0, "cached-ro-token");
+        // Both authenticate to the new session
+        let (s1, p1) = registry.authenticate("cached-rw-token").await.unwrap();
+        let (s2, _p2) = registry.authenticate("cached-ro-token").await.unwrap();
+        assert_eq!(s1, sid);
+        assert_eq!(s2, sid);
+        assert_eq!(p1, Permission::ReadWrite);
+        assert!(registry.is_temporary(&sid).await);
+    }
+
+    #[tokio::test]
+    async fn test_register_existing_overwrites_old_mapping() {
+        let registry = SessionRegistry::new();
+        let (old_sid, _t) = registry
+            .register_existing(vec![("shared-token".to_string(), Permission::ReadWrite)])
+            .await;
+        // Re-register same token: a new session wins the mapping
+        let (new_sid, _t) = registry
+            .register_existing(vec![("shared-token".to_string(), Permission::ReadWrite)])
+            .await;
+        assert_ne!(old_sid, new_sid);
+        let (resolved, _) = registry.authenticate("shared-token").await.unwrap();
+        assert_eq!(resolved, new_sid);
     }
 }
