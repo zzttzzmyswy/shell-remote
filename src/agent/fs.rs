@@ -7,7 +7,7 @@ use crate::proto::{FileEntry, FsResultPayload};
 /// Strips leading path separators (`/` and `\`) so a user-supplied path can
 /// be joined onto the file-manager root on both unix and Windows.
 fn strip_leading_seps(s: &str) -> &str {
-    s.trim_start_matches(|c| c == '/' || c == '\\')
+    s.trim_start_matches(['/', '\\'])
 }
 
 pub fn resolve_path(root: &Path, user_path: &str) -> Option<PathBuf> {
