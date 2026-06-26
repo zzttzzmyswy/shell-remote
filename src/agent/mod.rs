@@ -12,6 +12,17 @@ use crate::agent::client::RelayClient;
 use crate::agent::shell::Shell;
 use crate::proto::{FsResultPayload, McpResultPayload, Message};
 
+/// Returns the user's home directory, preferring `$HOME` (unix) and falling
+/// back to `%USERPROFILE%` (Windows). Used for the file-manager root default
+/// and the PTY child's cwd so the same code path works on both platforms.
+pub(crate) fn home_dir() -> String {
+    home_dir_from(std::env::var("HOME").ok(), std::env::var("USERPROFILE").ok())
+}
+
+fn home_dir_from(home: Option<String>, userprofile: Option<String>) -> String {
+    home.or(userprofile).unwrap_or_else(|| ".".to_string())
+}
+
 struct TabState {
     shell: Shell,
     title: String,
@@ -771,5 +782,26 @@ mod tests {
         for _ in 0..1000 {
             out.output("t".to_string(), b"x".to_vec());
         }
+    }
+
+    #[test]
+    fn test_home_dir_prefers_home() {
+        assert_eq!(
+            super::home_dir_from(Some("/home/u".to_string()), None),
+            "/home/u"
+        );
+    }
+
+    #[test]
+    fn test_home_dir_falls_back_to_userprofile() {
+        assert_eq!(
+            super::home_dir_from(None, Some("C:\\Users\\u".to_string())),
+            "C:\\Users\\u"
+        );
+    }
+
+    #[test]
+    fn test_home_dir_defaults_to_dot() {
+        assert_eq!(super::home_dir_from(None, None), ".");
     }
 }
