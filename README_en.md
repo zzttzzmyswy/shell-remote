@@ -177,8 +177,10 @@ Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in 
 
 - **Overview**: version, uptime, agent total/online, browser total, per-session token list with permissions, connected browser count.
 - **Token management**: revoke a single token, regenerate a session's tokens (old ones invalidated), toggle token permission (rw↔ro).
+- **Session tags**: tag existing sessions (e.g. prod/db) and filter by tag; tags are in-memory, scoped to the session's lifetime.
 - **Kick session**: disconnect that agent and all its browsers and invalidate its tokens.
 - **Server password**: view the current `--auth`, rotate it live (takes effect immediately).
+- **Chinese / English toggle**: switch the panel UI between zh and en (auto-detects browser language, remembered in localStorage).
 
 ### Security notes
 
@@ -250,7 +252,7 @@ Token is passed in arguments, not in URL or headers. Commands execute via `sh -c
 
 ```bash
 cargo test
-# 134 passed; 0 failed (including integration test)
+# 135 passed; 0 failed (including integration test)
 ```
 
 ## License

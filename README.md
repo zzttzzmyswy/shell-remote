@@ -186,8 +186,10 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
 
 - **概览**：版本、运行时间、agent 总数/在线数、浏览器总数、每会话 Token 列表与权限、连接浏览器数。
 - **Token 管理**：撤销单个 Token、重生成会话 Token（旧 Token 失效）、切换 Token 权限（rw↔ro）。
+- **会话标签**：给已有会话打标签（如 prod/db），按标签筛选；标签内存级，随会话存亡。
 - **踢出会话**：断开该 agent 及其所有浏览器并撤销其 Token。
 - **服务器密码**：查看当前 `--auth`、在线修改（即时生效）。
+- **中英文切换**：后台界面右上角切换中/英文（自动探测浏览器语言，localStorage 记忆）。
 
 ### 安全说明
 
@@ -287,7 +289,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 134 passed; 0 failed (含集成测试)
+# 135 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证

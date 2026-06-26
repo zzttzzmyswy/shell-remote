@@ -90,22 +90,44 @@
   .muted { color: var(--muted); }
   .alert { background: rgba(137,180,250,.1); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; font-size: 12px; margin-top: 10px; word-break: break-all; }
 
+  /* Tags */
+  .tag-chip { display: inline-flex; align-items: center; gap: 4px; background: rgba(137,180,250,.14); border: 1px solid rgba(137,180,250,.4); color: var(--accent); border-radius: 999px; padding: 2px 4px 2px 9px; font-size: 11px; margin: 2px 3px 2px 0; line-height: 1.6; }
+  .tag-chip .tag-x { background: transparent; border: none; color: inherit; cursor: pointer; font-size: 13px; line-height: 1; padding: 0 4px; border-radius: 999px; opacity: .7; }
+  .tag-chip .tag-x:hover { opacity: 1; color: var(--red); }
+  .tag-add-input { background: transparent; border: 1px dashed var(--border); border-radius: 999px; padding: 2px 9px; font-size: 11px; color: var(--text); width: 110px; outline: none; }
+  .tag-add-input::placeholder { color: var(--muted); }
+  .tag-add-input:focus { border-color: var(--accent); border-style: solid; }
+  .tag-add-btn { background: transparent; border: 1px dashed var(--border); color: var(--muted); border-radius: 999px; padding: 2px 9px; font-size: 11px; cursor: pointer; }
+  .tag-add-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  .filter-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .filter-bar .filter-label { color: var(--muted); font-size: 12px; }
+  .filter-chip { background: var(--bg); border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: 3px 10px; font-size: 11px; cursor: pointer; }
+  .filter-chip:hover { border-color: var(--accent); color: var(--accent); }
+  .filter-chip.active { background: rgba(137,180,250,.2); border-color: var(--accent); color: var(--accent); }
+
+  /* Language toggle */
+  .lang-toggle { position: fixed; top: 12px; right: 14px; z-index: 50; background: var(--panel); border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .lang-toggle:hover { color: var(--accent); border-color: var(--accent); }
+
   .hidden { display: none !important; }
-  @media (max-width: 640px) { .tok { max-width: 140px; } }
+  @media (max-width: 640px) { .tok { max-width: 140px; } .lang-toggle { top: 8px; right: 8px; } }
 </style>
 </head>
 <body>
 
+<button class="lang-toggle" id="langToggle" title="切换语言 / Switch language">中 / EN</button>
+
 <!-- Login view -->
 <div id="loginView" class="center-screen hidden">
   <form class="login-card" id="loginForm" autocomplete="off">
-    <h1>shell-remote admin</h1>
-    <div class="sub">Sign in to manage the relay.</div>
-    <label for="lu">Username</label>
+    <h1 data-i18n="app_title">shell-remote admin</h1>
+    <div class="sub" data-i18n="login_sub">Sign in to manage the relay.</div>
+    <label for="lu" data-i18n="username">Username</label>
     <input id="lu" type="text" autocomplete="username" required>
-    <label for="lp">Password</label>
+    <label for="lp" data-i18n="password">Password</label>
     <input id="lp" type="password" autocomplete="current-password" required>
-    <button type="submit" class="btn btn-primary btn-block">Login</button>
+    <button type="submit" class="btn btn-primary btn-block" data-i18n="login">Login</button>
     <div class="err" id="loginErr"></div>
   </form>
 </div>
@@ -113,44 +135,51 @@
 <!-- Dashboard view -->
 <div id="dashView" class="wrap hidden">
   <div class="header">
-    <h1>shell-remote admin</h1>
+    <h1 data-i18n="app_title">shell-remote admin</h1>
     <span class="badge badge-version" id="verBadge">v?</span>
     <span class="badge" id="upBadge">uptime —</span>
     <span class="spacer"></span>
-    <button class="btn" id="logoutBtn">Logout</button>
+    <button class="btn" id="logoutBtn" data-i18n="logout">Logout</button>
   </div>
 
   <div class="cards">
-    <div class="card"><div class="k">Agents</div><div class="v" id="cAgents">— <small>/ —</small></div></div>
-    <div class="card"><div class="k">Browsers</div><div class="v" id="cBrowsers">—</div></div>
-    <div class="card"><div class="k">Uptime</div><div class="v" id="cUptime">—</div></div>
-    <div class="card"><div class="k">Version</div><div class="v" id="cVersion">—</div></div>
+    <div class="card"><div class="k" data-i18n="card_agents">Agents</div><div class="v" id="cAgents">— <small>/ —</small></div></div>
+    <div class="card"><div class="k" data-i18n="card_browsers">Browsers</div><div class="v" id="cBrowsers">—</div></div>
+    <div class="card"><div class="k" data-i18n="card_uptime">Uptime</div><div class="v" id="cUptime">—</div></div>
+    <div class="card"><div class="k" data-i18n="card_version">Version</div><div class="v" id="cVersion">—</div></div>
   </div>
 
   <div class="panel">
-    <h2>Sessions</h2>
+    <h2 data-i18n="sessions">Sessions</h2>
+    <div class="filter-bar" id="filterBar"></div>
     <div style="overflow-x:auto;">
       <table>
         <thead>
-          <tr>
-            <th>Session ID</th><th>Status</th><th>Type</th><th>Browsers</th><th>Tokens</th><th>Actions</th>
+          <tr id="sessHead">
+            <th data-i18n="th_session_id">Session ID</th>
+            <th data-i18n="th_status">Status</th>
+            <th data-i18n="th_type">Type</th>
+            <th data-i18n="th_browsers">Browsers</th>
+            <th data-i18n="th_tokens">Tokens</th>
+            <th data-i18n="th_tags">Tags</th>
+            <th data-i18n="th_actions">Actions</th>
           </tr>
         </thead>
         <tbody id="sessionsBody"></tbody>
       </table>
     </div>
-    <div id="sessEmpty" class="muted" style="padding:10px 4px;">No sessions.</div>
+    <div id="sessEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_sessions">No sessions.</div>
   </div>
 
   <div class="panel">
-    <h2>Server password</h2>
+    <h2 data-i18n="server_password">Server password</h2>
     <div class="srv-row">
       <div class="srv-val" id="srvVal">••••••••</div>
-      <button class="btn btn-sm" id="srvShow">Show</button>
+      <button class="btn btn-sm" id="srvShow" data-i18n="show">Show</button>
     </div>
     <div class="srv-row" style="margin-top:12px;">
-      <input id="srvInput" type="password" class="srv-input" placeholder="New server password">
-      <button class="btn btn-primary btn-sm" id="srvUpdate">Update</button>
+      <input id="srvInput" type="password" class="srv-input" data-i18n-ph="new_server_password" placeholder="New server password">
+      <button class="btn btn-primary btn-sm" id="srvUpdate" data-i18n="update">Update</button>
     </div>
     <div class="err" id="srvErr"></div>
   </div>
@@ -163,6 +192,191 @@
 
   const $ = (id) => document.getElementById(id);
   const loginView = $('loginView'), dashView = $('dashView');
+
+  // --- i18n ---
+  const i18n = {
+    zh: {
+      app_title: "shell-remote 管理后台",
+      login_sub: "登录以管理中继。",
+      username: "用户名",
+      password: "密码",
+      login: "登录",
+      invalid_credentials: "凭据无效。",
+      login_failed: "登录失败：",
+      logout: "退出",
+      card_agents: "Agent",
+      card_browsers: "浏览器",
+      card_uptime: "运行时长",
+      card_version: "版本",
+      sessions: "会话",
+      th_session_id: "会话 ID",
+      th_status: "状态",
+      th_type: "类型",
+      th_browsers: "浏览器",
+      th_tokens: "令牌",
+      th_tags: "标签",
+      th_actions: "操作",
+      no_sessions: "暂无会话。",
+      online: "在线",
+      offline: "离线",
+      type_temporary: "临时",
+      type_fixed: "固定",
+      key_prefix: "密钥：",
+      dash_placeholder: "—",
+      click_to_copy: "点击复制",
+      copied: "已复制",
+      to_ro: "→ 只读",
+      to_rw: "→ 读写",
+      regenerate: "重新生成",
+      kick: "踢除",
+      confirm_revoke: "确定撤销此令牌？",
+      confirm_regenerate: "确定为会话 {id} 重新生成所有令牌？现有令牌将失效。",
+      confirm_kick: "确定踢除会话 {id}？",
+      confirm_update_pw: "确定更新服务器密码？Agent/浏览器将需要使用新密码。",
+      err_revoke: "撤销失败：",
+      err_toggle: "切换失败：",
+      err_regenerate: "重新生成失败：",
+      err_kick: "踢除失败：",
+      err_tag: "添加标签失败：",
+      err_untag: "移除标签失败：",
+      new_tokens: "新令牌：\n",
+      pw_updated: "服务器密码已更新。",
+      server_password: "服务器密码",
+      show: "显示",
+      hide: "隐藏",
+      empty_value: "（空）",
+      new_server_password: "新服务器密码",
+      update: "更新",
+      enter_new_pw: "请输入新密码。",
+      srv_failed: "失败：",
+      srv_update_failed: "更新失败：",
+      uptime_prefix: "运行时长 ",
+      unauthorized: "未授权",
+      add_tag: "添加标签",
+      add_tag_ph: "添加标签",
+      filter_label: "筛选：",
+      filter_all: "全部",
+      revoke_label: "撤销",
+      untag_title: "移除标签",
+      lang_toggle: "中 / EN",
+      lang_toggle_title: "切换语言 / Switch language"
+    },
+    en: {
+      app_title: "shell-remote admin",
+      login_sub: "Sign in to manage the relay.",
+      username: "Username",
+      password: "Password",
+      login: "Login",
+      invalid_credentials: "Invalid credentials.",
+      login_failed: "Login failed: ",
+      logout: "Logout",
+      card_agents: "Agents",
+      card_browsers: "Browsers",
+      card_uptime: "Uptime",
+      card_version: "Version",
+      sessions: "Sessions",
+      th_session_id: "Session ID",
+      th_status: "Status",
+      th_type: "Type",
+      th_browsers: "Browsers",
+      th_tokens: "Tokens",
+      th_tags: "Tags",
+      th_actions: "Actions",
+      no_sessions: "No sessions.",
+      online: "online",
+      offline: "offline",
+      type_temporary: "temporary",
+      type_fixed: "fixed",
+      key_prefix: "key: ",
+      dash_placeholder: "—",
+      click_to_copy: "click to copy",
+      copied: "copied",
+      to_ro: "→ ro",
+      to_rw: "→ rw",
+      regenerate: "Regenerate",
+      kick: "Kick",
+      confirm_revoke: "Revoke this token?",
+      confirm_regenerate: "Regenerate all tokens for session {id}? Existing tokens will be invalidated.",
+      confirm_kick: "Kick session {id}?",
+      confirm_update_pw: "Update server password? Agents/browsers will need the new password.",
+      err_revoke: "Revoke failed: ",
+      err_toggle: "Toggle failed: ",
+      err_regenerate: "Regenerate failed: ",
+      err_kick: "Kick failed: ",
+      err_tag: "Add tag failed: ",
+      err_untag: "Remove tag failed: ",
+      new_tokens: "New tokens:\n",
+      pw_updated: "Server password updated.",
+      server_password: "Server password",
+      show: "Show",
+      hide: "Hide",
+      empty_value: "(empty)",
+      new_server_password: "New server password",
+      update: "Update",
+      enter_new_pw: "Enter a new password.",
+      srv_failed: "Failed: ",
+      srv_update_failed: "Update failed: ",
+      uptime_prefix: "uptime ",
+      unauthorized: "unauthorized",
+      add_tag: "add tag",
+      add_tag_ph: "add tag",
+      filter_label: "Filter:",
+      filter_all: "All",
+      revoke_label: "revoke",
+      untag_title: "remove tag",
+      lang_toggle: "中 / EN",
+      lang_toggle_title: "切换语言 / Switch language"
+    }
+  };
+
+  function detectLang() {
+    try {
+      const saved = localStorage.getItem('sr_admin_lang');
+      if (saved === 'zh' || saved === 'en') return saved;
+    } catch (_) {}
+    const n = (navigator.language || 'en').toLowerCase();
+    return n.indexOf('zh') === 0 ? 'zh' : 'en';
+  }
+  let LANG = detectLang();
+  function t(key, params) {
+    const tbl = i18n[LANG] || i18n.en;
+    let s = tbl[key];
+    if (s === undefined) { s = i18n.en[key]; }
+    if (s === undefined) { s = key; }
+    if (params) {
+      for (const k in params) {
+        s = s.split('{' + k + '}').join(String(params[k]));
+      }
+    }
+    return s;
+  }
+  function setLang(lang) {
+    if (lang !== 'zh' && lang !== 'en') return;
+    LANG = lang;
+    try { localStorage.setItem('sr_admin_lang', lang); } catch (_) {}
+    applyStaticI18n();
+    // Re-render current view without refetching data.
+    if (lastOverview) {
+      renderOverview(lastOverview);
+      renderSessions(lastOverview.sessions || []);
+    }
+  }
+  function applyStaticI18n() {
+    document.documentElement.lang = LANG;
+    document.title = t('app_title');
+    const toggle = $('langToggle');
+    toggle.textContent = t('lang_toggle');
+    toggle.title = t('lang_toggle_title');
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      const key = el.getAttribute('data-i18n');
+      // Don't overwrite the server-auth masked value or dynamic badges.
+      if (el.id === 'srvVal') return;
+      el.textContent = t(key);
+    });
+    document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+      el.placeholder = t(el.getAttribute('data-i18n-ph'));
+    });
+  }
 
   // --- XSS-safe text helper: builds a <span> with textContent ---
   function textNode(s) { return document.createTextNode(s == null ? '' : String(s)); }
@@ -192,7 +406,7 @@
       body: opts.body ? JSON.stringify(opts.body) : undefined,
       credentials: 'same-origin'
     });
-    if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
+    if (res.status === 401) { showLogin(); throw new Error(t('unauthorized')); }
     let data = null;
     try { data = await res.json(); } catch (_) {}
     if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
@@ -222,18 +436,27 @@
       startRefresh();
       refresh();
     } catch (ex) {
-      err.textContent = ex.message === 'unauthorized' ? 'Invalid credentials.' : ('Login failed: ' + ex.message);
+      err.textContent = ex.message === t('unauthorized') ? t('invalid_credentials') : (t('login_failed') + ex.message);
     }
   });
 
   $('logoutBtn').addEventListener('click', async () => {
     try { await api('/logout', { method: 'POST' }); } catch (_) {}
     stopRefresh();
+    lastOverview = null;
+    activeFilter = null;
     showLogin();
+  });
+
+  $('langToggle').addEventListener('click', () => {
+    setLang(LANG === 'zh' ? 'en' : 'zh');
   });
 
   // --- Overview refresh ---
   let timer = null;
+  let lastOverview = null;
+  let activeFilter = null; // tag string or null
+
   function startRefresh() { if (!timer) timer = setInterval(refresh, 5000); }
   function stopRefresh() { if (timer) { clearInterval(timer); timer = null; } }
 
@@ -241,8 +464,10 @@
     let o;
     try { o = await api('/api/overview'); }
     catch (_) { return; }
+    lastOverview = o;
     renderOverview(o);
     renderSessions(o.sessions || []);
+    renderFilterBar(o.sessions || []);
   }
 
   function renderOverview(o) {
@@ -256,15 +481,59 @@
     $('cVersion').textContent = String(o.version ?? '?');
 
     $('verBadge').textContent = 'v' + (o.version ?? '?');
-    $('upBadge').textContent = 'uptime ' + fmtUptime(o.uptime_seconds);
+    $('upBadge').textContent = t('uptime_prefix') + fmtUptime(o.uptime_seconds);
+  }
+
+  // --- Filter-by-tag bar ---
+  function renderFilterBar(sessions) {
+    const bar = $('filterBar');
+    bar.textContent = '';
+    const set = new Set();
+    for (const s of sessions) {
+      for (const tag of (s.tags || [])) {
+        const v = String(tag).trim();
+        if (v) set.add(v);
+      }
+    }
+    if (set.size === 0) {
+      if (activeFilter) activeFilter = null;
+      bar.classList.add('hidden');
+      return;
+    }
+    bar.classList.remove('hidden');
+    const lbl = span(t('filter_label'), 'filter-label');
+    bar.appendChild(lbl);
+
+    const all = document.createElement('button');
+    all.className = 'filter-chip' + (activeFilter === null ? ' active' : '');
+    all.textContent = t('filter_all');
+    all.addEventListener('click', () => { activeFilter = null; renderSessions(sessions); renderFilterBar(sessions); });
+    bar.appendChild(all);
+
+    const tags = Array.from(set).sort();
+    for (const tag of tags) {
+      const chip = document.createElement('button');
+      chip.className = 'filter-chip' + (activeFilter === tag ? ' active' : '');
+      chip.textContent = tag;
+      chip.addEventListener('click', () => {
+        activeFilter = (activeFilter === tag) ? null : tag;
+        renderSessions(sessions);
+        renderFilterBar(sessions);
+      });
+      bar.appendChild(chip);
+    }
   }
 
   // --- Sessions table ---
   function renderSessions(sessions) {
     const body = $('sessionsBody');
     body.textContent = '';
-    $('sessEmpty').classList.toggle('hidden', sessions.length > 0);
-    for (const s of sessions) {
+    let list = sessions;
+    if (activeFilter) {
+      list = sessions.filter(s => (s.tags || []).some(tg => String(tg).trim() === activeFilter));
+    }
+    $('sessEmpty').classList.toggle('hidden', list.length > 0);
+    for (const s of list) {
       body.appendChild(buildSessionRow(s));
     }
   }
@@ -282,17 +551,17 @@
     const tdSt = document.createElement('td');
     const dot = document.createElement('span'); dot.className = 'dot' + (s.online ? ' on' : '');
     tdSt.appendChild(dot);
-    tdSt.appendChild(textNode(s.online ? 'online' : 'offline'));
+    tdSt.appendChild(textNode(s.online ? t('online') : t('offline')));
     tr.appendChild(tdSt);
 
     // Type
     const tdT = document.createElement('td'); tdT.className = 'type-cell';
     if (s.is_temporary) {
-      tdT.appendChild(textNode('temporary'));
+      tdT.appendChild(textNode(t('type_temporary')));
     } else {
-      tdT.appendChild(textNode('fixed'));
+      tdT.appendChild(textNode(t('type_fixed')));
       if (s.fixed_key) {
-        const fk = document.createElement('div'); fk.className = 'fk mono'; fk.textContent = 'key: ' + s.fixed_key;
+        const fk = document.createElement('div'); fk.className = 'fk mono'; fk.textContent = t('key_prefix') + s.fixed_key;
         tdT.appendChild(fk);
       }
     }
@@ -306,17 +575,22 @@
     // Tokens
     const tdTok = document.createElement('td');
     const toks = s.tokens || [];
-    if (toks.length === 0) tdTok.appendChild(textNode('—'));
-    for (const t of toks) {
-      tdTok.appendChild(buildTokenRow(s, t));
+    if (toks.length === 0) tdTok.appendChild(textNode(t('dash_placeholder')));
+    for (const tk of toks) {
+      tdTok.appendChild(buildTokenRow(s, tk));
     }
     tr.appendChild(tdTok);
 
+    // Tags
+    const tdTags = document.createElement('td');
+    tdTags.appendChild(buildTagsCell(s));
+    tr.appendChild(tdTags);
+
     // Actions
     const tdA = document.createElement('td'); tdA.className = 'actions';
-    const regen = document.createElement('button'); regen.className = 'btn btn-sm'; regen.textContent = 'Regenerate';
+    const regen = document.createElement('button'); regen.className = 'btn btn-sm'; regen.textContent = t('regenerate');
     regen.addEventListener('click', () => onRegenerate(s));
-    const kick = document.createElement('button'); kick.className = 'btn btn-sm btn-red'; kick.textContent = 'Kick';
+    const kick = document.createElement('button'); kick.className = 'btn btn-sm btn-red'; kick.textContent = t('kick');
     kick.style.marginLeft = '6px';
     kick.addEventListener('click', () => onKick(s));
     tdA.appendChild(regen); tdA.appendChild(kick);
@@ -325,98 +599,152 @@
     return tr;
   }
 
-  function buildTokenRow(s, t) {
+  function buildTokenRow(s, tk) {
     const row = document.createElement('div'); row.className = 'tok-row';
 
-    const tok = document.createElement('span'); tok.className = 'tok'; tok.title = 'click to copy';
-    tok.textContent = t.token || '';
-    const copied = document.createElement('span'); copied.className = 'copied hidden'; copied.textContent = 'copied';
+    const tok = document.createElement('span'); tok.className = 'tok'; tok.title = t('click_to_copy');
+    tok.textContent = tk.token || '';
+    const copied = document.createElement('span'); copied.className = 'copied hidden'; copied.textContent = t('copied');
     tok.addEventListener('click', async () => {
-      try { await navigator.clipboard.writeText(t.token || ''); }
+      try { await navigator.clipboard.writeText(tk.token || ''); }
       catch (_) {}
       copied.classList.remove('hidden');
       setTimeout(() => copied.classList.add('hidden'), 1000);
     });
     row.appendChild(tok);
 
-    const perm = document.createElement('span'); perm.className = 'perm ' + (t.permission === 'rw' ? 'perm-rw' : 'perm-ro');
-    perm.textContent = t.permission || 'ro';
+    const perm = document.createElement('span'); perm.className = 'perm ' + (tk.permission === 'rw' ? 'perm-rw' : 'perm-ro');
+    perm.textContent = tk.permission || 'ro';
     row.appendChild(perm);
 
     const toggle = document.createElement('button'); toggle.className = 'btn btn-sm';
-    toggle.textContent = t.permission === 'rw' ? '→ ro' : '→ rw';
-    toggle.addEventListener('click', () => onTogglePerm(s, t, toggle));
+    toggle.textContent = tk.permission === 'rw' ? t('to_ro') : t('to_rw');
+    toggle.addEventListener('click', () => onTogglePerm(s, tk, toggle));
     row.appendChild(toggle);
 
-    const x = document.createElement('button'); x.className = 'xbtn'; x.textContent = '×'; x.title = 'revoke';
-    x.addEventListener('click', () => onRevoke(t));
+    const x = document.createElement('button'); x.className = 'xbtn'; x.textContent = '×'; x.title = t('revoke_label');
+    x.addEventListener('click', () => onRevoke(tk));
     row.appendChild(x);
 
     row.appendChild(copied);
     return row;
   }
 
-  async function onRevoke(t) {
-    if (!confirm('Revoke this token?')) return;
-    try { await api('/api/token/revoke', { method: 'POST', body: { token: t.token } }); refresh(); }
-    catch (e) { alert('Revoke failed: ' + e.message); }
+  function buildTagsCell(s) {
+    const wrap = document.createElement('div');
+    wrap.style.display = 'flex';
+    wrap.style.flexWrap = 'wrap';
+    wrap.style.alignItems = 'center';
+    const tags = s.tags || [];
+    for (const tag of tags) {
+      const v = String(tag);
+      const chip = document.createElement('span'); chip.className = 'tag-chip';
+      const label = document.createElement('span'); label.textContent = v;
+      chip.appendChild(label);
+      const x = document.createElement('button'); x.className = 'tag-x'; x.textContent = '×';
+      x.title = t('untag_title');
+      x.addEventListener('click', () => onUntag(s, v));
+      chip.appendChild(x);
+      wrap.appendChild(chip);
+    }
+    // inline add input
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'tag-add-input';
+    input.placeholder = t('add_tag_ph');
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        const val = input.value.trim();
+        if (!val) return;
+        input.disabled = true;
+        onTag(s, val).finally(() => { input.disabled = false; input.value = ''; });
+      }
+    });
+    wrap.appendChild(input);
+    return wrap;
   }
 
-  async function onTogglePerm(s, t, btn) {
-    const next = t.permission === 'rw' ? 'ro' : 'rw';
+  async function onTag(s, tag) {
+    // POST /api/session/tag  (add)  and  POST /api/session/untag  (remove)
     try {
-      await api('/api/token/permission', { method: 'POST', body: { token: t.token, permission: next } });
+      await api('/api/session/tag', { method: 'POST', body: { session_id: s.session_id, tag: tag } });
+      await refresh();
+    } catch (e) { alert(t('err_tag') + e.message); }
+  }
+
+  async function onUntag(s, tag) {
+    try {
+      await api('/api/session/untag', { method: 'POST', body: { session_id: s.session_id, tag: tag } });
+      await refresh();
+    } catch (e) { alert(t('err_untag') + e.message); }
+  }
+
+  async function onRevoke(tk) {
+    if (!confirm(t('confirm_revoke'))) return;
+    try { await api('/api/token/revoke', { method: 'POST', body: { token: tk.token } }); refresh(); }
+    catch (e) { alert(t('err_revoke') + e.message); }
+  }
+
+  async function onTogglePerm(s, tk, btn) {
+    const next = tk.permission === 'rw' ? 'ro' : 'rw';
+    try {
+      await api('/api/token/permission', { method: 'POST', body: { token: tk.token, permission: next } });
       refresh();
-    } catch (e) { alert('Toggle failed: ' + e.message); }
+    } catch (e) { alert(t('err_toggle') + e.message); }
   }
 
   async function onRegenerate(s) {
-    if (!confirm('Regenerate all tokens for session ' + (s.session_id || '') + '? Existing tokens will be invalidated.')) return;
+    if (!confirm(t('confirm_regenerate', { id: s.session_id || '' }))) return;
     try {
       const r = await api('/api/token/regenerate', { method: 'POST', body: { session_id: s.session_id } });
       if (r && r.tokens) {
-        const list = r.tokens.map(t => t.token + ' (' + (t.permission || '?') + ')').join('\n');
-        alert('New tokens:\n' + list);
+        const list = r.tokens.map(tk => tk.token + ' (' + (tk.permission || '?') + ')').join('\n');
+        alert(t('new_tokens') + list);
       }
       refresh();
     } catch (e) {
-      alert('Regenerate failed: ' + e.message);
+      alert(t('err_regenerate') + e.message);
     }
   }
 
   async function onKick(s) {
-    if (!confirm('Kick session ' + (s.session_id || '') + '?')) return;
+    if (!confirm(t('confirm_kick', { id: s.session_id || '' }))) return;
     try { await api('/api/session/kick', { method: 'POST', body: { session_id: s.session_id } }); refresh(); }
-    catch (e) { alert('Kick failed: ' + e.message); }
+    catch (e) { alert(t('err_kick') + e.message); }
   }
 
   // --- Server auth ---
   let srvShown = false;
+  function renderSrvButton() {
+    $('srvShow').textContent = srvShown ? t('hide') : t('show');
+  }
   $('srvShow').addEventListener('click', async () => {
-    if (srvShown) { $('srvVal').textContent = '••••••••'; $('srvShow').textContent = 'Show'; srvShown = false; return; }
+    if (srvShown) { $('srvVal').textContent = '••••••••'; renderSrvButton(); srvShown = false; return; }
     try {
       const r = await api('/api/server-auth');
-      $('srvVal').textContent = r.server_auth || '(empty)';
-      $('srvShow').textContent = 'Hide';
+      $('srvVal').textContent = r.server_auth || t('empty_value');
       srvShown = true;
-    } catch (e) { $('srvErr').textContent = 'Failed: ' + e.message; }
+      renderSrvButton();
+    } catch (e) { $('srvErr').textContent = t('srv_failed') + e.message; }
   });
 
   $('srvUpdate').addEventListener('click', async () => {
     const v = $('srvInput').value;
     $('srvErr').textContent = '';
-    if (!v) { $('srvErr').textContent = 'Enter a new password.'; return; }
-    if (!confirm('Update server password? Agents/browsers will need the new password.')) return;
+    if (!v) { $('srvErr').textContent = t('enter_new_pw'); return; }
+    if (!confirm(t('confirm_update_pw'))) return;
     try {
       await api('/api/server-auth', { method: 'POST', body: { password: v } });
       $('srvInput').value = '';
-      $('srvVal').textContent = '••••••••'; $('srvShow').textContent = 'Show'; srvShown = false;
-      alert('Server password updated.');
-    } catch (e) { $('srvErr').textContent = 'Update failed: ' + e.message; }
+      $('srvVal').textContent = '••••••••'; srvShown = false; renderSrvButton();
+      alert(t('pw_updated'));
+    } catch (e) { $('srvErr').textContent = t('srv_update_failed') + e.message; }
   });
 
   // --- Boot ---
   (async function boot() {
+    applyStaticI18n();
     try {
       await api('/api/overview');
       showDash();

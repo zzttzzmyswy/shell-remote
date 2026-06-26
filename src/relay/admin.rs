@@ -164,6 +164,7 @@ pub async fn overview_handler(
             "fixed_key": info.fixed_key,
             "browser_count": browser_count,
             "tokens": tokens,
+            "tags": info.tags,
         }));
     }
     drop(broadcasts);
@@ -290,6 +291,48 @@ pub async fn permission_handler(
         .sessions
         .set_token_permission(&token, parse_perm(perm))
         .await;
+    Json(json!({"ok": ok})).into_response()
+}
+
+pub async fn add_tag_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let sid = body["session_id"].as_str().unwrap_or("").to_string();
+    let tag = body["tag"].as_str().unwrap_or("").to_string();
+    if sid.is_empty() || tag.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "missing session_id or tag"})),
+        )
+            .into_response();
+    }
+    let ok = state.sessions.add_tag(&sid, &tag).await;
+    Json(json!({"ok": ok})).into_response()
+}
+
+pub async fn remove_tag_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let sid = body["session_id"].as_str().unwrap_or("").to_string();
+    let tag = body["tag"].as_str().unwrap_or("").to_string();
+    if sid.is_empty() || tag.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "missing session_id or tag"})),
+        )
+            .into_response();
+    }
+    let ok = state.sessions.remove_tag(&sid, &tag).await;
     Json(json!({"ok": ok})).into_response()
 }
 

@@ -708,6 +708,8 @@ pub async fn start(
             .route(&format!("{}/logout", ap), axum::routing::post(admin::logout_handler))
             .route(&format!("{}/api/overview", ap), get(admin::overview_handler))
             .route(&format!("{}/api/session/kick", ap), axum::routing::post(admin::kick_handler))
+            .route(&format!("{}/api/session/tag", ap), axum::routing::post(admin::add_tag_handler))
+            .route(&format!("{}/api/session/untag", ap), axum::routing::post(admin::remove_tag_handler))
             .route(&format!("{}/api/token/revoke", ap), axum::routing::post(admin::revoke_handler))
             .route(&format!("{}/api/token/regenerate", ap), axum::routing::post(admin::regenerate_handler))
             .route(&format!("{}/api/token/permission", ap), axum::routing::post(admin::permission_handler))
