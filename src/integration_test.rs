@@ -16,6 +16,9 @@ mod integration_tests {
         let state = Arc::new(crate::relay::SharedState::new(
             server_auth.to_string(),
             100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
         ));
 
         use axum::routing::get;

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod mcp;
 pub mod session;
 pub mod ws;
+pub mod admin;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -35,11 +36,22 @@ pub struct SharedState {
     pub agent_broadcast: RwLock<HashMap<String, ChannelMap>>,
     pub pending_mcp: RwLock<HashMap<String, (String, oneshot::Sender<String>)>>,
     pub last_activity: RwLock<HashMap<String, Instant>>,
-    pub server_auth: String,
+    /// Server access password (`--auth`). Wrapped in a RwLock so the admin
+    /// panel can rotate it live; reads on the hot auth path take a read lock.
+    pub server_auth: RwLock<String>,
     pub agent_event_buffers: RwLock<HashMap<String, EventBuffer>>,
     pub rate_limiter: RwLock<RateLimiter>,
     pub max_upload_size: u64,
     pub sse_sessions: RwLock<HashMap<String, mpsc::UnboundedSender<String>>>,
+    /// Admin panel config. `admin_path` is `None` when `--admin-path` is
+    /// unset, in which case no admin routes are registered.
+    pub admin_path: Option<String>,
+    pub admin_user: String,
+    pub admin_pass: String,
+    /// Admin login session tokens -> expiry Instant.
+    pub admin_sessions: RwLock<HashMap<String, Instant>>,
+    /// Relay process start time, for the admin uptime display.
+    pub started_at: Instant,
 }
 
 pub struct RateLimiter {
@@ -108,17 +120,28 @@ impl EventBuffer {
 }
 
 impl SharedState {
-    pub fn new(server_auth: String, max_upload_size: u64) -> Self {
+    pub fn new(
+        server_auth: String,
+        max_upload_size: u64,
+        admin_path: Option<String>,
+        admin_user: String,
+        admin_pass: String,
+    ) -> Self {
         Self {
             sessions: SessionRegistry::new(),
             agent_broadcast: RwLock::new(HashMap::new()),
             pending_mcp: RwLock::new(HashMap::new()),
             last_activity: RwLock::new(HashMap::new()),
-            server_auth,
+            server_auth: RwLock::new(server_auth),
             agent_event_buffers: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter::new()),
             max_upload_size,
             sse_sessions: RwLock::new(HashMap::new()),
+            admin_path,
+            admin_user,
+            admin_pass,
+            admin_sessions: RwLock::new(HashMap::new()),
+            started_at: Instant::now(),
         }
     }
 
@@ -255,7 +278,7 @@ mod tests {
         use axum::Router;
         use tower_http::cors::{Any, CorsLayer};
 
-        let state = Arc::new(SharedState::new("test".into(), 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("test".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -290,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_unauthorized_no_token() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
         let headers = HeaderMap::new();
         let params = HashMap::new();
         let body = Body::from("test content");
@@ -300,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_readonly_token_forbidden() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
         let (_sid, tokens) = state.sessions.register(None, "ro").await;
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
@@ -317,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_returns_script() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "example.com:3000".parse().unwrap());
         let resp = install_script_handler(State(state), headers)
@@ -335,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_https_forwarded() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "example.com".parse().unwrap());
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
@@ -351,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_default_host() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
         let headers = axum::http::HeaderMap::new();
         let resp = install_script_handler(State(state), headers)
             .await
@@ -365,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_ps1_handler_returns_script() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "example.com:3000".parse().unwrap());
         let resp = install_script_ps1_handler(State(state), headers)
@@ -384,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_missing_path() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
         let (_sid, tokens) = state.sessions.register(None, "rw").await;
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
@@ -594,7 +617,13 @@ pub async fn install_script_ps1_handler(
     )
 }
 
-pub async fn start(bind: String, server_auth: Option<String>) -> anyhow::Result<()> {
+pub async fn start(
+    bind: String,
+    server_auth: Option<String>,
+    admin_path: Option<String>,
+    admin_user: Option<String>,
+    admin_pass: Option<String>,
+) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
         _ => {
@@ -604,11 +633,34 @@ pub async fn start(bind: String, server_auth: Option<String>) -> anyhow::Result<
         }
     };
 
+    // Admin panel is opt-in via --admin-path. When set, --admin-pass is
+    // required; --admin-user defaults to "admin". When unset, no admin routes
+    // are registered and the panel is completely inaccessible.
+    let admin_path_norm = admin_path.filter(|p| !p.is_empty());
+    let (admin_path_v, admin_user_v, admin_pass_v) = match admin_path_norm {
+        Some(p) => {
+            let pass = admin_pass
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("--admin-path requires --admin-pass"))?;
+            let user = admin_user
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "admin".to_string());
+            (Some(p), Some(user), Some(pass))
+        }
+        None => (None, None, None),
+    };
+
     use axum::routing::get;
     use axum::Router;
     use tower_http::cors::{Any, CorsLayer};
 
-    let state = Arc::new(SharedState::new(auth, 100 * 1024 * 1024));
+    let state = Arc::new(SharedState::new(
+        auth,
+        100 * 1024 * 1024,
+        admin_path_v.clone(),
+        admin_user_v.clone().unwrap_or_default(),
+        admin_pass_v.clone().unwrap_or_default(),
+    ));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -640,7 +692,32 @@ pub async fn start(bind: String, server_auth: Option<String>) -> anyhow::Result<
         .route("/sse.js", get(static_handler))
         .route("/term.js", get(static_handler))
         .route("/files.js", get(static_handler))
-        .route("/session.js", get(static_handler))
+        .route("/session.js", get(static_handler));
+
+    // Admin panel routes — registered only when --admin-path is set. Paths
+    // are built at startup from the configured secret prefix; axum parses them
+    // immediately so the temporary strings need not outlive this call.
+    let app = if let Some(ref ap_raw) = admin_path_v {
+        let ap = if ap_raw.starts_with('/') {
+            ap_raw.clone()
+        } else {
+            format!("/{}", ap_raw)
+        };
+        app.route(&ap, get(admin::admin_page_handler))
+            .route(&format!("{}/login", ap), axum::routing::post(admin::login_handler))
+            .route(&format!("{}/logout", ap), axum::routing::post(admin::logout_handler))
+            .route(&format!("{}/api/overview", ap), get(admin::overview_handler))
+            .route(&format!("{}/api/session/kick", ap), axum::routing::post(admin::kick_handler))
+            .route(&format!("{}/api/token/revoke", ap), axum::routing::post(admin::revoke_handler))
+            .route(&format!("{}/api/token/regenerate", ap), axum::routing::post(admin::regenerate_handler))
+            .route(&format!("{}/api/token/permission", ap), axum::routing::post(admin::permission_handler))
+            .route(&format!("{}/api/server-auth", ap), get(admin::get_server_auth_handler))
+            .route(&format!("{}/api/server-auth", ap), axum::routing::post(admin::set_server_auth_handler))
+    } else {
+        app
+    };
+
+    let app = app
         .fallback(get(static_handler))
         .layer(cors)
         .with_state(state.clone());

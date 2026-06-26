@@ -157,6 +157,36 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `/agent/mcp/sse` | GET → SSE | MCP SSE Transport endpoint |
 | `/agent/mcp/messages` | POST | MCP JSON-RPC messages |
 
+## Admin Panel
+
+The relay can optionally enable a web admin panel: view sessions/tokens, kick sessions, manage token permissions, view/rotate the server password, and see runtime status. Disabled by default; must be enabled via CLI. **The homepage has no link to it — you must type the secret sub-path manually.**
+
+### Enable
+
+```bash
+shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
+  --admin-path /your-secret-path --admin-pass ADMIN_PASSWORD
+# --admin-user defaults to "admin"; omit --admin-path to leave the panel fully disabled
+```
+
+### Access
+
+Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in a browser and sign in with `--admin-user` / `--admin-pass`. The secret path is the first barrier; a successful login issues an HttpOnly + SameSite=Strict session cookie (12h TTL).
+
+### Features
+
+- **Overview**: version, uptime, agent total/online, browser total, per-session token list with permissions, connected browser count.
+- **Token management**: revoke a single token, regenerate a session's tokens (old ones invalidated), toggle token permission (rw↔ro).
+- **Kick session**: disconnect that agent and all its browsers and invalidate its tokens.
+- **Server password**: view the current `--auth`, rotate it live (takes effect immediately).
+
+### Security notes
+
+- The admin page is not in the public static asset folder — it cannot be fetched via `/admin.html` or similar.
+- Two layers: secret path (hidden entry) + user/password login.
+- Admin sessions live in memory only; relay restart requires re-login.
+- Known limitation: after revoking/regenerating a token, an agent that reconnects via `register_existing` (replaying its cached tokens) may re-introduce that token; does not affect the live session.
+
 ## AI Agent Integration (MCP)
 
 ### Configuration
@@ -220,7 +250,7 @@ Token is passed in arguments, not in URL or headers. Commands execute via `sh -c
 
 ```bash
 cargo test
-# 120 passed; 0 failed (including integration test)
+# 134 passed; 0 failed (including integration test)
 ```
 
 ## License

@@ -209,7 +209,8 @@ pub async fn agent_send_handler(
     }
 
     // All other message types require server auth, unless they carry a valid session_id
-    if !state.server_auth.is_empty() {
+    let server_auth = state.server_auth.read().await.clone();
+    if !server_auth.is_empty() {
         let session_for_auth = body["session_id"].as_str().unwrap_or("");
         let has_valid_session = if !session_for_auth.is_empty() {
             let broadcasts = state.agent_broadcast.read().await;
@@ -224,8 +225,8 @@ pub async fn agent_send_handler(
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .unwrap_or("");
             let body_auth = body["auth"].as_str().unwrap_or("");
-            if !crate::relay::auth::constant_time_eq(auth_header, &state.server_auth)
-                && !crate::relay::auth::constant_time_eq(body_auth, &state.server_auth)
+            if !crate::relay::auth::constant_time_eq(auth_header, &server_auth)
+                && !crate::relay::auth::constant_time_eq(body_auth, &server_auth)
             {
                 return (
                     axum::http::StatusCode::UNAUTHORIZED,
@@ -595,17 +596,13 @@ mod tests {
     use tokio::sync::{oneshot, RwLock};
 
     fn make_state(server_auth: &str) -> Arc<SharedState> {
-        Arc::new(SharedState {
-            sessions: SessionRegistry::new(),
-            agent_broadcast: RwLock::new(HashMap::new()),
-            pending_mcp: RwLock::new(HashMap::new()),
-            last_activity: RwLock::new(HashMap::new()),
-            server_auth: server_auth.to_string(),
-            agent_event_buffers: RwLock::new(HashMap::new()),
-            rate_limiter: RwLock::new(RateLimiter::new()),
-            max_upload_size: 100 * 1024 * 1024,
-            sse_sessions: RwLock::new(HashMap::new()),
-        })
+        Arc::new(SharedState::new(
+            server_auth.to_string(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+        ))
     }
 
     async fn insert_channel_map(

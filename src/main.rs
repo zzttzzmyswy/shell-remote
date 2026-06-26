@@ -26,6 +26,20 @@ enum Command {
         /// Server access password (required)
         #[arg(long)]
         auth: Option<String>,
+
+        /// Secret sub-path that exposes the admin panel (e.g. /sr-admin-x7k).
+        /// Unset by default — the panel is fully disabled. The homepage has no
+        /// link to it; you must type this path manually.
+        #[arg(long)]
+        admin_path: Option<String>,
+
+        /// Admin login username (defaults to "admin" when --admin-path is set)
+        #[arg(long)]
+        admin_user: Option<String>,
+
+        /// Admin login password (required when --admin-path is set)
+        #[arg(long)]
+        admin_pass: Option<String>,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -71,8 +85,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("shell-remote v{}", version);
 
     match cli.command {
-        Command::Relay { bind, auth } => {
-            relay::start(bind, auth).await?;
+        Command::Relay {
+            bind,
+            auth,
+            admin_path,
+            admin_user,
+            admin_pass,
+        } => {
+            relay::start(bind, auth, admin_path, admin_user, admin_pass).await?;
         }
         Command::Agent {
             relay_url,

@@ -166,6 +166,36 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `/agent/mcp/sse` | GET → SSE | MCP SSE Transport 端点 |
 | `/agent/mcp/messages` | POST | MCP JSON-RPC 消息 |
 
+## 管理后台
+
+Relay 可选启用一个 web 管理后台：查看会话/Token、踢出会话、管理 Token 权限、查看/修改服务器密码、查看运行时状态。默认禁用，需命令行显式开启；**首页不显示入口，必须手动输入秘密子路径才能到达**。
+
+### 启用
+
+```bash
+shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
+  --admin-path /your-secret-path --admin-pass ADMIN_PASSWORD
+# --admin-user 默认 "admin"；不设 --admin-path 则后台完全不可访问
+```
+
+### 访问
+
+浏览器打开 `http://<relay-ip>:3000/your-secret-path`（即 `--admin-path` 的值），输入 `--admin-user` / `--admin-pass` 登录。秘密路径是第一道屏障；登录后获发 HttpOnly + SameSite=Strict 的 session cookie（12h 有效）。
+
+### 功能
+
+- **概览**：版本、运行时间、agent 总数/在线数、浏览器总数、每会话 Token 列表与权限、连接浏览器数。
+- **Token 管理**：撤销单个 Token、重生成会话 Token（旧 Token 失效）、切换 Token 权限（rw↔ro）。
+- **踢出会话**：断开该 agent 及其所有浏览器并撤销其 Token。
+- **服务器密码**：查看当前 `--auth`、在线修改（即时生效）。
+
+### 安全说明
+
+- 后台页面不在公开静态资源目录，无法经 `/admin.html` 等路径访问。
+- 双层保护：秘密路径（隐藏入口）+ 账户密码登录。
+- admin session 仅存内存，relay 重启需重新登录。
+- 已知局限：撤销/重生成 Token 后，若 agent 用 `register_existing`（带 Token 重连）重连，可能重新带回该 Token；不影响在线会话。
+
 ## AI Agent 接入 (MCP)
 
 ### 配置模板
@@ -257,7 +287,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 120 passed; 0 failed (含集成测试)
+# 134 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证

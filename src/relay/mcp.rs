@@ -50,7 +50,8 @@ pub async fn sse_handler(
     headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !state.server_auth.is_empty() {
+    let server_auth = state.server_auth.read().await.clone();
+    if !server_auth.is_empty() {
         let header_auth = headers
             .get("x-auth")
             .and_then(|v| v.to_str().ok())
@@ -61,7 +62,7 @@ pub async fn sse_handler(
         } else {
             header_auth
         };
-        if !crate::relay::auth::constant_time_eq(auth, &state.server_auth) {
+        if !crate::relay::auth::constant_time_eq(auth, &server_auth) {
             return Sse::new(tokio_stream::once(Ok::<_, Infallible>(
                 Event::default().event("error").data(
                     r#"{"code":"AUTH_INVALID_PASSWORD","message":"Invalid server password"}"#,
@@ -135,7 +136,8 @@ pub async fn messages_handler(
     }
 
     // Server auth check
-    if !state.server_auth.is_empty() {
+    let server_auth = state.server_auth.read().await.clone();
+    if !server_auth.is_empty() {
         let header_auth = headers
             .get("x-auth")
             .and_then(|v| v.to_str().ok())
@@ -149,7 +151,7 @@ pub async fn messages_handler(
         } else {
             body_auth
         };
-        if !crate::relay::auth::constant_time_eq(auth, &state.server_auth) {
+        if !crate::relay::auth::constant_time_eq(auth, &server_auth) {
             return Json(json!({
                 "jsonrpc": "2.0",
                 "id": body.get("id").cloned().unwrap_or(Value::Null),
@@ -364,17 +366,13 @@ mod tests {
     use tokio::sync::{mpsc, oneshot, RwLock};
 
     fn make_state() -> Arc<SharedState> {
-        Arc::new(SharedState {
-            sessions: SessionRegistry::new(),
-            agent_broadcast: RwLock::new(HashMap::new()),
-            pending_mcp: RwLock::new(HashMap::new()),
-            last_activity: RwLock::new(HashMap::new()),
-            server_auth: String::new(),
-            agent_event_buffers: RwLock::new(HashMap::new()),
-            rate_limiter: RwLock::new(RateLimiter::new()),
-            max_upload_size: 100 * 1024 * 1024,
-            sse_sessions: RwLock::new(HashMap::new()),
-        })
+        Arc::new(SharedState::new(
+            String::new(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+        ))
     }
 
     async fn mcp_send_and_recv(

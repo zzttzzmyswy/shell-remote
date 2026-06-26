@@ -133,6 +133,107 @@ impl SessionRegistry {
     pub async fn count(&self) -> usize {
         self.sessions.read().await.len()
     }
+
+    /// Snapshot of all sessions for the admin overview. Clones session info
+    /// (tokens, permissions, fixed_key, temporary flag).
+    pub async fn list_sessions(&self) -> Vec<(String, SessionInfo)> {
+        self.sessions
+            .read()
+            .await
+            .iter()
+            .map(|(id, info)| (id.clone(), info.clone()))
+            .collect()
+    }
+
+    /// Remove a single token from both the token map and its session's token
+    /// list. Returns false if the token was unknown. Browsers/MCP clients
+    /// using it will fail to authenticate on their next request.
+    pub async fn revoke_token(&self, token: &str) -> bool {
+        let sid = self
+            .token_map
+            .read()
+            .await
+            .get(token)
+            .map(|(sid, _)| sid.clone());
+        let Some(sid) = sid else { return false };
+        self.token_map.write().await.remove(token);
+        if let Some(info) = self.sessions.write().await.get_mut(&sid) {
+            info.tokens.retain(|(t, _)| t != token);
+        }
+        true
+    }
+
+    /// Mint a fresh set of tokens for a session (preserving each existing
+    /// permission slot), invalidate the old tokens, and return the new set.
+    /// Returns None if the session is unknown or has no tokens. For fixed-key
+    /// sessions this also replaces the fixed key — the agent must be restarted
+    /// / reconnected with the new credentials.
+    pub async fn regenerate_session(
+        &self,
+        session_id: &str,
+    ) -> Option<Vec<(String, Permission)>> {
+        let perms: Vec<Permission> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)?
+                .tokens
+                .iter()
+                .map(|(_, p)| p.clone())
+                .collect()
+        };
+        if perms.is_empty() {
+            return None;
+        }
+        let new_tokens: Vec<(String, Permission)> = perms
+            .iter()
+            .map(|p| (generate_token(), p.clone()))
+            .collect();
+
+        // token_map: drop old tokens for this session, insert new ones.
+        {
+            let old: Vec<String> = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .get(session_id)
+                    .map(|i| i.tokens.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            };
+            let mut tmap = self.token_map.write().await;
+            for t in &old {
+                tmap.remove(t);
+            }
+            for (t, p) in &new_tokens {
+                tmap.insert(t.clone(), (session_id.to_string(), p.clone()));
+            }
+        }
+
+        // session: replace the token list.
+        if let Some(info) = self.sessions.write().await.get_mut(session_id) {
+            info.tokens = new_tokens.clone();
+        }
+        Some(new_tokens)
+    }
+
+    /// Flip a single token's permission (rw <-> ro) in both the token map and
+    /// its session entry. Returns false if the token was unknown.
+    pub async fn set_token_permission(&self, token: &str, perm: Permission) -> bool {
+        let sid = self
+            .token_map
+            .read()
+            .await
+            .get(token)
+            .map(|(sid, _)| sid.clone());
+        let Some(sid) = sid else { return false };
+        if let Some(entry) = self.token_map.write().await.get_mut(token) {
+            entry.1 = perm.clone();
+        }
+        if let Some(info) = self.sessions.write().await.get_mut(&sid) {
+            if let Some(e) = info.tokens.iter_mut().find(|(t, _)| t == token) {
+                e.1 = perm;
+            }
+        }
+        true
+    }
 }
 
 fn generate_token() -> String {
@@ -290,5 +391,63 @@ mod tests {
         assert_ne!(old_sid, new_sid);
         let (resolved, _) = registry.authenticate("shared-token").await.unwrap();
         assert_eq!(resolved, new_sid);
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions() {
+        let registry = SessionRegistry::new();
+        let (sid, _t) = registry.register(None, "both").await;
+        let list = registry.list_sessions().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, sid);
+        assert_eq!(list[0].1.tokens.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_revoke_token() {
+        let registry = SessionRegistry::new();
+        let (_sid, tokens) = registry.register(None, "both").await;
+        assert!(registry.revoke_token(&tokens[0].0).await);
+        assert!(registry.authenticate(&tokens[0].0).await.is_none());
+        // the other token still works
+        assert!(registry.authenticate(&tokens[1].0).await.is_some());
+        // unknown token
+        assert!(!registry.revoke_token("nope").await);
+    }
+
+    #[tokio::test]
+    async fn test_regenerate_session() {
+        let registry = SessionRegistry::new();
+        let (sid, tokens) = registry.register(None, "rw").await;
+        let new_tokens = registry.regenerate_session(&sid).await.unwrap();
+        assert_eq!(new_tokens.len(), 1);
+        assert_ne!(new_tokens[0].0, tokens[0].0);
+        // old token invalidated
+        assert!(registry.authenticate(&tokens[0].0).await.is_none());
+        // new token authenticates to same session
+        let (resolved, perm) = registry.authenticate(&new_tokens[0].0).await.unwrap();
+        assert_eq!(resolved, sid);
+        assert_eq!(perm, Permission::ReadWrite);
+        // unknown session
+        assert!(registry.regenerate_session("deadbeef").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_token_permission() {
+        let registry = SessionRegistry::new();
+        let (_sid, tokens) = registry.register(None, "rw").await;
+        assert!(registry
+            .set_token_permission(&tokens[0].0, Permission::ReadOnly)
+            .await);
+        let (_sid, perm) = registry.authenticate(&tokens[0].0).await.unwrap();
+        assert_eq!(perm, Permission::ReadOnly);
+        // flip back
+        registry
+            .set_token_permission(&tokens[0].0, Permission::ReadWrite)
+            .await;
+        let (_, perm) = registry.authenticate(&tokens[0].0).await.unwrap();
+        assert_eq!(perm, Permission::ReadWrite);
+        // unknown token
+        assert!(!registry.set_token_permission("nope", Permission::ReadOnly).await);
     }
 }

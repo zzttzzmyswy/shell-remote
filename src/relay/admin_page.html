@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shell-remote admin</title>
+<style>
+  :root {
+    --bg: #1e1e2e;
+    --panel: #181825;
+    --panel2: #313244;
+    --text: #cdd6f4;
+    --muted: #a6adc8;
+    --accent: #89b4fa;
+    --green: #40a02b;
+    --red: #d20f39;
+    --yellow: #df8e1d;
+    --border: #45475a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 14px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 60px; }
+  .center-screen { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+
+  /* Login */
+  .login-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 32px 28px; width: 100%; max-width: 360px; box-shadow: 0 8px 32px rgba(0,0,0,0.35); }
+  .login-card h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
+  .login-card .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  label { display: block; color: var(--muted); font-size: 12px; margin: 12px 0 5px; }
+  input, button, select { font: inherit; color: var(--text); }
+  input[type="text"], input[type="password"] {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; outline: none; color: var(--text);
+  }
+  input[type="text"]:focus, input[type="password"]:focus { border-color: var(--accent); }
+  .btn {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 14px; cursor: pointer; color: var(--text); font-weight: 500; transition: background .12s, border-color .12s;
+  }
+  .btn:hover { background: #45475a; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #1e1e2e; font-weight: 600; }
+  .btn-primary:hover { background: #74a3f7; border-color: #74a3f7; }
+  .btn-red { background: var(--red); border-color: var(--red); color: #fff; }
+  .btn-red:hover { background: #b3182f; }
+  .btn-sm { padding: 4px 8px; font-size: 12px; border-radius: 6px; }
+  .btn-block { width: 100%; margin-top: 18px; }
+  .err { color: var(--red); font-size: 12px; min-height: 16px; margin-top: 10px; }
+
+  /* Dashboard */
+  .header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+  .header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  .badge { background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; font-size: 12px; color: var(--muted); }
+  .badge-version { color: var(--accent); }
+  .spacer { flex: 1 1 auto; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 26px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+  .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 22px; font-weight: 600; margin-top: 6px; }
+  .card .v small { font-size: 13px; color: var(--muted); font-weight: 400; }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 22px; }
+  .panel h2 { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+  td.actions { white-space: nowrap; }
+
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: var(--muted); }
+  .dot.on { background: var(--green); box-shadow: 0 0 6px rgba(64,160,43,.6); }
+
+  .tok-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; flex-wrap: wrap; }
+  .tok { font-family: ui-monospace, monospace; font-size: 11px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; cursor: pointer; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tok:hover { border-color: var(--accent); }
+  .perm { font-size: 10px; font-weight: 700; border-radius: 4px; padding: 2px 5px; text-transform: uppercase; }
+  .perm-rw { background: rgba(64,160,43,.18); color: var(--green); border: 1px solid rgba(64,160,43,.4); }
+  .perm-ro { background: rgba(223,142,29,.18); color: var(--yellow); border: 1px solid rgba(223,142,29,.4); }
+  .xbtn { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 1px 6px; cursor: pointer; font-size: 11px; line-height: 1.4; }
+  .xbtn:hover { color: var(--red); border-color: var(--red); }
+  .copied { font-size: 10px; color: var(--green); }
+
+  .type-cell .fk { color: var(--muted); font-size: 11px; }
+
+  .srv-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .srv-val { flex: 1 1 240px; min-width: 0; font-family: ui-monospace, monospace; font-size: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; word-break: break-all; }
+  .srv-input { flex: 1 1 240px; min-width: 0; }
+  .muted { color: var(--muted); }
+  .alert { background: rgba(137,180,250,.1); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; font-size: 12px; margin-top: 10px; word-break: break-all; }
+
+  .hidden { display: none !important; }
+  @media (max-width: 640px) { .tok { max-width: 140px; } }
+</style>
+</head>
+<body>
+
+<!-- Login view -->
+<div id="loginView" class="center-screen hidden">
+  <form class="login-card" id="loginForm" autocomplete="off">
+    <h1>shell-remote admin</h1>
+    <div class="sub">Sign in to manage the relay.</div>
+    <label for="lu">Username</label>
+    <input id="lu" type="text" autocomplete="username" required>
+    <label for="lp">Password</label>
+    <input id="lp" type="password" autocomplete="current-password" required>
+    <button type="submit" class="btn btn-primary btn-block">Login</button>
+    <div class="err" id="loginErr"></div>
+  </form>
+</div>
+
+<!-- Dashboard view -->
+<div id="dashView" class="wrap hidden">
+  <div class="header">
+    <h1>shell-remote admin</h1>
+    <span class="badge badge-version" id="verBadge">v?</span>
+    <span class="badge" id="upBadge">uptime —</span>
+    <span class="spacer"></span>
+    <button class="btn" id="logoutBtn">Logout</button>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="k">Agents</div><div class="v" id="cAgents">— <small>/ —</small></div></div>
+    <div class="card"><div class="k">Browsers</div><div class="v" id="cBrowsers">—</div></div>
+    <div class="card"><div class="k">Uptime</div><div class="v" id="cUptime">—</div></div>
+    <div class="card"><div class="k">Version</div><div class="v" id="cVersion">—</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Sessions</h2>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Session ID</th><th>Status</th><th>Type</th><th>Browsers</th><th>Tokens</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="sessionsBody"></tbody>
+      </table>
+    </div>
+    <div id="sessEmpty" class="muted" style="padding:10px 4px;">No sessions.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Server password</h2>
+    <div class="srv-row">
+      <div class="srv-val" id="srvVal">••••••••</div>
+      <button class="btn btn-sm" id="srvShow">Show</button>
+    </div>
+    <div class="srv-row" style="margin-top:12px;">
+      <input id="srvInput" type="password" class="srv-input" placeholder="New server password">
+      <button class="btn btn-primary btn-sm" id="srvUpdate">Update</button>
+    </div>
+    <div class="err" id="srvErr"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  const BASE = location.pathname.replace(/\/$/, '');
+
+  const $ = (id) => document.getElementById(id);
+  const loginView = $('loginView'), dashView = $('dashView');
+
+  // --- XSS-safe text helper: builds a <span> with textContent ---
+  function textNode(s) { return document.createTextNode(s == null ? '' : String(s)); }
+  function span(txt, cls) {
+    const e = document.createElement('span');
+    if (cls) e.className = cls;
+    e.appendChild(textNode(txt));
+    return e;
+  }
+
+  function showLogin() {
+    dashView.classList.add('hidden');
+    loginView.classList.remove('hidden');
+    $('lu').focus();
+  }
+  function showDash() {
+    loginView.classList.add('hidden');
+    dashView.classList.remove('hidden');
+  }
+
+  // --- API ---
+  async function api(path, opts) {
+    opts = opts || {};
+    const res = await fetch(BASE + path, {
+      method: opts.method || 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      credentials: 'same-origin'
+    });
+    if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+    return data;
+  }
+
+  // --- Uptime formatting ---
+  function fmtUptime(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+    return h + 'h ' + m + 'm';
+  }
+
+  // --- Login ---
+  $('loginForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const err = $('loginErr');
+    err.textContent = '';
+    const user = $('lu').value, pass = $('lp').value;
+    try {
+      await api('/login', { method: 'POST', body: { user, pass } });
+      $('lp').value = '';
+      showDash();
+      startRefresh();
+      refresh();
+    } catch (ex) {
+      err.textContent = ex.message === 'unauthorized' ? 'Invalid credentials.' : ('Login failed: ' + ex.message);
+    }
+  });
+
+  $('logoutBtn').addEventListener('click', async () => {
+    try { await api('/logout', { method: 'POST' }); } catch (_) {}
+    stopRefresh();
+    showLogin();
+  });
+
+  // --- Overview refresh ---
+  let timer = null;
+  function startRefresh() { if (!timer) timer = setInterval(refresh, 5000); }
+  function stopRefresh() { if (timer) { clearInterval(timer); timer = null; } }
+
+  async function refresh() {
+    let o;
+    try { o = await api('/api/overview'); }
+    catch (_) { return; }
+    renderOverview(o);
+    renderSessions(o.sessions || []);
+  }
+
+  function renderOverview(o) {
+    $('cAgents').textContent = '';
+    $('cAgents').appendChild(document.createTextNode(String(o.agent_online ?? 0)));
+    const sm = document.createElement('small'); sm.className = 'muted'; sm.textContent = ' / ' + (o.agent_count ?? 0);
+    $('cAgents').appendChild(sm);
+
+    $('cBrowsers').textContent = String(o.browser_count ?? 0);
+    $('cUptime').textContent = fmtUptime(o.uptime_seconds);
+    $('cVersion').textContent = String(o.version ?? '?');
+
+    $('verBadge').textContent = 'v' + (o.version ?? '?');
+    $('upBadge').textContent = 'uptime ' + fmtUptime(o.uptime_seconds);
+  }
+
+  // --- Sessions table ---
+  function renderSessions(sessions) {
+    const body = $('sessionsBody');
+    body.textContent = '';
+    $('sessEmpty').classList.toggle('hidden', sessions.length > 0);
+    for (const s of sessions) {
+      body.appendChild(buildSessionRow(s));
+    }
+  }
+
+  function buildSessionRow(s) {
+    const tr = document.createElement('tr');
+
+    // Session ID
+    const tdId = document.createElement('td');
+    const idEl = document.createElement('span'); idEl.className = 'mono'; idEl.textContent = s.session_id || '';
+    tdId.appendChild(idEl);
+    tr.appendChild(tdId);
+
+    // Status
+    const tdSt = document.createElement('td');
+    const dot = document.createElement('span'); dot.className = 'dot' + (s.online ? ' on' : '');
+    tdSt.appendChild(dot);
+    tdSt.appendChild(textNode(s.online ? 'online' : 'offline'));
+    tr.appendChild(tdSt);
+
+    // Type
+    const tdT = document.createElement('td'); tdT.className = 'type-cell';
+    if (s.is_temporary) {
+      tdT.appendChild(textNode('temporary'));
+    } else {
+      tdT.appendChild(textNode('fixed'));
+      if (s.fixed_key) {
+        const fk = document.createElement('div'); fk.className = 'fk mono'; fk.textContent = 'key: ' + s.fixed_key;
+        tdT.appendChild(fk);
+      }
+    }
+    tr.appendChild(tdT);
+
+    // Browsers
+    const tdB = document.createElement('td');
+    tdB.textContent = String(s.browser_count ?? 0);
+    tr.appendChild(tdB);
+
+    // Tokens
+    const tdTok = document.createElement('td');
+    const toks = s.tokens || [];
+    if (toks.length === 0) tdTok.appendChild(textNode('—'));
+    for (const t of toks) {
+      tdTok.appendChild(buildTokenRow(s, t));
+    }
+    tr.appendChild(tdTok);
+
+    // Actions
+    const tdA = document.createElement('td'); tdA.className = 'actions';
+    const regen = document.createElement('button'); regen.className = 'btn btn-sm'; regen.textContent = 'Regenerate';
+    regen.addEventListener('click', () => onRegenerate(s));
+    const kick = document.createElement('button'); kick.className = 'btn btn-sm btn-red'; kick.textContent = 'Kick';
+    kick.style.marginLeft = '6px';
+    kick.addEventListener('click', () => onKick(s));
+    tdA.appendChild(regen); tdA.appendChild(kick);
+    tr.appendChild(tdA);
+
+    return tr;
+  }
+
+  function buildTokenRow(s, t) {
+    const row = document.createElement('div'); row.className = 'tok-row';
+
+    const tok = document.createElement('span'); tok.className = 'tok'; tok.title = 'click to copy';
+    tok.textContent = t.token || '';
+    const copied = document.createElement('span'); copied.className = 'copied hidden'; copied.textContent = 'copied';
+    tok.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(t.token || ''); }
+      catch (_) {}
+      copied.classList.remove('hidden');
+      setTimeout(() => copied.classList.add('hidden'), 1000);
+    });
+    row.appendChild(tok);
+
+    const perm = document.createElement('span'); perm.className = 'perm ' + (t.permission === 'rw' ? 'perm-rw' : 'perm-ro');
+    perm.textContent = t.permission || 'ro';
+    row.appendChild(perm);
+
+    const toggle = document.createElement('button'); toggle.className = 'btn btn-sm';
+    toggle.textContent = t.permission === 'rw' ? '→ ro' : '→ rw';
+    toggle.addEventListener('click', () => onTogglePerm(s, t, toggle));
+    row.appendChild(toggle);
+
+    const x = document.createElement('button'); x.className = 'xbtn'; x.textContent = '×'; x.title = 'revoke';
+    x.addEventListener('click', () => onRevoke(t));
+    row.appendChild(x);
+
+    row.appendChild(copied);
+    return row;
+  }
+
+  async function onRevoke(t) {
+    if (!confirm('Revoke this token?')) return;
+    try { await api('/api/token/revoke', { method: 'POST', body: { token: t.token } }); refresh(); }
+    catch (e) { alert('Revoke failed: ' + e.message); }
+  }
+
+  async function onTogglePerm(s, t, btn) {
+    const next = t.permission === 'rw' ? 'ro' : 'rw';
+    try {
+      await api('/api/token/permission', { method: 'POST', body: { token: t.token, permission: next } });
+      refresh();
+    } catch (e) { alert('Toggle failed: ' + e.message); }
+  }
+
+  async function onRegenerate(s) {
+    if (!confirm('Regenerate all tokens for session ' + (s.session_id || '') + '? Existing tokens will be invalidated.')) return;
+    try {
+      const r = await api('/api/token/regenerate', { method: 'POST', body: { session_id: s.session_id } });
+      if (r && r.tokens) {
+        const list = r.tokens.map(t => t.token + ' (' + (t.permission || '?') + ')').join('\n');
+        alert('New tokens:\n' + list);
+      }
+      refresh();
+    } catch (e) {
+      alert('Regenerate failed: ' + e.message);
+    }
+  }
+
+  async function onKick(s) {
+    if (!confirm('Kick session ' + (s.session_id || '') + '?')) return;
+    try { await api('/api/session/kick', { method: 'POST', body: { session_id: s.session_id } }); refresh(); }
+    catch (e) { alert('Kick failed: ' + e.message); }
+  }
+
+  // --- Server auth ---
+  let srvShown = false;
+  $('srvShow').addEventListener('click', async () => {
+    if (srvShown) { $('srvVal').textContent = '••••••••'; $('srvShow').textContent = 'Show'; srvShown = false; return; }
+    try {
+      const r = await api('/api/server-auth');
+      $('srvVal').textContent = r.server_auth || '(empty)';
+      $('srvShow').textContent = 'Hide';
+      srvShown = true;
+    } catch (e) { $('srvErr').textContent = 'Failed: ' + e.message; }
+  });
+
+  $('srvUpdate').addEventListener('click', async () => {
+    const v = $('srvInput').value;
+    $('srvErr').textContent = '';
+    if (!v) { $('srvErr').textContent = 'Enter a new password.'; return; }
+    if (!confirm('Update server password? Agents/browsers will need the new password.')) return;
+    try {
+      await api('/api/server-auth', { method: 'POST', body: { password: v } });
+      $('srvInput').value = '';
+      $('srvVal').textContent = '••••••••'; $('srvShow').textContent = 'Show'; srvShown = false;
+      alert('Server password updated.');
+    } catch (e) { $('srvErr').textContent = 'Update failed: ' + e.message; }
+  });
+
+  // --- Boot ---
+  (async function boot() {
+    try {
+      await api('/api/overview');
+      showDash();
+      startRefresh();
+    } catch (_) {
+      showLogin();
+    }
+  })();
+})();
+</script>
+</body>
+</html>
