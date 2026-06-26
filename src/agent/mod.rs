@@ -462,8 +462,6 @@ async fn run_session(
                                 }
 
                                 "fs:upload" => {
-                                    #[allow(unused_variables)]
-                                    let temp_path = msg.payload["temp_path"].as_str().unwrap_or("");
                                     let final_path = msg.payload["final_path"].as_str().unwrap_or("");
 
                                     #[cfg(windows)]
@@ -492,49 +490,52 @@ async fn run_session(
                                         continue;
                                     }
 
-                                    #[allow(unreachable_code, unused_variables)]
-                                    let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
+                                    #[cfg(not(windows))]
+                                    {
+                                        let temp_path = msg.payload["temp_path"].as_str().unwrap_or("");
+                                        let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
 
-                                    // Validate temp_path is under our known upload directory
-                                    let temp = std::path::Path::new(temp_path);
-                                    if !temp.starts_with("/tmp/opencode/uploads/") {
-                                        let result = FsResultPayload {
-                                            success: false,
-                                            error: Some("Invalid temporary upload path".into()),
-                                            entries: None, content: None,
-                                            path: Some(final_path.to_string()), new_path: None,
+                                        // Validate temp_path is under our known upload directory
+                                        let temp = std::path::Path::new(temp_path);
+                                        if !temp.starts_with("/tmp/opencode/uploads/") {
+                                            let result = FsResultPayload {
+                                                success: false,
+                                                error: Some("Invalid temporary upload path".into()),
+                                                entries: None, content: None,
+                                                path: Some(final_path.to_string()), new_path: None,
+                                            };
+                                            let payload = serde_json::to_value(&result).unwrap();
+                                            let resp = Message { msg_type: "fs:result".into(), session_id: client.session_id.clone(), payload };
+                                            out.control(resp).await;
+                                            continue;
+                                        }
+
+                                        let result = match std::fs::read(temp_path) {
+                                            Ok(data) => {
+                                                let r = fs::write_file_bytes(&root_path, final_path, &data);
+                                                let _ = std::fs::remove_file(temp_path);
+                                                r
+                                            }
+                                            Err(e) => FsResultPayload {
+                                                success: false,
+                                                error: Some(format!("Failed to read uploaded file: {}", e)),
+                                                entries: None, content: None,
+                                                path: Some(final_path.to_string()), new_path: None,
+                                            }
                                         };
+                                        if let Some(ref req_id) = mcp_request_id {
+                                            let mut payload = serde_json::to_value(&result).unwrap();
+                                            if let serde_json::Value::Object(ref mut map) = payload {
+                                                map.insert("_mcp_request_id".to_string(), serde_json::Value::String(req_id.clone()));
+                                            }
+                                            let resp = Message { msg_type: "fs:result".into(), session_id: client.session_id.clone(), payload };
+                                            out.control(resp).await;
+                                            continue;
+                                        }
                                         let payload = serde_json::to_value(&result).unwrap();
                                         let resp = Message { msg_type: "fs:result".into(), session_id: client.session_id.clone(), payload };
                                         out.control(resp).await;
-                                        continue;
                                     }
-
-                                    let result = match std::fs::read(temp_path) {
-                                        Ok(data) => {
-                                            let r = fs::write_file_bytes(&root_path, final_path, &data);
-                                            let _ = std::fs::remove_file(temp_path);
-                                            r
-                                        }
-                                        Err(e) => FsResultPayload {
-                                            success: false,
-                                            error: Some(format!("Failed to read uploaded file: {}", e)),
-                                            entries: None, content: None,
-                                            path: Some(final_path.to_string()), new_path: None,
-                                        }
-                                    };
-                                    if let Some(ref req_id) = mcp_request_id {
-                                        let mut payload = serde_json::to_value(&result).unwrap();
-                                        if let serde_json::Value::Object(ref mut map) = payload {
-                                            map.insert("_mcp_request_id".to_string(), serde_json::Value::String(req_id.clone()));
-                                        }
-                                        let resp = Message { msg_type: "fs:result".into(), session_id: client.session_id.clone(), payload };
-                                        out.control(resp).await;
-                                        continue;
-                                    }
-                                    let payload = serde_json::to_value(&result).unwrap();
-                                    let resp = Message { msg_type: "fs:result".into(), session_id: client.session_id.clone(), payload };
-                                    out.control(resp).await;
                                 }
 
                                 "fs:delete" => {
