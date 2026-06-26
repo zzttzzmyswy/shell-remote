@@ -33,11 +33,32 @@
     <div class="install-section">
         <h2>一行命令启动客户端</h2>
         <p>在目标机器上执行以下命令即可自动部署并运行：</p>
-        <div class="install-cmd">
-            <code>$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh</code>
-            <button class="copy-btn" onclick="copyInstallCmd()">copy</button>
+
+        <div class="install-block">
+            <div class="install-label">Linux / macOS</div>
+            <div class="install-cmd">
+                <code id="linux-run">$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh</code>
+                <button class="copy-btn" onclick="copyCmd('linux-run')">copy</button>
+            </div>
+            <div class="install-sub">仅下载到当前目录不执行：</div>
+            <div class="install-cmd">
+                <code id="linux-dl">$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh -s -- --download-only</code>
+                <button class="copy-btn" onclick="copyCmd('linux-dl')">copy</button>
+            </div>
         </div>
 
+        <div class="install-block">
+            <div class="install-label">Windows（PowerShell）</div>
+            <div class="install-cmd">
+                <code id="win-run">irm <span class="relay-host">https://host</span>/agent/install.ps1 | iex</code>
+                <button class="copy-btn" onclick="copyCmd('win-run')">copy</button>
+            </div>
+            <div class="install-sub">仅下载到当前目录不执行：</div>
+            <div class="install-cmd">
+                <code id="win-dl">&amp; ([scriptblock]::Create((irm <span class="relay-host">https://host</span>/agent/install.ps1))) --download-only</code>
+                <button class="copy-btn" onclick="copyCmd('win-dl')">copy</button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -78,10 +99,18 @@
             el.textContent = relayHost;
         });
 
-        function copyInstallCmd() {
-            var cmd = 'curl -fsSL ' + location.protocol + '//' + location.host + '/agent/install | sh';
+        function copyCmd(id) {
+            var host = location.protocol + '//' + location.host;
+            var cmds = {
+                'linux-run': 'curl -fsSL ' + host + '/agent/install | sh',
+                'linux-dl':  'curl -fsSL ' + host + '/agent/install | sh -s -- --download-only',
+                'win-run':   'irm ' + host + '/agent/install.ps1 | iex',
+                'win-dl':    '& ([scriptblock]::Create((irm ' + host + '/agent/install.ps1))) --download-only'
+            };
+            var cmd = cmds[id];
             navigator.clipboard.writeText(cmd).then(function() {
-                var btn = document.querySelector('.install-cmd .copy-btn');
+                var code = document.getElementById(id);
+                var btn = code.parentElement.querySelector('.copy-btn');
                 btn.textContent = 'copied!';
                 btn.classList.add('copied');
                 setTimeout(function() { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 2000);

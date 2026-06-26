@@ -799,6 +799,21 @@ body {
     font-size: 0.88rem;
     margin-bottom: 1rem;
 }
+.install-block {
+    text-align: left;
+    margin-bottom: 1.25rem;
+}
+.install-label {
+    color: var(--text-primary);
+    font-size: 0.82rem;
+    font-weight: 600;
+    margin: 0 0 0.4rem 0.25rem;
+}
+.install-sub {
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    margin: 0.4rem 0 0.25rem 0.25rem;
+}
 .install-cmd {
     display: flex;
     align-items: center;

@@ -280,6 +280,7 @@ mod tests {
             .route("/files.js", get(static_handler))
             .route("/session.js", get(static_handler))
             .route("/agent/install", get(install_script_handler))
+            .route("/agent/install.ps1", get(install_script_ps1_handler))
             .fallback(get(static_handler))
             .layer(cors)
             .with_state(state);
@@ -360,6 +361,25 @@ mod tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("RELAY_URL=\"http://localhost\""));
+    }
+
+    #[tokio::test]
+    async fn test_install_script_ps1_handler_returns_script() {
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", "example.com:3000".parse().unwrap());
+        let resp = install_script_ps1_handler(State(state), headers)
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("$RELAY_URL = \"http://example.com:3000\""));
+        assert!(text.contains("agent --relay-url"));
+        assert!(text.contains("Invoke-WebRequest"));
+        assert!(text.contains("--download-only"));
     }
 
     #[tokio::test]
@@ -546,6 +566,34 @@ pub async fn install_script_handler(
     )
 }
 
+pub async fn install_script_ps1_handler(
+    State(_state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| *v == "https")
+        .map(|_| "https")
+        .unwrap_or("http");
+    let relay_url = format!("{}://{}", proto, host);
+
+    let script = include_str!("../../web/install.ps1").replace("__RELAY_URL__", &relay_url);
+
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        script,
+    )
+}
+
 pub async fn start(bind: String, server_auth: Option<String>) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -585,6 +633,7 @@ pub async fn start(bind: String, server_auth: Option<String>) -> anyhow::Result<
             axum::routing::post(mcp::messages_handler),
         )
         .route("/agent/install", get(install_script_handler))
+        .route("/agent/install.ps1", get(install_script_ps1_handler))
         .route("/", get(static_handler))
         .route("/session", get(static_handler))
         .route("/style.css", get(static_handler))

@@ -2,7 +2,9 @@
 set -e
 
 # shell-remote one-line agent install script
-# DO NOT run directly — use: curl -fsSL <relay>/agent/install | sh
+# DO NOT run directly — use:
+#   run:      curl -fsSL <relay>/agent/install | sh
+#   download: curl -fsSL <relay>/agent/install | sh -s -- --download-only
 
 RELAY_URL="__RELAY_URL__"
 
@@ -14,11 +16,21 @@ case "$ARCH" in
     *) echo "[shell-remote] unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-TMPDIR="/dev/shm"
-if [ ! -w "$TMPDIR" ]; then
-    TMPDIR="${TMPDIR:-/tmp}"
+# --download-only: save the binary to the current directory and do not run it.
+DOWNLOAD_ONLY=0
+for a in "$@"; do
+    [ "$a" = "--download-only" ] && DOWNLOAD_ONLY=1
+done
+
+if [ "$DOWNLOAD_ONLY" = "1" ]; then
+    BIN="./shell-remote"
+else
+    TMPDIR="/dev/shm"
+    if [ ! -w "$TMPDIR" ]; then
+        TMPDIR="/tmp"
+    fi
+    BIN="$TMPDIR/shell-remote-$$"
 fi
-BIN="$TMPDIR/shell-remote-$$"
 
 BASE="https://github.com/zzttzzmyswy/shell-remote/releases/latest/download"
 URLS="
@@ -44,6 +56,11 @@ if [ ! -f "$BIN" ] || [ ! -s "$BIN" ]; then
 fi
 
 chmod +x "$BIN"
+
+if [ "$DOWNLOAD_ONLY" = "1" ]; then
+    echo "[shell-remote] saved to $BIN (not executed)"
+    exit 0
+fi
 
 cleanup() {
     rm -f "$BIN"

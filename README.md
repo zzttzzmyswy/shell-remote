@@ -103,9 +103,24 @@ session: a1b2c3d4
 
 系统要求：Windows 10 1809+（ConPTY 最低版本）。
 
-安装：下载 release 中的 `shell-remote-x86_64.exe`，重命名为 `shell-remote.exe`，或 `cargo install --path .`。
+一行命令安装并运行（relay 地址自动注入）：
 
-启动：
+```powershell
+# 默认 cmd
+irm http://your-relay:3000/agent/install.ps1 | iex
+
+# 或手动下载 release 中的 shell-remote-x86_64.exe 重命名为 shell-remote.exe
+```
+
+仅下载到当前目录不执行：
+
+```powershell
+& ([scriptblock]::Create((irm http://your-relay:3000/agent/install.ps1))) --download-only
+```
+
+> Linux/macOS 等价命令：`curl -fsSL http://your-relay:3000/agent/install | sh`（运行）或 `... | sh -s -- --download-only`（仅下载）。
+
+手动启动：
 
 ```powershell
 # 默认 cmd
@@ -242,7 +257,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 119 passed; 0 failed (含集成测试)
+# 120 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证

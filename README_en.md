@@ -96,9 +96,24 @@ Open `http://<relay-ip>:3000`, enter server password and token. Main area: xterm
 
 Requirements: Windows 10 1809+ (ConPTY minimum).
 
-Install: download `shell-remote-x86_64.exe` from releases, rename to `shell-remote.exe`, or `cargo install --path .`.
+One-line install & run (relay URL auto-injected):
 
-Start:
+```powershell
+# default cmd
+irm http://your-relay:3000/agent/install.ps1 | iex
+
+# or manually download shell-remote-x86_64.exe from releases and rename to shell-remote.exe
+```
+
+Download to the current directory without running:
+
+```powershell
+& ([scriptblock]::Create((irm http://your-relay:3000/agent/install.ps1))) --download-only
+```
+
+> Linux/macOS equivalent: `curl -fsSL http://your-relay:3000/agent/install | sh` (run) or `... | sh -s -- --download-only` (download only).
+
+Manual start:
 
 ```powershell
 # default cmd
@@ -205,7 +220,7 @@ Token is passed in arguments, not in URL or headers. Commands execute via `sh -c
 
 ```bash
 cargo test
-# 119 passed; 0 failed (including integration test)
+# 120 passed; 0 failed (including integration test)
 ```
 
 ## License
