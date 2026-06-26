@@ -99,6 +99,44 @@ session: a1b2c3d4
 
 打开 `http://<relay-ip>:3000`，输入服务器密码及 Token 即可连接。主区域为 xterm.js 终端，右侧为文件管理器。
 
+## Windows Agent
+
+系统要求：Windows 10 1809+（ConPTY 最低版本）。
+
+安装：下载 release 中的 `shell-remote-x86_64.exe`，重命名为 `shell-remote.exe`，或 `cargo install --path .`。
+
+启动：
+
+```powershell
+# 默认 cmd
+shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx
+
+# 使用 PowerShell
+shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx --shell powershell.exe
+```
+
+注意事项：建议以管理员身份运行以完整访问文件系统；交互式程序（ssh/vim）在 MCP exec 路径暂不支持；文件上传（upload）在 Windows agent 暂不支持，请用 `fs:write`（base64）替代，文件下载（read）正常。
+
+### Windows 交叉编译（从 Linux）
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+# 需 x86_64-w64-mingw32-gcc（mingw-w64）
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+### 功能对比
+
+| 功能 | Linux/macOS | Windows |
+|------|-------------|---------|
+| PTY 交互式 Shell | ✅ | ✅（ConPTY） |
+| 命令执行 | ✅ | ✅（cmd / pwsh） |
+| 文件浏览/读写/改名/删除 | ✅ | ✅ |
+| 文件下载（read） | ✅ | ✅ |
+| 文件上传（upload） | ✅ | ❌（用 fs:write 替代） |
+| 交互式程序(ssh/vim) | ✅ | ⚠️ exec 路径不支持 |
+| 文件权限位(mode) | ✅ | 显示占位（无 POSIX 权限） |
+
 ## API 端点
 
 所有端点统一在 `/agent` 路径下：
@@ -204,7 +242,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 114 passed; 0 failed (含集成测试)
+# 119 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证

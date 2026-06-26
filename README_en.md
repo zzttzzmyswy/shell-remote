@@ -92,6 +92,44 @@ session: a1b2c3d4
 
 Open `http://<relay-ip>:3000`, enter server password and token. Main area: xterm.js terminal. Right drawer: file manager.
 
+## Windows Agent
+
+Requirements: Windows 10 1809+ (ConPTY minimum).
+
+Install: download `shell-remote-x86_64.exe` from releases, rename to `shell-remote.exe`, or `cargo install --path .`.
+
+Start:
+
+```powershell
+# default cmd
+shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx
+
+# using PowerShell
+shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx --shell powershell.exe
+```
+
+Notes: run as administrator for full filesystem access; interactive programs (ssh/vim) are not supported in the MCP exec path; file upload (upload) is not supported on the Windows agent — use `fs:write` (base64) instead; file download (read) works.
+
+### Cross-compile from Linux
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+# requires x86_64-w64-mingw32-gcc (mingw-w64)
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+### Feature comparison
+
+| Feature | Linux/macOS | Windows |
+|---------|-------------|---------|
+| PTY interactive shell | ✅ | ✅ (ConPTY) |
+| Command execution | ✅ | ✅ (cmd / pwsh) |
+| File browse/read/write/rename/delete | ✅ | ✅ |
+| File download (read) | ✅ | ✅ |
+| File upload (upload) | ✅ | ❌ (use fs:write) |
+| Interactive programs (ssh/vim) | ✅ | ⚠️ not supported in exec path |
+| File permission bits (mode) | ✅ | placeholder (no POSIX perms) |
+
 ## API Endpoints
 
 | Path | Method | Description |
@@ -167,7 +205,7 @@ Token is passed in arguments, not in URL or headers. Commands execute via `sh -c
 
 ```bash
 cargo test
-# 114 passed; 0 failed (including integration test)
+# 119 passed; 0 failed (including integration test)
 ```
 
 ## License
