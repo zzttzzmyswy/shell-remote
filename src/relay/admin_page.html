@@ -606,11 +606,11 @@
 
     // Actions
     const tdA = document.createElement('td'); tdA.className = 'actions';
-    const toks = s.tokens || [];
-    const connectToken = (toks.find(tk => tk.permission === 'rw') || toks[0] || null);
+    const connToks = s.tokens || [];
+    const connectToken = (connToks.find(tk => tk.permission === 'rw') || connToks[0] || null);
     const conn = document.createElement('button'); conn.className = 'btn btn-sm btn-primary';
     if (connectToken) {
-      const isRo = !toks.find(tk => tk.permission === 'rw');
+      const isRo = !connToks.find(tk => tk.permission === 'rw');
       conn.textContent = isRo ? t('connect_ro') : t('connect');
       conn.title = t('connect');
       conn.addEventListener('click', () => {
