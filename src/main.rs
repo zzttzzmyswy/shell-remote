@@ -73,6 +73,12 @@ enum Command {
         #[cfg(not(windows))]
         #[arg(long, env = "SHELL", default_value = "/bin/bash")]
         shell: String,
+
+        /// Stable session id (5-20 ASCII alphanumeric) shown in the admin
+        /// panel to distinguish devices. If it collides with an in-use id the
+        /// relay rejects registration and the agent exits. Omit for a random id.
+        #[arg(long)]
+        session_id: Option<String>,
     },
 }
 
@@ -106,9 +112,21 @@ async fn main() -> anyhow::Result<()> {
             root,
             token_type,
             shell,
+            session_id,
         } => {
+            let desired = match session_id.as_deref() {
+                Some(s) => {
+                    if !crate::proto::is_valid_custom_session_id(s) {
+                        tracing::error!("--session-id must be 5-20 ASCII alphanumeric chars");
+                        anyhow::bail!("invalid --session-id");
+                    }
+                    Some(s.to_string())
+                }
+                None => None,
+            };
             let root = root.unwrap_or_else(agent::home_dir);
-            agent::start(relay_url, key, root, token_type.as_str().to_string(), shell).await?;
+            agent::start(relay_url, key, root, token_type.as_str().to_string(), shell, desired)
+                .await?;
         }
     }
 

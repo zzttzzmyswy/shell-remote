@@ -135,6 +135,7 @@ pub async fn start(
     root: String,
     token_type: String,
     shell_path: String,
+    session_id: Option<String>,
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_secs(1);
     let max_delay = Duration::from_secs(300);
@@ -149,6 +150,7 @@ pub async fn start(
             &root,
             &token_type,
             &shell_path,
+            session_id.as_deref(),
             cached_tokens.as_deref(),
         )
         .await
@@ -174,11 +176,18 @@ async fn run_session(
     root: &str,
     token_type: &str,
     shell_path: &str,
+    session_id: Option<&str>,
     cached_tokens: Option<&[(String, String)]>,
 ) -> anyhow::Result<Option<Vec<(String, String)>>> {
-    let mut client =
-        RelayClient::connect_with_retry(relay_url, key.clone(), token_type, cached_tokens, 10)
-            .await?;
+    let mut client = RelayClient::connect_with_retry(
+        relay_url,
+        key.clone(),
+        token_type,
+        session_id,
+        cached_tokens,
+        10,
+    )
+    .await?;
 
     tracing::info!(session = %client.session_id, "agent session established");
     for (token, perm) in &client.tokens {

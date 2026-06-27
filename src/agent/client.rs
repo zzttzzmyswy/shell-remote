@@ -25,6 +25,7 @@ impl RelayClient {
         relay_url: &str,
         fixed_key: Option<String>,
         token_type: &str,
+        desired_session_id: Option<&str>,
         cached_tokens: Option<&[(String, String)]>,
     ) -> anyhow::Result<Self> {
         let base = relay_url.trim_end_matches('/');
@@ -34,7 +35,7 @@ impl RelayClient {
 
         // On reconnect, replay the cached tokens so the relay reuses them
         // instead of minting new random ones (keeps shared tokens stable).
-        let register_msg = if let Some(ct) = cached_tokens {
+        let mut register_msg = if let Some(ct) = cached_tokens {
             let arr: Vec<serde_json::Value> = ct
                 .iter()
                 .map(|(tok, perm)| json!({"token": tok, "permission": perm}))
@@ -50,6 +51,9 @@ impl RelayClient {
                 "token_type": token_type
             })
         };
+        if let Some(sid) = desired_session_id {
+            register_msg["session_id"] = json!(sid);
+        }
 
         let resp = http_client
             .post(&send_url)
@@ -200,6 +204,7 @@ impl RelayClient {
         relay_url: &str,
         fixed_key: Option<String>,
         token_type: &str,
+        desired_session_id: Option<&str>,
         cached_tokens: Option<&[(String, String)]>,
         max_retries: u32,
     ) -> anyhow::Result<Self> {
@@ -208,7 +213,14 @@ impl RelayClient {
         let max_delay = tokio::time::Duration::from_secs(300);
 
         for attempt in 0..=max_retries {
-            match Self::connect_http(relay_url, fixed_key.clone(), token_type, cached_tokens).await
+            match Self::connect_http(
+                relay_url,
+                fixed_key.clone(),
+                token_type,
+                desired_session_id,
+                cached_tokens,
+            )
+            .await
             {
                 Ok(client) => return Ok(client),
                 Err(e) => {
