@@ -40,6 +40,11 @@ enum Command {
         /// Admin login password (required when --admin-path is set)
         #[arg(long)]
         admin_pass: Option<String>,
+
+        /// Directory to record terminal sessions to (asciinema cast v2). Unset
+        /// disables recording entirely.
+        #[arg(long)]
+        record_dir: Option<String>,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -91,8 +96,9 @@ async fn main() -> anyhow::Result<()> {
             admin_path,
             admin_user,
             admin_pass,
+            record_dir,
         } => {
-            relay::start(bind, auth, admin_path, admin_user, admin_pass).await?;
+            relay::start(bind, auth, admin_path, admin_user, admin_pass, record_dir).await?;
         }
         Command::Agent {
             relay_url,

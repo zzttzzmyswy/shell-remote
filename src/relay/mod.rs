@@ -629,6 +629,7 @@ pub async fn start(
     admin_path: Option<String>,
     admin_user: Option<String>,
     admin_pass: Option<String>,
+    record_dir: Option<String>,
 ) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -660,13 +661,27 @@ pub async fn start(
     use axum::Router;
     use tower_http::cors::{Any, CorsLayer};
 
+    // Build the recorder if --record-dir was supplied. Create the directory
+    // up front so a bad path fails fast at startup.
+    let recorder: Option<std::sync::Arc<recorder::Recorder>> = match &record_dir {
+        Some(d) if !d.is_empty() => {
+            let dir = std::path::PathBuf::from(d);
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| anyhow::anyhow!("--record-dir {:?}: {}", d, e))?;
+            tracing::info!(dir = %dir.display(), "session recording enabled");
+            Some(std::sync::Arc::new(recorder::Recorder::new(dir)))
+        }
+        _ => None,
+    };
+
     let state = Arc::new(SharedState::new(
         auth,
         100 * 1024 * 1024,
         admin_path_v.clone(),
         admin_user_v.clone().unwrap_or_default(),
         admin_pass_v.clone().unwrap_or_default(),
-        None,
+        recorder,
     ));
 
     let cors = CorsLayer::new()
