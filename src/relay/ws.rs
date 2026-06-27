@@ -615,13 +615,7 @@ mod tests {
     use tokio::sync::{oneshot, RwLock};
 
     fn make_state(server_auth: &str) -> Arc<SharedState> {
-        Arc::new(SharedState::new(
-            server_auth.to_string(),
-            100 * 1024 * 1024,
-            None,
-            String::new(),
-            String::new(),
-        ))
+        Arc::new(SharedState::new(server_auth.to_string(), 100 * 1024 * 1024, None, String::new(), String::new(), None))
     }
 
     async fn insert_channel_map(

@@ -379,6 +379,7 @@ mod tests {
             Some("/admin-test".to_string()),
             user.to_string(),
             pass.to_string(),
+            None,
         ))
     }
 

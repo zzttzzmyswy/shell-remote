@@ -19,6 +19,7 @@ mod integration_tests {
             None,
             String::new(),
             String::new(),
+            None,
         ));
 
         use axum::routing::get;

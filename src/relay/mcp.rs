@@ -366,13 +366,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot, RwLock};
 
     fn make_state() -> Arc<SharedState> {
-        Arc::new(SharedState::new(
-            String::new(),
-            100 * 1024 * 1024,
-            None,
-            String::new(),
-            String::new(),
-        ))
+        Arc::new(SharedState::new(String::new(), 100 * 1024 * 1024, None, String::new(), String::new(), None))
     }
 
     async fn mcp_send_and_recv(

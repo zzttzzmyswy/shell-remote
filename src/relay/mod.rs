@@ -53,6 +53,9 @@ pub struct SharedState {
     pub admin_sessions: RwLock<HashMap<String, Instant>>,
     /// Relay process start time, for the admin uptime display.
     pub started_at: Instant,
+    /// asciinema cast recorder. `None` when `--record-dir` is unset, in which
+    /// case recording is fully disabled and the capture guards are no-ops.
+    pub recorder: Option<Arc<recorder::Recorder>>,
 }
 
 pub struct RateLimiter {
@@ -127,6 +130,7 @@ impl SharedState {
         admin_path: Option<String>,
         admin_user: String,
         admin_pass: String,
+        recorder: Option<Arc<recorder::Recorder>>,
     ) -> Self {
         Self {
             sessions: SessionRegistry::new(),
@@ -143,6 +147,7 @@ impl SharedState {
             admin_pass,
             admin_sessions: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
+            recorder,
         }
     }
 
@@ -279,7 +284,7 @@ mod tests {
         use axum::Router;
         use tower_http::cors::{Any, CorsLayer};
 
-        let state = Arc::new(SharedState::new("test".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
+        let state = Arc::new(SharedState::new("test".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -314,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_unauthorized_no_token() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let headers = HeaderMap::new();
         let params = HashMap::new();
         let body = Body::from("test content");
@@ -324,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_readonly_token_forbidden() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let (_sid, tokens) = state.sessions.register(None, "ro", None).await.unwrap();
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
@@ -341,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_returns_script() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "example.com:3000".parse().unwrap());
         let resp = install_script_handler(State(state), headers)
@@ -359,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_https_forwarded() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "example.com".parse().unwrap());
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
@@ -375,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_handler_default_host() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let headers = axum::http::HeaderMap::new();
         let resp = install_script_handler(State(state), headers)
             .await
@@ -389,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_script_ps1_handler_returns_script() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "example.com:3000".parse().unwrap());
         let resp = install_script_ps1_handler(State(state), headers)
@@ -408,7 +413,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_handler_missing_path() {
-        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new()));
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let (_sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
@@ -661,6 +666,7 @@ pub async fn start(
         admin_path_v.clone(),
         admin_user_v.clone().unwrap_or_default(),
         admin_pass_v.clone().unwrap_or_default(),
+        None,
     ));
 
     let cors = CorsLayer::new()
