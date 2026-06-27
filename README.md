@@ -70,6 +70,7 @@ cargo build --release
 |------|--------|------|
 | `--bind` | `0.0.0.0:3000` | 监听地址 |
 | `--auth` | 无默认值 | 服务器密码（必填） |
+| `--record-dir` | 无 | 终端会话录制目录（asciinema cast v2）；不设则不录制 |
 
 ### 启动 Agent
 
@@ -84,6 +85,7 @@ cargo build --release
 | `--root` | `$HOME` | 文件管理器默认目录 |
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
 | `--shell` | `/bin/bash` | Shell 路径 |
+| `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；冲突则启动失败 |
 
 输出示例：
 
@@ -187,6 +189,8 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
 - **概览**：版本、运行时间、agent 总数/在线数、浏览器总数、每会话 Token 列表与权限、连接浏览器数。
 - **Token 管理**：撤销单个 Token、重生成会话 Token（旧 Token 失效）、切换 Token 权限（rw↔ro）。
 - **会话标签**：给已有会话打标签（如 prod/db），按标签筛选；标签内存级，随会话存亡。
+- **跳转终端**：每会话"连接"按钮，新标签页打开该会话的浏览器终端（token 预填，服务器密码仍需手填）。
+- **会话录制**：`--record-dir` 启用后，交互式终端 I/O（输出+输入）以 asciinema cast v2 落盘；后台显示录制状态，文件可用 `asciinema play` 回放。
 - **踢出会话**：断开该 agent 及其所有浏览器并撤销其 Token。
 - **服务器密码**：查看当前 `--auth`、在线修改（即时生效）。
 - **中英文切换**：后台界面右上角切换中/英文（自动探测浏览器语言，localStorage 记忆）。
@@ -197,6 +201,19 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
 - 双层保护：秘密路径（隐藏入口）+ 账户密码登录。
 - admin session 仅存内存，relay 重启需重新登录。
 - 已知局限：撤销/重生成 Token 后，若 agent 用 `register_existing`（带 Token 重连）重连，可能重新带回该 Token；不影响在线会话。
+
+## 会话录制
+
+relay 加 `--record-dir <目录>` 即可录制交互式终端会话（不含 MCP exec）：
+
+```bash
+shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 --record-dir /var/log/shell-remote
+```
+
+- 格式：asciinema cast v2（JSONL），可用 `asciinema play xxx.cast` 或 xterm.js 回放。
+- 录制输出 + 输入流；**输入流会包含终端里键入的敏感内容（如 sudo 密码），请妥善保护录制目录的文件权限**。
+- 每会话一个文件 `{session_id}_{unix时间戳}.cast`；agent 用 `--session-id` 指定后文件名即该 ID。
+- 录制在 relay 侧捕获，不影响 agent；踢出/空闲回收会话时文件自动 flush 关闭。
 
 ## AI Agent 接入 (MCP)
 
@@ -289,7 +306,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 135 passed; 0 failed (含集成测试)
+# 150 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证

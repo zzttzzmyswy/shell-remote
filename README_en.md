@@ -65,6 +65,7 @@ cargo build --release
 |------|---------|-------------|
 | `--bind` | `0.0.0.0:3000` | Listen address |
 | `--auth` | none | Server password (required) |
+| `--record-dir` | none | Directory to record terminal sessions (asciinema cast v2); unset disables |
 
 ### Start Agent
 
@@ -80,6 +81,7 @@ cargo build --release
 | `--root` | `$HOME` | File manager default directory |
 | `--token-type` | `rw` | Token type: `rw`, `ro`, or `both` |
 | `--shell` | `/bin/bash` | Shell binary path |
+| `--session-id` | — | Custom session id (5-20 alphanumeric) shown in admin to distinguish devices; conflicts abort startup |
 
 Output:
 
@@ -178,6 +180,8 @@ Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in 
 - **Overview**: version, uptime, agent total/online, browser total, per-session token list with permissions, connected browser count.
 - **Token management**: revoke a single token, regenerate a session's tokens (old ones invalidated), toggle token permission (rw↔ro).
 - **Session tags**: tag existing sessions (e.g. prod/db) and filter by tag; tags are in-memory, scoped to the session's lifetime.
+- **Jump to terminal**: per-session "Connect" button opens that session's browser terminal in a new tab (token pre-filled; server password still typed manually).
+- **Session recording**: with `--record-dir`, interactive terminal I/O (output + input) is written as asciinema cast v2; the panel shows recording status; files replay with `asciinema play`.
 - **Kick session**: disconnect that agent and all its browsers and invalidate its tokens.
 - **Server password**: view the current `--auth`, rotate it live (takes effect immediately).
 - **Chinese / English toggle**: switch the panel UI between zh and en (auto-detects browser language, remembered in localStorage).
@@ -188,6 +192,19 @@ Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in 
 - Two layers: secret path (hidden entry) + user/password login.
 - Admin sessions live in memory only; relay restart requires re-login.
 - Known limitation: after revoking/regenerating a token, an agent that reconnects via `register_existing` (replaying its cached tokens) may re-introduce that token; does not affect the live session.
+
+## Session Recording
+
+Add `--record-dir <dir>` to record interactive terminal sessions (MCP exec is not recorded):
+
+```bash
+shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 --record-dir /var/log/shell-remote
+```
+
+- Format: asciinema cast v2 (JSONL); replay with `asciinema play xxx.cast` or xterm.js.
+- Records output + input streams; **the input stream includes sensitive keystrokes typed in the terminal (e.g. sudo passwords) — protect the record directory's filesystem permissions**.
+- One file per session: `{session_id}_{unix_timestamp}.cast`; with agent `--session-id`, the filename is that id.
+- Captured at the relay; no agent change. Kicked/idle-reaped sessions flush and close their files.
 
 ## AI Agent Integration (MCP)
 
@@ -252,7 +269,7 @@ Token is passed in arguments, not in URL or headers. Commands execute via `sh -c
 
 ```bash
 cargo test
-# 135 passed; 0 failed (including integration test)
+# 150 passed; 0 failed (including integration test)
 ```
 
 ## License
