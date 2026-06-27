@@ -188,9 +188,36 @@ pub fn requires_write(msg_type: &str) -> bool {
     true
 }
 
+/// Validate a client-supplied custom session id: 5-20 ASCII alphanumeric
+/// chars. Used by both the agent (CLI validation) and the relay (register
+/// validation). No regex dependency — a byte loop.
+pub fn is_valid_custom_session_id(s: &str) -> bool {
+    let len = s.len();
+    (5..=20).contains(&len) && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_valid_custom_session_id() {
+        assert!(is_valid_custom_session_id("mydev01"));
+        assert!(is_valid_custom_session_id("abcde"));
+        assert!(is_valid_custom_session_id("a1b2c3d4e5f6g7h8i9j0")); // exactly 20
+        // too short
+        assert!(!is_valid_custom_session_id("ab"));
+        assert!(!is_valid_custom_session_id("abcd")); // 4
+        // too long
+        assert!(!is_valid_custom_session_id("a1b2c3d4e5f6g7h8i9j0k")); // 21
+        // non-alphanumeric
+        assert!(!is_valid_custom_session_id("ab cd")); // space
+        assert!(!is_valid_custom_session_id("a-b")); // hyphen
+        assert!(!is_valid_custom_session_id("dev_01")); // underscore
+        assert!(!is_valid_custom_session_id("你好你好你好")); // non-ascii
+        // empty
+        assert!(!is_valid_custom_session_id(""));
+    }
 
     #[test]
     fn test_message_roundtrip() {
