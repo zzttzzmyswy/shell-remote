@@ -771,6 +771,10 @@ pub async fn start(
                         .write()
                         .await
                         .remove(&session_id);
+                    // Flush + close the recording file, if any.
+                    if let Some(rec) = &state_clone.recorder {
+                        rec.close(&session_id);
+                    }
                 }
             }
         });

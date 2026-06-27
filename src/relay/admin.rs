@@ -165,6 +165,7 @@ pub async fn overview_handler(
             "browser_count": browser_count,
             "tokens": tokens,
             "tags": info.tags,
+            "recording": state.recorder.as_ref().map_or(false, |r| r.is_recording(sid)),
         }));
     }
     drop(broadcasts);
@@ -175,6 +176,7 @@ pub async fn overview_handler(
         "agent_online": agent_online,
         "browser_count": browser_total,
         "sessions": sess_json,
+        "recording_enabled": state.recorder.is_some(),
     }))
     .into_response()
 }
@@ -215,6 +217,9 @@ pub async fn kick_handler(
     state.sessions.remove(&sid).await;
     state.agent_event_buffers.write().await.remove(&sid);
     state.last_activity.write().await.remove(&sid);
+    if let Some(rec) = &state.recorder {
+        rec.close(&sid);
+    }
     Json(json!({"ok": true})).into_response()
 }
 
@@ -549,5 +554,49 @@ mod tests {
                 .await;
         assert_eq!(r.status(), 200);
         assert_eq!(&*state.server_auth.read().await, "new-pw");
+    }
+
+    #[tokio::test]
+    async fn test_overview_reports_recording_flags() {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-rec-ov-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorder = std::sync::Arc::new(crate::relay::recorder::Recorder::new(dir));
+        let state = Arc::new(crate::relay::SharedState::new(
+            "relay-pw".to_string(),
+            100 * 1024 * 1024,
+            Some("/admin-test".to_string()),
+            "admin".to_string(),
+            "s3cret".to_string(),
+            Some(recorder.clone()),
+        ));
+        let (sid, _t) = state.sessions.register(None, "rw", None).await.unwrap();
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        // No event yet → not recording
+        let r = overview_handler(State(state.clone()), cookie_headers("tok")).await;
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["recording_enabled"], true);
+        assert_eq!(v["sessions"][0]["recording"], false);
+        // Fire an event
+        recorder.record(&sid, crate::relay::recorder::RecordEvent::Output("x".into()));
+        let r = overview_handler(State(state.clone()), cookie_headers("tok")).await;
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["sessions"][0]["recording"], true);
+        recorder.close(&sid);
     }
 }
