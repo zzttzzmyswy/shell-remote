@@ -225,6 +225,7 @@ pub fn write_file(root: &Path, user_path: &str, content_b64: &str) -> FsResultPa
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn write_file_bytes(root: &Path, user_path: &str, data: &[u8]) -> FsResultPayload {
     let path = match resolve_path(root, user_path) {
         Some(p) => p,

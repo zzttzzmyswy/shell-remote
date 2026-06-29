@@ -39,7 +39,15 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "mcp:result",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {
-            let is_mcp_rpc = proto_msg.payload.get("_mcp_request_id").is_some();
+            // fs:result is browser-facing (file manager reads + downloads).
+            // A browser download reuses `_mcp_request_id` as its correlation
+            // id, so it must still be broadcast — treating it as an MCP RPC
+            // reply would swallow it (the download was never registered in
+            // pending_mcp). MCP RPC replies use mcp:result / mcp:exec_result,
+            // never fs:result. The fs:result oneshot block below only fires
+            // for entries actually in pending_mcp, so it stays harmless.
+            let is_mcp_rpc = proto_msg.msg_type != "fs:result"
+                && proto_msg.payload.get("_mcp_request_id").is_some();
             if !is_mcp_rpc {
                 let sse_sessions = state.sse_sessions.read().await;
                 let broadcast = state.agent_broadcast.read().await;
@@ -757,6 +765,27 @@ mod tests {
         let result = rx.try_recv().unwrap();
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["success"].as_bool().unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn test_route_agent_message_fs_result_download_broadcasts_to_browser() {
+        // A browser download reuses `_mcp_request_id` as its correlation id.
+        // The fs:result reply must still be broadcast to the browser (it was
+        // never registered in pending_mcp), otherwise the download never
+        // arrives. This is the download fix.
+        let state = make_state("");
+        insert_channel_map(&state, "sid1").await;
+        let mut rx = add_browser(&state, "sid1", "user1").await;
+
+        let msg = json!({"type":"fs:result","session_id":"sid1","payload":{"success":true,"content":"aGk=","path":"/tmp/x","_mcp_request_id":"dl-1"}}).to_string();
+        route_agent_message(&state, "sid1", &msg).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await.unwrap().unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["type"], "fs:result");
+        assert_eq!(v["payload"]["_mcp_request_id"], "dl-1");
+        assert_eq!(v["payload"]["content"], "aGk=");
     }
 
     #[tokio::test]

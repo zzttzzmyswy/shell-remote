@@ -132,7 +132,7 @@ shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx
 shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx --shell powershell.exe
 ```
 
-注意事项：建议以管理员身份运行以完整访问文件系统；交互式程序（ssh/vim）在 MCP exec 路径暂不支持；文件上传（upload）在 Windows agent 暂不支持，请用 `fs:write`（base64）替代，文件下载（read）正常。
+注意事项：建议以管理员身份运行以完整访问文件系统；交互式程序（ssh/vim）在 MCP exec 路径暂不支持；文件下载（read）正常。
 
 ### Windows 交叉编译（从 Linux）
 
@@ -150,7 +150,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 | 命令执行 | ✅ | ✅（cmd / pwsh） |
 | 文件浏览/读写/改名/删除 | ✅ | ✅ |
 | 文件下载（read） | ✅ | ✅ |
-| 文件上传（upload） | ✅ | ❌（用 fs:write 替代） |
+| 文件上传（upload） | ✅ | ✅ |
 | 交互式程序(ssh/vim) | ✅ | ⚠️ exec 路径不支持 |
 | 文件权限位(mode) | ✅ | 显示占位（无 POSIX 权限） |
 
@@ -306,7 +306,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 151 passed; 0 failed (含集成测试)
+# 155 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证

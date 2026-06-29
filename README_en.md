@@ -125,7 +125,7 @@ shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx
 shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx --shell powershell.exe
 ```
 
-Notes: run as administrator for full filesystem access; interactive programs (ssh/vim) are not supported in the MCP exec path; file upload (upload) is not supported on the Windows agent — use `fs:write` (base64) instead; file download (read) works.
+Notes: run as administrator for full filesystem access; interactive programs (ssh/vim) are not supported in the MCP exec path; file download (read) works.
 
 ### Cross-compile from Linux
 
@@ -143,7 +143,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 | Command execution | ✅ | ✅ (cmd / pwsh) |
 | File browse/read/write/rename/delete | ✅ | ✅ |
 | File download (read) | ✅ | ✅ |
-| File upload (upload) | ✅ | ❌ (use fs:write) |
+| File upload (upload) | ✅ | ✅ |
 | Interactive programs (ssh/vim) | ✅ | ⚠️ not supported in exec path |
 | File permission bits (mode) | ✅ | placeholder (no POSIX perms) |
 
@@ -269,7 +269,7 @@ Token is passed in arguments, not in URL or headers. Commands execute via `sh -c
 
 ```bash
 cargo test
-# 151 passed; 0 failed (including integration test)
+# 155 passed; 0 failed (including integration test)
 ```
 
 ## License

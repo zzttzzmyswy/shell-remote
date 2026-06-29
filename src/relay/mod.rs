@@ -427,6 +427,44 @@ mod tests {
         assert_eq!(result, Err(StatusCode::BAD_REQUEST));
     }
 
+    #[tokio::test]
+    async fn test_upload_handler_sends_base64_content_to_agent() {
+        // The agent runs on a different host than the relay, so the relay must
+        // ship uploaded bytes as base64 `content` (not a temp_path the agent
+        // can't read). Verify the fs:upload message carries decodable content
+        // and no temp_path.
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
+        let (sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let token = &tokens[0].0;
+
+        let (atx, mut arx) = mpsc::unbounded_channel::<String>();
+        let mut cm = ChannelMap::new();
+        cm.agent = Some(atx);
+        state.agent_broadcast.write().await.insert(sid.clone(), cm);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "/tmp/uploaded.txt".to_string());
+        let body = Body::from("hello world");
+        let result = upload_handler(State(state.clone()), headers, Query(params), body).await;
+        assert_eq!(result, Ok(StatusCode::OK));
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), arx.recv())
+            .await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["type"], "fs:upload");
+        assert_eq!(v["payload"]["final_path"], "/tmp/uploaded.txt");
+        assert!(v["payload"].get("temp_path").is_none(), "must not send cross-machine temp_path");
+        let content_b64 = v["payload"]["content"].as_str().unwrap();
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        let decoded = String::from_utf8(B64.decode(content_b64).unwrap()).unwrap();
+        assert_eq!(decoded, "hello world");
+    }
+
     // ── EventBuffer tests ───────────────────────────────────────────
 
     #[test]
@@ -539,12 +577,29 @@ pub async fn upload_handler(
     }
     drop(file);
 
+    // The agent runs on a different machine than the relay, so it cannot
+    // read a temp file on the relay's filesystem. Read the bytes back and
+    // ship them as base64 in the fs:upload message; the agent decodes and
+    // writes them to final_path directly.
+    let data = match tokio::fs::read(&tmp_path).await {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            tracing::error!("Upload temp read failed for {}: {}", path, e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let content_b64 = B64.encode(&data);
+
     let msg = serde_json::json!({
         "type": "fs:upload",
         "session_id": session_id,
         "payload": {
-            "temp_path": tmp_path.to_string_lossy(),
-            "final_path": path
+            "final_path": path,
+            "content": content_b64
         }
     })
     .to_string();
@@ -559,10 +614,9 @@ pub async fn upload_handler(
     }
 
     tracing::info!(
-        "Upload received: {} ({} bytes) -> {}",
+        "Upload received: {} ({} bytes)",
         path,
-        total,
-        tmp_path.display()
+        total
     );
     Ok(StatusCode::OK)
 }
