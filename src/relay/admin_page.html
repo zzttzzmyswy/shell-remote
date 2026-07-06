@@ -563,6 +563,10 @@
       const rec = document.createElement('span'); rec.className = 'row-rec'; rec.textContent = '●REC';
       tdId.appendChild(rec);
     }
+    if (s.mcp_audit) {
+      const aud = document.createElement('span'); aud.className = 'row-rec'; aud.textContent = '●AUDIT';
+      tdId.appendChild(aud);
+    }
     tr.appendChild(tdId);
 
     // Status

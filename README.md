@@ -215,6 +215,20 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 --record-dir /var/lo
 - 每会话一个文件 `{session_id}_{unix时间戳}.cast`；agent 用 `--session-id` 指定后文件名即该 ID。
 - 录制在 relay 侧捕获，不影响 agent；踢出/空闲回收会话时文件自动 flush 关闭。
 
+### MCP 命令审计
+
+启用 `--record-dir` 后，每次 MCP `shell_remote` 工具调用也会被审计（与终端录制同开关、同目录），写入每会话文件 `{session_id}_{unix时间戳}.audit.jsonl`，每行一条 JSON：
+
+```json
+{"ts":"2026-07-06T12:34:56Z","unix_ms":1783339200000,"session_id":"seSupportBot","token_prefix":"b4e2ec42","permission":"rw","cmd":"ls -la","timeout_ms":30000,"duration_ms":12,"status":"ok","exit_code":0,"stdout_len":1234,"stderr_len":0,"stdout":"...","stderr":"..."}
+```
+
+- `status`：`ok` / `timeout` / `disconnected` / `no_agent` / `rejected_readonly`。
+- `token_prefix` 只记 token 前 8 位（足以与后台 token 列表对照，不泄露完整密钥）。
+- `stdout` / `stderr` 截断到 4KB（`stdout_len`/`stderr_len` 为完整长度）。
+- 管理后台概览页每会话显示 `●AUDIT` 标记；踢出/空闲回收会话时审计文件自动 flush 关闭。
+- **审计文件同样可能含命令及输出中的敏感内容，请保护录制目录的文件权限。**
+
 ## AI Agent 接入 (MCP)
 
 ### 配置模板
@@ -317,7 +331,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 166 passed; 0 failed (含集成测试)
+# 174 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证

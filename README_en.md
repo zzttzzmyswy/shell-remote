@@ -206,6 +206,20 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 --record-dir /var/lo
 - One file per session: `{session_id}_{unix_timestamp}.cast`; with agent `--session-id`, the filename is that id.
 - Captured at the relay; no agent change. Kicked/idle-reaped sessions flush and close their files.
 
+### MCP command audit
+
+With `--record-dir` enabled, every MCP `shell_remote` tool call is also audited (same opt-in and directory as terminal recording), written to a per-session file `{session_id}_{unix_timestamp}.audit.jsonl`, one JSON object per line:
+
+```json
+{"ts":"2026-07-06T12:34:56Z","unix_ms":1783339200000,"session_id":"seSupportBot","token_prefix":"b4e2ec42","permission":"rw","cmd":"ls -la","timeout_ms":30000,"duration_ms":12,"status":"ok","exit_code":0,"stdout_len":1234,"stderr_len":0,"stdout":"...","stderr":"..."}
+```
+
+- `status`: `ok` / `timeout` / `disconnected` / `no_agent` / `rejected_readonly`.
+- `token_prefix` stores only the first 8 chars of the token (enough to correlate with the admin token list without leaking the full secret).
+- `stdout` / `stderr` are truncated to 4KB (`stdout_len` / `stderr_len` hold the full lengths).
+- The admin overview shows a `●AUDIT` marker per session; kicked/idle-reaped sessions flush and close their audit file.
+- **Audit files may also contain sensitive data in commands and output — protect the record directory's filesystem permissions.**
+
 ## AI Agent Integration (MCP)
 
 ### Configuration
@@ -280,7 +294,7 @@ Trade-off: when a session's consumer is badly stuck, that session's transfer may
 
 ```bash
 cargo test
-# 166 passed; 0 failed (including integration test)
+# 174 passed; 0 failed (including integration test)
 ```
 
 ## License

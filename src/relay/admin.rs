@@ -166,6 +166,7 @@ pub async fn overview_handler(
             "tokens": tokens,
             "tags": info.tags,
             "recording": state.recorder.as_ref().map_or(false, |r| r.is_recording(sid)),
+            "mcp_audit": state.recorder.as_ref().map_or(false, |r| r.is_auditing(sid)),
         }));
     }
     drop(broadcasts);
@@ -177,6 +178,7 @@ pub async fn overview_handler(
         "browser_count": browser_total,
         "sessions": sess_json,
         "recording_enabled": state.recorder.is_some(),
+        "mcp_audit_enabled": state.recorder.is_some(),
     }))
     .into_response()
 }

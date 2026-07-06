@@ -263,26 +263,37 @@ async fn process_mcp_request(
                 .or(url_token.as_deref())
                 .unwrap_or("");
 
+            // Parse the command up front so every outcome branch (including
+            // rejections) can be audited. Without this, a rejected call would
+            // have no cmd to log.
+            let cmd = arguments.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+            let requested_timeout_ms = arguments.get("timeout_ms").and_then(|v| v.as_u64());
+
             let (session_id, permission) = match state.sessions.authenticate(token).await {
                 Some(r) => r,
                 None => {
+                    // No session resolved → can't attribute to a per-session
+                    // audit file, so nothing to record. (Invalid-token
+                    // attempts aren't "commands run" on any session.)
                     return Some(json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32001,"message":"Invalid token"}}))
                 }
             };
 
-            if permission == Permission::ReadOnly {
-                return Some(json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32002,"message":"Read-only token cannot call shell_remote"}}));
-            }
-
-            let cmd = arguments.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
-            let timeout_ms = arguments.get("timeout_ms").and_then(|v| v.as_u64());
-
-            let mcp_req_id = Uuid::new_v4().to_string();
             // Default 30s, cap 300s (matches the tool description). Always
             // forward the effective timeout so the agent kills the command when
             // the relay gives up — otherwise long commands outlive the MCP
             // client's own timeout and surface as i/o errors.
-            let timeout_ms_val = timeout_ms.unwrap_or(30_000).min(300_000);
+            let timeout_ms_val = requested_timeout_ms.unwrap_or(30_000).min(300_000);
+
+            if permission == Permission::ReadOnly {
+                audit_mcp_call(
+                    &state, &session_id, token, permission, cmd, timeout_ms_val,
+                    0, "rejected_readonly", None, "", "",
+                );
+                return Some(json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32002,"message":"Read-only token cannot call shell_remote"}}));
+            }
+
+            let mcp_req_id = Uuid::new_v4().to_string();
             let payload = json!({
                 "cmd": cmd,
                 "timeout_ms": timeout_ms_val,
@@ -323,18 +334,28 @@ async fn process_mcp_request(
                     }
                     None => {
                         state.pending_mcp.write().await.remove(&mcp_req_id);
+                        audit_mcp_call(
+                            &state, &session_id, token, permission, cmd, timeout_ms_val,
+                            0, "no_agent", None, "", "",
+                        );
                         return Some(json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Error: No agent connected for this session"}],"isError":true}}));
                     }
                 }
             }
 
             let timeout_dur = std::time::Duration::from_millis(timeout_ms_val);
+            let started = std::time::Instant::now();
             match tokio::time::timeout(timeout_dur, rx).await {
                 Ok(Ok(result)) => {
                     let value: Value = serde_json::from_str(&result).unwrap_or_default();
                     let stdout = value.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
                     let stderr = value.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
                     let exit_code = value.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    audit_mcp_call(
+                        &state, &session_id, token, permission, cmd, timeout_ms_val,
+                        duration_ms, "ok", Some(exit_code), stdout, stderr,
+                    );
                     let mut text = String::new();
                     if !stdout.is_empty() {
                         text.push_str(stdout);
@@ -349,6 +370,11 @@ async fn process_mcp_request(
                 }
                 _ => {
                     state.pending_mcp.write().await.remove(&mcp_req_id);
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    audit_mcp_call(
+                        &state, &session_id, token, permission, cmd, timeout_ms_val,
+                        duration_ms, "timeout", None, "", "",
+                    );
                     json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Error: Request timed out or agent disconnected"}],"isError":true}})
                 }
             }
@@ -360,6 +386,56 @@ async fn process_mcp_request(
             "error": {"code": -32601, "message": format!("Unknown method: {}", method)}
         }),
     })
+}
+
+/// Append one MCP command-audit line for a session's `.audit.jsonl` file.
+/// No-op when `--record-dir` is unset (recorder is `None`). The MCP hot path
+/// never blocks on auditing: the recorder's audit writer is fed via an
+/// unbounded channel, so a slow disk can't stall a tool call.
+#[allow(clippy::too_many_arguments)]
+fn audit_mcp_call(
+    state: &SharedState,
+    session_id: &str,
+    token: &str,
+    permission: Permission,
+    cmd: &str,
+    timeout_ms: u64,
+    duration_ms: u64,
+    status: &str,
+    exit_code: Option<i64>,
+    stdout: &str,
+    stderr: &str,
+) {
+    use crate::relay::recorder::{
+        truncate_output, unix_ms, unix_ms_to_iso, token_prefix, AuditLine, AUDIT_OUTPUT_CAP,
+    };
+    let Some(recorder) = &state.recorder else { return; };
+    let (stdout_t, stdout_len) = truncate_output(stdout, AUDIT_OUTPUT_CAP);
+    let (stderr_t, stderr_len) = truncate_output(stderr, AUDIT_OUTPUT_CAP);
+    let perm_str = match permission {
+        Permission::ReadWrite => "rw",
+        Permission::ReadOnly => "ro",
+    };
+    let ms = unix_ms();
+    recorder.audit_mcp(
+        session_id,
+        AuditLine {
+            ts: unix_ms_to_iso(ms),
+            unix_ms: ms,
+            session_id: session_id.to_string(),
+            token_prefix: token_prefix(token),
+            permission: perm_str.to_string(),
+            cmd: cmd.to_string(),
+            timeout_ms,
+            duration_ms,
+            status: status.to_string(),
+            exit_code,
+            stdout_len,
+            stderr_len,
+            stdout: stdout_t,
+            stderr: stderr_t,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -376,6 +452,41 @@ mod tests {
 
     fn make_state() -> Arc<SharedState> {
         Arc::new(SharedState::new(String::new(), 100 * 1024 * 1024, None, String::new(), String::new(), None))
+    }
+
+    fn make_state_with_recorder(dir: std::path::PathBuf) -> Arc<SharedState> {
+        let recorder = std::sync::Arc::new(crate::relay::recorder::Recorder::new(dir));
+        Arc::new(SharedState::new(
+            String::new(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+            Some(recorder),
+        ))
+    }
+
+    fn audit_tempdir() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("sr-mcp-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Read the single `.audit.jsonl` line written for `sid` under `dir`.
+    async fn read_audit_line(dir: &std::path::Path, sid: &str) -> serde_json::Value {
+        let entry = std::fs::read_dir(dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with(&format!("{}_", sid)))
+                    .unwrap_or(false)
+            })
+            .expect("audit file for session must exist");
+        let content = tokio::fs::read_to_string(&entry).await.unwrap();
+        let line = content.lines().next().expect("audit file non-empty");
+        serde_json::from_str(line).unwrap()
     }
 
     async fn mcp_send_and_recv(
@@ -485,6 +596,92 @@ mod tests {
         let r = mcp_send_and_recv(&state, HashMap::new(),
             json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"shell_remote","arguments":{"token":tokens[0].0,"cmd":"echo hello"}}})).await;
         assert!(r["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_call_audited_no_agent() {
+        // When --record-dir is enabled, a tool call that reaches the dispatch
+        // stage but finds no connected agent must still be audited (status
+        // "no_agent"), so the attempt is visible in the audit log.
+        let dir = audit_tempdir();
+        let state = make_state_with_recorder(dir.clone());
+        let (_sid, tokens) = state
+            .sessions
+            .register(None, "rw", Some("auditbot".to_string()))
+            .await
+            .unwrap();
+        let r = mcp_send_and_recv(
+            &state,
+            HashMap::new(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shell_remote","arguments":{"token":tokens[0].0,"cmd":"echo hello"}}}),
+        )
+        .await;
+        assert!(r["result"]["isError"].as_bool().unwrap_or(false));
+
+        state.recorder.as_ref().unwrap().close("auditbot");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let line = read_audit_line(&dir, "auditbot").await;
+        assert_eq!(line["session_id"], "auditbot");
+        assert_eq!(line["cmd"], "echo hello");
+        assert_eq!(line["status"], "no_agent");
+        assert_eq!(line["permission"], "rw");
+        assert_eq!(line["token_prefix"], &tokens[0].0[..8]);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_call_audited_rejected_readonly() {
+        // A read-only token attempting shell_remote is audited as
+        // "rejected_readonly" (the command was attempted, not executed).
+        let dir = audit_tempdir();
+        let state = make_state_with_recorder(dir.clone());
+        let (_sid, tokens) = state
+            .sessions
+            .register(None, "ro", Some("robot".to_string()))
+            .await
+            .unwrap();
+        let r = mcp_send_and_recv(
+            &state,
+            HashMap::new(),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shell_remote","arguments":{"token":tokens[0].0,"cmd":"ls"}}}),
+        )
+        .await;
+        assert_eq!(r["error"]["code"], -32002);
+
+        state.recorder.as_ref().unwrap().close("robot");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let line = read_audit_line(&dir, "robot").await;
+        assert_eq!(line["session_id"], "robot");
+        assert_eq!(line["cmd"], "ls");
+        assert_eq!(line["status"], "rejected_readonly");
+        assert_eq!(line["permission"], "ro");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_call_not_audited_when_recording_disabled() {
+        // No --record-dir → recorder is None → no audit file is ever written.
+        let dir = audit_tempdir();
+        let state = make_state(); // recorder = None
+        let (_sid, tokens) = state
+            .sessions
+            .register(None, "rw", Some("noaudit".to_string()))
+            .await
+            .unwrap();
+        let _ = mcp_send_and_recv(
+            &state,
+            HashMap::new(),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"shell_remote","arguments":{"token":tokens[0].0,"cmd":"echo hi"}}}),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Directory (a temp dir we created but the relay never writes to) has
+        // no audit files.
+        let any = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().to_string_lossy().ends_with(".audit.jsonl"));
+        assert!(!any, "no audit file when --record-dir is unset");
     }
 
     #[tokio::test]
