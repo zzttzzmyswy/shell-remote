@@ -82,33 +82,16 @@
   .xbtn:hover { color: var(--red); border-color: var(--red); }
   .copied { font-size: 10px; color: var(--green); }
 
-  .type-cell .fk { color: var(--muted); font-size: 11px; }
-
   .srv-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .srv-val { flex: 1 1 240px; min-width: 0; font-family: ui-monospace, monospace; font-size: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; word-break: break-all; }
   .srv-input { flex: 1 1 240px; min-width: 0; }
   .muted { color: var(--muted); }
   .alert { background: rgba(137,180,250,.1); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; font-size: 12px; margin-top: 10px; word-break: break-all; }
 
-  /* Tags */
-  .tag-chip { display: inline-flex; align-items: center; gap: 4px; background: rgba(137,180,250,.14); border: 1px solid rgba(137,180,250,.4); color: var(--accent); border-radius: 999px; padding: 2px 4px 2px 9px; font-size: 11px; margin: 2px 3px 2px 0; line-height: 1.6; }
-  .tag-chip .tag-x { background: transparent; border: none; color: inherit; cursor: pointer; font-size: 13px; line-height: 1; padding: 0 4px; border-radius: 999px; opacity: .7; }
-  .tag-chip .tag-x:hover { opacity: 1; color: var(--red); }
-  .tag-add-input { background: transparent; border: 1px dashed var(--border); border-radius: 999px; padding: 2px 9px; font-size: 11px; color: var(--text); width: 110px; outline: none; }
-  .tag-add-input::placeholder { color: var(--muted); }
-  .tag-add-input:focus { border-color: var(--accent); border-style: solid; }
-  .tag-add-btn { background: transparent; border: 1px dashed var(--border); color: var(--muted); border-radius: 999px; padding: 2px 9px; font-size: 11px; cursor: pointer; }
-  .tag-add-btn:hover { color: var(--accent); border-color: var(--accent); }
-
   .rec-badge { background: rgba(237,87,87,.16); border: 1px solid var(--red); color: var(--red); border-radius: 4px; padding: 3px 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em; margin-right: 10px; }
   .rec-badge::before { content: "● "; }
   .row-rec { font-size: 10px; color: var(--red); font-weight: 600; margin-left: 6px; }
 
-  .filter-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-  .filter-bar .filter-label { color: var(--muted); font-size: 12px; }
-  .filter-chip { background: var(--bg); border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: 3px 10px; font-size: 11px; cursor: pointer; }
-  .filter-chip:hover { border-color: var(--accent); color: var(--accent); }
-  .filter-chip.active { background: rgba(137,180,250,.2); border-color: var(--accent); color: var(--accent); }
 
   /* Language toggle */
   .lang-toggle { position: fixed; top: 12px; right: 14px; z-index: 50; background: var(--panel); border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
@@ -156,7 +139,6 @@
 
   <div class="panel">
     <h2 data-i18n="sessions">Sessions</h2>
-    <div class="filter-bar" id="filterBar"></div>
     <div style="overflow-x:auto;">
       <table>
         <thead>
@@ -166,7 +148,6 @@
             <th data-i18n="th_type">Type</th>
             <th data-i18n="th_browsers">Browsers</th>
             <th data-i18n="th_tokens">Tokens</th>
-            <th data-i18n="th_tags">Tags</th>
             <th data-i18n="th_actions">Actions</th>
           </tr>
         </thead>
@@ -219,7 +200,6 @@
       th_type: "类型",
       th_browsers: "浏览器",
       th_tokens: "令牌",
-      th_tags: "标签",
       th_actions: "操作",
       no_sessions: "暂无会话。",
       connect: "连接",
@@ -230,7 +210,6 @@
       offline: "离线",
       type_temporary: "临时",
       type_fixed: "固定",
-      key_prefix: "密钥：",
       dash_placeholder: "—",
       click_to_copy: "点击复制",
       copied: "已复制",
@@ -246,8 +225,6 @@
       err_toggle: "切换失败：",
       err_regenerate: "重新生成失败：",
       err_kick: "踢除失败：",
-      err_tag: "添加标签失败：",
-      err_untag: "移除标签失败：",
       new_tokens: "新令牌：\n",
       pw_updated: "服务器密码已更新。",
       server_password: "服务器密码",
@@ -261,12 +238,7 @@
       srv_update_failed: "更新失败：",
       uptime_prefix: "运行时长 ",
       unauthorized: "未授权",
-      add_tag: "添加标签",
-      add_tag_ph: "添加标签",
-      filter_label: "筛选：",
-      filter_all: "全部",
       revoke_label: "撤销",
-      untag_title: "移除标签",
       lang_toggle: "中 / EN",
       lang_toggle_title: "切换语言 / Switch language"
     },
@@ -289,7 +261,6 @@
       th_type: "Type",
       th_browsers: "Browsers",
       th_tokens: "Tokens",
-      th_tags: "Tags",
       th_actions: "Actions",
       no_sessions: "No sessions.",
       connect: "Connect",
@@ -300,7 +271,6 @@
       offline: "offline",
       type_temporary: "temporary",
       type_fixed: "fixed",
-      key_prefix: "key: ",
       dash_placeholder: "—",
       click_to_copy: "click to copy",
       copied: "copied",
@@ -316,8 +286,6 @@
       err_toggle: "Toggle failed: ",
       err_regenerate: "Regenerate failed: ",
       err_kick: "Kick failed: ",
-      err_tag: "Add tag failed: ",
-      err_untag: "Remove tag failed: ",
       new_tokens: "New tokens:\n",
       pw_updated: "Server password updated.",
       server_password: "Server password",
@@ -331,12 +299,7 @@
       srv_update_failed: "Update failed: ",
       uptime_prefix: "uptime ",
       unauthorized: "unauthorized",
-      add_tag: "add tag",
-      add_tag_ph: "add tag",
-      filter_label: "Filter:",
-      filter_all: "All",
       revoke_label: "revoke",
-      untag_title: "remove tag",
       lang_toggle: "中 / EN",
       lang_toggle_title: "切换语言 / Switch language"
     }
@@ -391,14 +354,8 @@
     });
   }
 
-  // --- XSS-safe text helper: builds a <span> with textContent ---
+  // --- XSS-safe text helper: builds a text node with textContent ---
   function textNode(s) { return document.createTextNode(s == null ? '' : String(s)); }
-  function span(txt, cls) {
-    const e = document.createElement('span');
-    if (cls) e.className = cls;
-    e.appendChild(textNode(txt));
-    return e;
-  }
 
   function showLogin() {
     dashView.classList.add('hidden');
@@ -457,7 +414,6 @@
     try { await api('/logout', { method: 'POST' }); } catch (_) {}
     stopRefresh();
     lastOverview = null;
-    activeFilter = null;
     showLogin();
   });
 
@@ -468,7 +424,6 @@
   // --- Overview refresh ---
   let timer = null;
   let lastOverview = null;
-  let activeFilter = null; // tag string or null
 
   function startRefresh() { if (!timer) timer = setInterval(refresh, 5000); }
   function stopRefresh() { if (timer) { clearInterval(timer); timer = null; } }
@@ -480,7 +435,6 @@
     lastOverview = o;
     renderOverview(o);
     renderSessions(o.sessions || []);
-    renderFilterBar(o.sessions || []);
   }
 
   function renderOverview(o) {
@@ -498,56 +452,12 @@
     $('recBadge').classList.toggle('hidden', !o.recording_enabled);
   }
 
-  // --- Filter-by-tag bar ---
-  function renderFilterBar(sessions) {
-    const bar = $('filterBar');
-    bar.textContent = '';
-    const set = new Set();
-    for (const s of sessions) {
-      for (const tag of (s.tags || [])) {
-        const v = String(tag).trim();
-        if (v) set.add(v);
-      }
-    }
-    if (set.size === 0) {
-      if (activeFilter) activeFilter = null;
-      bar.classList.add('hidden');
-      return;
-    }
-    bar.classList.remove('hidden');
-    const lbl = span(t('filter_label'), 'filter-label');
-    bar.appendChild(lbl);
-
-    const all = document.createElement('button');
-    all.className = 'filter-chip' + (activeFilter === null ? ' active' : '');
-    all.textContent = t('filter_all');
-    all.addEventListener('click', () => { activeFilter = null; renderSessions(sessions); renderFilterBar(sessions); });
-    bar.appendChild(all);
-
-    const tags = Array.from(set).sort();
-    for (const tag of tags) {
-      const chip = document.createElement('button');
-      chip.className = 'filter-chip' + (activeFilter === tag ? ' active' : '');
-      chip.textContent = tag;
-      chip.addEventListener('click', () => {
-        activeFilter = (activeFilter === tag) ? null : tag;
-        renderSessions(sessions);
-        renderFilterBar(sessions);
-      });
-      bar.appendChild(chip);
-    }
-  }
-
   // --- Sessions table ---
   function renderSessions(sessions) {
     const body = $('sessionsBody');
     body.textContent = '';
-    let list = sessions;
-    if (activeFilter) {
-      list = sessions.filter(s => (s.tags || []).some(tg => String(tg).trim() === activeFilter));
-    }
-    $('sessEmpty').classList.toggle('hidden', list.length > 0);
-    for (const s of list) {
+    $('sessEmpty').classList.toggle('hidden', sessions.length > 0);
+    for (const s of sessions) {
       body.appendChild(buildSessionRow(s));
     }
   }
@@ -578,15 +488,7 @@
 
     // Type
     const tdT = document.createElement('td'); tdT.className = 'type-cell';
-    if (s.is_temporary) {
-      tdT.appendChild(textNode(t('type_temporary')));
-    } else {
-      tdT.appendChild(textNode(t('type_fixed')));
-      if (s.fixed_key) {
-        const fk = document.createElement('div'); fk.className = 'fk mono'; fk.textContent = t('key_prefix') + s.fixed_key;
-        tdT.appendChild(fk);
-      }
-    }
+    tdT.appendChild(textNode(s.is_temporary ? t('type_temporary') : t('type_fixed')));
     tr.appendChild(tdT);
 
     // Browsers
@@ -602,11 +504,6 @@
       tdTok.appendChild(buildTokenRow(s, tk));
     }
     tr.appendChild(tdTok);
-
-    // Tags
-    const tdTags = document.createElement('td');
-    tdTags.appendChild(buildTagsCell(s));
-    tr.appendChild(tdTags);
 
     // Actions
     const tdA = document.createElement('td'); tdA.className = 'actions';
@@ -666,56 +563,6 @@
 
     row.appendChild(copied);
     return row;
-  }
-
-  function buildTagsCell(s) {
-    const wrap = document.createElement('div');
-    wrap.style.display = 'flex';
-    wrap.style.flexWrap = 'wrap';
-    wrap.style.alignItems = 'center';
-    const tags = s.tags || [];
-    for (const tag of tags) {
-      const v = String(tag);
-      const chip = document.createElement('span'); chip.className = 'tag-chip';
-      const label = document.createElement('span'); label.textContent = v;
-      chip.appendChild(label);
-      const x = document.createElement('button'); x.className = 'tag-x'; x.textContent = '×';
-      x.title = t('untag_title');
-      x.addEventListener('click', () => onUntag(s, v));
-      chip.appendChild(x);
-      wrap.appendChild(chip);
-    }
-    // inline add input
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'tag-add-input';
-    input.placeholder = t('add_tag_ph');
-    input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') {
-        ev.preventDefault();
-        const val = input.value.trim();
-        if (!val) return;
-        input.disabled = true;
-        onTag(s, val).finally(() => { input.disabled = false; input.value = ''; });
-      }
-    });
-    wrap.appendChild(input);
-    return wrap;
-  }
-
-  async function onTag(s, tag) {
-    // POST /api/session/tag  (add)  and  POST /api/session/untag  (remove)
-    try {
-      await api('/api/session/tag', { method: 'POST', body: { session_id: s.session_id, tag: tag } });
-      await refresh();
-    } catch (e) { alert(t('err_tag') + e.message); }
-  }
-
-  async function onUntag(s, tag) {
-    try {
-      await api('/api/session/untag', { method: 'POST', body: { session_id: s.session_id, tag: tag } });
-      await refresh();
-    } catch (e) { alert(t('err_untag') + e.message); }
   }
 
   async function onRevoke(tk) {

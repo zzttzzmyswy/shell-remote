@@ -188,7 +188,6 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
 
 - **概览**：版本、运行时间、agent 总数/在线数、浏览器总数、每会话 Token 列表与权限、连接浏览器数。
 - **Token 管理**：撤销单个 Token、重生成会话 Token（旧 Token 失效）、切换 Token 权限（rw↔ro）。
-- **会话标签**：给已有会话打标签（如 prod/db），按标签筛选；标签内存级，随会话存亡。
 - **跳转终端**：每会话"连接"按钮，新标签页打开该会话的浏览器终端（token 预填，服务器密码仍需手填）。
 - **会话录制**：`--record-dir` 启用后，交互式终端 I/O（输出+输入）以 asciinema cast v2 落盘；后台显示录制状态，文件可用 `asciinema play` 回放。
 - **踢出会话**：断开该 agent 及其所有浏览器并撤销其 Token。
@@ -331,7 +330,7 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 ```bash
 cargo test
-# 174 passed; 0 failed (含集成测试)
+# 173 passed; 0 failed (含集成测试)
 ```
 
 ## 许可证

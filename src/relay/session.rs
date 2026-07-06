@@ -10,9 +10,6 @@ pub struct SessionInfo {
     #[allow(dead_code)]
     pub fixed_key: Option<String>,
     pub is_temporary: bool,
-    /// Admin-assigned labels on a session (e.g. "prod", "db"). In-memory only;
-    /// cleared on relay restart. Duplicates are not stored.
-    pub tags: Vec<String>,
 }
 
 pub struct SessionRegistry {
@@ -111,7 +108,6 @@ impl SessionRegistry {
                     tokens: tokens.clone(),
                     fixed_key,
                     is_temporary,
-                    tags: Vec::new(),
                 },
             );
         }
@@ -175,7 +171,6 @@ impl SessionRegistry {
                     tokens: tokens.clone(),
                     fixed_key: None,
                     is_temporary: true,
-                    tags: Vec::new(),
                 },
             );
         }
@@ -309,34 +304,6 @@ impl SessionRegistry {
                 e.1 = perm;
             }
         }
-        true
-    }
-
-    /// Add a label to a session. The tag is trimmed; empty tags are ignored.
-    /// Returns false if the session is unknown. Duplicate tags are not added.
-    pub async fn add_tag(&self, session_id: &str, tag: &str) -> bool {
-        let tag = tag.trim();
-        if tag.is_empty() {
-            return false;
-        }
-        let mut sessions = self.sessions.write().await;
-        let Some(info) = sessions.get_mut(session_id) else {
-            return false;
-        };
-        if !info.tags.iter().any(|t| t == tag) {
-            info.tags.push(tag.to_string());
-        }
-        true
-    }
-
-    /// Remove a label from a session. Returns false if the session is unknown.
-    pub async fn remove_tag(&self, session_id: &str, tag: &str) -> bool {
-        let tag = tag.trim();
-        let mut sessions = self.sessions.write().await;
-        let Some(info) = sessions.get_mut(session_id) else {
-            return false;
-        };
-        info.tags.retain(|t| t != tag);
         true
     }
 }
@@ -682,31 +649,5 @@ mod tests {
         assert_eq!(perm, Permission::ReadWrite);
         // unknown token
         assert!(!registry.set_token_permission("nope", Permission::ReadOnly).await);
-    }
-
-    #[tokio::test]
-    async fn test_add_and_remove_tag() {
-        let registry = SessionRegistry::new();
-        let (sid, _t) = registry.register(None, "rw", None).await.unwrap();
-        assert!(registry.add_tag(&sid, "prod").await);
-        assert!(registry.add_tag(&sid, "  db  ").await); // trimmed
-        // duplicate is a no-op (still one "prod")
-        registry.add_tag(&sid, "prod").await;
-        let list = registry.list_sessions().await;
-        let info = list.iter().find(|(s, _)| s == &sid).unwrap();
-        assert_eq!(info.1.tags, vec!["prod".to_string(), "db".to_string()]);
-
-        // empty tag ignored
-        assert!(!registry.add_tag(&sid, "   ").await);
-
-        // remove
-        assert!(registry.remove_tag(&sid, "prod").await);
-        let list = registry.list_sessions().await;
-        let info = list.iter().find(|(s, _)| s == &sid).unwrap();
-        assert_eq!(info.1.tags, vec!["db".to_string()]);
-
-        // unknown session
-        assert!(!registry.add_tag("deadbeef", "x").await);
-        assert!(!registry.remove_tag("deadbeef", "x").await);
     }
 }
