@@ -226,7 +226,7 @@ async fn process_mcp_request(
                 "tools": [
                     {
                         "name": "shell_remote",
-                        "description": "Execute a shell command on the remote target machine via shell_remote. Returns stdout, stderr, and exit code. For file transfer: small in-context content (configs/scripts/patches) can be written directly via heredoc/cat through this tool; for large on-disk files, use curl to PUT /agent/mcp/put (upload) or GET /agent/mcp/get (download), with header X-SR-Token set to the same token as this tool. Bytes do not pass through LLM context. See README 'MCP 端文件传输'.",
+                        "description": "Execute a shell command on the remote machine; returns stdout, stderr, exit code.\n\nFILE TRANSFER (bytes bypass LLM context — use for files of any size):\n  upload:   curl -T <localfile> -H \"X-SR-Token: <token>\" <origin>/agent/mcp/put?path=<remotepath>\n  download: curl -H \"X-SR-Token: <token>\" <origin>/agent/mcp/get?path=<remotepath> -o <localfile>\n<origin> is this MCP server's origin (scheme://host:port, the base of /agent/mcp). <token> is the same session token used for this tool; upload needs read-write, download allows read-only.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
