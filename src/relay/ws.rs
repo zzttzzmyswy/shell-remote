@@ -149,6 +149,38 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 }
             }
         }
+
+        // Download streaming: fs:result carrying a correlation_id registered in
+        // download_streams is a file chunk pushed by the agent; decode and forward
+        // to the GET response task via the sink. Independent of pending_mcp.
+        if proto_msg.msg_type == "fs:result" {
+            if let Some(cid) = proto_msg.payload.get("_mcp_request_id").and_then(|v| v.as_str()) {
+                let sink_opt = state.download_streams.write().await.remove(cid);
+                if let Some(mut sink) = sink_opt {
+                    let success = proto_msg.payload.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !success {
+                        let err = proto_msg.payload.get("error").and_then(|v| v.as_str()).unwrap_or("download error").to_string();
+                        let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::Error(err)).await;
+                    } else if let Some(content) = proto_msg.payload.get("content").and_then(|v| v.as_str()) {
+                        if let Some(bytes) = crate::agent::fs::decode_b64(content) {
+                            sink.bytes += bytes.len() as u64;
+                            let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::Chunk(bytes)).await;
+                            // Detect last chunk: is_last field (Task 6) or chunk_index+1 >= total_chunks.
+                            let chunk_index = proto_msg.payload.get("chunk_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let total_chunks = proto_msg.payload.get("total_chunks").and_then(|v| v.as_u64()).unwrap_or(1);
+                            let is_last = proto_msg.payload.get("is_last").and_then(|v| v.as_bool()).unwrap_or(false)
+                                || chunk_index + 1 >= total_chunks;
+                            if is_last {
+                                let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::End).await;
+                                // sink dropped → removed from download_streams
+                            } else {
+                                state.download_streams.write().await.insert(cid.to_string(), sink);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -877,6 +909,33 @@ mod tests {
     async fn test_route_agent_message_invalid_json_no_panic() {
         let state = make_state("");
         route_agent_message(&state, "sid1", "not valid json {{{").await;
+    }
+
+    #[tokio::test]
+    async fn test_route_agent_message_download_chunk_pushes_to_sink() {
+        use crate::relay::file_transfer::{DownloadEvent, DownloadSink};
+        let state = make_state("");
+        let (tx, mut rx) = mpsc::channel(16);
+        state.download_streams.write().await.insert(
+            "dl-1".to_string(),
+            DownloadSink { tx, created_at: Instant::now(), bytes: 0 },
+        );
+        let msg = json!({
+            "type": "fs:result", "session_id": "sid1",
+            "payload": {"success": true, "content": "aGk=", "path": "/x",
+                        "chunk_index": 0, "total_chunks": 1,
+                        "_mcp_request_id": "dl-1"}
+        }).to_string();
+        route_agent_message(&state, "sid1", &msg).await;
+        match rx.recv().await.unwrap() {
+            DownloadEvent::Chunk(b) => assert_eq!(b, b"hi"),
+            _ => panic!("expected Chunk"),
+        }
+        // Only one chunk with total_chunks=1 → should receive End next
+        match rx.recv().await {
+            Some(DownloadEvent::End) => {} // expected
+            other => panic!("expected End, got {:?}", other),
+        }
     }
 
     // ── agent_send_handler tests ─────────────────────────────────────

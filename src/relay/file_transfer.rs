@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, RwLock};
 
 /// One event on a download's relay-internal sink. The relay response task
 /// reads these to drive the HTTP response body; Chunk 0 decides 200 vs 500.
+#[derive(Debug)]
 pub enum DownloadEvent {
     Chunk(Vec<u8>),
     Error(String),
