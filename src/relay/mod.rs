@@ -6,6 +6,7 @@ pub mod session;
 pub mod ws;
 pub mod admin;
 pub mod recorder;
+pub mod file_transfer;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -22,9 +23,16 @@ use crate::relay::session::SessionRegistry;
 /// case for one stuck session — bounded, and isolated from other sessions.
 pub const SSE_CHANNEL_CAPACITY: usize = 256;
 
+/// Capacity for the per-session relay→agent bulk (file-transfer) sub-channel.
+/// File chunks go here so they yield to interactive traffic under the
+/// agent's biased select; bounded so a stuck agent can't grow it unbounded.
+#[allow(dead_code)]
+pub const BULK_CHANNEL_CAPACITY: usize = 16;
+
 #[allow(dead_code)]
 pub struct ChannelMap {
     pub agent: Option<mpsc::Sender<String>>,
+    pub agent_bulk: Option<mpsc::Sender<String>>,
     pub browser_sessions: HashMap<String, String>,
 }
 
@@ -33,6 +41,7 @@ impl ChannelMap {
     pub fn new() -> Self {
         Self {
             agent: None,
+            agent_bulk: None,
             browser_sessions: HashMap::new(),
         }
     }
