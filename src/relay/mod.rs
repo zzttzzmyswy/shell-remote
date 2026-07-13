@@ -50,6 +50,7 @@ pub struct SharedState {
     pub sessions: SessionRegistry,
     pub agent_broadcast: RwLock<HashMap<String, ChannelMap>>,
     pub pending_mcp: RwLock<HashMap<String, (String, oneshot::Sender<String>)>>,
+    pub download_streams: RwLock<HashMap<String, crate::relay::file_transfer::DownloadSink>>,
     pub last_activity: RwLock<HashMap<String, Instant>>,
     /// Server access password (`--auth`). Wrapped in a RwLock so the admin
     /// panel can rotate it live; reads on the hot auth path take a read lock.
@@ -170,6 +171,7 @@ impl SharedState {
             sessions: SessionRegistry::new(),
             agent_broadcast: RwLock::new(HashMap::new()),
             pending_mcp: RwLock::new(HashMap::new()),
+            download_streams: RwLock::new(HashMap::new()),
             last_activity: RwLock::new(HashMap::new()),
             server_auth: RwLock::new(server_auth),
             agent_event_buffers: RwLock::new(HashMap::new()),

@@ -1,5 +1,24 @@
 #![allow(dead_code)]
-use tokio::sync::mpsc;
+use std::collections::HashMap;
+use std::time::Instant;
+use tokio::sync::{mpsc, RwLock};
+
+/// One event on a download's relay-internal sink. The relay response task
+/// reads these to drive the HTTP response body; Chunk 0 decides 200 vs 500.
+pub enum DownloadEvent {
+    Chunk(Vec<u8>),
+    Error(String),
+    End,
+}
+
+/// The relay-side handle for one in-flight download. `route_agent_message`
+/// pushes decoded file bytes (or errors) into `tx`; the `get_handler` task
+/// drains `tx` into the HTTP response body.
+pub struct DownloadSink {
+    pub tx: mpsc::Sender<DownloadEvent>,
+    pub created_at: Instant,
+    pub bytes: u64,
+}
 
 /// Capacity for the per-session relay→agent bulk (file-transfer) sub-channel.
 /// Deliberately smaller than [`SSE_CHANNEL_CAPACITY`] so file chunks yield to
