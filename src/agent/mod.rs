@@ -6,6 +6,8 @@ pub mod shell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::agent::client::RelayClient;
@@ -155,11 +157,42 @@ async fn post_fs_err(
     post_raw(client, send_url, &msg).await;
 }
 
+/// Build a chunked `fs:result` payload envelope for a single download chunk.
+/// Pure function extracted from `stream_file_download` so it can be unit-tested
+/// independently of I/O.
+fn build_download_chunk_payload(
+    session_id: &str,
+    path: &str,
+    content_b64: &str,
+    idx: u32,
+    total: u32,
+    mcp_request_id: Option<String>,
+) -> serde_json::Value {
+    let is_last = idx + 1 >= total;
+    let payload = serde_json::json!({
+        "success": true,
+        "content": content_b64,
+        "chunk_index": idx,
+        "total_chunks": total,
+        "is_last": is_last,
+        "path": path,
+        "_mcp_request_id": mcp_request_id.clone()
+    });
+    serde_json::json!({"type":"fs:result","session_id":session_id,"payload":payload})
+}
+
 /// Stream a file to the relay as chunked `fs:result` messages (one base64
 /// chunk per POST), correlated by `_mcp_request_id`. Runs in its own task so
 /// a large/slow download can't block the agent's main message loop (and thus
 /// terminal input). Each message stays small so the relay can't be held by a
 /// single giant message, and backpressure flows through the HTTP POST.
+///
+/// Each chunk is POSTed independently via `client.post()`, bypassing the
+/// `sender_loop` control channel so download chunks don't compete with
+/// terminal:output / mcp:result. Between chunks: `tokio::task::yield_now()`.
+///
+/// If `cancel` is supplied, the task checks `cancel.load(Ordering::Relaxed)`
+/// before each chunk and aborts early when the peer disconnects.
 async fn stream_file_download(
     client: reqwest::Client,
     send_url: String,
@@ -167,15 +200,10 @@ async fn stream_file_download(
     root: PathBuf,
     path: String,
     mcp_request_id: Option<String>,
+    cancel: Option<Arc<AtomicBool>>,
 ) {
     const CHUNK_SIZE: usize = 256 * 1024;
     use std::io::Read;
-
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("download")
-        .to_string();
 
     let resolved = match crate::agent::fs::resolve_path(&root, &path) {
         Some(p) => p,
@@ -210,6 +238,13 @@ async fn stream_file_download(
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut idx: u32 = 0;
     loop {
+        // Check for cancellation before reading/processing each chunk
+        if let Some(ref c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                tracing::debug!("Download cancelled for {}", path);
+                break;
+            }
+        }
         let n = match f.read(&mut buf) {
             Ok(n) => n,
             Err(e) => {
@@ -218,17 +253,13 @@ async fn stream_file_download(
             }
         };
         let content_b64 = crate::agent::fs::encode_b64(&buf[..n]);
-        let payload = serde_json::json!({
-            "success": true,
-            "content": content_b64,
-            "chunk_index": idx,
-            "total_chunks": total_chunks,
-            "name": name,
-            "path": path,
-            "_mcp_request_id": mcp_request_id.clone()
-        });
-        let msg = serde_json::json!({"type":"fs:result","session_id":session_id,"payload":payload}).to_string();
-        post_raw(&client, &send_url, &msg).await;
+        let msg = build_download_chunk_payload(
+            &session_id, &path, &content_b64, idx, total_chunks, mcp_request_id.clone(),
+        );
+        // Independent POST (not via sender_loop) so terminal:output/mcp:result
+        // are not starved by download chunks.
+        let _ = client.post(&send_url).json(&msg).send().await;
+        tokio::task::yield_now().await;
         idx += 1;
         if idx >= total_chunks {
             break;
@@ -481,6 +512,12 @@ async fn run_session(
     // chunk; the last chunk flushes, closes, and replies.
     let mut upload_reassembly: HashMap<String, UploadReassembly> = HashMap::new();
 
+    // Cancel registry for in-flight downloads, keyed by correlation_id
+    // (_mcp_request_id from the fs:read request). When the relay sends
+    // fs:read_cancel{correlation_id} (client disconnected), we set the
+    // AtomicBool so the spawned stream_file_download task stops early.
+    let mut download_cancels: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+
     loop {
         tokio::select! {
                 shell_output = shell_rx.recv() => {
@@ -665,6 +702,13 @@ async fn run_session(
                                     let send_url = client.send_url().to_string();
                                     let sid = client.session_id.clone();
                                     let root_clone = root_path.clone();
+                                    // Register a cancel token for this correlation_id so the
+                                    // relay can abort the download via fs:read_cancel.
+                                    let cancel = Arc::new(AtomicBool::new(false));
+                                    let cancel_token = cancel.clone();
+                                    if let Some(ref cid) = mcp_request_id {
+                                        download_cancels.insert(cid.clone(), cancel);
+                                    }
                                     tokio::spawn(stream_file_download(
                                         client_req,
                                         send_url,
@@ -672,7 +716,20 @@ async fn run_session(
                                         root_clone,
                                         path,
                                         mcp_request_id,
+                                        Some(cancel_token),
                                     ));
+                                }
+
+                                "fs:read_cancel" => {
+                                    let mcp_request_id = msg.payload["_mcp_request_id"]
+                                        .as_str()
+                                        .map(|s| s.to_string());
+                                    if let Some(ref cid) = mcp_request_id {
+                                        if let Some(cancel) = download_cancels.remove(cid) {
+                                            cancel.store(true, Ordering::Relaxed);
+                                            tracing::debug!("Cancelled download for correlation_id={}", cid);
+                                        }
+                                    }
                                 }
 
                                 "fs:write" => {
@@ -994,6 +1051,18 @@ async fn execute_command(cmd: &str, timeout_ms: u64, shell: &str) -> (String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_download_chunk_payload_is_last_flag() {
+        let p0 = build_download_chunk_payload(
+            "s", "/x", "AAAA", 0, 3, Some("r".to_string()));
+        let p2 = build_download_chunk_payload(
+            "s", "/x", "AAAA", 2, 3, Some("r".to_string()));
+        assert_eq!(p0["payload"]["is_last"], serde_json::json!(false));
+        assert_eq!(p2["payload"]["is_last"], serde_json::json!(true));
+        assert_eq!(p2["payload"]["chunk_index"], serde_json::json!(2));
+        assert_eq!(p2["payload"]["total_chunks"], serde_json::json!(3));
+    }
 
     #[test]
     fn test_assemble_upload_chunk_reassembles_multiple_chunks() {
