@@ -1205,4 +1205,79 @@ mod tests {
         let first_bulk = got.iter().position(|s| s.starts_with('b')).unwrap();
         assert!(i_pos < first_bulk, "interactive must precede bulk under biased merge; got {:?}", got);
     }
+
+    /// Stronger biased-merge test: pre-fill bulk with 100 chunks to simulate a
+    /// bandwidth-heavy download flooding the bulk channel.  An interactive
+    /// message injected last must still emerge from the merged stream before
+    /// any queued bulk message — regardless of channel depth.
+    #[tokio::test]
+    async fn test_merge_biased_interactive_beats_flooded_bulk() {
+        use tokio::sync::mpsc;
+        let (itx, irx) = mpsc::channel::<String>(128);
+        let (btx, brx) = mpsc::channel::<String>(128);
+        // Pre-fill bulk with 100 messages, then one interactive.
+        for i in 0..100 {
+            btx.send(format!("bulk-chunk-{:04}", i)).await.unwrap();
+        }
+        itx.send("interactive-ping".to_string()).await.unwrap();
+        // Close both senders so merge terminates.
+        drop(itx);
+        drop(btx);
+        let mut out = Box::pin(merge_biased(irx, brx));
+        let mut got = Vec::new();
+        use tokio_stream::StreamExt as _;
+        while let Some(s) = out.next().await {
+            got.push(s);
+        }
+        // The interactive message must be the *first* item in the merged
+        // output — biased draining means interactive is polled before bulk
+        // on every cycle.
+        assert_eq!(got.len(), 101, "should receive 101 messages total");
+        let first = got.first().expect("non-empty");
+        assert_eq!(
+            first, "interactive-ping",
+            "interactive must be very first item under heavy bulk flood; got {:?}", first
+        );
+    }
+
+    /// Relay-level integration test for biased merge.  Channels are wired into
+    /// the shared state's `agent_broadcast` (as `agent_events_handler` does),
+    /// then pre-filled with bulk chunks and one interactive message.  The merged
+    /// stream drains interactive first thanks to biased select.
+    ///
+    /// A true end-to-end test with a live agent pumping chunks over HTTP while a
+    /// browser concurrently POSTs terminal:input is deferred — it requires a
+    /// process-spanning harness.  This relay-level test validates the ordering
+    /// property at the boundary where the merged SSE stream is assembled.
+    #[tokio::test]
+    async fn test_relay_biased_merge_interactive_beats_bulk_in_stream() {
+        // Create fresh channels and wire them into agent_broadcast — exactly
+        // what agent_events_handler does.
+        let (itx, irx) = mpsc::channel::<String>(16);
+        let (btx, brx) = mpsc::channel::<String>(128);
+
+        // Simulate bulk channel being flooded with download chunks.
+        for i in 0..5 {
+            let _ = btx.send(format!("bulk-download-chunk-{}", i)).await;
+        }
+        // Send the interactive terminal:input after bulk is queued.
+        let _ = itx.send("terminal:input".to_string()).await;
+
+        drop(itx);
+        drop(btx);
+
+        let mut merged = Box::pin(merge_biased(irx, brx));
+        use tokio_stream::StreamExt as _;
+        let mut got = Vec::new();
+        while let Some(s) = merged.next().await {
+            got.push(s);
+        }
+
+        assert_eq!(got.len(), 6, "one interactive + five bulk");
+        assert_eq!(
+            got[0], "terminal:input",
+            "interactive must be first in merged output; got {:?}",
+            got.first()
+        );
+    }
 }

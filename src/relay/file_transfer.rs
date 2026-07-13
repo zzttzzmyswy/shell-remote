@@ -90,7 +90,7 @@ pub async fn get_handler(
         Some(DownloadEvent::Error(msg)) => {
             state.download_streams.write().await.remove(&correlation_id);
             audit_ft(&state, &session_id, token, &permission, &path, 0, "downfile_failed", &msg).await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":msg}))).into_response();
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":msg}))).into_response()
         }
         Some(DownloadEvent::Chunk(first_bytes)) => {
             // Build streaming body: first_bytes + rest from sink_rx until End.
@@ -188,7 +188,7 @@ pub async fn put_handler(
         Some(n) => n,
         None => return StatusCode::LENGTH_REQUIRED.into_response(),
     };
-    let total_chunks = ((content_len as usize + CHUNK_SIZE - 1) / CHUNK_SIZE).max(1) as u32;
+    let total_chunks = (content_len as usize).div_ceil(CHUNK_SIZE).max(1) as u32;
     let upload_id = Uuid::new_v4().to_string();
 
     let bulk_tx = {
@@ -330,6 +330,7 @@ pub async fn put_handler(
 }
 
 /// Audit helper for file-transfer endpoints. status ∈ {upfile, downfile, *_failed}.
+#[allow(clippy::too_many_arguments)]
 async fn audit_ft(
     state: &crate::relay::SharedState,
     sid: &str,
@@ -490,7 +491,6 @@ mod tests {
         // Drain bulk channel: respond to the last chunk's fs:result via pending_mcp.
         let state_c = state.clone();
         let h = tokio::spawn(async move {
-            let mut last_req_id: Option<String> = None;
             let mut count = 0u32;
             while let Some(m) = bulk_rx.recv().await {
                 let v: serde_json::Value = serde_json::from_str(&m).unwrap();
@@ -499,15 +499,13 @@ mod tests {
                     let ci = v["payload"]["chunk_index"].as_u64().unwrap() as u32;
                     let tc = v["payload"]["total_chunks"].as_u64().unwrap() as u32;
                     if ci + 1 >= tc {
-                        last_req_id = Some(
-                            v["payload"]["_mcp_request_id"]
+                        let req_id = v["payload"]["_mcp_request_id"]
                                 .as_str()
                                 .unwrap()
-                                .to_string(),
-                        );
+                                .to_string();
                         // fulfill oneshot
                         let mut pending = state_c.pending_mcp.write().await;
-                        if let Some((_sid, tx)) = pending.remove(last_req_id.as_ref().unwrap()) {
+                        if let Some((_sid, tx)) = pending.remove(&req_id) {
                             let _ = tx
                                 .send(serde_json::json!({"success":true}).to_string());
                         }

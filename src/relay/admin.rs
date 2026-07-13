@@ -164,8 +164,8 @@ pub async fn overview_handler(
             "fixed_key": info.fixed_key,
             "browser_count": browser_count,
             "tokens": tokens,
-            "recording": state.recorder.as_ref().map_or(false, |r| r.is_recording(sid)),
-            "mcp_audit": state.recorder.as_ref().map_or(false, |r| r.is_auditing(sid)),
+            "recording": state.recorder.as_ref().is_some_and(|r| r.is_recording(sid)),
+            "mcp_audit": state.recorder.as_ref().is_some_and(|r| r.is_auditing(sid)),
         }));
     }
     drop(broadcasts);

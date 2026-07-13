@@ -713,7 +713,7 @@ pub async fn upload_handler(
     // authoritative size rather than re-stat'ing the file (a stat can race
     // the sync above and under-report on some filesystems).
     let file_size = total as usize;
-    let total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let total_chunks = file_size.div_ceil(CHUNK_SIZE);
     let upload_id = uuid::Uuid::new_v4().to_string();
 
     use tokio::io::AsyncReadExt;

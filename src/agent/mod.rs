@@ -197,6 +197,7 @@ fn build_download_chunk_payload(
 /// `download_cancels` is the shared registry; this task removes its own entry
 /// on completion (normal or error) so the map doesn't accumulate stale entries
 /// after the download finishes.
+#[allow(clippy::too_many_arguments)]
 async fn stream_file_download(
     client: reqwest::Client,
     send_url: String,
@@ -233,7 +234,7 @@ async fn stream_file_download(
         return;
     }
     let file_size = meta.len() as usize;
-    let total_chunks = (((file_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32).max(1);
+    let total_chunks = (file_size.div_ceil(CHUNK_SIZE) as u32).max(1);
 
     let mut f = match std::fs::File::open(&resolved) {
         Ok(f) => f,

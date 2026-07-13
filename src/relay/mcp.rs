@@ -287,7 +287,7 @@ async fn process_mcp_request(
 
             if permission == Permission::ReadOnly {
                 audit_mcp_call(
-                    &state, &session_id, token, permission, cmd, timeout_ms_val,
+                    state, &session_id, token, permission, cmd, timeout_ms_val,
                     0, "rejected_readonly", None, "", "",
                 );
                 return Some(json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32002,"message":"Read-only token cannot call shell_remote"}}));
@@ -335,7 +335,7 @@ async fn process_mcp_request(
                     None => {
                         state.pending_mcp.write().await.remove(&mcp_req_id);
                         audit_mcp_call(
-                            &state, &session_id, token, permission, cmd, timeout_ms_val,
+                            state, &session_id, token, permission, cmd, timeout_ms_val,
                             0, "no_agent", None, "", "",
                         );
                         return Some(json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Error: No agent connected for this session"}],"isError":true}}));
@@ -353,7 +353,7 @@ async fn process_mcp_request(
                     let exit_code = value.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
                     let duration_ms = started.elapsed().as_millis() as u64;
                     audit_mcp_call(
-                        &state, &session_id, token, permission, cmd, timeout_ms_val,
+                        state, &session_id, token, permission, cmd, timeout_ms_val,
                         duration_ms, "ok", Some(exit_code), stdout, stderr,
                     );
                     let mut text = String::new();
@@ -372,7 +372,7 @@ async fn process_mcp_request(
                     state.pending_mcp.write().await.remove(&mcp_req_id);
                     let duration_ms = started.elapsed().as_millis() as u64;
                     audit_mcp_call(
-                        &state, &session_id, token, permission, cmd, timeout_ms_val,
+                        state, &session_id, token, permission, cmd, timeout_ms_val,
                         duration_ms, "timeout", None, "", "",
                     );
                     json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Error: Request timed out or agent disconnected"}],"isError":true}})
