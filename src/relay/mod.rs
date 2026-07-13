@@ -916,6 +916,10 @@ pub async fn start(
             "/agent/mcp/messages",
             axum::routing::post(mcp::messages_handler),
         )
+        .route(
+            "/agent/mcp/put",
+            axum::routing::put(file_transfer::put_handler),
+        )
         .route("/agent/install", get(install_script_handler))
         .route("/agent/install.ps1", get(install_script_ps1_handler))
         .route("/", get(static_handler))

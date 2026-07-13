@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 
@@ -35,9 +36,245 @@ pub async fn deliver_bulk(tx: &mpsc::Sender<String>, msg: String) {
     let _ = tx.send(msg).await;
 }
 
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde_json::json;
+use uuid::Uuid;
+
+const CHUNK_SIZE: usize = 256 * 1024;
+
+pub async fn put_handler(
+    State(state): State<Arc<crate::relay::SharedState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    // Rate limit (mirrors upload_handler).
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    {
+        let mut rl = state.rate_limiter.write().await;
+        if !rl.check(&client_ip, 20, std::time::Duration::from_secs(60)) {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+    }
+    let token = headers
+        .get("x-sr-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let (session_id, permission) = match state.sessions.authenticate(token).await {
+        Some(r) => r,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    use crate::proto::Permission;
+    if permission == Permission::ReadOnly {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let path = match params.get("path") {
+        Some(p) => p.clone(),
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let content_len = match headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(n) => n,
+        None => return StatusCode::LENGTH_REQUIRED.into_response(),
+    };
+    let total_chunks = ((content_len as usize + CHUNK_SIZE - 1) / CHUNK_SIZE).max(1) as u32;
+    let upload_id = Uuid::new_v4().to_string();
+
+    let bulk_tx = {
+        let broadcast = state.agent_broadcast.read().await;
+        match broadcast
+            .get(&session_id)
+            .and_then(|cm| cm.agent_bulk.clone())
+        {
+            Some(tx) => tx,
+            None => return StatusCode::SERVICE_UNAVAILABLE.into_response(), // no agent
+        }
+    };
+
+    // Stream the body into CHUNK_SIZE chunks → fs:upload on bulk channel.
+    use tokio_stream::StreamExt;
+    let mut reader = body.into_data_stream();
+    let mut chunk_index: u32 = 0;
+    let mut bytes_sent: u64 = 0;
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        // Collect enough data for one chunk (or until EOF).
+        while carry.len() < CHUNK_SIZE {
+            match reader.next().await {
+                Some(Ok(b)) => carry.extend_from_slice(&b),
+                Some(Err(_)) => break,
+                None => break,
+            }
+        }
+        // Take at most CHUNK_SIZE bytes for this chunk.
+        let send_len = carry.len().min(CHUNK_SIZE);
+        let chunk_data: Vec<u8> = carry.drain(..send_len).collect();
+        // Now `carry` holds any leftover bytes beyond CHUNK_SIZE.
+
+        if chunk_data.is_empty() && chunk_index >= total_chunks {
+            break;
+        }
+        if chunk_data.is_empty() && chunk_index < total_chunks {
+            // client closed prematurely
+            // send abort to agent
+            let abort = json!({"type":"fs:upload","session_id":&session_id,
+                "payload":{"upload_id":&upload_id,"final_path":&path,"aborted":true,
+                "_mcp_request_id":Uuid::new_v4().to_string()}});
+            let _ = bulk_tx.send(abort.to_string()).await;
+            audit_ft(
+                &state,
+                &session_id,
+                token,
+                &permission,
+                &path,
+                bytes_sent,
+                "upfile_failed",
+                "client closed",
+            )
+            .await;
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        bytes_sent += chunk_data.len() as u64;
+        let is_last = chunk_index + 1 >= total_chunks;
+        let mcp_req_id = Uuid::new_v4().to_string();
+        let payload = json!({
+            "final_path": &path, "content": BASE64.encode(&chunk_data),
+            "upload_id": &upload_id, "chunk_index": chunk_index, "total_chunks": total_chunks,
+            "_mcp_request_id": &mcp_req_id
+        });
+        if is_last {
+            // register oneshot, await agent fs:result
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state
+                .pending_mcp
+                .write()
+                .await
+                .insert(mcp_req_id.clone(), (session_id.clone(), tx));
+            let proto = json!({"type":"fs:upload","session_id":&session_id,"payload":payload});
+            let _ = deliver_bulk(&bulk_tx, proto.to_string()).await;
+            match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+                Ok(Ok(result)) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&result).unwrap_or_default();
+                    if v.get("success").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        audit_ft(
+                            &state,
+                            &session_id,
+                            token,
+                            &permission,
+                            &path,
+                            bytes_sent,
+                            "upfile",
+                            "",
+                        )
+                        .await;
+                        return axum::Json(json!({"ok":true,"bytes":bytes_sent})).into_response();
+                    } else {
+                        let err = v
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("agent write failed");
+                        audit_ft(
+                            &state,
+                            &session_id,
+                            token,
+                            &permission,
+                            &path,
+                            bytes_sent,
+                            "upfile_failed",
+                            err,
+                        )
+                        .await;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"error": err})),
+                        )
+                            .into_response();
+                    }
+                }
+                _ => {
+                    state.pending_mcp.write().await.remove(&mcp_req_id);
+                    audit_ft(
+                        &state,
+                        &session_id,
+                        token,
+                        &permission,
+                        &path,
+                        bytes_sent,
+                        "upfile_failed",
+                        "timeout",
+                    )
+                    .await;
+                    return StatusCode::GATEWAY_TIMEOUT.into_response();
+                }
+            }
+        } else {
+            let proto = json!({"type":"fs:upload","session_id":&session_id,"payload":payload});
+            let _ = deliver_bulk(&bulk_tx, proto.to_string()).await;
+            chunk_index += 1;
+        }
+    }
+    // empty file (content_len == 0, total_chunks==1, loop sends chunk 0 as last)
+    axum::Json(json!({"ok":true,"bytes":0u64})).into_response()
+}
+
+/// Audit helper for file-transfer endpoints. status ∈ {upfile, downfile, *_failed}.
+async fn audit_ft(
+    state: &crate::relay::SharedState,
+    sid: &str,
+    token: &str,
+    perm: &crate::proto::Permission,
+    path: &str,
+    bytes: u64,
+    status: &str,
+    err: &str,
+) {
+    use crate::relay::recorder::{token_prefix, unix_ms, unix_ms_to_iso, AuditLine};
+    let Some(recorder) = &state.recorder else {
+        return;
+    };
+    let ms = unix_ms();
+    let perm_str = match perm {
+        crate::proto::Permission::ReadWrite => "rw",
+        crate::proto::Permission::ReadOnly => "ro",
+    };
+    recorder.audit_mcp(
+        sid,
+        AuditLine {
+            ts: unix_ms_to_iso(ms),
+            unix_ms: ms,
+            session_id: sid.to_string(),
+            token_prefix: token_prefix(token),
+            permission: perm_str.to_string(),
+            cmd: path.to_string(), // path stored in cmd field
+            timeout_ms: 0,
+            duration_ms: 0,
+            status: status.to_string(),
+            exit_code: None,
+            stdout_len: bytes as usize, // bytes stored in stdout_len
+            stderr_len: if err.is_empty() { 0 } else { err.len() },
+            stdout: String::new(), // never log content
+            stderr: err.to_string(),
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::extract::{Query, State};
+    use axum::http::HeaderMap;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -62,5 +299,132 @@ mod tests {
         }
         h.await.unwrap();
         assert_eq!(got, msgs, "deliver_bulk must not drop or alter file chunks");
+    }
+
+    fn make_state() -> Arc<crate::relay::SharedState> {
+        Arc::new(crate::relay::SharedState::new(
+            String::new(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_put_unauthorized_no_token() {
+        let state = make_state();
+        let mut params = HashMap::new();
+        params.insert("path".into(), "/x".into());
+        let resp =
+            put_handler(State(state), HeaderMap::new(), Query(params), Body::empty()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_put_readonly_forbidden() {
+        let state = make_state();
+        let (_sid, tokens) = state
+            .sessions
+            .register(None, "ro", None)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert("path".into(), "/x".into());
+        let resp =
+            put_handler(State(state), headers, Query(params), Body::empty()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_put_missing_content_length_411() {
+        let state = make_state();
+        let (_sid, tokens) = state
+            .sessions
+            .register(None, "rw", None)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
+        // Body without Content-Length → 411
+        let mut params = HashMap::new();
+        params.insert("path".into(), "/x".into());
+        let resp =
+            put_handler(State(state), headers, Query(params), Body::from("partial")).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::LENGTH_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn test_put_streams_chunks_and_awaits_last_result() {
+        let state = make_state();
+        let (_sid, tokens) = state
+            .sessions
+            .register(None, "rw", None)
+            .await
+            .unwrap();
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let cm = crate::relay::ChannelMap {
+                agent: None,
+                agent_bulk: Some(bulk_tx),
+                browser_sessions: HashMap::new(),
+            };
+            broadcast.insert(_sid.clone(), cm);
+        }
+        // Exactly 3 chunks at CHUNK_SIZE each
+        let data = vec![0xABu8; CHUNK_SIZE * 3];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
+        headers.insert(
+            "content-length",
+            (data.len()).to_string().parse().unwrap(),
+        );
+        let mut params = HashMap::new();
+        params.insert("path".into(), "/remote/x".into());
+
+        // Drain bulk channel: respond to the last chunk's fs:result via pending_mcp.
+        let state_c = state.clone();
+        let h = tokio::spawn(async move {
+            let mut last_req_id: Option<String> = None;
+            let mut count = 0u32;
+            while let Some(m) = bulk_rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+                if v["type"] == "fs:upload" {
+                    count += 1;
+                    let ci = v["payload"]["chunk_index"].as_u64().unwrap() as u32;
+                    let tc = v["payload"]["total_chunks"].as_u64().unwrap() as u32;
+                    if ci + 1 >= tc {
+                        last_req_id = Some(
+                            v["payload"]["_mcp_request_id"]
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                        );
+                        // fulfill oneshot
+                        let mut pending = state_c.pending_mcp.write().await;
+                        if let Some((_sid, tx)) = pending.remove(last_req_id.as_ref().unwrap()) {
+                            let _ = tx
+                                .send(serde_json::json!({"success":true}).to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            assert!(count >= 1);
+        });
+
+        let resp = put_handler(
+            State(state),
+            headers,
+            Query(params),
+            Body::from(data),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        h.await.unwrap();
     }
 }
