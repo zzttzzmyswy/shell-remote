@@ -6,6 +6,7 @@ pub mod session;
 pub mod ws;
 pub mod admin;
 pub mod recorder;
+pub mod file_transfer;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -22,9 +23,14 @@ use crate::relay::session::SessionRegistry;
 /// case for one stuck session — bounded, and isolated from other sessions.
 pub const SSE_CHANNEL_CAPACITY: usize = 256;
 
+/// Re-export of [`file_transfer::BULK_CHANNEL_CAPACITY`] so callers can use
+/// `crate::relay::BULK_CHANNEL_CAPACITY` (canonical home: `file_transfer`).
+pub use crate::relay::file_transfer::BULK_CHANNEL_CAPACITY;
+
 #[allow(dead_code)]
 pub struct ChannelMap {
     pub agent: Option<mpsc::Sender<String>>,
+    pub agent_bulk: Option<mpsc::Sender<String>>,
     pub browser_sessions: HashMap<String, String>,
 }
 
@@ -33,6 +39,7 @@ impl ChannelMap {
     pub fn new() -> Self {
         Self {
             agent: None,
+            agent_bulk: None,
             browser_sessions: HashMap::new(),
         }
     }
@@ -43,6 +50,7 @@ pub struct SharedState {
     pub sessions: SessionRegistry,
     pub agent_broadcast: RwLock<HashMap<String, ChannelMap>>,
     pub pending_mcp: RwLock<HashMap<String, (String, oneshot::Sender<String>)>>,
+    pub download_streams: RwLock<HashMap<String, crate::relay::file_transfer::DownloadSink>>,
     pub last_activity: RwLock<HashMap<String, Instant>>,
     /// Server access password (`--auth`). Wrapped in a RwLock so the admin
     /// panel can rotate it live; reads on the hot auth path take a read lock.
@@ -163,6 +171,7 @@ impl SharedState {
             sessions: SessionRegistry::new(),
             agent_broadcast: RwLock::new(HashMap::new()),
             pending_mcp: RwLock::new(HashMap::new()),
+            download_streams: RwLock::new(HashMap::new()),
             last_activity: RwLock::new(HashMap::new()),
             server_auth: RwLock::new(server_auth),
             agent_event_buffers: RwLock::new(HashMap::new()),
@@ -704,7 +713,7 @@ pub async fn upload_handler(
     // authoritative size rather than re-stat'ing the file (a stat can race
     // the sync above and under-report on some filesystems).
     let file_size = total as usize;
-    let total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let total_chunks = file_size.div_ceil(CHUNK_SIZE);
     let upload_id = uuid::Uuid::new_v4().to_string();
 
     use tokio::io::AsyncReadExt;
@@ -907,6 +916,11 @@ pub async fn start(
             "/agent/mcp/messages",
             axum::routing::post(mcp::messages_handler),
         )
+        .route(
+            "/agent/mcp/put",
+            axum::routing::put(file_transfer::put_handler),
+        )
+        .route("/agent/mcp/get", axum::routing::get(file_transfer::get_handler))
         .route("/agent/install", get(install_script_handler))
         .route("/agent/install.ps1", get(install_script_ps1_handler))
         .route("/", get(static_handler))
@@ -988,6 +1002,22 @@ pub async fn start(
                     // Flush + close the recording file, if any.
                     if let Some(rec) = &state_clone.recorder {
                         rec.close(&session_id);
+                    }
+                }
+
+                // Reap stale download sinks (>5min no activity).
+                // Dropping the sender ends the agent's push / the get_handler
+                // streaming task, so orphaned downloads can't leak forever.
+                // Uses last_activity (refreshed per chunk) so a legitimately
+                // slow-but-progressing transfer isn't reaped mid-stream.
+                {
+                    let mut ds = state_clone.download_streams.write().await;
+                    let stale: Vec<String> = ds.iter()
+                        .filter(|(_, s)| now.duration_since(s.last_activity) > std::time::Duration::from_secs(300))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for k in stale {
+                        ds.remove(&k);
                     }
                 }
             }

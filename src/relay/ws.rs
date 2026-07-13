@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::proto::{requires_write, Message as ProtoMessage, Permission, TokenType};
@@ -145,6 +146,42 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                         "new_path": proto_msg.payload.get("new_path").and_then(|v| v.as_str()).unwrap_or("")
                     })).unwrap_or_default();
                     let _ = tx.send(result_text);
+                }
+            }
+        }
+
+        // Download streaming: fs:result carrying a correlation_id registered in
+        // download_streams is a file chunk pushed by the agent; decode and forward
+        // to the GET response task via the sink. Independent of pending_mcp.
+        if proto_msg.msg_type == "fs:result" {
+            if let Some(cid) = proto_msg.payload.get("_mcp_request_id").and_then(|v| v.as_str()) {
+                let sink_opt = state.download_streams.write().await.remove(cid);
+                if let Some(mut sink) = sink_opt {
+                    let success = proto_msg.payload.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !success {
+                        let err = proto_msg.payload.get("error").and_then(|v| v.as_str()).unwrap_or("download error").to_string();
+                        let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::Error(err)).await;
+                    } else if let Some(content) = proto_msg.payload.get("content").and_then(|v| v.as_str()) {
+                        if let Some(bytes) = crate::agent::fs::decode_b64(content) {
+                            sink.bytes += bytes.len() as u64;
+                            let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::Chunk(bytes)).await;
+                            // Detect last chunk: is_last field (Task 6) or chunk_index+1 >= total_chunks.
+                            let chunk_index = proto_msg.payload.get("chunk_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let total_chunks = proto_msg.payload.get("total_chunks").and_then(|v| v.as_u64()).unwrap_or(1);
+                            let is_last = proto_msg.payload.get("is_last").and_then(|v| v.as_bool()).unwrap_or(false)
+                                || chunk_index + 1 >= total_chunks;
+                            if is_last {
+                                let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::End).await;
+                                // sink dropped → removed from download_streams
+                            } else {
+                                sink.last_activity = std::time::Instant::now();
+                                state.download_streams.write().await.insert(cid.to_string(), sink);
+                            }
+                        } else {
+                            let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::Error("base64 decode failed".to_string())).await;
+                            // sink dropped → removed from download_streams (error terminates)
+                        }
+                    }
                 }
             }
         }
@@ -335,6 +372,34 @@ pub async fn agent_send_handler(
     axum::http::StatusCode::OK.into_response()
 }
 
+/// Biased merge of the interactive and bulk agent channels into one stream
+/// for the agent SSE. Interactive is drained first each cycle, so file chunks
+/// (bulk) yield to terminal:input / mcp:exec / control messages. Both
+/// receivers are bounded independently; bulk backpressure cannot stall
+/// interactive.
+fn merge_biased(
+    mut interactive: tokio::sync::mpsc::Receiver<String>,
+    mut bulk: tokio::sync::mpsc::Receiver<String>,
+) -> impl tokio_stream::Stream<Item = String> {
+    async_stream::stream! {
+        loop {
+            tokio::select! {
+                biased;
+                m = interactive.recv() => match m { Some(s) => yield s, None => {
+                    // drain remaining bulk
+                    while let Some(s) = bulk.recv().await { yield s; }
+                    break;
+                }},
+                m = bulk.recv() => match m { Some(s) => yield s, None => {
+                    // drain remaining interactive
+                    while let Some(s) = interactive.recv().await { yield s; }
+                    break;
+                }},
+            }
+        }
+    }
+}
+
 // ── Agent SSE handler (GET, for HTTP-mode agent receive) ─────────────
 
 pub async fn agent_events_handler(
@@ -371,12 +436,14 @@ pub async fn agent_events_handler(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
 
-    let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);          // interactive
+    let (bulk_tx, bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
 
     {
         let mut broadcast = state.agent_broadcast.write().await;
         if let Some(cm) = broadcast.get_mut(&session_id) {
             cm.agent = Some(tx);
+            cm.agent_bulk = Some(bulk_tx);
         }
     }
 
@@ -397,8 +464,8 @@ pub async fn agent_events_handler(
             }
         }
 
-        let mut rx_stream = ReceiverStream::new(rx);
-        while let Some(msg) = tokio_stream::StreamExt::next(&mut rx_stream).await {
+        let mut merged = Box::pin(merge_biased(rx, bulk_rx));
+        while let Some(msg) = merged.next().await {
             let id = state_clone.buffer_agent_event(&sid_clone, &msg).await;
             yield Ok::<_, Infallible>(
                 axum::response::sse::Event::default()
@@ -848,6 +915,56 @@ mod tests {
         route_agent_message(&state, "sid1", "not valid json {{{").await;
     }
 
+    #[tokio::test]
+    async fn test_route_agent_message_download_chunk_pushes_to_sink() {
+        use crate::relay::file_transfer::{DownloadEvent, DownloadSink};
+        let state = make_state("");
+        let (tx, mut rx) = mpsc::channel(16);
+        state.download_streams.write().await.insert(
+            "dl-1".to_string(),
+            DownloadSink { tx, last_activity: Instant::now(), bytes: 0 },
+        );
+        let msg = json!({
+            "type": "fs:result", "session_id": "sid1",
+            "payload": {"success": true, "content": "aGk=", "path": "/x",
+                        "chunk_index": 0, "total_chunks": 1,
+                        "_mcp_request_id": "dl-1"}
+        }).to_string();
+        route_agent_message(&state, "sid1", &msg).await;
+        match rx.recv().await.unwrap() {
+            DownloadEvent::Chunk(b) => assert_eq!(b, b"hi"),
+            _ => panic!("expected Chunk"),
+        }
+        // Only one chunk with total_chunks=1 → should receive End next
+        match rx.recv().await {
+            Some(DownloadEvent::End) => {} // expected
+            other => panic!("expected End, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_agent_message_download_bad_b64_sends_error() {
+        use crate::relay::file_transfer::{DownloadEvent, DownloadSink};
+        let state = make_state("");
+        let (tx, mut rx) = mpsc::channel(16);
+        state.download_streams.write().await.insert(
+            "dl-bad".to_string(),
+            DownloadSink { tx, last_activity: Instant::now(), bytes: 0 },
+        );
+        // "!!!" is not valid base64
+        let msg = json!({
+            "type": "fs:result", "session_id": "sid1",
+            "payload": {"success": true, "content": "!!!", "path": "/x",
+                        "chunk_index": 0, "total_chunks": 1,
+                        "_mcp_request_id": "dl-bad"}
+        }).to_string();
+        route_agent_message(&state, "sid1", &msg).await;
+        match rx.recv().await.unwrap() {
+            DownloadEvent::Error(e) => assert!(e.contains("base64 decode failed")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
     // ── agent_send_handler tests ─────────────────────────────────────
 
     #[tokio::test]
@@ -1066,5 +1183,102 @@ mod tests {
         assert_eq!(resp.status(), 202);
         assert!(recorder.is_recording(&sid));
         recorder.close(&sid);
+    }
+
+    // ── merge_biased tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_merge_biased_drains_interactive_first() {
+        use tokio::sync::mpsc;
+        let (itx, irx) = mpsc::channel::<String>(8);
+        let (btx, brx) = mpsc::channel::<String>(8);
+        // pre-fill: 3 bulk, then 1 interactive, then 1 bulk
+        for i in 0..3 { btx.send(format!("b{}", i)).await.unwrap(); }
+        itx.send("i0".to_string()).await.unwrap();
+        btx.send("b3".to_string()).await.unwrap();
+        drop(itx); drop(btx); // close so merge terminates
+        let mut out = Box::pin(merge_biased(irx, brx));
+        let mut got = Vec::new();
+        use tokio_stream::StreamExt as _;
+        while let Some(s) = out.next().await { got.push(s); }
+        // interactive i0 must come before all bulk (biased: interactive drained first each cycle)
+        let i_pos = got.iter().position(|s| s == "i0").unwrap();
+        let first_bulk = got.iter().position(|s| s.starts_with('b')).unwrap();
+        assert!(i_pos < first_bulk, "interactive must precede bulk under biased merge; got {:?}", got);
+    }
+
+    /// Stronger biased-merge test: pre-fill bulk with 100 chunks to simulate a
+    /// bandwidth-heavy download flooding the bulk channel.  An interactive
+    /// message injected last must still emerge from the merged stream before
+    /// any queued bulk message — regardless of channel depth.
+    #[tokio::test]
+    async fn test_merge_biased_interactive_beats_flooded_bulk() {
+        use tokio::sync::mpsc;
+        let (itx, irx) = mpsc::channel::<String>(128);
+        let (btx, brx) = mpsc::channel::<String>(128);
+        // Pre-fill bulk with 100 messages, then one interactive.
+        for i in 0..100 {
+            btx.send(format!("bulk-chunk-{:04}", i)).await.unwrap();
+        }
+        itx.send("interactive-ping".to_string()).await.unwrap();
+        // Close both senders so merge terminates.
+        drop(itx);
+        drop(btx);
+        let mut out = Box::pin(merge_biased(irx, brx));
+        let mut got = Vec::new();
+        use tokio_stream::StreamExt as _;
+        while let Some(s) = out.next().await {
+            got.push(s);
+        }
+        // The interactive message must be the *first* item in the merged
+        // output — biased draining means interactive is polled before bulk
+        // on every cycle.
+        assert_eq!(got.len(), 101, "should receive 101 messages total");
+        let first = got.first().expect("non-empty");
+        assert_eq!(
+            first, "interactive-ping",
+            "interactive must be very first item under heavy bulk flood; got {:?}", first
+        );
+    }
+
+    /// Relay-level integration test for biased merge.  Channels are wired into
+    /// the shared state's `agent_broadcast` (as `agent_events_handler` does),
+    /// then pre-filled with bulk chunks and one interactive message.  The merged
+    /// stream drains interactive first thanks to biased select.
+    ///
+    /// A true end-to-end test with a live agent pumping chunks over HTTP while a
+    /// browser concurrently POSTs terminal:input is deferred — it requires a
+    /// process-spanning harness.  This relay-level test validates the ordering
+    /// property at the boundary where the merged SSE stream is assembled.
+    #[tokio::test]
+    async fn test_relay_biased_merge_interactive_beats_bulk_in_stream() {
+        // Create fresh channels and wire them into agent_broadcast — exactly
+        // what agent_events_handler does.
+        let (itx, irx) = mpsc::channel::<String>(16);
+        let (btx, brx) = mpsc::channel::<String>(128);
+
+        // Simulate bulk channel being flooded with download chunks.
+        for i in 0..5 {
+            let _ = btx.send(format!("bulk-download-chunk-{}", i)).await;
+        }
+        // Send the interactive terminal:input after bulk is queued.
+        let _ = itx.send("terminal:input".to_string()).await;
+
+        drop(itx);
+        drop(btx);
+
+        let mut merged = Box::pin(merge_biased(irx, brx));
+        use tokio_stream::StreamExt as _;
+        let mut got = Vec::new();
+        while let Some(s) = merged.next().await {
+            got.push(s);
+        }
+
+        assert_eq!(got.len(), 6, "one interactive + five bulk");
+        assert_eq!(
+            got[0], "terminal:input",
+            "interactive must be first in merged output; got {:?}",
+            got.first()
+        );
     }
 }

@@ -6,6 +6,8 @@ pub mod shell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::agent::client::RelayClient;
@@ -35,6 +37,7 @@ struct TabState {
 struct UploadReassembly {
     file: std::fs::File,
     final_path: String,
+    last_activity: std::time::Instant,
 }
 
 /// Outbound message handle. The main loop never blocks on HTTP: terminal
@@ -155,11 +158,46 @@ async fn post_fs_err(
     post_raw(client, send_url, &msg).await;
 }
 
+/// Build a chunked `fs:result` payload envelope for a single download chunk.
+/// Pure function extracted from `stream_file_download` so it can be unit-tested
+/// independently of I/O.
+fn build_download_chunk_payload(
+    session_id: &str,
+    path: &str,
+    content_b64: &str,
+    idx: u32,
+    total: u32,
+    mcp_request_id: Option<String>,
+) -> serde_json::Value {
+    let is_last = idx + 1 >= total;
+    let payload = serde_json::json!({
+        "success": true,
+        "content": content_b64,
+        "chunk_index": idx,
+        "total_chunks": total,
+        "is_last": is_last,
+        "path": path,
+        "_mcp_request_id": mcp_request_id.clone()
+    });
+    serde_json::json!({"type":"fs:result","session_id":session_id,"payload":payload})
+}
+
 /// Stream a file to the relay as chunked `fs:result` messages (one base64
 /// chunk per POST), correlated by `_mcp_request_id`. Runs in its own task so
 /// a large/slow download can't block the agent's main message loop (and thus
 /// terminal input). Each message stays small so the relay can't be held by a
 /// single giant message, and backpressure flows through the HTTP POST.
+///
+/// Each chunk is POSTed independently via `client.post()`, bypassing the
+/// `sender_loop` control channel so download chunks don't compete with
+/// terminal:output / mcp:result. Between chunks: `tokio::task::yield_now()`.
+///
+/// If `cancel` is supplied, the task checks `cancel.load(Ordering::Relaxed)`
+/// before each chunk and aborts early when the peer disconnects.
+/// `download_cancels` is the shared registry; this task removes its own entry
+/// on completion (normal or error) so the map doesn't accumulate stale entries
+/// after the download finishes.
+#[allow(clippy::too_many_arguments)]
 async fn stream_file_download(
     client: reqwest::Client,
     send_url: String,
@@ -167,20 +205,17 @@ async fn stream_file_download(
     root: PathBuf,
     path: String,
     mcp_request_id: Option<String>,
+    cancel: Option<Arc<AtomicBool>>,
+    download_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
 ) {
     const CHUNK_SIZE: usize = 256 * 1024;
     use std::io::Read;
-
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("download")
-        .to_string();
 
     let resolved = match crate::agent::fs::resolve_path(&root, &path) {
         Some(p) => p,
         None => {
             post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, "Invalid path").await;
+            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
             return;
         }
     };
@@ -189,20 +224,23 @@ async fn stream_file_download(
         Ok(m) => m,
         Err(e) => {
             post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to read file: {}", e)).await;
+            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
             return;
         }
     };
     if meta.is_dir() {
         post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, "Path is a directory").await;
+        if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
         return;
     }
     let file_size = meta.len() as usize;
-    let total_chunks = (((file_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32).max(1);
+    let total_chunks = (file_size.div_ceil(CHUNK_SIZE) as u32).max(1);
 
     let mut f = match std::fs::File::open(&resolved) {
         Ok(f) => f,
         Err(e) => {
             post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to open file: {}", e)).await;
+            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
             return;
         }
     };
@@ -210,25 +248,29 @@ async fn stream_file_download(
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut idx: u32 = 0;
     loop {
+        // Check for cancellation before reading/processing each chunk
+        if let Some(ref c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                tracing::debug!("Download cancelled for {}", path);
+                break;
+            }
+        }
         let n = match f.read(&mut buf) {
             Ok(n) => n,
             Err(e) => {
                 post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to read file: {}", e)).await;
+                if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
                 return;
             }
         };
         let content_b64 = crate::agent::fs::encode_b64(&buf[..n]);
-        let payload = serde_json::json!({
-            "success": true,
-            "content": content_b64,
-            "chunk_index": idx,
-            "total_chunks": total_chunks,
-            "name": name,
-            "path": path,
-            "_mcp_request_id": mcp_request_id.clone()
-        });
-        let msg = serde_json::json!({"type":"fs:result","session_id":session_id,"payload":payload}).to_string();
-        post_raw(&client, &send_url, &msg).await;
+        let msg = build_download_chunk_payload(
+            &session_id, &path, &content_b64, idx, total_chunks, mcp_request_id.clone(),
+        );
+        // Independent POST (not via sender_loop) so terminal:output/mcp:result
+        // are not starved by download chunks.
+        let _ = client.post(&send_url).json(&msg).send().await;
+        tokio::task::yield_now().await;
         idx += 1;
         if idx >= total_chunks {
             break;
@@ -238,10 +280,33 @@ async fn stream_file_download(
             break;
         }
     }
+    // Remove from cancel registry now that the download has finished (normal
+    // completion, cancellation, or early EOF). The spawned task holds its own
+    // Arc clone, so a late fs:read_cancel is harmless (token already dropped).
+    if let Some(ref cid) = mcp_request_id {
+        let _ = download_cancels.lock().unwrap().remove(cid);
+    }
 }
 
-/// Assemble one base64 chunk of a chunked upload into `final_path`.
+/// Handle a relay-aborted upload: drop the open reassembly handle (so the
+/// half-written file is closed) and best-effort delete the destination file
+/// so no truncated artifact lingers. No reply is emitted — the relay's abort
+/// uses a fresh `_mcp_request_id` not registered in `pending_mcp`.
+fn handle_upload_abort(
+    reassembly: &mut HashMap<String, UploadReassembly>,
+    root: &Path,
+    upload_id: &str,
+    final_path: &str,
+) {
+    reassembly.remove(upload_id);
+    if let Some(p) = crate::agent::fs::resolve_path(root, final_path) {
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+
 ///
+/// Assemble one base64 chunk of a chunked upload into `final_path`.
 /// Chunk 0 opens (truncating) the destination and writes; subsequent chunks
 /// append to the open file held in `reassembly` (keyed by `upload_id`); the
 /// last chunk flushes, closes, and returns a terminal result. Returns
@@ -291,6 +356,7 @@ fn assemble_upload_chunk(
                             reassembly.insert(upload_id.to_string(), UploadReassembly {
                                 file: f,
                                 final_path: final_path.to_string(),
+                                last_activity: std::time::Instant::now(),
                             });
                             (ok(), true)
                         }
@@ -315,6 +381,8 @@ fn assemble_upload_chunk(
                             path: Some(fp), new_path: None,
                         }, false)
                     } else {
+                        let mut st = st;
+                        st.last_activity = std::time::Instant::now();
                         reassembly.insert(upload_id.to_string(), st);
                         (crate::proto::FsResultPayload {
                             success: true, error: None,
@@ -481,8 +549,29 @@ async fn run_session(
     // chunk; the last chunk flushes, closes, and replies.
     let mut upload_reassembly: HashMap<String, UploadReassembly> = HashMap::new();
 
+    // Cancel registry for in-flight downloads, keyed by correlation_id
+    // (_mcp_request_id from the fs:read request). When the relay sends
+    // fs:read_cancel{correlation_id} (client disconnected), we set the
+    // AtomicBool so the spawned stream_file_download task stops early.
+    let download_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    let mut cleanup_tick = tokio::time::interval(Duration::from_secs(60));
+    cleanup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
+                _ = cleanup_tick.tick() => {
+                    let now = std::time::Instant::now();
+                    upload_reassembly.retain(|_, r| {
+                        if now.duration_since(r.last_activity) > Duration::from_secs(300) {
+                            let _ = std::fs::remove_file(&r.final_path);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
                 shell_output = shell_rx.recv() => {
                     match shell_output {
                         Some((tab_id, data)) => {
@@ -665,6 +754,14 @@ async fn run_session(
                                     let send_url = client.send_url().to_string();
                                     let sid = client.session_id.clone();
                                     let root_clone = root_path.clone();
+                                    // Register a cancel token for this correlation_id so the
+                                    // relay can abort the download via fs:read_cancel.
+                                    let cancel = Arc::new(AtomicBool::new(false));
+                                    let cancel_token = cancel.clone();
+                                    if let Some(ref cid) = mcp_request_id {
+                                        download_cancels.lock().unwrap().insert(cid.clone(), cancel);
+                                    }
+                                    let dc = download_cancels.clone();
                                     tokio::spawn(stream_file_download(
                                         client_req,
                                         send_url,
@@ -672,7 +769,21 @@ async fn run_session(
                                         root_clone,
                                         path,
                                         mcp_request_id,
+                                        Some(cancel_token),
+                                        dc,
                                     ));
+                                }
+
+                                "fs:read_cancel" => {
+                                    let mcp_request_id = msg.payload["_mcp_request_id"]
+                                        .as_str()
+                                        .map(|s| s.to_string());
+                                    if let Some(ref cid) = mcp_request_id {
+                                        if let Some(cancel) = download_cancels.lock().unwrap().remove(cid) {
+                                            cancel.store(true, Ordering::Relaxed);
+                                            tracing::debug!("Cancelled download for correlation_id={}", cid);
+                                        }
+                                    }
                                 }
 
                                 "fs:write" => {
@@ -700,6 +811,18 @@ async fn run_session(
                                     let chunk_index = msg.payload["chunk_index"].as_u64().unwrap_or(0) as u32;
                                     let total_chunks = msg.payload["total_chunks"].as_u64().unwrap_or(0) as u32;
                                     let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
+
+                                    // Abort: the relay detected a premature client
+                                    // close and sent {"aborted":true} with a fresh
+                                    // _mcp_request_id (not registered in pending_mcp).
+                                    // Drop the open reassembly handle and delete the
+                                    // half-written destination file; no reply (the
+                                    // relay's abort uses an unregistered id, so no
+                                    // oneshot leaks).
+                                    if msg.payload.get("aborted").and_then(|v| v.as_bool()) == Some(true) {
+                                        handle_upload_abort(&mut upload_reassembly, &root_path, &upload_id, &final_path);
+                                        continue;
+                                    }
 
                                     let (result, more_expected) = assemble_upload_chunk(
                                         &mut upload_reassembly,
@@ -996,6 +1119,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_download_chunk_payload_is_last_flag() {
+        let p0 = build_download_chunk_payload(
+            "s", "/x", "AAAA", 0, 3, Some("r".to_string()));
+        let p2 = build_download_chunk_payload(
+            "s", "/x", "AAAA", 2, 3, Some("r".to_string()));
+        assert_eq!(p0["payload"]["is_last"], serde_json::json!(false));
+        assert_eq!(p2["payload"]["is_last"], serde_json::json!(true));
+        assert_eq!(p2["payload"]["chunk_index"], serde_json::json!(2));
+        assert_eq!(p2["payload"]["total_chunks"], serde_json::json!(3));
+    }
+
+    #[test]
     fn test_assemble_upload_chunk_reassembles_multiple_chunks() {
         // Feed a 3-chunk upload through the reassembly state machine and
         // verify the final file equals the concatenation, only the last
@@ -1132,5 +1267,160 @@ mod tests {
     #[test]
     fn test_home_dir_defaults_to_dot() {
         assert_eq!(super::home_dir_from(None, None), ".");
+    }
+
+    #[test]
+    fn test_stale_upload_reassembly_reaped() {
+        // Simulate an old entry in upload_reassembly and verify the 5min
+        // cleanup removes it and deletes the half-written file.
+        let tmp = std::env::temp_dir().join(format!("sr-stale-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dest = tmp.join("stale.bin");
+        // Write some bytes so the file exists and removal must succeed.
+        std::fs::write(&dest, b"partial").unwrap();
+        let final_path = dest.to_string_lossy().to_string();
+
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+        // Create a stale entry: last_activity set to 10 minutes in the past.
+        let old_entry = UploadReassembly {
+            file: std::fs::File::open(&dest).unwrap(),
+            final_path: final_path.clone(),
+            last_activity: std::time::Instant::now() - Duration::from_secs(600),
+        };
+        reassembly.insert("stale-uid".to_string(), old_entry);
+
+        // Run the retain logic.
+        let now = std::time::Instant::now();
+        reassembly.retain(|_, r| {
+            if now.duration_since(r.last_activity) > Duration::from_secs(300) {
+                let _ = std::fs::remove_file(&r.final_path);
+                false
+            } else {
+                true
+            }
+        });
+
+        assert!(reassembly.is_empty(), "stale entry must be removed");
+        assert!(!dest.exists(), "half-written file must be deleted");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_fresh_upload_reassembly_not_reaped() {
+        // A fresh entry (just created) must survive the cleanup.
+        let tmp = std::env::temp_dir().join(format!("sr-fresh-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dest = tmp.join("fresh.bin");
+        std::fs::write(&dest, b"data").unwrap();
+        let final_path = dest.to_string_lossy().to_string();
+
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+        let fresh_entry = UploadReassembly {
+            file: std::fs::File::open(&dest).unwrap(),
+            final_path: final_path.clone(),
+            last_activity: std::time::Instant::now(),
+        };
+        reassembly.insert("fresh-uid".to_string(), fresh_entry);
+
+        let now = std::time::Instant::now();
+        reassembly.retain(|_, r| {
+            if now.duration_since(r.last_activity) > Duration::from_secs(300) {
+                let _ = std::fs::remove_file(&r.final_path);
+                false
+            } else {
+                true
+            }
+        });
+
+        assert_eq!(reassembly.len(), 1, "fresh entry must survive");
+        assert!(dest.exists(), "fresh file must not be deleted");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_handle_upload_abort_removes_reassembly_and_file() {
+        // Finding 3: an fs:upload with aborted:true must drop the open
+        // reassembly handle AND delete the half-written destination file.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        // Pre-existing partial file at final_path (relative to root).
+        let dest = root.join("partial.bin");
+        fs::write(&dest, b"partial-data").unwrap();
+        assert!(dest.exists());
+
+        // Simulate a prior chunk-0 that opened the file for appending.
+        let final_path = "partial.bin".to_string();
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+        reassembly.insert(
+            "uid-1".to_string(),
+            UploadReassembly {
+                file: fs::OpenOptions::new().append(true).open(&dest).unwrap(),
+                final_path: final_path.clone(),
+                last_activity: std::time::Instant::now(),
+            },
+        );
+
+        handle_upload_abort(&mut reassembly, &root, "uid-1", &final_path);
+
+        assert!(reassembly.is_empty(), "reassembly entry must be removed on abort");
+        assert!(!dest.exists(), "half-written file must be deleted on abort");
+
+        // Idempotent: a second abort (no entry) is a no-op, doesn't panic.
+        handle_upload_abort(&mut reassembly, &root, "uid-1", &final_path);
+    }
+
+    #[test]
+    fn test_assemble_upload_chunk_refreshes_last_activity_on_append() {
+        // Finding 4 (agent): a non-final append chunk must refresh
+        // UploadReassembly.last_activity so a slow-but-progressing upload isn't
+        // reaped mid-stream.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let dest = root.join("big.bin");
+        // chunk 0: open + write, non-final (total_chunks=2) → inserts entry.
+        let (res, more) = assemble_upload_chunk(
+            &mut HashMap::new(),
+            &root,
+            "uid-2",
+            "big.bin",
+            &crate::agent::fs::encode_b64(b"AAAA"),
+            0,
+            2,
+        );
+        assert!(res.success);
+        assert!(more);
+
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+        // Stale entry (as if created long ago, then chunk 1 arrives now).
+        let stale = std::time::Instant::now() - Duration::from_secs(600);
+        reassembly.insert(
+            "uid-2".to_string(),
+            UploadReassembly {
+                file: fs::OpenOptions::new().append(true).create(true).open(&dest).unwrap(),
+                final_path: "big.bin".to_string(),
+                last_activity: stale,
+            },
+        );
+        let before = reassembly.get("uid-2").unwrap().last_activity;
+        assert!(std::time::Instant::now().duration_since(before) > Duration::from_secs(5));
+
+        // Non-final append (chunk_index=1, total_chunks=3 → not last) refreshes.
+        let (_res, more2) = assemble_upload_chunk(
+            &mut reassembly,
+            &root,
+            "uid-2",
+            "big.bin",
+            &crate::agent::fs::encode_b64(b"BBBB"),
+            1,
+            3,
+        );
+        assert!(more2, "chunk 1/3 is not last → more expected");
+        let after = reassembly.get("uid-2").unwrap().last_activity;
+        assert!(std::time::Instant::now().duration_since(after) < Duration::from_secs(1),
+            "last_activity must be refreshed on non-final append");
     }
 }

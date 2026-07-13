@@ -226,7 +226,7 @@ async fn process_mcp_request(
                 "tools": [
                     {
                         "name": "shell_remote",
-                        "description": "Execute a shell command on the remote target machine via shell_remote. Returns stdout, stderr, and exit code. Authenticate with a shell_remote token (the session token shown when the agent starts).",
+                        "description": "Execute a shell command on the remote target machine via shell_remote. Returns stdout, stderr, and exit code. For file transfer: small in-context content (configs/scripts/patches) can be written directly via heredoc/cat through this tool; for large on-disk files, use curl to PUT /agent/mcp/put (upload) or GET /agent/mcp/get (download), with header X-SR-Token set to the same token as this tool. Bytes do not pass through LLM context. See README 'MCP 端文件传输'.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -287,7 +287,7 @@ async fn process_mcp_request(
 
             if permission == Permission::ReadOnly {
                 audit_mcp_call(
-                    &state, &session_id, token, permission, cmd, timeout_ms_val,
+                    state, &session_id, token, permission, cmd, timeout_ms_val,
                     0, "rejected_readonly", None, "", "",
                 );
                 return Some(json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32002,"message":"Read-only token cannot call shell_remote"}}));
@@ -335,7 +335,7 @@ async fn process_mcp_request(
                     None => {
                         state.pending_mcp.write().await.remove(&mcp_req_id);
                         audit_mcp_call(
-                            &state, &session_id, token, permission, cmd, timeout_ms_val,
+                            state, &session_id, token, permission, cmd, timeout_ms_val,
                             0, "no_agent", None, "", "",
                         );
                         return Some(json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Error: No agent connected for this session"}],"isError":true}}));
@@ -353,7 +353,7 @@ async fn process_mcp_request(
                     let exit_code = value.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
                     let duration_ms = started.elapsed().as_millis() as u64;
                     audit_mcp_call(
-                        &state, &session_id, token, permission, cmd, timeout_ms_val,
+                        state, &session_id, token, permission, cmd, timeout_ms_val,
                         duration_ms, "ok", Some(exit_code), stdout, stderr,
                     );
                     let mut text = String::new();
@@ -372,7 +372,7 @@ async fn process_mcp_request(
                     state.pending_mcp.write().await.remove(&mcp_req_id);
                     let duration_ms = started.elapsed().as_millis() as u64;
                     audit_mcp_call(
-                        &state, &session_id, token, permission, cmd, timeout_ms_val,
+                        state, &session_id, token, permission, cmd, timeout_ms_val,
                         duration_ms, "timeout", None, "", "",
                     );
                     json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Error: Request timed out or agent disconnected"}],"isError":true}})
@@ -723,5 +723,20 @@ mod tests {
         .await;
         assert_eq!(r["error"]["code"], -32601);
         assert_eq!(r["id"], "req-42");
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_description_mentions_file_transfer() {
+        let state = make_state();
+        let r = mcp_send_and_recv(
+            &state,
+            HashMap::new(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let desc = r["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(desc.contains("/agent/mcp/put"));
+        assert!(desc.contains("/agent/mcp/get"));
+        assert!(desc.contains("X-SR-Token"));
     }
 }

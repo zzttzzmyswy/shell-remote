@@ -1550,6 +1550,7 @@ dependencies = [
  "base64",
  "clap",
  "hex",
+ "http-body-util",
  "mime_guess",
  "portable-pty",
  "rand 0.8.6",
