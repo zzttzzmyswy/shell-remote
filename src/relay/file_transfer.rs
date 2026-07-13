@@ -16,9 +16,10 @@ pub enum DownloadEvent {
 /// The relay-side handle for one in-flight download. `route_agent_message`
 /// pushes decoded file bytes (or errors) into `tx`; the `get_handler` task
 /// drains `tx` into the HTTP response body.
+#[derive(Debug, Clone)]
 pub struct DownloadSink {
     pub tx: mpsc::Sender<DownloadEvent>,
-    pub created_at: Instant,
+    pub last_activity: Instant,
     pub bytes: u64,
 }
 
@@ -77,7 +78,7 @@ pub async fn get_handler(
     let (sink_tx, mut sink_rx) = mpsc::channel::<DownloadEvent>(16);
     {
         let mut ds = state.download_streams.write().await;
-        ds.insert(correlation_id.clone(), DownloadSink { tx: sink_tx, created_at: std::time::Instant::now(), bytes: 0 });
+        ds.insert(correlation_id.clone(), DownloadSink { tx: sink_tx, last_activity: std::time::Instant::now(), bytes: 0 });
     }
     // Send fs:read to agent on bulk channel.
     let proto = json!({"type":"fs:read","session_id":&session_id,
@@ -89,6 +90,11 @@ pub async fn get_handler(
     match first {
         Some(DownloadEvent::Error(msg)) => {
             state.download_streams.write().await.remove(&correlation_id);
+            // Agent reported an error on chunk 0 — it has already stopped, but
+            // send fs:read_cancel defensively (no-op if no cancel token).
+            let proto = json!({"type":"fs:read_cancel","session_id":&session_id,
+                "payload":{"_mcp_request_id":&correlation_id}});
+            let _ = deliver_bulk(&bulk_tx, proto.to_string()).await;
             audit_ft(&state, &session_id, token, &permission, &path, 0, "downfile_failed", &msg).await;
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":msg}))).into_response()
         }
@@ -103,21 +109,39 @@ pub async fn get_handler(
             let perm_c = permission.clone();
             let path_c = path.clone();
             let cid_c = correlation_id.clone();
+            let bulk_c = bulk_tx.clone();
             let (body_tx, body_rx) = mpsc::channel::<std::result::Result<Vec<u8>, std::convert::Infallible>>(16);
             tokio::spawn(async move {
+                // On any disconnect/abandon path, remove the sink from
+                // `download_streams` AND send `fs:read_cancel` to the agent so it
+                // stops reading/posting the whole file into a relay that drops
+                // every chunk. Order: remove sink, THEN send cancel.
+                let send_cancel = || {
+                    let cid = cid_c.clone();
+                    let sid = sid_c.clone();
+                    let bulk = bulk_c.clone();
+                    async move {
+                        let proto = json!({"type":"fs:read_cancel","session_id":&sid,
+                            "payload":{"_mcp_request_id":&cid}});
+                        let _ = deliver_bulk(&bulk, proto.to_string()).await;
+                    }
+                };
                 // Send first_bytes.
                 if body_tx.send(Ok(first_bytes)).await.is_err() {
                     let _ = state_c.download_streams.write().await.remove(&cid_c);
+                    send_cancel().await;
                     audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, 0, "downfile_failed", "client disconnected").await;
                     return;
                 }
                 let mut total = first_len;
+                let mut saw_end = false;
                 while let Some(ev) = sink_rx.recv().await {
                     match ev {
                         DownloadEvent::Chunk(b) => {
                             let chunk_len = b.len() as u64;
                             if body_tx.send(Ok(b)).await.is_err() {
                                 let _ = state_c.download_streams.write().await.remove(&cid_c);
+                                send_cancel().await;
                                 audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile_failed", "client disconnected").await;
                                 return;
                             }
@@ -125,14 +149,26 @@ pub async fn get_handler(
                         }
                         DownloadEvent::Error(e) => {
                             let _ = state_c.download_streams.write().await.remove(&cid_c);
+                            send_cancel().await;
                             audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile_failed", &e).await;
                             return;
                         }
-                        DownloadEvent::End => break,
+                        DownloadEvent::End => {
+                            saw_end = true;
+                            break;
+                        }
                     }
                 }
                 let _ = state_c.download_streams.write().await.remove(&cid_c);
-                audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile", "").await;
+                if saw_end {
+                    audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile", "").await;
+                } else {
+                    // sink_rx returned None without End — the sink was removed
+                    // out from under the download (reaped by the inactivity
+                    // reaper, or otherwise dropped). Honest status: failed.
+                    send_cancel().await;
+                    audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile_failed", "stream interrupted").await;
+                }
             });
             let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx));
             let mut resp = body.into_response();
@@ -141,6 +177,10 @@ pub async fn get_handler(
         }
         _ => {
             state.download_streams.write().await.remove(&correlation_id);
+            // Sink was reaped before chunk 0 arrived — tell the agent to stop.
+            let proto = json!({"type":"fs:read_cancel","session_id":&session_id,
+                "payload":{"_mcp_request_id":&correlation_id}});
+            let _ = deliver_bulk(&bulk_tx, proto.to_string()).await;
             StatusCode::GATEWAY_TIMEOUT.into_response()
         }
     }
@@ -210,11 +250,14 @@ pub async fn put_handler(
     let mut carry: Vec<u8> = Vec::new();
     loop {
         // Collect enough data for one chunk (or until EOF).
+        let mut stream_done = false;
         while carry.len() < CHUNK_SIZE {
             match reader.next().await {
                 Some(Ok(b)) => carry.extend_from_slice(&b),
-                Some(Err(_)) => break,
-                None => break,
+                Some(Err(_)) | None => {
+                    stream_done = true;
+                    break;
+                }
             }
         }
         // Take at most CHUNK_SIZE bytes for this chunk.
@@ -225,9 +268,14 @@ pub async fn put_handler(
         if chunk_data.is_empty() && chunk_index >= total_chunks {
             break;
         }
-        if chunk_data.is_empty() && bytes_sent < content_len {
-            // client closed prematurely (received fewer bytes than promised)
-            // send abort to agent
+        // Premature close: the body stream ended (EOF or error) before
+        // `content_len` bytes arrived. This covers BOTH the zero-leftover
+        // case (chunk_data empty) and the short-final-chunk case (partial
+        // chunk_data). Either way the remote file would be truncated vs the
+        // declared Content-Length, so we must NOT report success — send the
+        // abort message to the agent and return 400. (The 0-byte case is
+        // excluded: content_len==0 → `0 < 0` is false.)
+        if stream_done && bytes_sent + (chunk_data.len() as u64) < content_len {
             let abort = json!({"type":"fs:upload","session_id":&session_id,
                 "payload":{"upload_id":&upload_id,"final_path":&path,"aborted":true,
                 "_mcp_request_id":Uuid::new_v4().to_string()}});
@@ -628,5 +676,146 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["bytes"], 0);
         h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_download_disconnect_sends_fs_read_cancel() {
+        // Finding 1: when the HTTP body client disconnects mid-stream, the
+        // get_handler body task must send fs:read_cancel to the agent bulk
+        // channel so the agent stops streaming the rest of the file.
+        let state = make_state();
+        let (_sid, tokens) = state.sessions.register(None, "ro", None).await.unwrap();
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            broadcast.insert(_sid.clone(), crate::relay::ChannelMap {
+                agent: None, agent_bulk: Some(bulk_tx), browser_sessions: HashMap::new(),
+            });
+        }
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let state_c = state.clone();
+        let sid_c = _sid.clone();
+        tokio::spawn(async move {
+            // Read fs:read, extract correlation_id, push chunk 0 (non-final).
+            let m = bulk_rx.recv().await.unwrap();
+            let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+            assert_eq!(v["type"], "fs:read");
+            let cid = v["payload"]["_mcp_request_id"].as_str().unwrap().to_string();
+            let chunk0 = serde_json::json!({
+                "type":"fs:result","session_id":&sid_c,
+                "payload":{"success":true,"content":BASE64.encode(b"a"),
+                "chunk_index":0,"total_chunks":2,"is_last":false,"_mcp_request_id":&cid}
+            }).to_string();
+            crate::relay::ws::route_agent_message(&state_c, &sid_c, &chunk0).await;
+            // Wait for the test to drop the response body.
+            go_rx.await.unwrap();
+            // Push chunk 1 (final) — the body task's body_tx.send will fail
+            // (client gone), triggering the fs:read_cancel path.
+            let chunk1 = serde_json::json!({
+                "type":"fs:result","session_id":&sid_c,
+                "payload":{"success":true,"content":BASE64.encode(b"b"),
+                "chunk_index":1,"total_chunks":2,"is_last":true,"_mcp_request_id":&cid}
+            }).to_string();
+            crate::relay::ws::route_agent_message(&state_c, &sid_c, &chunk1).await;
+            // Drain bulk_rx until fs:read_cancel arrives.
+            while let Some(m) = bulk_rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+                if v["type"] == "fs:read_cancel" {
+                    assert_eq!(v["payload"]["_mcp_request_id"], cid);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            }
+            panic!("fs:read_cancel never arrived on bulk channel");
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert("path".into(), "/remote/x".into());
+        let resp = get_handler(State(state), headers, Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Simulate client disconnect by dropping the response body.
+        drop(resp);
+        let _ = go_tx.send(());
+        // fs:read_cancel must arrive within 5s.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), done_rx).await {
+            Ok(Ok(())) => {}
+            _ => panic!("fs:read_cancel not received within 5s"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_put_short_final_chunk_returns_400() {
+        // Finding 2: a single-chunk upload where Content-Length exceeds the
+        // actual body bytes (premature close) must return 400, not 200 — the
+        // relay must not report a truncated upload as success.
+        let state = make_state();
+        let (_sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            broadcast.insert(_sid.clone(), crate::relay::ChannelMap {
+                agent: None, agent_bulk: Some(bulk_tx), browser_sessions: HashMap::new(),
+            });
+        }
+        // Drain bulk: assert the abort message is sent.
+        let h = tokio::spawn(async move {
+            while let Some(m) = bulk_rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+                if v["type"] == "fs:upload" {
+                    assert_eq!(v["payload"]["aborted"], true);
+                    return;
+                }
+            }
+            panic!("no abort message received");
+        });
+
+        // Declare 100 bytes but send only 3, then close the stream.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
+        headers.insert("content-length", "100".parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert("path".into(), "/remote/x".into());
+        let resp = put_handler(
+            State(state),
+            headers,
+            Query(params),
+            Body::from("abc"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_download_sink_last_activity_refreshed_on_chunk() {
+        // Finding 4 (relay): route_agent_message must refresh
+        // DownloadSink.last_activity on a non-final chunk so a slow-but-progressing
+        // download is not reaped mid-stream.
+        use crate::relay::file_transfer::{DownloadEvent, DownloadSink};
+        use std::time::{Duration, Instant};
+        let state = make_state();
+        let (tx, mut rx) = mpsc::channel(16);
+        let old = Instant::now() - Duration::from_secs(600);
+        state.download_streams.write().await.insert(
+            "dl-act".to_string(),
+            DownloadSink { tx, last_activity: old, bytes: 0 },
+        );
+        let msg = serde_json::json!({
+            "type":"fs:result","session_id":"sid1",
+            "payload":{"success":true,"content":"aGk=","path":"/x",
+            "chunk_index":0,"total_chunks":2,"is_last":false,"_mcp_request_id":"dl-act"}
+        }).to_string();
+        crate::relay::ws::route_agent_message(&state, "sid1", &msg).await;
+        // Drain the chunk so the sender isn't back-pressured.
+        let _ = rx.recv().await;
+        let now = Instant::now();
+        let sink = state.download_streams.read().await.get("dl-act").cloned();
+        assert!(sink.is_some(), "non-final chunk must re-insert the sink");
+        let la = sink.unwrap().last_activity;
+        assert!(now.duration_since(la) < Duration::from_secs(1),
+            "last_activity must be refreshed on chunk push");
     }
 }

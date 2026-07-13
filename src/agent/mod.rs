@@ -37,7 +37,7 @@ struct TabState {
 struct UploadReassembly {
     file: std::fs::File,
     final_path: String,
-    created_at: std::time::Instant,
+    last_activity: std::time::Instant,
 }
 
 /// Outbound message handle. The main loop never blocks on HTTP: terminal
@@ -288,8 +288,25 @@ async fn stream_file_download(
     }
 }
 
-/// Assemble one base64 chunk of a chunked upload into `final_path`.
+/// Handle a relay-aborted upload: drop the open reassembly handle (so the
+/// half-written file is closed) and best-effort delete the destination file
+/// so no truncated artifact lingers. No reply is emitted — the relay's abort
+/// uses a fresh `_mcp_request_id` not registered in `pending_mcp`.
+fn handle_upload_abort(
+    reassembly: &mut HashMap<String, UploadReassembly>,
+    root: &Path,
+    upload_id: &str,
+    final_path: &str,
+) {
+    reassembly.remove(upload_id);
+    if let Some(p) = crate::agent::fs::resolve_path(root, final_path) {
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+
 ///
+/// Assemble one base64 chunk of a chunked upload into `final_path`.
 /// Chunk 0 opens (truncating) the destination and writes; subsequent chunks
 /// append to the open file held in `reassembly` (keyed by `upload_id`); the
 /// last chunk flushes, closes, and returns a terminal result. Returns
@@ -339,7 +356,7 @@ fn assemble_upload_chunk(
                             reassembly.insert(upload_id.to_string(), UploadReassembly {
                                 file: f,
                                 final_path: final_path.to_string(),
-                                created_at: std::time::Instant::now(),
+                                last_activity: std::time::Instant::now(),
                             });
                             (ok(), true)
                         }
@@ -364,6 +381,8 @@ fn assemble_upload_chunk(
                             path: Some(fp), new_path: None,
                         }, false)
                     } else {
+                        let mut st = st;
+                        st.last_activity = std::time::Instant::now();
                         reassembly.insert(upload_id.to_string(), st);
                         (crate::proto::FsResultPayload {
                             success: true, error: None,
@@ -545,7 +564,7 @@ async fn run_session(
                 _ = cleanup_tick.tick() => {
                     let now = std::time::Instant::now();
                     upload_reassembly.retain(|_, r| {
-                        if now.duration_since(r.created_at) > Duration::from_secs(300) {
+                        if now.duration_since(r.last_activity) > Duration::from_secs(300) {
                             let _ = std::fs::remove_file(&r.final_path);
                             false
                         } else {
@@ -792,6 +811,18 @@ async fn run_session(
                                     let chunk_index = msg.payload["chunk_index"].as_u64().unwrap_or(0) as u32;
                                     let total_chunks = msg.payload["total_chunks"].as_u64().unwrap_or(0) as u32;
                                     let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
+
+                                    // Abort: the relay detected a premature client
+                                    // close and sent {"aborted":true} with a fresh
+                                    // _mcp_request_id (not registered in pending_mcp).
+                                    // Drop the open reassembly handle and delete the
+                                    // half-written destination file; no reply (the
+                                    // relay's abort uses an unregistered id, so no
+                                    // oneshot leaks).
+                                    if msg.payload.get("aborted").and_then(|v| v.as_bool()) == Some(true) {
+                                        handle_upload_abort(&mut upload_reassembly, &root_path, &upload_id, &final_path);
+                                        continue;
+                                    }
 
                                     let (result, more_expected) = assemble_upload_chunk(
                                         &mut upload_reassembly,
@@ -1250,18 +1281,18 @@ mod tests {
         let final_path = dest.to_string_lossy().to_string();
 
         let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
-        // Create a stale entry: created_at set to 10 minutes in the past.
+        // Create a stale entry: last_activity set to 10 minutes in the past.
         let old_entry = UploadReassembly {
             file: std::fs::File::open(&dest).unwrap(),
             final_path: final_path.clone(),
-            created_at: std::time::Instant::now() - Duration::from_secs(600),
+            last_activity: std::time::Instant::now() - Duration::from_secs(600),
         };
         reassembly.insert("stale-uid".to_string(), old_entry);
 
         // Run the retain logic.
         let now = std::time::Instant::now();
         reassembly.retain(|_, r| {
-            if now.duration_since(r.created_at) > Duration::from_secs(300) {
+            if now.duration_since(r.last_activity) > Duration::from_secs(300) {
                 let _ = std::fs::remove_file(&r.final_path);
                 false
             } else {
@@ -1288,13 +1319,13 @@ mod tests {
         let fresh_entry = UploadReassembly {
             file: std::fs::File::open(&dest).unwrap(),
             final_path: final_path.clone(),
-            created_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
         };
         reassembly.insert("fresh-uid".to_string(), fresh_entry);
 
         let now = std::time::Instant::now();
         reassembly.retain(|_, r| {
-            if now.duration_since(r.created_at) > Duration::from_secs(300) {
+            if now.duration_since(r.last_activity) > Duration::from_secs(300) {
                 let _ = std::fs::remove_file(&r.final_path);
                 false
             } else {
@@ -1306,5 +1337,90 @@ mod tests {
         assert!(dest.exists(), "fresh file must not be deleted");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_handle_upload_abort_removes_reassembly_and_file() {
+        // Finding 3: an fs:upload with aborted:true must drop the open
+        // reassembly handle AND delete the half-written destination file.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        // Pre-existing partial file at final_path (relative to root).
+        let dest = root.join("partial.bin");
+        fs::write(&dest, b"partial-data").unwrap();
+        assert!(dest.exists());
+
+        // Simulate a prior chunk-0 that opened the file for appending.
+        let final_path = "partial.bin".to_string();
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+        reassembly.insert(
+            "uid-1".to_string(),
+            UploadReassembly {
+                file: fs::OpenOptions::new().append(true).open(&dest).unwrap(),
+                final_path: final_path.clone(),
+                last_activity: std::time::Instant::now(),
+            },
+        );
+
+        handle_upload_abort(&mut reassembly, &root, "uid-1", &final_path);
+
+        assert!(reassembly.is_empty(), "reassembly entry must be removed on abort");
+        assert!(!dest.exists(), "half-written file must be deleted on abort");
+
+        // Idempotent: a second abort (no entry) is a no-op, doesn't panic.
+        handle_upload_abort(&mut reassembly, &root, "uid-1", &final_path);
+    }
+
+    #[test]
+    fn test_assemble_upload_chunk_refreshes_last_activity_on_append() {
+        // Finding 4 (agent): a non-final append chunk must refresh
+        // UploadReassembly.last_activity so a slow-but-progressing upload isn't
+        // reaped mid-stream.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let dest = root.join("big.bin");
+        // chunk 0: open + write, non-final (total_chunks=2) → inserts entry.
+        let (res, more) = assemble_upload_chunk(
+            &mut HashMap::new(),
+            &root,
+            "uid-2",
+            "big.bin",
+            &crate::agent::fs::encode_b64(b"AAAA"),
+            0,
+            2,
+        );
+        assert!(res.success);
+        assert!(more);
+
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+        // Stale entry (as if created long ago, then chunk 1 arrives now).
+        let stale = std::time::Instant::now() - Duration::from_secs(600);
+        reassembly.insert(
+            "uid-2".to_string(),
+            UploadReassembly {
+                file: fs::OpenOptions::new().append(true).create(true).open(&dest).unwrap(),
+                final_path: "big.bin".to_string(),
+                last_activity: stale,
+            },
+        );
+        let before = reassembly.get("uid-2").unwrap().last_activity;
+        assert!(std::time::Instant::now().duration_since(before) > Duration::from_secs(5));
+
+        // Non-final append (chunk_index=1, total_chunks=3 → not last) refreshes.
+        let (_res, more2) = assemble_upload_chunk(
+            &mut reassembly,
+            &root,
+            "uid-2",
+            "big.bin",
+            &crate::agent::fs::encode_b64(b"BBBB"),
+            1,
+            3,
+        );
+        assert!(more2, "chunk 1/3 is not last → more expected");
+        let after = reassembly.get("uid-2").unwrap().last_activity;
+        assert!(std::time::Instant::now().duration_since(after) < Duration::from_secs(1),
+            "last_activity must be refreshed on non-final append");
     }
 }

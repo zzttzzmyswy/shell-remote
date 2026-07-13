@@ -174,6 +174,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                                 let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::End).await;
                                 // sink dropped → removed from download_streams
                             } else {
+                                sink.last_activity = std::time::Instant::now();
                                 state.download_streams.write().await.insert(cid.to_string(), sink);
                             }
                         } else {
@@ -921,7 +922,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         state.download_streams.write().await.insert(
             "dl-1".to_string(),
-            DownloadSink { tx, created_at: Instant::now(), bytes: 0 },
+            DownloadSink { tx, last_activity: Instant::now(), bytes: 0 },
         );
         let msg = json!({
             "type": "fs:result", "session_id": "sid1",
@@ -948,7 +949,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         state.download_streams.write().await.insert(
             "dl-bad".to_string(),
-            DownloadSink { tx, created_at: Instant::now(), bytes: 0 },
+            DownloadSink { tx, last_activity: Instant::now(), bytes: 0 },
         );
         // "!!!" is not valid base64
         let msg = json!({
