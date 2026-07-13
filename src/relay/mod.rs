@@ -23,11 +23,9 @@ use crate::relay::session::SessionRegistry;
 /// case for one stuck session — bounded, and isolated from other sessions.
 pub const SSE_CHANNEL_CAPACITY: usize = 256;
 
-/// Capacity for the per-session relay→agent bulk (file-transfer) sub-channel.
-/// File chunks go here so they yield to interactive traffic under the
-/// agent's biased select; bounded so a stuck agent can't grow it unbounded.
-#[allow(dead_code)]
-pub const BULK_CHANNEL_CAPACITY: usize = 16;
+/// Re-export of [`file_transfer::BULK_CHANNEL_CAPACITY`] so callers can use
+/// `crate::relay::BULK_CHANNEL_CAPACITY` (canonical home: `file_transfer`).
+pub use crate::relay::file_transfer::BULK_CHANNEL_CAPACITY;
 
 #[allow(dead_code)]
 pub struct ChannelMap {
