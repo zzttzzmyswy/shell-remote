@@ -226,7 +226,7 @@ async fn process_mcp_request(
                 "tools": [
                     {
                         "name": "shell_remote",
-                        "description": "Execute a shell command on the remote target machine via shell_remote. Returns stdout, stderr, and exit code. Authenticate with a shell_remote token (the session token shown when the agent starts).",
+                        "description": "Execute a shell command on the remote target machine via shell_remote. Returns stdout, stderr, and exit code. For file transfer: small in-context content (configs/scripts/patches) can be written directly via heredoc/cat through this tool; for large on-disk files, use curl to PUT /agent/mcp/put (upload) or GET /agent/mcp/get (download), with header X-SR-Token set to the same token as this tool. Bytes do not pass through LLM context. See README 'MCP 端文件传输'.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -723,5 +723,20 @@ mod tests {
         .await;
         assert_eq!(r["error"]["code"], -32601);
         assert_eq!(r["id"], "req-42");
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_description_mentions_file_transfer() {
+        let state = make_state();
+        let r = mcp_send_and_recv(
+            &state,
+            HashMap::new(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let desc = r["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(desc.contains("/agent/mcp/put"));
+        assert!(desc.contains("/agent/mcp/get"));
+        assert!(desc.contains("X-SR-Token"));
     }
 }

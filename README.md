@@ -287,6 +287,15 @@ SSE  ← event: message  {JSON-RPC 响应}
 - `cmd` 通过 `sh -c` 执行，支持管道、重定向等完整 Shell 语法
 - 返回 stdout、stderr 和 exit code
 
+### MCP 端文件传输
+
+大文件上传/下载走专用流式端点（不经 LLM context）：
+
+- 上传：`curl -T localfile -H "X-SR-Token: <token>" "https://relay/agent/mcp/put?path=/remote/path"`
+- 下载：`curl -H "X-SR-Token: <token>" "https://relay/agent/mcp/get?path=/remote/path" -o localfile`
+
+token 即 `shell_remote` 的会话 token；上传需 rw token，下载 rw/ro 均可。NAT 下两机间文件传输走此端点（relay 中继，不落盘）。小内容（配置/脚本）直接用 `shell_remote` + heredoc 写入。
+
 ## Token 权限模型
 
 | Token 类型 | 终端输入 | 文件操作 | MCP 执行 |
