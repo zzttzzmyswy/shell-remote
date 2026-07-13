@@ -108,18 +108,20 @@ pub async fn get_handler(
                 // Send first_bytes.
                 if body_tx.send(Ok(first_bytes)).await.is_err() {
                     let _ = state_c.download_streams.write().await.remove(&cid_c);
+                    audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, 0, "downfile_failed", "client disconnected").await;
                     return;
                 }
                 let mut total = first_len;
                 while let Some(ev) = sink_rx.recv().await {
                     match ev {
                         DownloadEvent::Chunk(b) => {
-                            total += b.len() as u64;
+                            let chunk_len = b.len() as u64;
                             if body_tx.send(Ok(b)).await.is_err() {
                                 let _ = state_c.download_streams.write().await.remove(&cid_c);
                                 audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile_failed", "client disconnected").await;
                                 return;
                             }
+                            total += chunk_len;
                         }
                         DownloadEvent::Error(e) => {
                             let _ = state_c.download_streams.write().await.remove(&cid_c);
