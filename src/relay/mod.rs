@@ -1004,6 +1004,20 @@ pub async fn start(
                         rec.close(&session_id);
                     }
                 }
+
+                // Reap stale download sinks (>5min no progress).
+                // Dropping the sender ends the agent's push / the get_handler
+                // streaming task, so orphaned downloads can't leak forever.
+                {
+                    let mut ds = state_clone.download_streams.write().await;
+                    let stale: Vec<String> = ds.iter()
+                        .filter(|(_, s)| now.duration_since(s.created_at) > std::time::Duration::from_secs(300))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for k in stale {
+                        ds.remove(&k);
+                    }
+                }
             }
         });
     }

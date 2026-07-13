@@ -37,6 +37,7 @@ struct TabState {
 struct UploadReassembly {
     file: std::fs::File,
     final_path: String,
+    created_at: std::time::Instant,
 }
 
 /// Outbound message handle. The main loop never blocks on HTTP: terminal
@@ -193,6 +194,9 @@ fn build_download_chunk_payload(
 ///
 /// If `cancel` is supplied, the task checks `cancel.load(Ordering::Relaxed)`
 /// before each chunk and aborts early when the peer disconnects.
+/// `download_cancels` is the shared registry; this task removes its own entry
+/// on completion (normal or error) so the map doesn't accumulate stale entries
+/// after the download finishes.
 async fn stream_file_download(
     client: reqwest::Client,
     send_url: String,
@@ -201,6 +205,7 @@ async fn stream_file_download(
     path: String,
     mcp_request_id: Option<String>,
     cancel: Option<Arc<AtomicBool>>,
+    download_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
 ) {
     const CHUNK_SIZE: usize = 256 * 1024;
     use std::io::Read;
@@ -209,6 +214,7 @@ async fn stream_file_download(
         Some(p) => p,
         None => {
             post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, "Invalid path").await;
+            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
             return;
         }
     };
@@ -217,11 +223,13 @@ async fn stream_file_download(
         Ok(m) => m,
         Err(e) => {
             post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to read file: {}", e)).await;
+            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
             return;
         }
     };
     if meta.is_dir() {
         post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, "Path is a directory").await;
+        if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
         return;
     }
     let file_size = meta.len() as usize;
@@ -231,6 +239,7 @@ async fn stream_file_download(
         Ok(f) => f,
         Err(e) => {
             post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to open file: {}", e)).await;
+            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
             return;
         }
     };
@@ -249,6 +258,7 @@ async fn stream_file_download(
             Ok(n) => n,
             Err(e) => {
                 post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to read file: {}", e)).await;
+                if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
                 return;
             }
         };
@@ -268,6 +278,12 @@ async fn stream_file_download(
             // file exhausted before total_chunks (size shrank mid-read) — stop
             break;
         }
+    }
+    // Remove from cancel registry now that the download has finished (normal
+    // completion, cancellation, or early EOF). The spawned task holds its own
+    // Arc clone, so a late fs:read_cancel is harmless (token already dropped).
+    if let Some(ref cid) = mcp_request_id {
+        let _ = download_cancels.lock().unwrap().remove(cid);
     }
 }
 
@@ -322,6 +338,7 @@ fn assemble_upload_chunk(
                             reassembly.insert(upload_id.to_string(), UploadReassembly {
                                 file: f,
                                 final_path: final_path.to_string(),
+                                created_at: std::time::Instant::now(),
                             });
                             (ok(), true)
                         }
@@ -516,10 +533,25 @@ async fn run_session(
     // (_mcp_request_id from the fs:read request). When the relay sends
     // fs:read_cancel{correlation_id} (client disconnected), we set the
     // AtomicBool so the spawned stream_file_download task stops early.
-    let mut download_cancels: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+    let download_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    let mut cleanup_tick = tokio::time::interval(Duration::from_secs(60));
+    cleanup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+                _ = cleanup_tick.tick() => {
+                    let now = std::time::Instant::now();
+                    upload_reassembly.retain(|_, r| {
+                        if now.duration_since(r.created_at) > Duration::from_secs(300) {
+                            let _ = std::fs::remove_file(&r.final_path);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
                 shell_output = shell_rx.recv() => {
                     match shell_output {
                         Some((tab_id, data)) => {
@@ -707,8 +739,9 @@ async fn run_session(
                                     let cancel = Arc::new(AtomicBool::new(false));
                                     let cancel_token = cancel.clone();
                                     if let Some(ref cid) = mcp_request_id {
-                                        download_cancels.insert(cid.clone(), cancel);
+                                        download_cancels.lock().unwrap().insert(cid.clone(), cancel);
                                     }
+                                    let dc = download_cancels.clone();
                                     tokio::spawn(stream_file_download(
                                         client_req,
                                         send_url,
@@ -717,6 +750,7 @@ async fn run_session(
                                         path,
                                         mcp_request_id,
                                         Some(cancel_token),
+                                        dc,
                                     ));
                                 }
 
@@ -725,7 +759,7 @@ async fn run_session(
                                         .as_str()
                                         .map(|s| s.to_string());
                                     if let Some(ref cid) = mcp_request_id {
-                                        if let Some(cancel) = download_cancels.remove(cid) {
+                                        if let Some(cancel) = download_cancels.lock().unwrap().remove(cid) {
                                             cancel.store(true, Ordering::Relaxed);
                                             tracing::debug!("Cancelled download for correlation_id={}", cid);
                                         }
@@ -1201,5 +1235,75 @@ mod tests {
     #[test]
     fn test_home_dir_defaults_to_dot() {
         assert_eq!(super::home_dir_from(None, None), ".");
+    }
+
+    #[test]
+    fn test_stale_upload_reassembly_reaped() {
+        // Simulate an old entry in upload_reassembly and verify the 5min
+        // cleanup removes it and deletes the half-written file.
+        let tmp = std::env::temp_dir().join(format!("sr-stale-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dest = tmp.join("stale.bin");
+        // Write some bytes so the file exists and removal must succeed.
+        std::fs::write(&dest, b"partial").unwrap();
+        let final_path = dest.to_string_lossy().to_string();
+
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+        // Create a stale entry: created_at set to 10 minutes in the past.
+        let old_entry = UploadReassembly {
+            file: std::fs::File::open(&dest).unwrap(),
+            final_path: final_path.clone(),
+            created_at: std::time::Instant::now() - Duration::from_secs(600),
+        };
+        reassembly.insert("stale-uid".to_string(), old_entry);
+
+        // Run the retain logic.
+        let now = std::time::Instant::now();
+        reassembly.retain(|_, r| {
+            if now.duration_since(r.created_at) > Duration::from_secs(300) {
+                let _ = std::fs::remove_file(&r.final_path);
+                false
+            } else {
+                true
+            }
+        });
+
+        assert!(reassembly.is_empty(), "stale entry must be removed");
+        assert!(!dest.exists(), "half-written file must be deleted");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_fresh_upload_reassembly_not_reaped() {
+        // A fresh entry (just created) must survive the cleanup.
+        let tmp = std::env::temp_dir().join(format!("sr-fresh-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dest = tmp.join("fresh.bin");
+        std::fs::write(&dest, b"data").unwrap();
+        let final_path = dest.to_string_lossy().to_string();
+
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+        let fresh_entry = UploadReassembly {
+            file: std::fs::File::open(&dest).unwrap(),
+            final_path: final_path.clone(),
+            created_at: std::time::Instant::now(),
+        };
+        reassembly.insert("fresh-uid".to_string(), fresh_entry);
+
+        let now = std::time::Instant::now();
+        reassembly.retain(|_, r| {
+            if now.duration_since(r.created_at) > Duration::from_secs(300) {
+                let _ = std::fs::remove_file(&r.final_path);
+                false
+            } else {
+                true
+            }
+        });
+
+        assert_eq!(reassembly.len(), 1, "fresh entry must survive");
+        assert!(dest.exists(), "fresh file must not be deleted");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
