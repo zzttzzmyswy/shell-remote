@@ -45,6 +45,105 @@ use uuid::Uuid;
 
 const CHUNK_SIZE: usize = 256 * 1024;
 
+pub async fn get_handler(
+    State(state): State<Arc<crate::relay::SharedState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let client_ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("unknown").to_string();
+    {
+        let mut rl = state.rate_limiter.write().await;
+        if !rl.check(&client_ip, 60, std::time::Duration::from_secs(60)) {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+    }
+    let token = headers.get("x-sr-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let (session_id, permission) = match state.sessions.authenticate(token).await {
+        Some(r) => r,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let path = match params.get("path") {
+        Some(p) => p.clone(),
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let bulk_tx = {
+        let broadcast = state.agent_broadcast.read().await;
+        match broadcast.get(&session_id).and_then(|cm| cm.agent_bulk.clone()) {
+            Some(tx) => tx,
+            None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    };
+    let correlation_id = Uuid::new_v4().to_string();
+    let (sink_tx, mut sink_rx) = mpsc::channel::<DownloadEvent>(16);
+    {
+        let mut ds = state.download_streams.write().await;
+        ds.insert(correlation_id.clone(), DownloadSink { tx: sink_tx, created_at: std::time::Instant::now(), bytes: 0 });
+    }
+    // Send fs:read to agent on bulk channel.
+    let proto = json!({"type":"fs:read","session_id":&session_id,
+        "payload":{"path":&path,"_mcp_request_id":&correlation_id}});
+    let _ = deliver_bulk(&bulk_tx, proto.to_string()).await;
+
+    // Wait for chunk 0 to decide 200 vs 500.
+    let first = sink_rx.recv().await;
+    match first {
+        Some(DownloadEvent::Error(msg)) => {
+            state.download_streams.write().await.remove(&correlation_id);
+            audit_ft(&state, &session_id, token, &permission, &path, 0, "downfile_failed", &msg).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":msg}))).into_response();
+        }
+        Some(DownloadEvent::Chunk(first_bytes)) => {
+            // Build streaming body: first_bytes + rest from sink_rx until End.
+            // Use a spawned task + ReceiverStream so cleanup runs even on
+            // client disconnect (task continues past the dropped body_rx).
+            let first_len = first_bytes.len() as u64;
+            let state_c = state.clone();
+            let sid_c = session_id.clone();
+            let token_c = token.to_string();
+            let perm_c = permission.clone();
+            let path_c = path.clone();
+            let cid_c = correlation_id.clone();
+            let (body_tx, body_rx) = mpsc::channel::<std::result::Result<Vec<u8>, std::convert::Infallible>>(16);
+            tokio::spawn(async move {
+                // Send first_bytes.
+                if body_tx.send(Ok(first_bytes)).await.is_err() {
+                    let _ = state_c.download_streams.write().await.remove(&cid_c);
+                    return;
+                }
+                let mut total = first_len;
+                while let Some(ev) = sink_rx.recv().await {
+                    match ev {
+                        DownloadEvent::Chunk(b) => {
+                            total += b.len() as u64;
+                            if body_tx.send(Ok(b)).await.is_err() {
+                                let _ = state_c.download_streams.write().await.remove(&cid_c);
+                                audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile_failed", "client disconnected").await;
+                                return;
+                            }
+                        }
+                        DownloadEvent::Error(e) => {
+                            let _ = state_c.download_streams.write().await.remove(&cid_c);
+                            audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile_failed", &e).await;
+                            return;
+                        }
+                        DownloadEvent::End => break,
+                    }
+                }
+                let _ = state_c.download_streams.write().await.remove(&cid_c);
+                audit_ft(&state_c, &sid_c, &token_c, &perm_c, &path_c, total, "downfile", "").await;
+            });
+            let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx));
+            let mut resp = body.into_response();
+            resp.headers_mut().insert("content-type", "application/octet-stream".parse().unwrap());
+            resp
+        }
+        _ => {
+            state.download_streams.write().await.remove(&correlation_id);
+            StatusCode::GATEWAY_TIMEOUT.into_response()
+        }
+    }
+}
+
 pub async fn put_handler(
     State(state): State<Arc<crate::relay::SharedState>>,
     headers: axum::http::HeaderMap,
@@ -426,6 +525,46 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_streams_file_bytes_to_response() {
+        let state = make_state();
+        let (_sid, tokens) = state.sessions.register(None, "ro", None).await.unwrap(); // ro allowed for download
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            broadcast.insert(_sid.clone(), crate::relay::ChannelMap {
+                agent: None, agent_bulk: Some(bulk_tx), browser_sessions: HashMap::new(),
+            });
+        }
+        // Mock agent: when relay sends fs:read via bulk, push 2 fs:result chunks back.
+        let state_c = state.clone();
+        tokio::spawn(async move {
+            let m = bulk_rx.recv().await.unwrap();
+            let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+            assert_eq!(v["type"], "fs:read");
+            let cid = v["payload"]["_mcp_request_id"].as_str().unwrap().to_string();
+            // push chunks via route_agent_message
+            for (i, (bytes, is_last)) in [(b"a".to_vec(), false), (b"b".to_vec(), true)].iter().enumerate() {
+                let chunk = serde_json::json!({
+                    "type":"fs:result","session_id":&_sid,
+                    "payload":{"success":true,"content":BASE64.encode(bytes),
+                    "chunk_index":i,"total_chunks":2,"is_last":*is_last,
+                    "_mcp_request_id":&cid}
+                }).to_string();
+                crate::relay::ws::route_agent_message(&state_c, &_sid, &chunk).await;
+            }
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
+        let mut params = HashMap::new(); params.insert("path".into(), "/remote/x".into());
+        let resp = get_handler(State(state), headers, Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        use http_body_util::BodyExt;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"ab");
     }
 
     #[tokio::test]
