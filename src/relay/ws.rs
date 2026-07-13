@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::proto::{requires_write, Message as ProtoMessage, Permission, TokenType};
@@ -335,6 +336,34 @@ pub async fn agent_send_handler(
     axum::http::StatusCode::OK.into_response()
 }
 
+/// Biased merge of the interactive and bulk agent channels into one stream
+/// for the agent SSE. Interactive is drained first each cycle, so file chunks
+/// (bulk) yield to terminal:input / mcp:exec / control messages. Both
+/// receivers are bounded independently; bulk backpressure cannot stall
+/// interactive.
+fn merge_biased(
+    mut interactive: tokio::sync::mpsc::Receiver<String>,
+    mut bulk: tokio::sync::mpsc::Receiver<String>,
+) -> impl tokio_stream::Stream<Item = String> {
+    async_stream::stream! {
+        loop {
+            tokio::select! {
+                biased;
+                m = interactive.recv() => match m { Some(s) => yield s, None => {
+                    // drain remaining bulk
+                    while let Some(s) = bulk.recv().await { yield s; }
+                    break;
+                }},
+                m = bulk.recv() => match m { Some(s) => yield s, None => {
+                    // drain remaining interactive
+                    while let Some(s) = interactive.recv().await { yield s; }
+                    break;
+                }},
+            }
+        }
+    }
+}
+
 // ── Agent SSE handler (GET, for HTTP-mode agent receive) ─────────────
 
 pub async fn agent_events_handler(
@@ -371,12 +400,14 @@ pub async fn agent_events_handler(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
 
-    let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);          // interactive
+    let (bulk_tx, bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
 
     {
         let mut broadcast = state.agent_broadcast.write().await;
         if let Some(cm) = broadcast.get_mut(&session_id) {
             cm.agent = Some(tx);
+            cm.agent_bulk = Some(bulk_tx);
         }
     }
 
@@ -397,8 +428,8 @@ pub async fn agent_events_handler(
             }
         }
 
-        let mut rx_stream = ReceiverStream::new(rx);
-        while let Some(msg) = tokio_stream::StreamExt::next(&mut rx_stream).await {
+        let mut merged = Box::pin(merge_biased(rx, bulk_rx));
+        while let Some(msg) = merged.next().await {
             let id = state_clone.buffer_agent_event(&sid_clone, &msg).await;
             yield Ok::<_, Infallible>(
                 axum::response::sse::Event::default()
@@ -1066,5 +1097,27 @@ mod tests {
         assert_eq!(resp.status(), 202);
         assert!(recorder.is_recording(&sid));
         recorder.close(&sid);
+    }
+
+    // ── merge_biased tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_merge_biased_drains_interactive_first() {
+        use tokio::sync::mpsc;
+        let (itx, irx) = mpsc::channel::<String>(8);
+        let (btx, brx) = mpsc::channel::<String>(8);
+        // pre-fill: 3 bulk, then 1 interactive, then 1 bulk
+        for i in 0..3 { btx.send(format!("b{}", i)).await.unwrap(); }
+        itx.send("i0".to_string()).await.unwrap();
+        btx.send("b3".to_string()).await.unwrap();
+        drop(itx); drop(btx); // close so merge terminates
+        let mut out = Box::pin(merge_biased(irx, brx));
+        let mut got = Vec::new();
+        use tokio_stream::StreamExt as _;
+        while let Some(s) = out.next().await { got.push(s); }
+        // interactive i0 must come before all bulk (biased: interactive drained first each cycle)
+        let i_pos = got.iter().position(|s| s == "i0").unwrap();
+        let first_bulk = got.iter().position(|s| s.starts_with('b')).unwrap();
+        assert!(i_pos < first_bulk, "interactive must precede bulk under biased merge; got {:?}", got);
     }
 }
