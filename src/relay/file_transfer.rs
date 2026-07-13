@@ -124,8 +124,8 @@ pub async fn put_handler(
         if chunk_data.is_empty() && chunk_index >= total_chunks {
             break;
         }
-        if chunk_data.is_empty() && chunk_index < total_chunks {
-            // client closed prematurely
+        if chunk_data.is_empty() && bytes_sent < content_len {
+            // client closed prematurely (received fewer bytes than promised)
             // send abort to agent
             let abort = json!({"type":"fs:upload","session_id":&session_id,
                 "payload":{"upload_id":&upload_id,"final_path":&path,"aborted":true,
@@ -414,7 +414,7 @@ mod tests {
                     }
                 }
             }
-            assert!(count >= 1);
+            assert_eq!(count, 3, "exactly 3 chunks for CHUNK_SIZE*3 bytes");
         });
 
         let resp = put_handler(
@@ -425,6 +425,69 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_put_zero_byte_file_succeeds() {
+        let state = make_state();
+        let (_sid, tokens) = state
+            .sessions
+            .register(None, "rw", None)
+            .await
+            .unwrap();
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let cm = crate::relay::ChannelMap {
+                agent: None,
+                agent_bulk: Some(bulk_tx),
+                browser_sessions: HashMap::new(),
+            };
+            broadcast.insert(_sid.clone(), cm);
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
+        headers.insert("content-length", "0".parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert("path".into(), "/remote/empty".into());
+
+        // Drain bulk channel: fulfill the lone chunk's fs:result via pending_mcp.
+        let state_c = state.clone();
+        let h = tokio::spawn(async move {
+            while let Some(m) = bulk_rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+                if v["type"] == "fs:upload" {
+                    let ci = v["payload"]["chunk_index"].as_u64().unwrap() as u32;
+                    let tc = v["payload"]["total_chunks"].as_u64().unwrap() as u32;
+                    assert_eq!(ci, 0);
+                    assert_eq!(tc, 1);
+                    assert_eq!(v["payload"]["content"].as_str().unwrap(), "");
+                    let req_id = v["payload"]["_mcp_request_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    let mut pending = state_c.pending_mcp.write().await;
+                    if let Some((_sid, tx)) = pending.remove(&req_id) {
+                        let _ = tx.send(serde_json::json!({"success":true}).to_string());
+                    }
+                    break;
+                }
+            }
+        });
+
+        let resp = put_handler(
+            State(state),
+            headers,
+            Query(params),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["bytes"], 0);
         h.await.unwrap();
     }
 }
