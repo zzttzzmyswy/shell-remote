@@ -113,7 +113,7 @@ Download to the current directory without running:
 & ([scriptblock]::Create((irm http://your-relay:3000/agent/install.ps1))) --download-only
 ```
 
-> Linux/macOS equivalent: `curl -fsSL http://your-relay:3000/agent/install | sh` (run) or `... | sh -s -- --download-only` (download only).
+> Linux/macOS equivalent: `curl -fsSL http://your-relay:3000/agent/install | sh` (run) or `... | sh -s -- --download-only` (download only). If curl is missing, use `wget -qO- http://your-relay:3000/agent/install | sh` (or `... | sh -s -- --download-only`). The script supports both curl and wget internally and tries multiple GitHub mirrors, so it works in most network environments.
 
 Manual start:
 

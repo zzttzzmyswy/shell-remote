@@ -40,10 +40,18 @@
                 <code id="linux-run">$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh</code>
                 <button class="copy-btn" onclick="copyCmd('linux-run')">copy</button>
             </div>
+            <div class="install-cmd">
+                <code id="linux-run-wget">$ wget -qO- <span class="relay-host">https://host</span>/agent/install | sh</code>
+                <button class="copy-btn" onclick="copyCmd('linux-run-wget')">copy</button>
+            </div>
             <div class="install-sub">仅下载到当前目录不执行：</div>
             <div class="install-cmd">
                 <code id="linux-dl">$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh -s -- --download-only</code>
                 <button class="copy-btn" onclick="copyCmd('linux-dl')">copy</button>
+            </div>
+            <div class="install-cmd">
+                <code id="linux-dl-wget">$ wget -qO- <span class="relay-host">https://host</span>/agent/install | sh -s -- --download-only</code>
+                <button class="copy-btn" onclick="copyCmd('linux-dl-wget')">copy</button>
             </div>
         </div>
 
@@ -103,7 +111,9 @@
             var host = location.protocol + '//' + location.host;
             var cmds = {
                 'linux-run': 'curl -fsSL ' + host + '/agent/install | sh',
+                'linux-run-wget': 'wget -qO- ' + host + '/agent/install | sh',
                 'linux-dl':  'curl -fsSL ' + host + '/agent/install | sh -s -- --download-only',
+                'linux-dl-wget': 'wget -qO- ' + host + '/agent/install | sh -s -- --download-only',
                 'win-run':   'irm ' + host + '/agent/install.ps1 | iex',
                 'win-dl':    '& ([scriptblock]::Create((irm ' + host + '/agent/install.ps1))) --download-only'
             };

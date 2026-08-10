@@ -120,7 +120,7 @@ irm http://your-relay:3000/agent/install.ps1 | iex
 & ([scriptblock]::Create((irm http://your-relay:3000/agent/install.ps1))) --download-only
 ```
 
-> Linux/macOS 等价命令：`curl -fsSL http://your-relay:3000/agent/install | sh`（运行）或 `... | sh -s -- --download-only`（仅下载）。
+> Linux/macOS 等价命令：`curl -fsSL http://your-relay:3000/agent/install | sh`（运行）或 `... | sh -s -- --download-only`（仅下载）。没有 curl 时可用 `wget -qO- http://your-relay:3000/agent/install | sh`（或 `... | sh -s -- --download-only`）。脚本内部同时支持 curl 与 wget，并从多个 GitHub 镜像自动尝试，以保证在更多网络环境下都能下载成功。
 
 手动启动：
 

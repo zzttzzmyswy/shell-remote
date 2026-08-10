@@ -5,6 +5,8 @@ set -e
 # DO NOT run directly — use:
 #   run:      curl -fsSL <relay>/agent/install | sh
 #   download: curl -fsSL <relay>/agent/install | sh -s -- --download-only
+# Uses curl if available, otherwise falls back to wget; tries a list of
+# GitHub mirrors so at least one source is reachable in most networks.
 
 RELAY_URL="__RELAY_URL__"
 
@@ -41,10 +43,33 @@ https://gh-proxy.com/${BASE}/shell-remote-${BIN_ARCH}
 https://gh.llkk.cc/${BASE}/shell-remote-${BIN_ARCH}
 "
 
+# Prefer curl, fall back to wget. Mirrors combined with a timeout mean a
+# non-curl-only environment and a flaky single mirror still make progress.
+DL_NAME=""
+if command -v curl >/dev/null 2>&1; then
+    DL_NAME="curl"
+elif command -v wget >/dev/null 2>&1; then
+    DL_NAME="wget"
+else
+    echo "[shell-remote] error: neither curl nor wget is available"
+    exit 1
+fi
+echo "[shell-remote] using $DL_NAME for download"
+
+# download <url> -> 0 on success, non-zero otherwise
+download() {
+    url="$1"
+    if [ "$DL_NAME" = "curl" ]; then
+        curl -fsSL --connect-timeout 5 --max-time 60 -o "$BIN" "$url" 2>/dev/null
+    else
+        wget -q -T 60 --tries 1 -O "$BIN" "$url" 2>/dev/null
+    fi
+}
+
 echo "[shell-remote] downloading for $ARCH ($BIN_ARCH)..."
 
 for url in $URLS; do
-    if curl -fsSL --connect-timeout 5 --max-time 60 -o "$BIN" "$url" 2>/dev/null; then
+    if download "$url" && [ -s "$BIN" ]; then
         echo "[shell-remote] downloaded via $(echo "$url" | cut -d/ -f3)"
         break
     fi
@@ -56,6 +81,40 @@ if [ ! -f "$BIN" ] || [ ! -s "$BIN" ]; then
 fi
 
 chmod +x "$BIN"
+
+# Sanity check: reject an HTML error page / truncated download that happens to
+# be non-empty. Linux/macOS binaries start with the 4-byte ELF magic
+# (\x7fELF); a non-ELF file is a mirror's error page. If the first download is
+# invalid, try the remaining mirrors.
+is_elf() {
+    [ -f "$1" ] || return 1
+    magic=$(dd if="$1" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [ "$magic" = "7f454c46" ]
+}
+
+if ! is_elf "$BIN"; then
+    echo "[shell-remote] downloaded file is not a valid binary, trying next source..."
+    for url in $URLS; do
+        case "$url" in
+            *"/shell-remote-${BIN_ARCH}") ;;
+            *) continue ;;
+        esac
+        rm -f "$BIN"
+        if download "$url" && [ -s "$BIN" ]; then
+            chmod +x "$BIN"
+            if is_elf "$BIN"; then
+                echo "[shell-remote] downloaded via $(echo "$url" | cut -d/ -f3)"
+                break
+            fi
+        fi
+    done
+fi
+
+if [ ! -x "$BIN" ] || ! is_elf "$BIN"; then
+    rm -f "$BIN"
+    echo "[shell-remote] download failed — no valid binary obtained"
+    exit 1
+fi
 
 if [ "$DOWNLOAD_ONLY" = "1" ]; then
     echo "[shell-remote] saved to $BIN (not executed)"
