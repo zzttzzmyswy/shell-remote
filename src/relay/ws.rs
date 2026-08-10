@@ -265,15 +265,8 @@ pub async fn agent_send_handler(
                 .register(fixed_key.clone(), token_type.as_str(), desired_session_id)
                 .await
         };
-        let (session_id, tokens) = match register_result {
-            Ok(v) => v,
-            Err(crate::relay::session::RegisterError::IdTaken) => {
-                return (
-                    axum::http::StatusCode::CONFLICT,
-                    "session_id already in use",
-                )
-                    .into_response();
-            }
+        let (session_id, tokens, evicted) = match register_result {
+            Ok(r) => (r.session_id, r.tokens, r.evicted),
             Err(crate::relay::session::RegisterError::InvalidId) => {
                 return (
                     axum::http::StatusCode::BAD_REQUEST,
@@ -302,7 +295,13 @@ pub async fn agent_send_handler(
                 .map(|k| format!("key:{}", k))
                 .unwrap_or_else(|| "temp".to_string())
         };
-        tracing::info!(session = %session_id, key = %key_info, "session created (HTTP-mode)");
+        tracing::info!(session = %session_id, key = %key_info, evicted, "session created (HTTP-mode)");
+        if evicted {
+            tracing::warn!(
+                session = %session_id,
+                "session_id reused — a previous session with this id/token was evicted"
+            );
+        }
         for (token, perm) in &tokens {
             let perm_str = match perm {
                 Permission::ReadWrite => "rw",
@@ -321,6 +320,7 @@ pub async fn agent_send_handler(
         return Json(json!({
             "type": "agent:registered",
             "session_id": session_id,
+            "evicted": evicted,
             "payload": { "tokens": tokens_json }
         }))
         .into_response();
@@ -532,6 +532,11 @@ pub async fn browser_sse_handler(
         Permission::ReadOnly => "ro",
     };
 
+    // Bastion-style audit: record this browser access (token prefix only).
+    state
+        .log_conn(&session_id, &token[..token.len().min(8)], perm_str, "connect")
+        .await;
+
     {
         let mut broadcast = state.agent_broadcast.write().await;
         if let Some(cm) = broadcast.get_mut(&session_id) {
@@ -580,6 +585,7 @@ pub async fn browser_sse_handler(
     let uid_clone = user_id.clone();
     let _sse_sid_clone = sse_sid.clone();
     let perm_clone = perm_str.to_string();
+    let token_prefix_clone = token[..token.len().min(8)].to_string();
 
     // connected event data
     let connected_data = json!({
@@ -597,7 +603,11 @@ pub async fn browser_sse_handler(
             let sid = sid_clone.clone();
             let uid = uid_clone.clone();
             let perm = perm_clone.clone();
+            let tprefix = token_prefix_clone.clone();
             tokio::spawn(async move {
+                // Bastion-style audit: record disconnect (token prefix only).
+                s.log_conn(&sid, &tprefix, &perm, "disconnect").await;
+
                 let count = {
                     let mut broadcast = s.agent_broadcast.write().await;
                     if let Some(cm) = broadcast.get_mut(&sid) {
@@ -1076,7 +1086,9 @@ mod tests {
     #[tokio::test]
     async fn test_browser_send_readonly_write_forbidden() {
         let state = make_state("");
-        let (sid, tokens) = state.sessions.register(None, "ro", None).await.unwrap();
+        let r = state.sessions.register(None, "ro", None).await.unwrap();
+        let sid = r.session_id;
+        let tokens = r.tokens;
         let token = &tokens[0].0;
         state
             .agent_broadcast
@@ -1105,7 +1117,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_send_register_custom_id_conflict() {
+    async fn test_agent_send_register_custom_id_reusable() {
+        // Session ids are reusable: a second agent registering under the same
+        // id succeeds and evicts the first (no 409).
         let state = make_state("");
         let b1 = json!({"type":"agent:register","token_type":"rw","session_id":"mydev02"});
         let r1 = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(b1))
@@ -1116,7 +1130,13 @@ mod tests {
         let r2 = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(b2))
             .await
             .into_response();
-        assert_eq!(r2.status(), 409);
+        assert_eq!(r2.status(), 200, "reusing a session id must succeed, not 409");
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r2.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["evicted"], true, "re-registering an in-use id evicts the old session");
+        assert_eq!(v["session_id"], "mydev02");
     }
 
     #[tokio::test]
@@ -1170,7 +1190,9 @@ mod tests {
     #[tokio::test]
     async fn test_browser_send_records_input() {
         let (state, recorder) = make_state_with_recorder();
-        let (sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let tokens = r.tokens;
         state
             .agent_broadcast
             .write()
@@ -1280,5 +1302,34 @@ mod tests {
             "interactive must be first in merged output; got {:?}",
             got.first()
         );
+    }
+
+    // ── Access-audit (conn_log) tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_log_conn_records_entry() {
+        let state = make_state("");
+        state.log_conn("sess1", "abc12345", "rw", "connect").await;
+        let q = state.conn_log.read().await;
+        assert_eq!(q.len(), 1);
+        let e = &q[0];
+        assert_eq!(e.session, "sess1");
+        assert_eq!(e.prefix, "abc12345");
+        assert_eq!(e.permission, "rw");
+        assert_eq!(e.kind, "connect");
+        assert!(e.at > 0);
+    }
+
+    #[tokio::test]
+    async fn test_conn_log_bounded() {
+        let state = make_state("");
+        for i in 0..600 {
+            state.log_conn(&format!("s{}", i), "tok12345", "ro", "disconnect").await;
+        }
+        let q = state.conn_log.read().await;
+        assert!(q.len() <= 500, "conn log must be bounded");
+        // Oldest entries evicted.
+        assert_eq!(q.front().unwrap().session, "s100");
+        assert_eq!(q.back().unwrap().session, "s599");
     }
 }

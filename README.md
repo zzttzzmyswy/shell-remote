@@ -85,7 +85,7 @@ cargo build --release
 | `--root` | `$HOME` | 文件管理器默认目录 |
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
 | `--shell` | `/bin/bash` | Shell 路径 |
-| `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；冲突则启动失败 |
+| `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；**可重复使用**——新的 agent 用相同 ID 注册会顶替旧会话（旧 Token 失效），不再报冲突 |
 
 输出示例：
 
@@ -187,6 +187,8 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
 ### 功能
 
 - **概览**：版本、运行时间、agent 总数/在线数、浏览器总数、每会话 Token 列表与权限、连接浏览器数。
+- **会话监控**：每个会话显示在线状态、最近活跃时间（秒级实时刷新）。
+- **访问日志（简易堡垒机审计）**：记录浏览器/MCP 的连接与断开事件（会话、token 前 8 位、权限、时间），最多保留 500 条，可在后台查看最近访问历史。
 - **Token 管理**：撤销单个 Token、重生成会话 Token（旧 Token 失效）、切换 Token 权限（rw↔ro）。
 - **跳转终端**：每会话"连接"按钮，新标签页打开该会话的浏览器终端（token 预填，服务器密码仍需手填）。
 - **会话录制**：`--record-dir` 启用后，交互式终端 I/O（输出+输入）以 asciinema cast v2 落盘；后台显示录制状态，文件可用 `asciinema play` 回放。

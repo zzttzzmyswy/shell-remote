@@ -475,11 +475,9 @@ mod tests {
     #[tokio::test]
     async fn test_put_readonly_forbidden() {
         let state = make_state();
-        let (_sid, tokens) = state
-            .sessions
-            .register(None, "ro", None)
-            .await
-            .unwrap();
+        let r = state.sessions.register(None, "ro", None).await.unwrap();
+            let _sid = r.session_id;
+            let tokens = r.tokens;
         let mut headers = HeaderMap::new();
         headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
         let mut params = HashMap::new();
@@ -492,11 +490,9 @@ mod tests {
     #[tokio::test]
     async fn test_put_missing_content_length_411() {
         let state = make_state();
-        let (_sid, tokens) = state
-            .sessions
-            .register(None, "rw", None)
-            .await
-            .unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+            let _sid = r.session_id;
+            let tokens = r.tokens;
         let mut headers = HeaderMap::new();
         headers.insert("x-sr-token", tokens[0].0.parse().unwrap());
         // Body without Content-Length → 411
@@ -510,11 +506,9 @@ mod tests {
     #[tokio::test]
     async fn test_put_streams_chunks_and_awaits_last_result() {
         let state = make_state();
-        let (_sid, tokens) = state
-            .sessions
-            .register(None, "rw", None)
-            .await
-            .unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+            let _sid = r.session_id;
+            let tokens = r.tokens;
         let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
         {
             let mut broadcast = state.agent_broadcast.write().await;
@@ -578,7 +572,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_streams_file_bytes_to_response() {
         let state = make_state();
-        let (_sid, tokens) = state.sessions.register(None, "ro", None).await.unwrap(); // ro allowed for download
+        let r = state.sessions.register(None, "ro", None).await.unwrap();
+        let _sid = r.session_id;
+        let tokens = r.tokens;
         let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
         {
             let mut broadcast = state.agent_broadcast.write().await;
@@ -618,11 +614,9 @@ mod tests {
     #[tokio::test]
     async fn test_put_zero_byte_file_succeeds() {
         let state = make_state();
-        let (_sid, tokens) = state
-            .sessions
-            .register(None, "rw", None)
-            .await
-            .unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+            let _sid = r.session_id;
+            let tokens = r.tokens;
         let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
         {
             let mut broadcast = state.agent_broadcast.write().await;
@@ -684,7 +678,9 @@ mod tests {
         // get_handler body task must send fs:read_cancel to the agent bulk
         // channel so the agent stops streaming the rest of the file.
         let state = make_state();
-        let (_sid, tokens) = state.sessions.register(None, "ro", None).await.unwrap();
+        let r = state.sessions.register(None, "ro", None).await.unwrap();
+        let _sid = r.session_id;
+        let tokens = r.tokens;
         let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
         {
             let mut broadcast = state.agent_broadcast.write().await;
@@ -752,7 +748,9 @@ mod tests {
         // actual body bytes (premature close) must return 400, not 200 — the
         // relay must not report a truncated upload as success.
         let state = make_state();
-        let (_sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let _sid = r.session_id;
+        let tokens = r.tokens;
         let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
         {
             let mut broadcast = state.agent_broadcast.write().await;

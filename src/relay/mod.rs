@@ -71,7 +71,25 @@ pub struct SharedState {
     /// asciinema cast recorder. `None` when `--record-dir` is unset, in which
     /// case recording is fully disabled and the capture guards are no-ops.
     pub recorder: Option<Arc<recorder::Recorder>>,
+    /// Bounded audit trail of browser/MCP access events (bastion-style
+    /// "who accessed which session, when, with what permission").
+    pub conn_log: RwLock<std::collections::VecDeque<ConnLogEntry>>,
 }
+
+/// One entry in the access audit trail. `conn` is the session id, `prefix` is
+/// the first 8 chars of the token (never the full secret), `permission` is
+/// rw/ro, `at` is epoch seconds, `kind` is "connect" / "disconnect".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnLogEntry {
+    pub session: String,
+    pub prefix: String,
+    pub permission: String,
+    pub at: u64,
+    pub kind: &'static str,
+}
+
+/// Max entries kept in the audit trail (oldest evicted).
+const CONN_LOG_CAP: usize = 500;
 
 pub struct RateLimiter {
     attempts: HashMap<String, Vec<Instant>>,
@@ -184,7 +202,28 @@ impl SharedState {
             admin_sessions: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
             recorder,
+            conn_log: RwLock::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Append an access-audit entry (bounded). Non-blocking; used on the
+    /// browser connect/disconnect and MCP tool-call hot paths.
+    pub async fn log_conn(&self, session: &str, prefix: &str, permission: &str, kind: &'static str) {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut q = self.conn_log.write().await;
+        if q.len() >= CONN_LOG_CAP {
+            q.pop_front();
+        }
+        q.push_back(ConnLogEntry {
+            session: session.to_string(),
+            prefix: prefix.to_string(),
+            permission: permission.to_string(),
+            at,
+            kind,
+        });
     }
 
     pub async fn buffer_agent_event(&self, session_id: &str, msg: &str) -> u64 {
@@ -366,7 +405,9 @@ mod tests {
     #[tokio::test]
     async fn test_upload_handler_readonly_token_forbidden() {
         let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
-        let (_sid, tokens) = state.sessions.register(None, "ro", None).await.unwrap();
+        let r = state.sessions.register(None, "ro", None).await.unwrap();
+        let _sid = r.session_id;
+        let tokens = r.tokens;
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -450,7 +491,9 @@ mod tests {
     #[tokio::test]
     async fn test_upload_handler_missing_path() {
         let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
-        let (_sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let _sid = r.session_id;
+        let tokens = r.tokens;
         let token = &tokens[0].0;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -470,7 +513,9 @@ mod tests {
         // can't read). Verify the fs:upload message carries decodable content
         // and no temp_path.
         let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
-        let (sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let tokens = r.tokens;
         let token = &tokens[0].0;
 
         let (atx, mut arx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);
@@ -507,7 +552,9 @@ mod tests {
         // ordered fs:upload chunks whose reassembled content matches, so no
         // single giant message is ever put on the relay→agent channel.
         let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
-        let (sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let tokens = r.tokens;
         let token = &tokens[0].0;
 
         let (atx, mut arx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);

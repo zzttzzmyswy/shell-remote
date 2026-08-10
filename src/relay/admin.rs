@@ -141,6 +141,8 @@ pub async fn overview_handler(
     }
     let sessions = state.sessions.list_sessions().await;
     let broadcasts = state.agent_broadcast.read().await;
+    let activity = state.last_activity.read().await;
+    let now = Instant::now();
     let mut sess_json: Vec<Value> = Vec::with_capacity(sessions.len());
     let mut agent_online = 0usize;
     let mut browser_total = 0usize;
@@ -152,6 +154,9 @@ pub async fn overview_handler(
             agent_online += 1;
         }
         browser_total += browser_count;
+        let last_active_seconds = activity
+            .get(sid)
+            .map(|last| now.saturating_duration_since(*last).as_secs());
         let tokens: Vec<Value> = info
             .tokens
             .iter()
@@ -163,12 +168,33 @@ pub async fn overview_handler(
             "is_temporary": info.is_temporary,
             "fixed_key": info.fixed_key,
             "browser_count": browser_count,
+            "last_active_seconds": last_active_seconds,
             "tokens": tokens,
             "recording": state.recorder.as_ref().is_some_and(|r| r.is_recording(sid)),
             "mcp_audit": state.recorder.as_ref().is_some_and(|r| r.is_auditing(sid)),
         }));
     }
+    drop(activity);
     drop(broadcasts);
+
+    // Access-audit trail (browser/MCP connections), newest first.
+    let conn_log: Vec<Value> = state
+        .conn_log
+        .read()
+        .await
+        .iter()
+        .rev()
+        .map(|e| {
+            json!({
+                "session": e.session,
+                "prefix": e.prefix,
+                "permission": e.permission,
+                "at": e.at,
+                "kind": e.kind,
+            })
+        })
+        .collect();
+
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": state.started_at.elapsed().as_secs(),
@@ -178,6 +204,7 @@ pub async fn overview_handler(
         "sessions": sess_json,
         "recording_enabled": state.recorder.is_some(),
         "mcp_audit_enabled": state.recorder.is_some(),
+        "conn_log": conn_log,
     }))
     .into_response()
 }
@@ -418,7 +445,9 @@ mod tests {
     #[tokio::test]
     async fn test_overview_returns_sessions() {
         let state = state_with_admin("admin", "s3cret");
-        let (sid, _t) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let _t = r.tokens;
         state.admin_sessions.write().await.insert(
             "tok".to_string(),
             Instant::now() + ADMIN_SESSION_TTL,
@@ -438,7 +467,9 @@ mod tests {
     #[tokio::test]
     async fn test_kick_removes_session() {
         let state = state_with_admin("admin", "s3cret");
-        let (sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let tokens = r.tokens;
         state.admin_sessions.write().await.insert(
             "tok".to_string(),
             Instant::now() + ADMIN_SESSION_TTL,
@@ -453,7 +484,9 @@ mod tests {
     #[tokio::test]
     async fn test_revoke_and_regenerate_and_perm() {
         let state = state_with_admin("admin", "s3cret");
-        let (sid, tokens) = state.sessions.register(None, "both", None).await.unwrap();
+        let r = state.sessions.register(None, "both", None).await.unwrap();
+        let sid = r.session_id;
+        let tokens = r.tokens;
         state.admin_sessions.write().await.insert(
             "tok".to_string(),
             Instant::now() + ADMIN_SESSION_TTL,
@@ -534,7 +567,9 @@ mod tests {
             "s3cret".to_string(),
             Some(recorder.clone()),
         ));
-        let (sid, _t) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let _t = r.tokens;
         state
             .admin_sessions
             .write()

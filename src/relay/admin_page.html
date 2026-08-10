@@ -20,7 +20,7 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 14px; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 60px; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 28px 24px 60px; }
   .center-screen { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
 
   /* Login */
@@ -71,6 +71,14 @@
 
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: var(--muted); }
   .dot.on { background: var(--green); box-shadow: 0 0 6px rgba(64,160,43,.6); }
+  td.recent { color: var(--green); font-weight: 500; }
+
+  .status-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; border: 1px solid var(--border); }
+  .status-pill.on { color: var(--green); border-color: rgba(64,160,43,.4); background: rgba(64,160,43,.12); }
+  .status-pill.off { color: var(--muted); border-color: var(--border); background: var(--panel2); }
+
+  .evt-conn { color: var(--green); font-size: 12px; font-weight: 500; }
+  .evt-disc { color: var(--muted); font-size: 12px; }
 
   .tok-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; flex-wrap: wrap; }
   .tok { font-family: ui-monospace, monospace; font-size: 11px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; cursor: pointer; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -147,6 +155,7 @@
             <th data-i18n="th_status">Status</th>
             <th data-i18n="th_type">Type</th>
             <th data-i18n="th_browsers">Browsers</th>
+            <th data-i18n="th_last_active">Last active</th>
             <th data-i18n="th_tokens">Tokens</th>
             <th data-i18n="th_actions">Actions</th>
           </tr>
@@ -155,6 +164,25 @@
       </table>
     </div>
     <div id="sessEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_sessions">No sessions.</div>
+  </div>
+
+  <div class="panel">
+    <h2 data-i18n="access_log">Access log</h2>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th data-i18n="th_time">Time</th>
+            <th data-i18n="th_session_id">Session ID</th>
+            <th data-i18n="th_token_prefix">Token</th>
+            <th data-i18n="th_permission">Perm</th>
+            <th data-i18n="th_event">Event</th>
+          </tr>
+        </thead>
+        <tbody id="connLogBody"></tbody>
+      </table>
+    </div>
+    <div id="connLogEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_access_log">No access events yet.</div>
   </div>
 
   <div class="panel">
@@ -199,9 +227,19 @@
       th_status: "状态",
       th_type: "类型",
       th_browsers: "浏览器",
+      th_last_active: "最近活跃",
       th_tokens: "令牌",
       th_actions: "操作",
       no_sessions: "暂无会话。",
+      never_active: "无活动",
+      access_log: "访问日志",
+      no_access_log: "暂无访问事件。",
+      th_time: "时间",
+      th_token_prefix: "令牌",
+      th_permission: "权限",
+      th_event: "事件",
+      event_connect: "连接",
+      event_disconnect: "断开",
       connect: "连接",
       connect_ro: "连接(只读)",
       no_token: "无令牌",
@@ -260,9 +298,19 @@
       th_status: "Status",
       th_type: "Type",
       th_browsers: "Browsers",
+      th_last_active: "Last active",
       th_tokens: "Tokens",
       th_actions: "Actions",
       no_sessions: "No sessions.",
+      never_active: "never",
+      access_log: "Access log",
+      no_access_log: "No access events yet.",
+      th_time: "Time",
+      th_token_prefix: "Token",
+      th_permission: "Perm",
+      th_event: "Event",
+      event_connect: "connect",
+      event_disconnect: "disconnect",
       connect: "Connect",
       connect_ro: "Connect (ro)",
       no_token: "no token",
@@ -335,6 +383,7 @@
     if (lastOverview) {
       renderOverview(lastOverview);
       renderSessions(lastOverview.sessions || []);
+      renderConnLog(lastOverview.conn_log || []);
     }
   }
   function applyStaticI18n() {
@@ -393,6 +442,24 @@
     return h + 'h ' + m + 'm';
   }
 
+  // --- Relative "last active" time ---
+  function fmtAgo(sec) {
+    if (sec === null || sec === undefined) return t('never_active');
+    sec = Math.max(0, Math.floor(sec));
+    if (sec < 60) return sec + 's';
+    if (sec < 3600) return Math.floor(sec / 60) + 'm';
+    if (sec < 86400) return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+    return Math.floor(sec / 86400) + 'd';
+  }
+
+  // --- Absolute time (epoch seconds -> HH:MM:SS) ---
+  function fmtTime(sec) {
+    if (!sec) return '—';
+    const d = new Date(sec * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
   // --- Login ---
   $('loginForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -435,6 +502,7 @@
     lastOverview = o;
     renderOverview(o);
     renderSessions(o.sessions || []);
+    renderConnLog(o.conn_log || []);
   }
 
   function renderOverview(o) {
@@ -462,6 +530,29 @@
     }
   }
 
+  // --- Access log table ---
+  function renderConnLog(entries) {
+    const body = $('connLogBody');
+    body.textContent = '';
+    $('connLogEmpty').classList.toggle('hidden', entries.length > 0);
+    const shown = entries.slice(0, 50);
+    for (const e of shown) {
+      const tr = document.createElement('tr');
+      const tdT = document.createElement('td'); tdT.className = 'mono'; tdT.textContent = fmtTime(e.at); tr.appendChild(tdT);
+      const tdS = document.createElement('td'); tdS.className = 'mono'; tdS.textContent = e.session || ''; tr.appendChild(tdS);
+      const tdP = document.createElement('td'); tdP.className = 'mono'; tdP.textContent = (e.prefix || '') + '…'; tr.appendChild(tdP);
+      const tdPerm = document.createElement('td');
+      const perm = document.createElement('span'); perm.className = 'perm ' + (e.permission === 'rw' ? 'perm-rw' : 'perm-ro');
+      perm.textContent = e.permission || 'ro'; tdPerm.appendChild(perm); tr.appendChild(tdPerm);
+      const tdK = document.createElement('td');
+      const kind = document.createElement('span');
+      kind.className = 'evt-' + (e.kind === 'connect' ? 'conn' : 'disc');
+      kind.textContent = e.kind === 'connect' ? t('event_connect') : t('event_disconnect');
+      tdK.appendChild(kind); tr.appendChild(tdK);
+      body.appendChild(tr);
+    }
+  }
+
   function buildSessionRow(s) {
     const tr = document.createElement('tr');
 
@@ -481,9 +572,12 @@
 
     // Status
     const tdSt = document.createElement('td');
+    const pill = document.createElement('span');
+    pill.className = 'status-pill ' + (s.online ? 'on' : 'off');
     const dot = document.createElement('span'); dot.className = 'dot' + (s.online ? ' on' : '');
-    tdSt.appendChild(dot);
-    tdSt.appendChild(textNode(s.online ? t('online') : t('offline')));
+    pill.appendChild(dot);
+    pill.appendChild(textNode(s.online ? t('online') : t('offline')));
+    tdSt.appendChild(pill);
     tr.appendChild(tdSt);
 
     // Type
@@ -495,6 +589,15 @@
     const tdB = document.createElement('td');
     tdB.textContent = String(s.browser_count ?? 0);
     tr.appendChild(tdB);
+
+    // Last active
+    const tdAgo = document.createElement('td');
+    const ago = fmtAgo(s.last_active_seconds);
+    tdAgo.textContent = ago;
+    if (s.online && (s.last_active_seconds ?? 9999) < 60) {
+      tdAgo.className = 'recent';
+    }
+    tr.appendChild(tdAgo);
 
     // Tokens
     const tdTok = document.createElement('td');

@@ -81,7 +81,7 @@ cargo build --release
 | `--root` | `$HOME` | File manager default directory |
 | `--token-type` | `rw` | Token type: `rw`, `ro`, or `both` |
 | `--shell` | `/bin/bash` | Shell binary path |
-| `--session-id` | — | Custom session id (5-20 alphanumeric) shown in admin to distinguish devices; conflicts abort startup |
+| `--session-id` | — | Custom session id (5-20 alphanumeric) shown in admin to distinguish devices; **reusable** — a new agent registering with the same id takes over the old session (old tokens invalidated), no more conflict error |
 
 Output:
 
@@ -178,6 +178,8 @@ Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in 
 ### Features
 
 - **Overview**: version, uptime, agent total/online, browser total, per-session token list with permissions, connected browser count.
+- **Session monitoring**: per-session online status and last-active time (refreshes every few seconds).
+- **Access log (lightweight bastion audit)**: records browser/MCP connect & disconnect events (session, first 8 chars of token, permission, time), bounded to the latest 500 entries, visible in the panel.
 - **Token management**: revoke a single token, regenerate a session's tokens (old ones invalidated), toggle token permission (rw↔ro).
 - **Jump to terminal**: per-session "Connect" button opens that session's browser terminal in a new tab (token pre-filled; server password still typed manually).
 - **Session recording**: with `--record-dir`, interactive terminal I/O (output + input) is written as asciinema cast v2; the panel shows recording status; files replay with `asciinema play`.

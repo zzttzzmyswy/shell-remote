@@ -592,7 +592,9 @@ mod tests {
     #[tokio::test]
     async fn test_messages_handler_shell_remote_without_agent() {
         let state = make_state();
-        let (_sid, tokens) = state.sessions.register(None, "rw", None).await.unwrap();
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let _sid = r.session_id;
+        let tokens = r.tokens;
         let r = mcp_send_and_recv(&state, HashMap::new(),
             json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"shell_remote","arguments":{"token":tokens[0].0,"cmd":"echo hello"}}})).await;
         assert!(r["result"]["isError"].as_bool().unwrap_or(false));
@@ -605,11 +607,9 @@ mod tests {
         // "no_agent"), so the attempt is visible in the audit log.
         let dir = audit_tempdir();
         let state = make_state_with_recorder(dir.clone());
-        let (_sid, tokens) = state
-            .sessions
-            .register(None, "rw", Some("auditbot".to_string()))
-            .await
-            .unwrap();
+        let r = state.sessions.register(None, "rw", Some("auditbot".to_string())).await.unwrap();
+            let _sid = r.session_id;
+            let tokens = r.tokens;
         let r = mcp_send_and_recv(
             &state,
             HashMap::new(),
@@ -635,11 +635,9 @@ mod tests {
         // "rejected_readonly" (the command was attempted, not executed).
         let dir = audit_tempdir();
         let state = make_state_with_recorder(dir.clone());
-        let (_sid, tokens) = state
-            .sessions
-            .register(None, "ro", Some("robot".to_string()))
-            .await
-            .unwrap();
+        let r = state.sessions.register(None, "ro", Some("robot".to_string())).await.unwrap();
+            let _sid = r.session_id;
+            let tokens = r.tokens;
         let r = mcp_send_and_recv(
             &state,
             HashMap::new(),
@@ -663,11 +661,9 @@ mod tests {
         // No --record-dir → recorder is None → no audit file is ever written.
         let dir = audit_tempdir();
         let state = make_state(); // recorder = None
-        let (_sid, tokens) = state
-            .sessions
-            .register(None, "rw", Some("noaudit".to_string()))
-            .await
-            .unwrap();
+        let r = state.sessions.register(None, "rw", Some("noaudit".to_string())).await.unwrap();
+            let _sid = r.session_id;
+            let tokens = r.tokens;
         let _ = mcp_send_and_recv(
             &state,
             HashMap::new(),

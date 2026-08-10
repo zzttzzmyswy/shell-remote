@@ -20,16 +20,10 @@ mod integration_tests {
         ))
     }
 
-    /// Regression for the "ghost session blocks re-registration with 409" bug.
-    ///
-    /// Scenario reported by a user: an agent with `--session-id seSupportBot`
-    /// registers successfully (relay mints a token and stores the session),
-    /// then fails locally (e.g. root dir missing) and reconnects. Because the
-    /// relay still holds the prior session entry, a fresh `register` for the
-    /// same id returns 409 "session_id already in use". The fix is for the
-    /// agent to replay its cached token on reconnect, which routes through
-    /// `register_existing` and evicts the stale entry. This test pins the
-    /// relay behavior that makes that recovery work.
+    /// Session ids are reusable: a fresh agent re-registering under an id that
+    /// a previous incarnation (possibly dead) already holds takes over the
+    /// identity — the old session is evicted and its tokens invalidated. No
+    /// more 409 "id in use"; the response flags `evicted: true`.
     #[tokio::test]
     async fn test_ghost_session_reclaimed_by_cached_token_reconnect() {
         let state = relay_app();
@@ -59,47 +53,46 @@ mod integration_tests {
         assert_eq!(resp.status(), 200);
         let reg: Value = resp.json().await.unwrap();
         assert_eq!(reg["session_id"], "seSupportBot");
+        assert_eq!(reg["evicted"], false, "first registration evicts nothing");
         let token = reg["payload"]["tokens"][0]["token"].as_str().unwrap().to_string();
 
-        // 2. A *fresh* re-registration for the same id (no cached tokens) is
-        //    rejected with 409 — the ghost entry is still live. This is the
-        //    exact error the user saw.
+        // 2. A *fresh* re-registration for the same id (no cached tokens) now
+        //    succeeds and evicts the prior incarnation (no 409).
         let resp = client
             .post(format!("{}/agent/send", relay_url))
             .json(&json!({"type":"agent:register","token_type":"rw","session_id":"seSupportBot"}))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 409, "fresh re-register must hit 409 (ghost live)");
+        assert_eq!(resp.status(), 200, "fresh re-register must succeed, not 409");
+        let reg2: Value = resp.json().await.unwrap();
+        assert_eq!(reg2["evicted"], true, "re-registering an in-use id must evict");
+        assert_eq!(reg2["session_id"], "seSupportBot");
+        // The old token is invalidated by the eviction.
+        assert!(state.sessions.authenticate(&token).await.is_none());
 
-        // 3. Re-registration replaying the cached token routes through
-        //    register_existing, recognizes the stale incarnation as the same
-        //    logical session, evicts it, and succeeds. This is the path the
-        //    agent takes after caching its tokens across a local failure.
+        // 3. Re-registration replaying a cached token routes through
+        //    register_existing and succeeds (token reuse).
         let resp = client
             .post(format!("{}/agent/send", relay_url))
             .json(&json!({
                 "type":"agent:register",
-                "tokens":[{"token":token,"permission":"rw"}],
+                "tokens":[{"token":"cached-tok","permission":"rw"}],
                 "session_id":"seSupportBot"
             }))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "cached-token reconnect must evict ghost and succeed");
-        let reg: Value = resp.json().await.unwrap();
-        assert_eq!(reg["session_id"], "seSupportBot");
-        // The replayed token is reused verbatim.
-        assert_eq!(reg["payload"]["tokens"][0]["token"], token);
+        assert_eq!(resp.status(), 200, "cached-token reconnect must succeed");
+        let reg3: Value = resp.json().await.unwrap();
+        assert_eq!(reg3["session_id"], "seSupportBot");
+        assert_eq!(reg3["payload"]["tokens"][0]["token"], "cached-tok");
     }
 
-    /// Regression for the user-reported scenario that the v0.10.1 fix missed:
-    /// an agent started with `--key <fixed> --session-id <id>` (NOT cached
-    /// tokens) that **restarts as a fresh process**. The new process has no
-    /// cached tokens, so it sends a plain `agent:register` with `key` + the
-    /// same `session_id`. The relay still holds the prior incarnation's ghost
-    /// (the old process died without cleanly disconnecting), so the fresh
-    /// register must reclaim the id via the fixed key — not 409.
+    /// An agent started with `--key <fixed> --session-id <id>` that restarts
+    /// as a fresh process (no cached tokens) reclaims its id via the fixed key.
+    /// And a *different* key claiming the same id also succeeds — ids are fully
+    /// reusable; the newest incarnation evicts the old.
     #[tokio::test]
     async fn test_fixed_key_register_reclaims_id_across_process_restart() {
         let state = relay_app();
@@ -129,9 +122,7 @@ mod integration_tests {
         assert_eq!(reg["session_id"], "seSupportBot");
         assert_eq!(reg["payload"]["tokens"][0]["token"], "fixed-key-Z");
 
-        // Process 1 dies (no clean disconnect) — the ghost stays in the
-        // registry. Process 2 starts fresh: NO cached tokens, same key + id.
-        // Before the fix this returned 409 "session_id already in use".
+        // Process 2 starts fresh: NO cached tokens, same key + id. Reclaims.
         let resp = client
             .post(format!("{}/agent/send", relay_url))
             .json(&json!({"type":"agent:register","key":"fixed-key-Z","token_type":"rw","session_id":"seSupportBot"}))
@@ -141,21 +132,27 @@ mod integration_tests {
         assert_eq!(
             resp.status(),
             200,
-            "fixed-key register across a process restart must reclaim the id, not 409"
+            "fixed-key register across a process restart must reclaim the id"
         );
         let reg: Value = resp.json().await.unwrap();
         assert_eq!(reg["session_id"], "seSupportBot");
         assert_eq!(reg["payload"]["tokens"][0]["token"], "fixed-key-Z");
 
-        // A *different* fixed key trying to claim the same in-use id is still
-        // rejected — only the same key can reclaim.
+        // A *different* fixed key claiming the same in-use id now succeeds and
+        // evicts the previous session — ids are reusable across devices/keys.
         let resp = client
             .post(format!("{}/agent/send", relay_url))
             .json(&json!({"type":"agent:register","key":"intruder-key","token_type":"rw","session_id":"seSupportBot"}))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 409, "a different key must not steal the id");
+        assert_eq!(resp.status(), 200, "a different key reusing an id must take over");
+        let reg: Value = resp.json().await.unwrap();
+        assert_eq!(reg["evicted"], true);
+        assert_eq!(reg["session_id"], "seSupportBot");
+        assert_eq!(reg["payload"]["tokens"][0]["token"], "intruder-key");
+        // The previous key is no longer valid.
+        assert!(state.sessions.authenticate("fixed-key-Z").await.is_none());
     }
 
     #[tokio::test]

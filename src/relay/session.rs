@@ -19,10 +19,19 @@ pub struct SessionRegistry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterError {
-    /// The requested custom id is already held by a different live session.
-    IdTaken,
     /// The requested custom id failed validation (must be 5-20 alphanumeric).
     InvalidId,
+}
+
+/// Result of a successful registration. `evicted` is true when an existing
+/// session with the same `session_id` (or sharing any of the new tokens) was
+/// displaced — i.e. a new agent incarnation took over the identity, and the
+/// old session's tokens were invalidated.
+#[derive(Debug, Clone)]
+pub struct RegisterResult {
+    pub session_id: String,
+    pub tokens: Vec<(String, Permission)>,
+    pub evicted: bool,
 }
 
 impl SessionRegistry {
@@ -38,7 +47,7 @@ impl SessionRegistry {
         fixed_key: Option<String>,
         token_type: &str,
         desired_id: Option<String>,
-    ) -> Result<(String, Vec<(String, Permission)>), RegisterError> {
+    ) -> Result<RegisterResult, RegisterError> {
         let tokens: Vec<(String, Permission)> = if let Some(ref key) = fixed_key {
             let mut result = vec![(key.clone(), Permission::ReadWrite)];
             if token_type == "both" {
@@ -67,40 +76,36 @@ impl SessionRegistry {
         };
         let is_temporary = fixed_key.is_none();
 
+        // Session id is reusable: a new agent may take over an existing
+        // session_id (agent restart, second device reusing the identity).
+        // Any existing session under this id — or any session currently
+        // holding one of the tokens we're about to install — is evicted so the
+        // new incarnation fully owns the identity. No 409 "id in use" anymore.
+        let mut evicted = false;
         {
             let mut sessions = self.sessions.write().await;
-            if sessions.contains_key(&session_id) {
-                // Reclaim across a process restart: if any of the tokens we're
-                // about to install already maps to the existing session (i.e.
-                // a fixed key being re-used by the same agent restarting with
-                // the same --key + --session-id), evict the stale incarnation
-                // and re-register instead of rejecting with 409. Without this
-                // an agent restarted with a fixed key could never reclaim its
-                // id — its ghost session lingers in the registry until idle-
-                // reaped, so every fresh `register` hits IdTaken. A random-
-                // token agent that lost its tokens on restart can't prove
-                // ownership (its new random token doesn't map to the existing
-                // session) and still gets IdTaken, which is the safe behavior.
-                let same_agent = {
-                    let tmap = self.token_map.read().await;
-                    tokens.iter().any(|(t, _)| {
-                        tmap.get(t)
-                            .map(|(sid, _)| sid == &session_id)
-                            .unwrap_or(false)
-                    })
-                };
-                if !same_agent {
-                    return Err(RegisterError::IdTaken);
-                }
-                // Evict the stale prior incarnation: drop the old session
-                // entry and clear its tokens from the token_map so the new
-                // minted set replaces them cleanly.
-                if let Some(old_info) = sessions.remove(&session_id) {
-                    let mut tmap = self.token_map.write().await;
-                    for (t, _) in &old_info.tokens {
-                        tmap.remove(t);
+            // If any of our tokens already maps to a *different* session, that
+            // session is displaced too (token reuse → newest wins).
+            for (t, _) in &tokens {
+                let old_sid = self.token_map.read().await.get(t).map(|(sid, _)| sid.clone());
+                if let Some(old_sid) = old_sid {
+                    if old_sid != session_id {
+                        if let Some(old_info) = sessions.remove(&old_sid) {
+                            let mut tmap = self.token_map.write().await;
+                            for (ot, _) in &old_info.tokens {
+                                tmap.remove(ot);
+                            }
+                            evicted = true;
+                        }
                     }
                 }
+            }
+            if let Some(old_info) = sessions.remove(&session_id) {
+                let mut tmap = self.token_map.write().await;
+                for (t, _) in &old_info.tokens {
+                    tmap.remove(t);
+                }
+                evicted = true;
             }
             sessions.insert(
                 session_id.clone(),
@@ -119,7 +124,11 @@ impl SessionRegistry {
             }
         }
 
-        Ok((session_id, tokens))
+        Ok(RegisterResult {
+            session_id,
+            tokens,
+            evicted,
+        })
     }
 
     pub async fn authenticate(&self, token: &str) -> Option<(String, Permission)> {
@@ -128,42 +137,46 @@ impl SessionRegistry {
     }
 
     /// Re-register an agent that already holds a set of tokens (e.g. on
-    /// auto-reconnect). A fresh session_id is issued, but the supplied tokens
-    /// are reused verbatim so clients/browsers that cached them keep working.
-    /// The session is temporary so idle cleanup can still reap it.
+    /// auto-reconnect). The supplied tokens are reused verbatim so
+    /// clients/browsers that cached them keep working. The session is
+    /// temporary so idle cleanup can still reap it. Like [`register`], any
+    /// existing session under the same id (or holding any of the tokens) is
+    /// evicted — newest incarnation wins.
     pub async fn register_existing(
         &self,
         tokens: Vec<(String, Permission)>,
         desired_id: Option<String>,
-    ) -> Result<(String, Vec<(String, Permission)>), RegisterError> {
+    ) -> Result<RegisterResult, RegisterError> {
         let session_id = match desired_id {
             Some(ref id) if crate::proto::is_valid_custom_session_id(id) => id.clone(),
             Some(_) => return Err(RegisterError::InvalidId),
             None => generate_session_id(),
         };
 
+        let mut evicted = false;
         {
             let mut sessions = self.sessions.write().await;
-            if sessions.contains_key(&session_id) {
-                // Evict only if this is the same logical session resuming
-                // (one of our cached tokens already maps to that session).
-                let same_session = {
-                    let tmap = self.token_map.read().await;
-                    tokens.iter().any(|(t, _)| {
-                        tmap.get(t).map(|(sid, _)| sid == &session_id).unwrap_or(false)
-                    })
-                };
-                if !same_session {
-                    return Err(RegisterError::IdTaken);
-                }
-                // Evict the stale prior incarnation: remove the old session
-                // entry and clear its tokens from the token_map.
-                if let Some(old_info) = sessions.remove(&session_id) {
-                    let mut tmap = self.token_map.write().await;
-                    for (t, _) in &old_info.tokens {
-                        tmap.remove(t);
+            // Displace any session that currently holds one of our tokens.
+            for (t, _) in &tokens {
+                let old_sid = self.token_map.read().await.get(t).map(|(sid, _)| sid.clone());
+                if let Some(old_sid) = old_sid {
+                    if old_sid != session_id {
+                        if let Some(old_info) = sessions.remove(&old_sid) {
+                            let mut tmap = self.token_map.write().await;
+                            for (ot, _) in &old_info.tokens {
+                                tmap.remove(ot);
+                            }
+                            evicted = true;
+                        }
                     }
                 }
+            }
+            if let Some(old_info) = sessions.remove(&session_id) {
+                let mut tmap = self.token_map.write().await;
+                for (t, _) in &old_info.tokens {
+                    tmap.remove(t);
+                }
+                evicted = true;
             }
             sessions.insert(
                 session_id.clone(),
@@ -181,7 +194,11 @@ impl SessionRegistry {
             }
         }
 
-        Ok((session_id, tokens))
+        Ok(RegisterResult {
+            session_id,
+            tokens,
+            evicted,
+        })
     }
 
     pub async fn remove(&self, session_id: &str) {
@@ -327,114 +344,136 @@ mod tests {
     #[tokio::test]
     async fn test_register_temporary() {
         let registry = SessionRegistry::new();
-        let (_session_id, tokens) = registry.register(None, "rw", None).await.unwrap();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].1, Permission::ReadWrite);
-        assert!(registry.is_temporary(&_session_id).await);
+        let r = registry.register(None, "rw", None).await.unwrap();
+        assert_eq!(r.tokens.len(), 1);
+        assert_eq!(r.tokens[0].1, Permission::ReadWrite);
+        assert!(registry.is_temporary(&r.session_id).await);
     }
 
     #[tokio::test]
     async fn test_register_both_token_types() {
         let registry = SessionRegistry::new();
-        let (_session_id, tokens) = registry.register(None, "both", None).await.unwrap();
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].1, Permission::ReadWrite);
-        assert_eq!(tokens[1].1, Permission::ReadOnly);
-        assert_ne!(tokens[0].0, tokens[1].0);
+        let r = registry.register(None, "both", None).await.unwrap();
+        assert_eq!(r.tokens.len(), 2);
+        assert_eq!(r.tokens[0].1, Permission::ReadWrite);
+        assert_eq!(r.tokens[1].1, Permission::ReadOnly);
+        assert_ne!(r.tokens[0].0, r.tokens[1].0);
     }
 
     #[tokio::test]
     async fn test_register_ro_only() {
         let registry = SessionRegistry::new();
-        let (_session_id, tokens) = registry.register(None, "ro", None).await.unwrap();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].1, Permission::ReadOnly);
+        let r = registry.register(None, "ro", None).await.unwrap();
+        assert_eq!(r.tokens.len(), 1);
+        assert_eq!(r.tokens[0].1, Permission::ReadOnly);
     }
 
     #[tokio::test]
     async fn test_register_fixed_key() {
         let registry = SessionRegistry::new();
-        let (_session_id, tokens) = registry
+        let r = registry
             .register(Some("my-secret-key".to_string()), "rw", None)
             .await
             .unwrap();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].0, "my-secret-key");
-        assert_eq!(tokens[0].1, Permission::ReadWrite);
+        assert_eq!(r.tokens.len(), 1);
+        assert_eq!(r.tokens[0].0, "my-secret-key");
+        assert_eq!(r.tokens[0].1, Permission::ReadWrite);
     }
 
     #[tokio::test]
     async fn test_register_fixed_key_both() {
         let registry = SessionRegistry::new();
-        let (_session_id, tokens) = registry
+        let r = registry
             .register(Some("my-secret-key".to_string()), "both", None)
             .await
             .unwrap();
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].0, "my-secret-key");
-        assert_eq!(tokens[0].1, Permission::ReadWrite);
-        assert_eq!(tokens[1].1, Permission::ReadOnly);
-        assert_ne!(tokens[1].0, "my-secret-key");
+        assert_eq!(r.tokens.len(), 2);
+        assert_eq!(r.tokens[0].0, "my-secret-key");
+        assert_eq!(r.tokens[0].1, Permission::ReadWrite);
+        assert_eq!(r.tokens[1].1, Permission::ReadOnly);
+        assert_ne!(r.tokens[1].0, "my-secret-key");
     }
 
     #[tokio::test]
     async fn test_register_with_custom_id() {
         let registry = SessionRegistry::new();
-        let (sid, _t) = registry.register(None, "rw", Some("mydev01".to_string())).await.unwrap();
-        assert_eq!(sid, "mydev01");
+        let r = registry.register(None, "rw", Some("mydev01".to_string())).await.unwrap();
+        assert_eq!(r.session_id, "mydev01");
+        assert!(!r.evicted, "first registration evicts nothing");
     }
 
     #[tokio::test]
-    async fn test_register_custom_id_taken() {
+    async fn test_register_same_id_evicts_previous() {
+        // Session ids are reusable: a second agent claiming the same id
+        // takes over (evicts) the previous session instead of failing.
         let registry = SessionRegistry::new();
-        let _ = registry.register(None, "rw", Some("mydev01".to_string())).await.unwrap();
-        let err = registry.register(None, "rw", Some("mydev01".to_string())).await.unwrap_err();
-        assert!(matches!(err, RegisterError::IdTaken));
+        let first = registry.register(None, "rw", Some("mydev01".to_string())).await.unwrap();
+        let old_token = first.tokens[0].0.clone();
+
+        let second = registry.register(None, "rw", Some("mydev01".to_string())).await.unwrap();
+        assert_eq!(second.session_id, "mydev01");
+        assert!(second.evicted, "re-registering an in-use id must evict the old session");
+        // Old tokens invalidated
+        assert!(registry.authenticate(&old_token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_register_same_token_evicts_old_session() {
+        // Token reuse: a new session using an already-registered token
+        // displaces the session that owned it (newest wins).
+        let registry = SessionRegistry::new();
+        let first = registry.register(Some("shared-key".to_string()), "rw", None).await.unwrap();
+        let sid1 = first.session_id.clone();
+
+        let second = registry.register(Some("shared-key".to_string()), "rw", None).await.unwrap();
+        assert_ne!(second.session_id, sid1);
+        assert!(second.evicted, "reusing a token must evict the old session");
+        // Old session gone
+        assert!(registry.authenticate("shared-key").await.is_some());
+        assert!(!registry.sessions.read().await.contains_key(&sid1));
     }
 
     #[tokio::test]
     async fn test_register_fixed_key_reclaims_id_after_restart() {
-        // An agent restarted with the same --key + --session-id must reclaim
-        // its id (evict the ghost from the prior incarnation), not 409. This
-        // is the user-reported scenario: fixed key + fixed session id still
-        // hit "session_id already in use" across a process restart.
+        // An agent restarted with the same --key + --session-id reclaims its
+        // id, evicting the prior incarnation.
         let registry = SessionRegistry::new();
-        let (sid1, t1) = registry
+        let r1 = registry
             .register(Some("fixed-key-X".to_string()), "rw", Some("dev01".to_string()))
             .await
             .unwrap();
-        assert_eq!(sid1, "dev01");
-        assert_eq!(t1[0].0, "fixed-key-X");
+        assert_eq!(r1.session_id, "dev01");
+        assert_eq!(r1.tokens[0].0, "fixed-key-X");
 
-        // A fresh process re-registering with the same key + id: must succeed
-        // (evicts the stale prior incarnation) instead of IdTaken.
-        let (sid2, t2) = registry
+        let r2 = registry
             .register(Some("fixed-key-X".to_string()), "rw", Some("dev01".to_string()))
             .await
             .unwrap();
-        assert_eq!(sid2, "dev01");
-        assert_eq!(t2[0].0, "fixed-key-X");
-        // The fixed key still authenticates to the (reclaimed) session.
+        assert_eq!(r2.session_id, "dev01");
+        assert_eq!(r2.tokens[0].0, "fixed-key-X");
+        assert!(r2.evicted, "restart reclaims id by evicting the stale incarnation");
         let (resolved, _) = registry.authenticate("fixed-key-X").await.unwrap();
         assert_eq!(resolved, "dev01");
     }
 
     #[tokio::test]
-    async fn test_register_different_fixed_key_conflict() {
-        // A different agent (different fixed key) trying to claim an in-use id
-        // is still rejected — only the same key can reclaim.
+    async fn test_register_different_key_evicts_and_takes_over() {
+        // A *different* fixed key claiming an in-use id now takes over rather
+        // than failing — the id is reusable across devices/keys.
         let registry = SessionRegistry::new();
-        let _ = registry
+        let _r1 = registry
             .register(Some("key-A".to_string()), "rw", Some("dev01".to_string()))
             .await
             .unwrap();
-        let err = registry
+        let r2 = registry
             .register(Some("key-B".to_string()), "rw", Some("dev01".to_string()))
             .await
-            .unwrap_err();
-        assert!(matches!(err, RegisterError::IdTaken));
-        // Original key still owns the session.
-        let (resolved, _) = registry.authenticate("key-A").await.unwrap();
+            .unwrap();
+        assert_eq!(r2.session_id, "dev01");
+        assert!(r2.evicted, "different key reusing id must evict old session");
+        // key-A no longer authenticates; key-B does
+        assert!(registry.authenticate("key-A").await.is_none());
+        let (resolved, _) = registry.authenticate("key-B").await.unwrap();
         assert_eq!(resolved, "dev01");
     }
 
@@ -443,26 +482,24 @@ mod tests {
         // token_type=both: the fixed rw key reclaims the id; the random ro
         // token is rotated (old one invalidated, new one minted).
         let registry = SessionRegistry::new();
-        let (_sid, t1) = registry
+        let r1 = registry
             .register(Some("fixed".to_string()), "both", Some("dev01".to_string()))
             .await
             .unwrap();
-        let old_ro = t1.iter().find(|(_, p)| *p == Permission::ReadOnly).unwrap().0.clone();
+        let old_ro = r1.tokens.iter().find(|(_, p)| *p == Permission::ReadOnly).unwrap().0.clone();
         assert!(registry.authenticate(&old_ro).await.is_some());
 
-        let (_sid, t2) = registry
+        let r2 = registry
             .register(Some("fixed".to_string()), "both", Some("dev01".to_string()))
             .await
             .unwrap();
-        let new_ro = t2.iter().find(|(_, p)| *p == Permission::ReadOnly).unwrap().0.clone();
+        let new_ro = r2.tokens.iter().find(|(_, p)| *p == Permission::ReadOnly).unwrap().0.clone();
         assert_ne!(old_ro, new_ro);
-        // Old ro token invalidated by the eviction.
         assert!(registry.authenticate(&old_ro).await.is_none());
-        // Fixed rw key + new ro both authenticate to the reclaimed session.
-        let (r1, _) = registry.authenticate("fixed").await.unwrap();
-        let (r2, _) = registry.authenticate(&new_ro).await.unwrap();
-        assert_eq!(r1, "dev01");
-        assert_eq!(r2, "dev01");
+        let (r1_, _) = registry.authenticate("fixed").await.unwrap();
+        let (r2_, _) = registry.authenticate(&new_ro).await.unwrap();
+        assert_eq!(r1_, "dev01");
+        assert_eq!(r2_, "dev01");
     }
 
     #[tokio::test]
@@ -470,45 +507,52 @@ mod tests {
         let registry = SessionRegistry::new();
         let err = registry.register(None, "rw", Some("ab!".to_string())).await.unwrap_err();
         assert!(matches!(err, RegisterError::InvalidId));
-        // None still works (random id)
-        let (_sid, _t) = registry.register(None, "rw", None).await.unwrap();
+        let r = registry.register(None, "rw", None).await.unwrap();
+        assert!(!r.session_id.is_empty());
     }
 
     #[tokio::test]
     async fn test_register_existing_evicts_same_tokens() {
         let registry = SessionRegistry::new();
-        let (sid, tokens) = registry.register(None, "rw", Some("dev01".to_string())).await.unwrap();
-        assert_eq!(sid, "dev01");
-        // reconnect with the same cached tokens + same id: evicts the stale
-        // prior incarnation, returns the same id, tokens re-map to new session.
-        let (sid2, _t2) = registry
-            .register_existing(tokens.clone(), Some("dev01".to_string()))
+        let r1 = registry.register(None, "rw", Some("dev01".to_string())).await.unwrap();
+        assert_eq!(r1.session_id, "dev01");
+        let cached = r1.tokens.clone();
+        let r2 = registry
+            .register_existing(cached.clone(), Some("dev01".to_string()))
             .await
             .unwrap();
-        assert_eq!(sid2, "dev01");
-        // cached token now authenticates to the (new) dev1 session
-        let (resolved, _) = registry.authenticate(&tokens[0].0).await.unwrap();
+        assert_eq!(r2.session_id, "dev01");
+        assert!(r2.evicted);
+        let (resolved, _) = registry.authenticate(&cached[0].0).await.unwrap();
         assert_eq!(resolved, "dev01");
     }
 
     #[tokio::test]
-    async fn test_register_existing_conflict_different_tokens() {
+    async fn test_register_existing_different_tokens_evicts() {
+        // A different device (different tokens) claiming the same id now
+        // takes over (evicts) the old session — no 409.
         let registry = SessionRegistry::new();
-        let _ = registry.register(None, "rw", Some("dev01".to_string())).await.unwrap();
-        // a different device (different tokens) tries to claim the same id
+        let r1 = registry.register(None, "rw", Some("dev01".to_string())).await.unwrap();
         let other = vec![("other-token-xx".to_string(), Permission::ReadWrite)];
-        let err = registry.register_existing(other, Some("dev01".to_string())).await.unwrap_err();
-        assert!(matches!(err, RegisterError::IdTaken));
+        let r2 = registry
+            .register_existing(other.clone(), Some("dev01".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(r2.session_id, "dev01");
+        assert!(r2.evicted);
+        // Old session's token invalidated
+        assert!(registry.authenticate(&r1.tokens[0].0).await.is_none());
+        assert!(registry.authenticate("other-token-xx").await.is_some());
     }
 
     #[tokio::test]
     async fn test_authenticate_valid_token() {
         let registry = SessionRegistry::new();
-        let (_session_id, tokens) = registry.register(None, "rw", None).await.unwrap();
-        let result = registry.authenticate(&tokens[0].0).await;
+        let r = registry.register(None, "rw", None).await.unwrap();
+        let result = registry.authenticate(&r.tokens[0].0).await;
         assert!(result.is_some());
         let (sid, perm) = result.unwrap();
-        assert_eq!(sid, _session_id);
+        assert_eq!(sid, r.session_id);
         assert_eq!(perm, Permission::ReadWrite);
     }
 
@@ -522,8 +566,8 @@ mod tests {
     #[tokio::test]
     async fn test_authenticate_ro_token() {
         let registry = SessionRegistry::new();
-        let (_session_id, tokens) = registry.register(None, "both", None).await.unwrap();
-        let result = registry.authenticate(&tokens[1].0).await;
+        let r = registry.register(None, "both", None).await.unwrap();
+        let result = registry.authenticate(&r.tokens[1].0).await;
         assert!(result.is_some());
         let (_sid, perm) = result.unwrap();
         assert_eq!(perm, Permission::ReadOnly);
@@ -532,25 +576,25 @@ mod tests {
     #[tokio::test]
     async fn test_remove_session() {
         let registry = SessionRegistry::new();
-        let (session_id, tokens) = registry.register(None, "rw", None).await.unwrap();
-        registry.remove(&session_id).await;
-        let result = registry.authenticate(&tokens[0].0).await;
+        let r = registry.register(None, "rw", None).await.unwrap();
+        registry.remove(&r.session_id).await;
+        let result = registry.authenticate(&r.tokens[0].0).await;
         assert!(result.is_none());
-        assert!(!registry.is_temporary(&session_id).await);
+        assert!(!registry.is_temporary(&r.session_id).await);
     }
 
     #[tokio::test]
     async fn test_is_temporary_false_for_fixed_key() {
         let registry = SessionRegistry::new();
-        let (session_id, _tokens) = registry.register(Some("key".to_string()), "rw", None).await.unwrap();
-        assert!(!registry.is_temporary(&session_id).await);
+        let r = registry.register(Some("key".to_string()), "rw", None).await.unwrap();
+        assert!(!registry.is_temporary(&r.session_id).await);
     }
 
     #[tokio::test]
     async fn test_token_hex_format() {
         let registry = SessionRegistry::new();
-        let (_session_id, tokens) = registry.register(None, "rw", None).await.unwrap();
-        let token = &tokens[0].0;
+        let r = registry.register(None, "rw", None).await.unwrap();
+        let token = &r.tokens[0].0;
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -562,92 +606,83 @@ mod tests {
             ("cached-rw-token".to_string(), Permission::ReadWrite),
             ("cached-ro-token".to_string(), Permission::ReadOnly),
         ];
-        let (sid, tokens) = registry.register_existing(reused.clone(), None).await.unwrap();
-        // Tokens come back unchanged
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].0, "cached-rw-token");
-        assert_eq!(tokens[1].0, "cached-ro-token");
-        // Both authenticate to the new session
+        let r = registry.register_existing(reused.clone(), None).await.unwrap();
+        assert_eq!(r.tokens.len(), 2);
+        assert_eq!(r.tokens[0].0, "cached-rw-token");
+        assert_eq!(r.tokens[1].0, "cached-ro-token");
         let (s1, p1) = registry.authenticate("cached-rw-token").await.unwrap();
         let (s2, _p2) = registry.authenticate("cached-ro-token").await.unwrap();
-        assert_eq!(s1, sid);
-        assert_eq!(s2, sid);
+        assert_eq!(s1, r.session_id);
+        assert_eq!(s2, r.session_id);
         assert_eq!(p1, Permission::ReadWrite);
-        assert!(registry.is_temporary(&sid).await);
+        assert!(registry.is_temporary(&r.session_id).await);
     }
 
     #[tokio::test]
     async fn test_register_existing_overwrites_old_mapping() {
         let registry = SessionRegistry::new();
-        let (old_sid, _t) = registry
+        let r1 = registry
             .register_existing(vec![("shared-token".to_string(), Permission::ReadWrite)], None)
             .await
             .unwrap();
-        // Re-register same token: a new session wins the mapping
-        let (new_sid, _t) = registry
+        let r2 = registry
             .register_existing(vec![("shared-token".to_string(), Permission::ReadWrite)], None)
             .await
             .unwrap();
-        assert_ne!(old_sid, new_sid);
+        assert_ne!(r1.session_id, r2.session_id);
+        assert!(r2.evicted, "re-registering a reused token evicts the prior session");
         let (resolved, _) = registry.authenticate("shared-token").await.unwrap();
-        assert_eq!(resolved, new_sid);
+        assert_eq!(resolved, r2.session_id);
     }
 
     #[tokio::test]
     async fn test_list_sessions() {
         let registry = SessionRegistry::new();
-        let (sid, _t) = registry.register(None, "both", None).await.unwrap();
+        let r = registry.register(None, "both", None).await.unwrap();
         let list = registry.list_sessions().await;
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].0, sid);
+        assert_eq!(list[0].0, r.session_id);
         assert_eq!(list[0].1.tokens.len(), 2);
     }
 
     #[tokio::test]
     async fn test_revoke_token() {
         let registry = SessionRegistry::new();
-        let (_sid, tokens) = registry.register(None, "both", None).await.unwrap();
-        assert!(registry.revoke_token(&tokens[0].0).await);
-        assert!(registry.authenticate(&tokens[0].0).await.is_none());
-        // the other token still works
-        assert!(registry.authenticate(&tokens[1].0).await.is_some());
-        // unknown token
+        let r = registry.register(None, "both", None).await.unwrap();
+        assert!(registry.revoke_token(&r.tokens[0].0).await);
+        assert!(registry.authenticate(&r.tokens[0].0).await.is_none());
+        assert!(registry.authenticate(&r.tokens[1].0).await.is_some());
         assert!(!registry.revoke_token("nope").await);
     }
 
     #[tokio::test]
     async fn test_regenerate_session() {
         let registry = SessionRegistry::new();
-        let (sid, tokens) = registry.register(None, "rw", None).await.unwrap();
-        let new_tokens = registry.regenerate_session(&sid).await.unwrap();
+        let r = registry.register(None, "rw", None).await.unwrap();
+        let new_tokens = registry.regenerate_session(&r.session_id).await.unwrap();
         assert_eq!(new_tokens.len(), 1);
-        assert_ne!(new_tokens[0].0, tokens[0].0);
-        // old token invalidated
-        assert!(registry.authenticate(&tokens[0].0).await.is_none());
-        // new token authenticates to same session
+        assert_ne!(new_tokens[0].0, r.tokens[0].0);
+        assert!(registry.authenticate(&r.tokens[0].0).await.is_none());
         let (resolved, perm) = registry.authenticate(&new_tokens[0].0).await.unwrap();
-        assert_eq!(resolved, sid);
+        assert_eq!(resolved, r.session_id);
         assert_eq!(perm, Permission::ReadWrite);
-        // unknown session
         assert!(registry.regenerate_session("deadbeef").await.is_none());
     }
 
     #[tokio::test]
     async fn test_set_token_permission() {
         let registry = SessionRegistry::new();
-        let (_sid, tokens) = registry.register(None, "rw", None).await.unwrap();
+        let r = registry.register(None, "rw", None).await.unwrap();
         assert!(registry
-            .set_token_permission(&tokens[0].0, Permission::ReadOnly)
+            .set_token_permission(&r.tokens[0].0, Permission::ReadOnly)
             .await);
-        let (_sid, perm) = registry.authenticate(&tokens[0].0).await.unwrap();
+        let (_sid, perm) = registry.authenticate(&r.tokens[0].0).await.unwrap();
         assert_eq!(perm, Permission::ReadOnly);
-        // flip back
         registry
-            .set_token_permission(&tokens[0].0, Permission::ReadWrite)
+            .set_token_permission(&r.tokens[0].0, Permission::ReadWrite)
             .await;
-        let (_, perm) = registry.authenticate(&tokens[0].0).await.unwrap();
+        let (_, perm) = registry.authenticate(&r.tokens[0].0).await.unwrap();
         assert_eq!(perm, Permission::ReadWrite);
-        // unknown token
         assert!(!registry.set_token_permission("nope", Permission::ReadOnly).await);
     }
 }

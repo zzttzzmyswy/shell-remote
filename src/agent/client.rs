@@ -182,6 +182,17 @@ impl RelayClient {
             .context("Missing session_id")?
             .to_string();
 
+        // The relay marks the registration with `evicted: true` when this
+        // agent took over a session_id / token that a previous incarnation
+        // still held — the old session was displaced. Surface it prominently
+        // so operators notice a duplicate/restart immediately.
+        if response.get("evicted").and_then(|v| v.as_bool()).unwrap_or(false) {
+            tracing::warn!(
+                session = %client.session_id,
+                "registration evicted a previous session with the same session_id/token — duplicate agent detected"
+            );
+        }
+
         let payload = &response["payload"];
         if let Some(tokens_array) = payload["tokens"].as_array() {
             for t in tokens_array {
