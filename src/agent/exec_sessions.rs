@@ -141,7 +141,7 @@ impl ExecSessionManager {
                         match n {
                             Ok(0) => { done = true; }
                             Ok(n) => {
-                                let s = String::from_utf8_lossy(&stdout_buf[..n]).to_string();
+                                let s = crate::agent::encoding::decode_bytes(&stdout_buf[..n]);
                                 let mut buf = output_buf_clone.lock().await;
                                 buf.push_str(&s);
                                 if buf.len() > MAX_OUTPUT_BUF {
@@ -157,7 +157,7 @@ impl ExecSessionManager {
                         match n {
                             Ok(0) => { done = true; }
                             Ok(n) => {
-                                let s = String::from_utf8_lossy(&stderr_buf[..n]).to_string();
+                                let s = crate::agent::encoding::decode_bytes(&stderr_buf[..n]);
                                 let mut buf = output_buf_clone.lock().await;
                                 buf.push_str(&s);
                                 if buf.len() > MAX_OUTPUT_BUF {

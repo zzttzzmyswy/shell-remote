@@ -132,7 +132,7 @@ shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx
 shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx --shell powershell.exe
 ```
 
-注意事项：建议以管理员身份运行以完整访问文件系统；交互式程序（ssh/vim）在 MCP exec 路径暂不支持；文件下载（read）正常。
+注意事项：建议以管理员身份运行以完整访问文件系统；交互式程序（ssh/vim）在 MCP exec 路径暂不支持；文件下载（read）正常。终端输出与 MCP 命令结果会自动兼容 Windows 控制台的非常见编码（如 GBK/cp936），统一转换为 UTF-8 后回传，浏览器与 AI Agent 侧无需关心目标机编码。
 
 ### Windows 交叉编译（从 Linux）
 

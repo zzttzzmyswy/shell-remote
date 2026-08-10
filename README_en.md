@@ -125,7 +125,7 @@ shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx
 shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx --shell powershell.exe
 ```
 
-Notes: run as administrator for full filesystem access; interactive programs (ssh/vim) are not supported in the MCP exec path; file download (read) works.
+Notes: run as administrator for full filesystem access; interactive programs (ssh/vim) are not supported in the MCP exec path; file download (read) works. Terminal output and MCP command results are automatically normalized from non-UTF-8 console encodings (e.g. GBK/cp936) to UTF-8, so browsers and AI agents never need to know the target machine's encoding.
 
 ### Cross-compile from Linux
 

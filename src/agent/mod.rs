@@ -1,4 +1,5 @@
 pub mod client;
+pub mod encoding;
 pub mod exec_sessions;
 pub mod fs;
 pub mod shell;
@@ -109,7 +110,12 @@ async fn flush_output(
         if data.is_empty() {
             continue;
         }
-        let encoded = fs::encode_b64(&data);
+        // Decode subprocess/PTY bytes to UTF-8 before base64-ing so browsers
+        // (which TextDecoder UTF-8 by default) render correctly even when the
+        // agent's console emits a legacy encoding (e.g. GBK on Windows). On
+        // POSIX this is a no-op (already UTF-8).
+        let text = crate::agent::encoding::decode_bytes(&data);
+        let encoded = fs::encode_b64(text.as_bytes());
         let msg = Message {
             msg_type: "terminal:output".to_string(),
             session_id: session_id.to_string(),
@@ -709,7 +715,8 @@ async fn run_session(
                                         // Replay buffered output, routed to requesting user only
                                         if let Some(ts) = tabs.get(&active_tab_id) {
                                             if !ts.output_buf.is_empty() {
-                                                let encoded = fs::encode_b64(&ts.output_buf);
+                                                let text = crate::agent::encoding::decode_bytes(&ts.output_buf);
+                                                let encoded = fs::encode_b64(text.as_bytes());
                                                 let mut replay_payload = serde_json::json!({
                                                     "data": encoded,
                                                     "tab_id": active_tab_id
@@ -964,7 +971,8 @@ async fn run_session(
                                     // Replay buffered output AFTER tab_list so JS knows activeTabId
                                     for (tid, ts) in &tabs {
                                         if !ts.output_buf.is_empty() {
-                                            let encoded = fs::encode_b64(&ts.output_buf);
+                                            let text = crate::agent::encoding::decode_bytes(&ts.output_buf);
+                                            let encoded = fs::encode_b64(text.as_bytes());
                                             let replay_msg = Message {
                                                 msg_type: "terminal:output".to_string(),
                                                 session_id: client.session_id.clone(),
@@ -1055,8 +1063,8 @@ async fn execute_command(cmd: &str, timeout_ms: u64, _shell: &str) -> (String, S
 
     match result {
         Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let stdout = crate::agent::encoding::decode_bytes(&out.stdout);
+            let stderr = crate::agent::encoding::decode_bytes(&out.stderr);
             let exit_code = out.status.code().unwrap_or(-1);
             (stdout, stderr, exit_code)
         }
@@ -1096,8 +1104,8 @@ async fn execute_command(cmd: &str, timeout_ms: u64, shell: &str) -> (String, St
 
     match result {
         Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let stdout = crate::agent::encoding::decode_bytes(&out.stdout);
+            let stderr = crate::agent::encoding::decode_bytes(&out.stderr);
             let exit_code = out.status.code().unwrap_or(-1);
             (stdout, stderr, exit_code)
         }
