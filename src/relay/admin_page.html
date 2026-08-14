@@ -737,6 +737,9 @@
       await api('/api/overview');
       showDash();
       startRefresh();
+      // Render data immediately instead of waiting for the first 5s tick —
+      // otherwise a page refresh leaves the dashboard showing empty placeholders.
+      await refresh();
     } catch (_) {
       showLogin();
     }
