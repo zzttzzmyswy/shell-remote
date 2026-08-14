@@ -183,6 +183,7 @@ Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in 
 - **Token management**: revoke a single token, regenerate a session's tokens (old ones invalidated), toggle token permission (rw↔ro).
 - **Jump to terminal**: per-session "Connect" button opens that session's browser terminal in a new tab (token pre-filled; server password still typed manually).
 - **Session recording**: with `--record-dir`, interactive terminal I/O (output + input) is written as asciinema cast v2; the panel shows recording status; files replay with `asciinema play`.
+- **Recording management**: the "Recordings" panel lists all recorded files (terminal casts + MCP command audits) with their time and size; terminal casts replay in an in-panel player (xterm.js, with play/pause, 0.25x–4x speed, and seek bar), MCP command records are shown as structured cards, and any recording can be deleted.
 - **Kick session**: disconnect that agent and all its browsers and invalidate its tokens.
 - **Server password**: view the current `--auth`, rotate it live (takes effect immediately).
 - **Chinese / English toggle**: switch the panel UI between zh and en (auto-detects browser language, remembered in localStorage).
@@ -219,6 +220,7 @@ With `--record-dir` enabled, every MCP `shell_remote` tool call is also audited 
 - `token_prefix` stores only the first 8 chars of the token (enough to correlate with the admin token list without leaking the full secret).
 - `stdout` / `stderr` are truncated to 4KB (`stdout_len` / `stderr_len` hold the full lengths).
 - The admin overview shows a `●AUDIT` marker per session; kicked/idle-reaped sessions flush and close their audit file.
+- The "Recordings" panel lists each audit file as an "MCP cmd" entry; clicking it shows a structured card (command, status, exit code, duration, permission, token prefix, stdout/stderr), and it can be deleted.
 - **Audit files may also contain sensitive data in commands and output — protect the record directory's filesystem permissions.**
 
 ## AI Agent Integration (MCP)

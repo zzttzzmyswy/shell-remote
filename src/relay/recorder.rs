@@ -136,6 +136,137 @@ impl Recorder {
         }
         self.audit.close(session_id);
     }
+
+    /// List all recorded files (`.cast` terminal sessions + `.audit.jsonl`
+    /// MCP command records), newest first. Only files in the record dir are
+    /// returned; the returned [`RecordingFile`] carries a validated file name
+    /// safe to pass back for content fetch / delete.
+    pub fn list_recordings(&self) -> Vec<RecordingFile> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let ft = match e.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !ft.is_file() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(kind) = recording_kind(&name) else {
+                continue;
+            };
+            let meta = e.metadata().ok();
+            let bytes = meta.map(|m| m.len() as u64).unwrap_or(0);
+            if let Some((session_id, ts_unix)) = parse_recording_name(&name, kind) {
+                out.push(RecordingFile {
+                    name,
+                    kind,
+                    session_id,
+                    ts_unix,
+                    bytes,
+                });
+            }
+        }
+        out.sort_by(|a, b| b.ts_unix.cmp(&a.ts_unix));
+        out
+    }
+
+    /// Resolve a validated `RecordingFile` name to its absolute path inside the
+    /// record dir, or `None` if the name escapes the dir (path traversal) or
+    /// isn't a recording. Content serving and deletion must go through this to
+    /// guarantee an admin can only ever touch files the recorder owns.
+    pub fn recording_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        if recording_kind(name).is_none() {
+            return None;
+        }
+        // Reject anything that isn't a bare file name (no path separators). A
+        // bare file name joined onto the record dir can never contain a `..`
+        // traversal component, so this is a complete containment guarantee —
+        // no canonicalization (which would also reject not-yet-created files
+        // and add unavoidable callers).
+        if name.contains('/') || name.contains('\\') {
+            return None;
+        }
+        Some(self.dir.join(name))
+    }
+}
+
+/// Terminal session recordings (`.cast`) vs MCP command records
+/// (`.audit.jsonl`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum RecordingKind {
+    Cast,
+    Audit,
+}
+
+/// One file found in the record dir, with its name pre-validated and its
+/// identity/size parsed for the admin listing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordingFile {
+    pub name: String,
+    pub kind: RecordingKind,
+    pub session_id: String,
+    /// Unix seconds from the file name suffix (the moment the writer spawned).
+    pub ts_unix: u64,
+    pub bytes: u64,
+}
+
+/// Classify a record-dir file name; `None` for anything that isn't a
+/// `.cast` or `.audit.jsonl` recording.
+fn recording_kind(name: &str) -> Option<RecordingKind> {
+    if name.ends_with(".audit.jsonl") {
+        Some(RecordingKind::Audit)
+    } else if name.ends_with(".cast") {
+        Some(RecordingKind::Cast)
+    } else {
+        None
+    }
+}
+
+/// Parse `{sid}_{ts}.cast` / `{sid}_{ts}.audit.jsonl`, returning the session
+/// id and the unix-second timestamp embedded in the file name.
+fn parse_recording_name(name: &str, kind: RecordingKind) -> Option<(String, u64)> {
+    let stem = match kind {
+        RecordingKind::Cast => name.strip_suffix(".cast")?,
+        RecordingKind::Audit => name.strip_suffix(".audit.jsonl")?,
+    };
+    let (sid, ts) = stem.rsplit_once('_')?;
+    if sid.is_empty() {
+        return None;
+    }
+    let ts_unix: u64 = ts.parse().ok()?;
+    Some((sid.to_string(), ts_unix))
+}
+
+/// A serializable representation of a recording for the admin JSON API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordingView {
+    pub name: String,
+    pub kind: &'static str,
+    pub session_id: String,
+    pub ts_unix: u64,
+    pub bytes: u64,
+    pub iso: String,
+}
+
+impl RecordingView {
+    pub fn from_file(f: &RecordingFile) -> Self {
+        let kind = match f.kind {
+            RecordingKind::Cast => "cast",
+            RecordingKind::Audit => "audit",
+        };
+        Self {
+            name: f.name.clone(),
+            kind,
+            session_id: f.session_id.clone(),
+            ts_unix: f.ts_unix,
+            bytes: f.bytes,
+            iso: unix_ms_to_iso(f.ts_unix * 1000),
+        }
+    }
 }
 
 /// Compute unix seconds for the cast header timestamp.
@@ -592,5 +723,63 @@ mod tests {
         assert_eq!(unix_ms_to_iso(0), "1970-01-01T00:00:00Z");
         // A known leap-day instant: 2024-02-29T00:00:00Z = 1709164800 s
         assert_eq!(unix_ms_to_iso(1_709_164_800_000), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn test_recording_kind_parse() {
+        assert_eq!(recording_kind("s1_1700000000.cast"), Some(RecordingKind::Cast));
+        assert_eq!(
+            recording_kind("s1_1700000000.audit.jsonl"),
+            Some(RecordingKind::Audit)
+        );
+        assert_eq!(recording_kind("s1_1700000000.txt"), None);
+        assert_eq!(recording_kind("README"), None);
+        let (sid, ts) = parse_recording_name("mq-7f3a_1700000000.cast", RecordingKind::Cast).unwrap();
+        assert_eq!(sid, "mq-7f3a");
+        assert_eq!(ts, 1_700_000_000);
+        let (sid, ts) =
+            parse_recording_name("mq-7f3a_1700000000.audit.jsonl", RecordingKind::Audit).unwrap();
+        assert_eq!(sid, "mq-7f3a");
+        assert_eq!(ts, 1_700_000_000);
+        // No underscore → not parseable.
+        assert!(parse_recording_name("abc.cast", RecordingKind::Cast).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_recordings_sorts_and_classifies() {
+        let dir = tempdir();
+        let rec = Recorder::new(dir.clone());
+        rec.record("sid-a", RecordEvent::Output("hi".into()));
+        rec.close("sid-a");
+        rec.audit_mcp("sid-b", make_audit_line("sid-b", "ls", "ok"));
+        rec.close("sid-b");
+        // A stray non-recording file must be ignored.
+        std::fs::write(dir.join("README.md"), "x").unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+
+        let list = rec.list_recordings();
+        assert_eq!(list.len(), 2, "two recordings, one stray file ignored");
+        let cast = list.iter().find(|f| f.kind == RecordingKind::Cast).unwrap();
+        assert_eq!(cast.session_id, "sid-a");
+        assert!(cast.bytes > 0);
+        assert_eq!(parse_recording_name(&cast.name, cast.kind).unwrap().0, "sid-a");
+        let audit = list.iter().find(|f| f.kind == RecordingKind::Audit).unwrap();
+        assert_eq!(audit.session_id, "sid-b");
+    }
+
+    #[test]
+    fn test_recording_path_rejects_traversal() {
+        let dir = std::env::temp_dir().join(format!("sr-rec-path-{}", unix_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = Recorder::new(dir.clone());
+        // Valid names resolve inside the dir.
+        assert!(rec.recording_path("s_1700.cast").is_some());
+        assert!(rec.recording_path("s_1700.audit.jsonl").is_some());
+        // Traversal / non-recording names are rejected.
+        assert!(rec.recording_path("../etc/passwd.cast").is_none());
+        assert!(rec.recording_path("..//etc/passwd.cast").is_none());
+        assert!(rec.recording_path("s_pwn.cast").is_some(), "internal name ok");
+        assert!(rec.recording_path("notes.txt").is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

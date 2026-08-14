@@ -997,6 +997,9 @@ pub async fn start(
             .route(&format!("{}/api/token/permission", ap), axum::routing::post(admin::permission_handler))
             .route(&format!("{}/api/server-auth", ap), get(admin::get_server_auth_handler))
             .route(&format!("{}/api/server-auth", ap), axum::routing::post(admin::set_server_auth_handler))
+            .route(&format!("{}/api/recordings", ap), get(admin::recordings_handler))
+            .route(&format!("{}/api/recordings/content", ap), get(admin::recording_content_handler))
+            .route(&format!("{}/api/recordings/delete", ap), axum::routing::delete(admin::recording_delete_handler))
     } else {
         app
     };
