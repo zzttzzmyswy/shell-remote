@@ -192,6 +192,7 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
 - **Token 管理**：撤销单个 Token、重生成会话 Token（旧 Token 失效）、切换 Token 权限（rw↔ro）。
 - **跳转终端**：每会话"连接"按钮，新标签页打开该会话的浏览器终端（token 预填，服务器密码仍需手填）。
 - **会话录制**：`--record-dir` 启用后，交互式终端 I/O（输出+输入）以 asciinema cast v2 落盘；后台显示录制状态，文件可用 `asciinema play` 回放。
+- **录像管理**：后台"录像"面板列出全部录制文件（终端录像 + MCP 命令审计）与录制时间/大小；终端录像可直接在后台内嵌播放器回放（xterm.js 渲染，支持播放/暂停、0.25x–4x 慢放快放、时间轴拖拽跳转），MCP 命令记录以结构化卡片查看，均可一键删除。
 - **踢出会话**：断开该 agent 及其所有浏览器并撤销其 Token。
 - **服务器密码**：查看当前 `--auth`、在线修改（即时生效）。
 - **中英文切换**：后台界面右上角切换中/英文（自动探测浏览器语言，localStorage 记忆）。
@@ -228,6 +229,7 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 --record-dir /var/lo
 - `token_prefix` 只记 token 前 8 位（足以与后台 token 列表对照，不泄露完整密钥）。
 - `stdout` / `stderr` 截断到 4KB（`stdout_len`/`stderr_len` 为完整长度）。
 - 管理后台概览页每会话显示 `●AUDIT` 标记；踢出/空闲回收会话时审计文件自动 flush 关闭。
+- 后台"录像"面板以"MCP 命令"类型列出每份审计文件，点击查看可见结构化的命令卡片（命令、状态、退出码、耗时、权限、token 前缀、stdout/stderr），亦可直接删除。
 - **审计文件同样可能含命令及输出中的敏感内容，请保护录制目录的文件权限。**
 
 ## AI Agent 接入 (MCP)

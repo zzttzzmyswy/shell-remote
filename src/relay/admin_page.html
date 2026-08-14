@@ -107,7 +107,39 @@
 
   .hidden { display: none !important; }
   @media (max-width: 640px) { .tok { max-width: 140px; } .lang-toggle { top: 8px; right: 8px; } }
+
+  /* Recordings */
+  .rec-kind { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; border-radius: 6px; padding: 3px 8px; }
+  .rec-kind.cast { background: rgba(137,180,250,.14); color: var(--accent); border: 1px solid rgba(137,180,250,.4); }
+  .rec-kind.audit { background: rgba(223,142,29,.14); color: var(--yellow); border: 1px solid rgba(223,142,29,.4); }
+  .rec-act { margin-right: 6px; }
+
+  /* Player modal */
+  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 90; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; max-width: 100%; width: 860px; max-height: 92vh; display: flex; flex-direction: column; overflow: hidden; }
+  .modal-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .modal-title { font-weight: 600; font-family: ui-monospace, monospace; font-size: 13px; }
+  .player-term { padding: 12px 16px; overflow: auto; background: #0e0e14; min-height: 240px; }
+  .player-term .xterm { padding: 4px; }
+  .player-controls { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+  .player-controls .btn { padding: 6px 11px; }
+  .speed-group { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .speed-group button { background: transparent; border: none; color: var(--muted); padding: 6px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
+  .speed-group button.active { background: var(--accent); color: #1e1e2e; }
+  .player-time { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
+  input[type="range"] { flex: 1 1 120px; accent-color: var(--accent); }
+
+  /* Audit view */
+  .audit-list { overflow: auto; max-height: 70vh; }
+  .audit-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; margin: 10px; padding: 12px 14px; }
+  .audit-card .cmd { font-family: ui-monospace, monospace; font-size: 13px; word-break: break-all; margin-bottom: 6px; color: var(--accent); }
+  .audit-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+  .audit-out { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; max-height: 160px; overflow: auto; color: var(--text); }
+  .audit-out.err { color: #f38ba8; }
+  .audit-empty { color: var(--muted); font-size: 12px; padding: 16px; text-align: center; }
+  .res-page { font-size: 12px; color: var(--muted); font-weight: 600; }
 </style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 </head>
 <body>
 
@@ -167,6 +199,31 @@
   </div>
 
   <div class="panel">
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
+      <h2 style="margin:0 0 0;" data-i18n="recordings">Recordings</h2>
+      <span class="badge" id="recCount" data-i18n="recordings_count">–</span>
+      <span class="spacer"></span>
+      <button class="btn btn-sm" id="recRefresh" data-i18n="refresh">Refresh</button>
+    </div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th data-i18n="th_type">Type</th>
+            <th data-i18n="th_session_id">Session ID</th>
+            <th data-i18n="th_rec_time">Recorded at</th>
+            <th data-i18n="th_size">Size</th>
+            <th data-i18n="th_actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="recBody"></tbody>
+      </table>
+    </div>
+    <div id="recEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_recordings">No recordings.</div>
+    <div id="recDisabled" class="alert hidden" data-i18n="recordings_disabled">Recording is off — start the relay with --record-dir to enable.</div>
+  </div>
+
+  <div class="panel">
     <h2 data-i18n="access_log">Access log</h2>
     <div style="overflow-x:auto;">
       <table>
@@ -199,6 +256,43 @@
   </div>
 </div>
 
+<!-- Player modal -->
+<div id="playerView" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="modal-title" id="playerTitle"></span>
+      <span class="player-time" id="playerTime">0:00 / 0:00</span>
+      <span class="spacer"></span>
+      <button class="btn btn-sm" id="playerClose" data-i18n="close">Close</button>
+    </div>
+    <div class="player-term" id="playerTerm"></div>
+    <div class="player-controls">
+      <button class="btn" id="playBtn" data-i18n="play">Play</button>
+      <div class="speed-group" id="speedGroup">
+        <button data-speed="0.25">0.25x</button>
+        <button data-speed="0.5">0.5x</button>
+        <button data-speed="1" class="active">1x</button>
+        <button data-speed="2">2x</button>
+        <button data-speed="4">4x</button>
+      </div>
+      <input type="range" id="seekBar" min="0" max="1000" value="0">
+    </div>
+  </div>
+</div>
+
+<!-- MCP audit viewer modal -->
+<div id="auditView" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="modal-title" data-i18n="mcp_records">MCP command records</span>
+      <span class="spacer"></span>
+      <button class="btn btn-sm" id="auditClose" data-i18n="close">Close</button>
+    </div>
+    <div class="audit-list" id="auditList"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
 <script>
 (function () {
   "use strict";
@@ -278,7 +372,33 @@
       unauthorized: "未授权",
       revoke_label: "撤销",
       lang_toggle: "中 / EN",
-      lang_toggle_title: "切换语言 / Switch language"
+      lang_toggle_title: "切换语言 / Switch language",
+      recordings: "录像",
+      refresh: "刷新",
+      recordings_count: "项",
+      recordings_disabled_short: "off",
+      no_recordings: "暂无录像。",
+      recordings_disabled: "录像未开启 —— 请使用 --record-dir 启动 relay 以启用录像。",
+      th_rec_time: "录像时间",
+      th_size: "大小",
+      kind_cast: "终端",
+      kind_audit: "MCP 命令",
+      view_play: "播放",
+      view_audit: "查看",
+      delete: "删除",
+      close: "关闭",
+      play: "播放",
+      pause: "暂停",
+      confirm_delete_rec: "确定删除录像 {name}？",
+      err_delete_rec: "删除失败：",
+      err_open_rec: "打开失败：",
+      err_parse_cast: "无法解析该录像文件。",
+      player_unavailable: "播放器组件不可用（需联网加载 xterm.js）。",
+      mcp_records: "MCP 命令记录",
+      no_mcp_records: "无命令记录。",
+      exit_code: "退出码",
+      duration: "耗时",
+      perm: "权限"
     },
     en: {
       app_title: "shell-remote admin",
@@ -349,7 +469,33 @@
       unauthorized: "unauthorized",
       revoke_label: "revoke",
       lang_toggle: "中 / EN",
-      lang_toggle_title: "切换语言 / Switch language"
+      lang_toggle_title: "切换语言 / Switch language",
+      recordings: "Recordings",
+      refresh: "Refresh",
+      recordings_count: "items",
+      recordings_disabled_short: "off",
+      no_recordings: "No recordings.",
+      recordings_disabled: "Recording is off — start the relay with --record-dir to enable.",
+      th_rec_time: "Recorded at",
+      th_size: "Size",
+      kind_cast: "Terminal",
+      kind_audit: "MCP cmd",
+      view_play: "Play",
+      view_audit: "View",
+      delete: "Delete",
+      close: "Close",
+      play: "Play",
+      pause: "Pause",
+      confirm_delete_rec: "Delete recording {name}?",
+      err_delete_rec: "Delete failed: ",
+      err_open_rec: "Open failed: ",
+      err_parse_cast: "Could not parse this recording.",
+      player_unavailable: "Player component unavailable (xterm.js needs a network load).",
+      mcp_records: "MCP command records",
+      no_mcp_records: "No command records.",
+      exit_code: "exit",
+      duration: "dur",
+      perm: "perm"
     }
   };
 
@@ -385,6 +531,7 @@
       renderSessions(lastOverview.sessions || []);
       renderConnLog(lastOverview.conn_log || []);
     }
+    refreshRecordings();
   }
   function applyStaticI18n() {
     document.documentElement.lang = LANG;
@@ -503,6 +650,84 @@
     renderOverview(o);
     renderSessions(o.sessions || []);
     renderConnLog(o.conn_log || []);
+    refreshRecordings();
+  }
+
+  // --- Recordings ---
+  async function refreshRecordings() {
+    let r;
+    try { r = await api('/api/recordings'); }
+    catch (_) { return; }
+    renderRecordings(r.recordings || [], !!r.enabled);
+  }
+
+  function renderRecordings(recs, enabled) {
+    $('recDisabled').classList.toggle('hidden', enabled);
+    if (!enabled) { $('recBody').textContent = ''; $('recEmpty').classList.add('hidden'); $('recCount').textContent = t('recordings_disabled_short'); return; }
+    $('recCount').textContent = String(recs.length);
+    recs.sort((a, b) => b.ts_unix - a.ts_unix);
+    const body = $('recBody');
+    body.textContent = '';
+    $('recEmpty').classList.toggle('hidden', recs.length > 0);
+    for (const r of recs) {
+      body.appendChild(buildRecordRow(r));
+    }
+  }
+
+  function fmtBytes(n) {
+    n = n || 0;
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+
+  function fmtIso(sec) {
+    if (!sec) return '—';
+    const d = new Date(sec * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  function buildRecordRow(r) {
+    const tr = document.createElement('tr');
+    // Type
+    const tdK = document.createElement('td');
+    const kind = document.createElement('span');
+    kind.className = 'rec-kind ' + (r.kind === 'audit' ? 'audit' : 'cast');
+    kind.textContent = r.kind === 'audit' ? t('kind_audit') : t('kind_cast');
+    tdK.appendChild(kind); tr.appendChild(tdK);
+    // Session
+    const tdS = document.createElement('td');
+    const sd = document.createElement('span'); sd.className = 'mono'; sd.textContent = r.session_id || '';
+    tdS.appendChild(sd); tr.appendChild(tdS);
+    // Time
+    const tdT = document.createElement('td');
+    tdT.textContent = fmtIso(r.ts_unix); tdT.className = 'mono'; tr.appendChild(tdT);
+    // Size
+    const tdSz = document.createElement('td');
+    tdSz.textContent = fmtBytes(r.bytes); tr.appendChild(tdSz);
+    // Actions
+    const tdA = document.createElement('td'); tdA.className = 'actions';
+    const view = document.createElement('button');
+    view.className = 'btn btn-sm btn-primary rec-act';
+    view.textContent = r.kind === 'audit' ? t('view_audit') : t('view_play');
+    view.addEventListener('click', () => { r.kind === 'audit' ? openAudit(r) : openPlayer(r); });
+    tdA.appendChild(view);
+    const del = document.createElement('button');
+    del.className = 'btn btn-sm btn-red';
+    del.textContent = t('delete');
+    del.addEventListener('click', () => onDeleteRecording(r));
+    tdA.appendChild(del);
+    tr.appendChild(tdA);
+    return tr;
+  }
+
+  async function onDeleteRecording(r) {
+    if (!confirm(t('confirm_delete_rec', { name: r.name || '' }))) return;
+    try {
+      await api('/api/recordings/delete', { method: 'DELETE', body: { file: r.name } });
+      refreshRecordings();
+    } catch (e) { alert(t('err_delete_rec') + e.message); }
   }
 
   function renderOverview(o) {
@@ -729,6 +954,209 @@
       alert(t('pw_updated'));
     } catch (e) { $('srvErr').textContent = t('srv_update_failed') + e.message; }
   });
+
+  // --- Player (asciinema cast v2 replay via xterm.js) ---
+  let PLAYER = null; // {term, events, wx, totalMs, idx, elapsed, raf, playing, speed, startedAt, seekBarMounted}
+
+  function openPlayer(r) {
+    fetch(BASE + '/api/recordings/content?file=' + encodeURIComponent(r.name), { credentials: 'same-origin' })
+      .then((res) => { if (!res.ok) throw new Error('HTTP ' + res.status); return res.text(); })
+      .then((text) => startPlayer(r, text))
+      .catch((e) => alert(t('err_open_rec') + e.message));
+  }
+
+  function parseCast(text) {
+    const lines = text.split('\n').filter((l) => l.trim().length > 0);
+    if (lines.length === 0) return null;
+    let header = null;
+    try { header = JSON.parse(lines[0]); } catch (_) { return null; }
+    const events = [];
+    let maxT = 0;
+    for (let i = 1; i < lines.length; i++) {
+      let ev;
+      try { ev = JSON.parse(lines[i]); } catch (_) { continue; }
+      if (!Array.isArray(ev) || ev.length < 3) continue;
+      const t = Number(ev[0]) || 0;
+      const ch = String(ev[1]);
+      const data = String(ev[2]);
+      if (ch === 'o' || ch === 'i') {
+        events.push({ t, ch, data });
+        if (t > maxT) maxT = t;
+      }
+    }
+    return { header, events, totalMs: maxT * 1000 };
+  }
+
+  function startPlayer(r, text) {
+    if (typeof Terminal === 'undefined') {
+      alert(t('player_unavailable'));
+      return;
+    }
+    const parsed = parseCast(text);
+    if (!parsed) { alert(t('err_parse_cast')); return; }
+    const view = $('playerView');
+    const termEl = $('playerTerm');
+    termEl.textContent = '';
+    const wx = Math.min(parsed.header.width || 80, 200);
+    const wy = Math.min(parsed.header.height || 24, 60);
+    const term = new Terminal({ cols: wx, rows: wy, disableStdin: true, cursorBlink: false });
+    term.open(termEl);
+
+    $('playerTitle').textContent = r.session_id + ' · ' + (parsed.header.width || 80) + 'x' + (parsed.header.height || 24);
+    view.classList.remove('hidden');
+    PLAYER = {
+      term, events: parsed.events, wx, wy,
+      totalMs: parsed.totalMs || 1,
+      idx: 0, elapsed: 0, raf: null, playing: false, speed: 1
+    };
+    resetPlayer(true);
+    $('speedGroup').querySelectorAll('button').forEach((b) => {
+      b.classList.toggle('active', Number(b.dataset.speed) === 1);
+    });
+  }
+
+  function resetPlayer(start) {
+    const P = PLAYER; if (!P) return;
+    P.idx = 0; P.elapsed = start ? 0 : P.elapsed;
+    P.term.reset();
+    // Rewind: replay all events with time <= seek point, fast.
+    let acc = 0;
+    for (let i = 0; i < P.events.length; i++) {
+      const ev = P.events[i];
+      if (acc >= P.elapsed) break; // stop at seek point (we seek by rewinding)
+      P.term.write(ev.ch === 'o' ? ev.data : '');
+      acc = ev.t * 1000;
+      P.idx = i + 1;
+    }
+    updateSeekUI();
+  }
+
+  function updateSeekUI() {
+    const P = PLAYER; if (!P) return;
+    const pct = Math.min(1, P.elapsed / P.totalMs);
+    $('seekBar').value = Math.round(pct * 1000);
+    $('playerTime').textContent = fmtPlayTime(P.elapsed) + ' / ' + fmtPlayTime(P.totalMs);
+  }
+
+  function fmtPlayTime(ms) {
+    ms = Math.max(0, Math.floor(ms || 0));
+    const m = Math.floor(ms / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    return m + ':' + String(s).padStart(2, '0');
+  }
+
+  function setPlaying(on) {
+    const P = PLAYER; if (!P) return;
+    if (on && !P.playing) {
+      P.playing = true;
+      $('playBtn').textContent = t('pause');
+      P.startedAt = performance.now();
+      const tick = () => {
+        const P2 = PLAYER;
+        if (!P2 || !P2.playing) return;
+        // Advance by wall-clock delta * speed (cast times are in seconds).
+        const now = performance.now();
+        const dt = (now - P2.startedAt) / 1000;
+        P2.startedAt = now;
+        P2.elapsed += dt * P2.speed * 1000;
+        // Emit events whose time <= elapsed.
+        while (P2.idx < P2.events.length && P2.events[P2.idx].t * 1000 <= P2.elapsed) {
+          const ev = P2.events[P2.idx];
+          if (ev.ch === 'o') P2.term.write(ev.data);
+          P2.idx++;
+        }
+        if (P2.idx >= P2.events.length) { P2.playing = false; $('playBtn').textContent = t('play'); }
+        updateSeekUI();
+        if (P2.playing) P2.raf = requestAnimationFrame(tick);
+      };
+      P.raf = requestAnimationFrame(tick);
+    } else if (!on && P.playing) {
+      P.playing = false;
+      if (P.raf) cancelAnimationFrame(P.raf);
+      P.raf = null;
+      $('playBtn').textContent = t('play');
+    }
+  }
+
+  function closePlayer() {
+    if (PLAYER) {
+      if (PLAYER.raf) cancelAnimationFrame(PLAYER.raf);
+      if (PLAYER.term) { try { PLAYER.term.dispose(); } catch (_) {} }
+      PLAYER = null;
+    }
+    $('playerView').classList.add('hidden');
+    $('playerTerm').textContent = '';
+  }
+
+  $('playBtn').addEventListener('click', () => setPlaying(!(PLAYER && PLAYER.playing)));
+  $('speedGroup').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-speed]');
+    if (!btn || !PLAYER) return;
+    PLAYER.speed = Number(btn.dataset.speed);
+    $('speedGroup').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+  });
+  $('seekBar').addEventListener('input', () => {
+    const P = PLAYER; if (!P) return;
+    const wasPlaying = P.playing;
+    setPlaying(false);
+    P.elapsed = (Number($('seekBar').value) / 1000) * P.totalMs;
+    resetPlayer(false);
+    if (wasPlaying && P.elapsed < P.totalMs) setPlaying(true);
+  });
+  $('playerClose').addEventListener('click', closePlayer);
+
+  // --- MCP audit viewer ---
+  async function openAudit(r) {
+    try {
+      const res = await fetch(BASE + '/api/recordings/content?file=' + encodeURIComponent(r.name), { credentials: 'same-origin' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const text = await res.text();
+      renderAudit(text);
+    } catch (e) { alert(t('err_open_rec') + e.message); }
+  }
+
+  function renderAudit(text) {
+    const list = $('auditList');
+    list.textContent = '';
+    const lines = text.split('\n').filter((l) => l.trim().length > 0);
+    if (lines.length === 0) {
+      const d = document.createElement('div'); d.className = 'audit-empty'; d.textContent = t('no_mcp_records');
+      list.appendChild(d);
+    } else {
+      for (const line of lines) {
+        let rec;
+        try { rec = JSON.parse(line); } catch (_) { continue; }
+        list.appendChild(buildAuditCard(rec));
+      }
+    }
+    $('auditView').classList.remove('hidden');
+  }
+
+  function buildAuditCard(rec) {
+    const card = document.createElement('div'); card.className = 'audit-card';
+    const cmd = document.createElement('div'); cmd.className = 'cmd';
+    cmd.textContent = '❯ ' + (rec.cmd || '');
+    card.appendChild(cmd);
+    const meta = document.createElement('div'); meta.className = 'audit-meta';
+    const status = document.createElement('span'); status.className = 'rec-kind ' + (rec.status === 'ok' ? 'cast' : 'audit');
+    status.textContent = String(rec.status || '?');
+    meta.appendChild(status);
+    meta.appendChild(textNode(fmtIso(Math.floor((rec.unix_ms || 0) / 1000)) || fmtIso(rec.ts ? Date.parse(rec.ts + 'Z') / 1000 : 0)));
+    meta.appendChild(textNode(t('exit_code') + ' ' + (rec.exit_code === null || rec.exit_code === undefined ? '—' : rec.exit_code)));
+    if (rec.duration_ms !== undefined) meta.appendChild(textNode(t('duration') + ' ' + rec.duration_ms + 'ms'));
+    if (rec.permission) meta.appendChild(textNode(t('perm') + ' ' + rec.permission));
+    if (rec.token_prefix) { const p = document.createElement('span'); p.className = 'mono'; p.textContent = '…' + rec.token_prefix; meta.appendChild(p); }
+    card.appendChild(meta);
+    if (rec.stdout) { const o = document.createElement('div'); o.className = 'audit-out'; o.textContent = rec.stdout; card.appendChild(o); }
+    if (rec.stderr) { const o = document.createElement('div'); o.className = 'audit-out err'; o.textContent = rec.stderr; card.appendChild(o); }
+    return card;
+  }
+
+  $('auditClose').addEventListener('click', () => $('auditView').classList.add('hidden'));
+  ['playerView', 'auditView'].forEach((id) => {
+    $(id).addEventListener('click', (e) => { if (e.target === e.currentTarget) $(id).classList.add('hidden'); });
+  });
+  $('recRefresh').addEventListener('click', refreshRecordings);
 
   // --- Boot ---
   (async function boot() {

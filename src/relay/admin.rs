@@ -358,6 +358,105 @@ pub async fn set_server_auth_handler(
     Json(json!({"ok": true})).into_response()
 }
 
+/// List every recorded file (terminal `.cast` sessions + MCP `.audit.jsonl`
+/// commands), newest first. Requires `--record-dir`; an empty list when
+/// recording is disabled.
+pub async fn recordings_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let Some(rec) = &state.recorder else {
+        return Json(json!({"recordings": [], "enabled": false})).into_response();
+    };
+    let views: Vec<crate::relay::recorder::RecordingView> = rec
+        .list_recordings()
+        .iter()
+        .map(crate::relay::recorder::RecordingView::from_file)
+        .collect();
+    Json(json!({"recordings": views, "enabled": true})).into_response()
+}
+
+/// Serve a recording's raw file content (`?file=<name>`). Cast files are
+/// returned as-is so the admin player can parse the asciinema v2 lines; audit
+/// files are served as JSONL text. The file name is validated against the
+/// record dir to block path traversal.
+pub async fn recording_content_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<Value>,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let name = params["file"].as_str().unwrap_or("");
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing file"})),
+        )
+            .into_response();
+    }
+    let Some(rec) = &state.recorder else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "recording disabled"}))).into_response();
+    };
+    let Some(path) = rec.recording_path(name) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid file"}))).into_response();
+    };
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => (
+            StatusCode::OK,
+            [("content-type", "text/plain; charset=utf-8")],
+            text,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("not found: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// Delete a recorded file (`{file: <name>}`). Only files inside the record
+/// dir that the recorder owns (`.cast` / `.audit.jsonl`) can be removed.
+pub async fn recording_delete_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let name = body["file"].as_str().unwrap_or("");
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "missing file"})),
+        )
+            .into_response();
+    }
+    let Some(rec) = &state.recorder else {
+        return (StatusCode::NOT_FOUND, Json(json!({"ok": false, "error": "recording disabled"}))).into_response();
+    };
+    let Some(path) = rec.recording_path(name) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": "invalid file"}))).into_response();
+    };
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, Json(json!({"ok": false, "error": "file not found"}))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": format!("{}", e)})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +691,142 @@ mod tests {
         .unwrap();
         assert_eq!(v["sessions"][0]["recording"], true);
         recorder.close(&sid);
+    }
+
+    fn cookie_headers_owned(token: &str) -> HeaderMap {
+        cookie_headers(token)
+    }
+
+    async fn body_json(r: Response) -> Value {
+        serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_recordings_list_content_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-rec-admin-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorder = std::sync::Arc::new(crate::relay::recorder::Recorder::new(dir.clone()));
+        let state = Arc::new(crate::relay::SharedState::new(
+            "relay-pw".to_string(),
+            100 * 1024 * 1024,
+            Some("/admin-test".to_string()),
+            "admin".to_string(),
+            "s3cret".to_string(),
+            Some(recorder.clone()),
+        ));
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        let h = cookie_headers_owned("tok");
+
+        // Produce one cast recording + one audit file.
+        recorder.record("ag-s1", crate::relay::recorder::RecordEvent::Output("hello\n".into()));
+        recorder.close("ag-s1");
+        recorder.audit_mcp(
+            "ag-s2",
+            crate::relay::recorder::AuditLine {
+                ts: "2026-08-14T00:00:00Z".to_string(),
+                unix_ms: 1_784_000_000_000,
+                session_id: "ag-s2".to_string(),
+                token_prefix: "abcd1234".to_string(),
+                permission: "rw".to_string(),
+                cmd: "ls".to_string(),
+                timeout_ms: 30_000,
+                duration_ms: 5,
+                status: "ok".to_string(),
+                exit_code: Some(0),
+                stdout_len: 2,
+                stderr_len: 0,
+                stdout: "hi".to_string(),
+                stderr: "".to_string(),
+            },
+        );
+        recorder.close("ag-s2");
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+
+        // List
+        let r = recordings_handler(State(state.clone()), h.clone()).await;
+        let v = body_json(r).await;
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["recordings"].as_array().unwrap().len(), 2);
+        let cast = v["recordings"].as_array().unwrap().iter().find(|x| x["kind"] == "cast").unwrap().clone();
+        assert_eq!(cast["session_id"], "ag-s1");
+        let cast_name = cast["name"].as_str().unwrap().to_string();
+
+        // Content (auth required)
+        let r = recordings_handler(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(r.status(), 401);
+
+        // Content fetch
+        let q = axum::extract::Query(serde_json::json!({"file": cast_name}));
+        let r = recording_content_handler(State(state.clone()), h.clone(), q).await;
+        let body = axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("\"version\":2"), "header present: {}", text);
+        assert!(text.contains("hello"));
+
+        // Content — traversal rejected
+        let q = axum::extract::Query(serde_json::json!({"file": "../../etc/passwd.cast"}));
+        let r = recording_content_handler(State(state.clone()), h.clone(), q).await;
+        assert_eq!(r.status(), 400);
+
+        // Delete
+        let r = recording_delete_handler(
+            State(state.clone()),
+            h.clone(),
+            Json(serde_json::json!({"file": cast_name})),
+        )
+        .await;
+        let v = body_json(r).await;
+        assert_eq!(v["ok"], true);
+        assert!(!dir.join(&cast_name).exists());
+
+        // Delete again → 404
+        let r = recording_delete_handler(
+            State(state.clone()),
+            h.clone(),
+            Json(serde_json::json!({"file": cast_name})),
+        )
+        .await;
+        assert_eq!(r.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn test_recordings_disabled_when_no_recorder() {
+        let state = Arc::new(crate::relay::SharedState::new(
+            "relay-pw".to_string(),
+            100 * 1024 * 1024,
+            Some("/admin-test".to_string()),
+            "admin".to_string(),
+            "s3cret".to_string(),
+            None,
+        ));
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        let h = cookie_headers_owned("tok");
+        let r = recordings_handler(State(state.clone()), h.clone()).await;
+        let v = body_json(r).await;
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["recordings"].as_array().unwrap().len(), 0);
+        // Delete without recorder → 404
+        let r = recording_delete_handler(
+            State(state.clone()),
+            h.clone(),
+            Json(serde_json::json!({"file": "x_1.cast"})),
+        )
+        .await;
+        assert_eq!(r.status(), 404);
     }
 }
