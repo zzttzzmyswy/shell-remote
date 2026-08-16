@@ -239,7 +239,7 @@ async fn stream_file_download(
     offset: u64,
     limit: Option<u64>,
 ) {
-    const CHUNK_SIZE: usize = 1024 * 1024;
+    const CHUNK_SIZE: usize = 256 * 1024;
     use std::io::{Read, Seek, SeekFrom};
 
     let resolved = match crate::agent::fs::resolve_path(&root, &path) {

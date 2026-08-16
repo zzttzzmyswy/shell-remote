@@ -54,7 +54,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
 use uuid::Uuid;
 
-const CHUNK_SIZE: usize = 1024 * 1024;
+const CHUNK_SIZE: usize = 256 * 1024;
 
 /// Parse an HTTP Range header (`bytes=a-b` / `bytes=a-`). Returns `None` when
 /// the header is absent, the unit is not bytes, or the range is a suffix
