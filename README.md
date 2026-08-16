@@ -300,6 +300,20 @@ SSE  ← event: message  {JSON-RPC 响应}
 
 token 即 `shell_remote` 的会话 token；上传需 rw token，下载 rw/ro 均可。NAT 下两机间文件传输走此端点（relay 中继，不落盘）。小内容（配置/脚本）直接用 `shell_remote` + heredoc 写入。
 
+**路径语义**：`path` 为绝对路径时按远程文件系统原样使用；相对路径（如 `foo.txt`）相对于 agent 的 `--root`（默认 `$HOME`）解析，与命令执行时的 cwd 基准不同，注意区分。
+
+**断点续传**：下载支持 HTTP Range（`curl -H "Range: bytes=1000-" ...`），中断后可续传；`bytes=-n`（后缀区间）不支持，返回完整文件。Range 响应为 `206`，带 `Content-Range`/`Content-Length`。
+
+**大小限制**：应用层为流式传输、无内置上限，实际上限由部署方反向代理（nginx/openresty）的 `client_max_body_size` 决定，默认常见 50m。若需更大上传，提高代理配置即可，例如：
+
+```nginx
+location /agent/mcp/put {
+    client_max_body_size 200m;
+}
+```
+
+**错误码**：`401` token 无效；`400` 缺少/重复 path 参数、路径是目录、相对路径无法解析；`403` 权限不足；`404` 文件不存在；`416` Range 越界；`500` 其他服务错误。所有错误响应均为 `{"error": "..."}` JSON。
+
 ## Token 权限模型
 
 | Token 类型 | 终端输入 | 文件操作 | MCP 执行 |
@@ -313,7 +327,7 @@ token 即 `shell_remote` 的会话 token；上传需 rw token，下载 rw/ro 均
 ## 文件管理器
 
 - 面包屑路径导航
-- 上传（流式传输，默认 100MB 上限）
+- 上传（流式传输，上限由部署方代理配置决定，见上文"大小限制"）
 - 下载、删除、重命名、新建文件夹、刷新
 - 侧栏宽度可拖拽调整
 

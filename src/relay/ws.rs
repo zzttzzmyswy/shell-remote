@@ -62,7 +62,9 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 if let Some(data) = proto_msg.payload.get("data").and_then(|v| v.as_str()) {
                     rec.record(
                         session_id,
-                        crate::relay::recorder::RecordEvent::Output(crate::relay::recorder::decode_terminal_data(data)),
+                        crate::relay::recorder::RecordEvent::Output(
+                            crate::relay::recorder::decode_terminal_data(data),
+                        ),
                     );
                 }
             }
@@ -140,6 +142,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                     let result_text = serde_json::to_string(&json!({
                         "success": proto_msg.payload.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
                         "error": proto_msg.payload.get("error").and_then(|v| v.as_str()).unwrap_or(""),
+                        "kind": proto_msg.payload.get("kind").and_then(|v| v.as_str()).unwrap_or("other"),
                         "content": proto_msg.payload.get("content").and_then(|v| v.as_str()).unwrap_or(""),
                         "entries": proto_msg.payload.get("entries"),
                         "path": proto_msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or(""),
@@ -154,31 +157,91 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
         // download_streams is a file chunk pushed by the agent; decode and forward
         // to the GET response task via the sink. Independent of pending_mcp.
         if proto_msg.msg_type == "fs:result" {
-            if let Some(cid) = proto_msg.payload.get("_mcp_request_id").and_then(|v| v.as_str()) {
+            if let Some(cid) = proto_msg
+                .payload
+                .get("_mcp_request_id")
+                .and_then(|v| v.as_str())
+            {
                 let sink_opt = state.download_streams.write().await.remove(cid);
                 if let Some(mut sink) = sink_opt {
-                    let success = proto_msg.payload.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let success = proto_msg
+                        .payload
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if !success {
-                        let err = proto_msg.payload.get("error").and_then(|v| v.as_str()).unwrap_or("download error").to_string();
-                        let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::Error(err)).await;
-                    } else if let Some(content) = proto_msg.payload.get("content").and_then(|v| v.as_str()) {
+                        let kind = proto_msg
+                            .payload
+                            .get("kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("other")
+                            .to_string();
+                        let err = proto_msg
+                            .payload
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("download error")
+                            .to_string();
+                        let _ = sink
+                            .tx
+                            .send(crate::relay::file_transfer::DownloadEvent::Error {
+                                kind,
+                                msg: err,
+                            })
+                            .await;
+                    } else if let Some(content) =
+                        proto_msg.payload.get("content").and_then(|v| v.as_str())
+                    {
                         if let Some(bytes) = crate::agent::fs::decode_b64(content) {
                             sink.bytes += bytes.len() as u64;
-                            let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::Chunk(bytes)).await;
+                            let file_size =
+                                proto_msg.payload.get("file_size").and_then(|v| v.as_u64());
+                            let _ = sink
+                                .tx
+                                .send(crate::relay::file_transfer::DownloadEvent::Chunk {
+                                    data: bytes,
+                                    file_size,
+                                })
+                                .await;
                             // Detect last chunk: is_last field (Task 6) or chunk_index+1 >= total_chunks.
-                            let chunk_index = proto_msg.payload.get("chunk_index").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let total_chunks = proto_msg.payload.get("total_chunks").and_then(|v| v.as_u64()).unwrap_or(1);
-                            let is_last = proto_msg.payload.get("is_last").and_then(|v| v.as_bool()).unwrap_or(false)
+                            let chunk_index = proto_msg
+                                .payload
+                                .get("chunk_index")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let total_chunks = proto_msg
+                                .payload
+                                .get("total_chunks")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(1);
+                            let is_last = proto_msg
+                                .payload
+                                .get("is_last")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
                                 || chunk_index + 1 >= total_chunks;
                             if is_last {
-                                let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::End).await;
+                                let _ = sink
+                                    .tx
+                                    .send(crate::relay::file_transfer::DownloadEvent::End)
+                                    .await;
                                 // sink dropped → removed from download_streams
                             } else {
                                 sink.last_activity = std::time::Instant::now();
-                                state.download_streams.write().await.insert(cid.to_string(), sink);
+                                state
+                                    .download_streams
+                                    .write()
+                                    .await
+                                    .insert(cid.to_string(), sink);
                             }
                         } else {
-                            let _ = sink.tx.send(crate::relay::file_transfer::DownloadEvent::Error("base64 decode failed".to_string())).await;
+                            let _ = sink
+                                .tx
+                                .send(crate::relay::file_transfer::DownloadEvent::Error {
+                                    kind: "other".to_string(),
+                                    msg: "base64 decode failed".to_string(),
+                                })
+                                .await;
                             // sink dropped → removed from download_streams (error terminates)
                         }
                     }
@@ -254,7 +317,10 @@ pub async fn agent_send_handler(
             .map(|s| s.to_string());
 
         let register_result = if let Some(ct) = cached_tokens {
-            state.sessions.register_existing(ct, desired_session_id).await
+            state
+                .sessions
+                .register_existing(ct, desired_session_id)
+                .await
         } else {
             let fixed_key = body["key"].as_str().map(|s| s.to_string());
             let token_type_str = body["token_type"].as_str().unwrap_or("rw");
@@ -436,7 +502,7 @@ pub async fn agent_events_handler(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
 
-    let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);          // interactive
+    let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY); // interactive
     let (bulk_tx, bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
 
     {
@@ -534,7 +600,12 @@ pub async fn browser_sse_handler(
 
     // Bastion-style audit: record this browser access (token prefix only).
     state
-        .log_conn(&session_id, &token[..token.len().min(8)], perm_str, "connect")
+        .log_conn(
+            &session_id,
+            &token[..token.len().min(8)],
+            perm_str,
+            "connect",
+        )
         .await;
 
     {
@@ -728,7 +799,9 @@ pub async fn browser_send_handler(
             if let Some(data) = body["payload"]["data"].as_str() {
                 rec.record(
                     &session_id,
-                    crate::relay::recorder::RecordEvent::Input(crate::relay::recorder::decode_terminal_data(data)),
+                    crate::relay::recorder::RecordEvent::Input(
+                        crate::relay::recorder::decode_terminal_data(data),
+                    ),
                 );
             }
         }
@@ -766,16 +839,20 @@ mod tests {
     use tokio::sync::{oneshot, RwLock};
 
     fn make_state(server_auth: &str) -> Arc<SharedState> {
-        Arc::new(SharedState::new(server_auth.to_string(), 100 * 1024 * 1024, None, String::new(), String::new(), None))
+        Arc::new(SharedState::new(
+            server_auth.to_string(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+            None,
+        ))
     }
 
     async fn insert_channel_map(
         state: &Arc<SharedState>,
         session_id: &str,
-    ) -> (
-        mpsc::Sender<String>,
-        mpsc::Receiver<String>,
-    ) {
+    ) -> (mpsc::Sender<String>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
         let mut cm = ChannelMap::new();
         cm.agent = Some(tx.clone());
@@ -912,7 +989,9 @@ mod tests {
         route_agent_message(&state, "sid1", &msg).await;
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["type"], "fs:result");
         assert_eq!(v["payload"]["_mcp_request_id"], "dl-1");
@@ -932,17 +1011,22 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         state.download_streams.write().await.insert(
             "dl-1".to_string(),
-            DownloadSink { tx, last_activity: Instant::now(), bytes: 0 },
+            DownloadSink {
+                tx,
+                last_activity: Instant::now(),
+                bytes: 0,
+            },
         );
         let msg = json!({
             "type": "fs:result", "session_id": "sid1",
             "payload": {"success": true, "content": "aGk=", "path": "/x",
                         "chunk_index": 0, "total_chunks": 1,
                         "_mcp_request_id": "dl-1"}
-        }).to_string();
+        })
+        .to_string();
         route_agent_message(&state, "sid1", &msg).await;
         match rx.recv().await.unwrap() {
-            DownloadEvent::Chunk(b) => assert_eq!(b, b"hi"),
+            DownloadEvent::Chunk { data, .. } => assert_eq!(data, b"hi"),
             _ => panic!("expected Chunk"),
         }
         // Only one chunk with total_chunks=1 → should receive End next
@@ -959,7 +1043,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         state.download_streams.write().await.insert(
             "dl-bad".to_string(),
-            DownloadSink { tx, last_activity: Instant::now(), bytes: 0 },
+            DownloadSink {
+                tx,
+                last_activity: Instant::now(),
+                bytes: 0,
+            },
         );
         // "!!!" is not valid base64
         let msg = json!({
@@ -967,10 +1055,11 @@ mod tests {
             "payload": {"success": true, "content": "!!!", "path": "/x",
                         "chunk_index": 0, "total_chunks": 1,
                         "_mcp_request_id": "dl-bad"}
-        }).to_string();
+        })
+        .to_string();
         route_agent_message(&state, "sid1", &msg).await;
         match rx.recv().await.unwrap() {
-            DownloadEvent::Error(e) => assert!(e.contains("base64 decode failed")),
+            DownloadEvent::Error { msg, .. } => assert!(msg.contains("base64 decode failed")),
             other => panic!("expected Error, got {:?}", other),
         }
     }
@@ -1106,13 +1195,20 @@ mod tests {
     async fn test_agent_send_register_with_custom_id() {
         let state = make_state("");
         let body = json!({"type":"agent:register","token_type":"rw","session_id":"mydev01"});
-        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
-            .await
-            .into_response();
+        let resp = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(body),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), 200);
-        let v: Value =
-            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap())
-                .unwrap();
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["session_id"], "mydev01");
     }
 
@@ -1130,12 +1226,21 @@ mod tests {
         let r2 = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(b2))
             .await
             .into_response();
-        assert_eq!(r2.status(), 200, "reusing a session id must succeed, not 409");
+        assert_eq!(
+            r2.status(),
+            200,
+            "reusing a session id must succeed, not 409"
+        );
         let v: Value = serde_json::from_slice(
-            &axum::body::to_bytes(r2.into_body(), 1024 * 1024).await.unwrap(),
+            &axum::body::to_bytes(r2.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
         )
         .unwrap();
-        assert_eq!(v["evicted"], true, "re-registering an in-use id evicts the old session");
+        assert_eq!(
+            v["evicted"], true,
+            "re-registering an in-use id evicts the old session"
+        );
         assert_eq!(v["session_id"], "mydev02");
     }
 
@@ -1178,7 +1283,8 @@ mod tests {
         let (state, recorder) = make_state_with_recorder();
         insert_channel_map(&state, "sid1").await;
         let mut rx = add_browser(&state, "sid1", "u1").await;
-        let msg = json!({"type":"terminal:output","session_id":"sid1","payload":{"data":"hi"}}).to_string();
+        let msg = json!({"type":"terminal:output","session_id":"sid1","payload":{"data":"hi"}})
+            .to_string();
         route_agent_message(&state, "sid1", &msg).await;
         // browser still received it
         assert!(rx.try_recv().is_ok());
@@ -1198,7 +1304,8 @@ mod tests {
             .write()
             .await
             .insert(sid.clone(), ChannelMap::new());
-        let body = json!({"token": tokens[0].0, "type": "terminal:input", "payload": {"data": "ls"}});
+        let body =
+            json!({"token": tokens[0].0, "type": "terminal:input", "payload": {"data": "ls"}});
         let resp = browser_send_handler(State(state), Json(body))
             .await
             .into_response();
@@ -1215,18 +1322,27 @@ mod tests {
         let (itx, irx) = mpsc::channel::<String>(8);
         let (btx, brx) = mpsc::channel::<String>(8);
         // pre-fill: 3 bulk, then 1 interactive, then 1 bulk
-        for i in 0..3 { btx.send(format!("b{}", i)).await.unwrap(); }
+        for i in 0..3 {
+            btx.send(format!("b{}", i)).await.unwrap();
+        }
         itx.send("i0".to_string()).await.unwrap();
         btx.send("b3".to_string()).await.unwrap();
-        drop(itx); drop(btx); // close so merge terminates
+        drop(itx);
+        drop(btx); // close so merge terminates
         let mut out = Box::pin(merge_biased(irx, brx));
         let mut got = Vec::new();
         use tokio_stream::StreamExt as _;
-        while let Some(s) = out.next().await { got.push(s); }
+        while let Some(s) = out.next().await {
+            got.push(s);
+        }
         // interactive i0 must come before all bulk (biased: interactive drained first each cycle)
         let i_pos = got.iter().position(|s| s == "i0").unwrap();
         let first_bulk = got.iter().position(|s| s.starts_with('b')).unwrap();
-        assert!(i_pos < first_bulk, "interactive must precede bulk under biased merge; got {:?}", got);
+        assert!(
+            i_pos < first_bulk,
+            "interactive must precede bulk under biased merge; got {:?}",
+            got
+        );
     }
 
     /// Stronger biased-merge test: pre-fill bulk with 100 chunks to simulate a
@@ -1259,7 +1375,8 @@ mod tests {
         let first = got.first().expect("non-empty");
         assert_eq!(
             first, "interactive-ping",
-            "interactive must be very first item under heavy bulk flood; got {:?}", first
+            "interactive must be very first item under heavy bulk flood; got {:?}",
+            first
         );
     }
 
@@ -1298,7 +1415,8 @@ mod tests {
 
         assert_eq!(got.len(), 6, "one interactive + five bulk");
         assert_eq!(
-            got[0], "terminal:input",
+            got[0],
+            "terminal:input",
             "interactive must be first in merged output; got {:?}",
             got.first()
         );
@@ -1324,7 +1442,9 @@ mod tests {
     async fn test_conn_log_bounded() {
         let state = make_state("");
         for i in 0..600 {
-            state.log_conn(&format!("s{}", i), "tok12345", "ro", "disconnect").await;
+            state
+                .log_conn(&format!("s{}", i), "tok12345", "ro", "disconnect")
+                .await;
         }
         let q = state.conn_log.read().await;
         assert!(q.len() <= 500, "conn log must be bounded");

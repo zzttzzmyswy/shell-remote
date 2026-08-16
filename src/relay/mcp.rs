@@ -226,7 +226,8 @@ async fn process_mcp_request(
                 "tools": [
                     {
                         "name": "shell_remote",
-                        "description": "Execute a shell command on the remote machine; returns stdout, stderr, exit code.\n\nFILE TRANSFER (bytes bypass LLM context — use for files of any size):\n  upload:   curl -T <localfile> -H \"X-SR-Token: <token>\" <origin>/agent/mcp/put?path=<remotepath>\n  download: curl -H \"X-SR-Token: <token>\" <origin>/agent/mcp/get?path=<remotepath> -o <localfile>\n<origin> is this MCP server's origin (scheme://host:port, the base of /agent/mcp). <token> is the same session token used for this tool; upload needs read-write, download allows read-only.",
+                        "description": "Execute a shell command on the remote machine; returns stdout, stderr, exit code.\n\nFILE TRANSFER (bytes bypass LLM context — use for files of any size):\n  upload:   curl -T <localfile> -H \"X-SR-Token: <token>\" <origin>/agent/mcp/put?path=<remotepath>\n  download: curl -H \"X-SR-Token: <token>\" <origin>/agent/mcp/get?path=<remotepath> -o <localfile>
+<origin> is this MCP server's origin (scheme://host:port, the base of /agent/mcp). <token> is the same session token used for this tool; upload needs read-write, download allows read-only.\nPATH: absolute paths are used as-is on the remote filesystem; relative paths resolve under the agent root (--root). Use an absolute path unless you mean the agent root.\nDownload supports HTTP Range (e.g. `-H \"Range: bytes=1000-\"`) for resumable downloads; a `bytes=-n` suffix range is not supported and returns the full file. Errors return proper status codes: 404 missing file, 400 directory/bad path, 403 permission, 401 bad token. Upload size is capped by the deployment's reverse proxy (commonly 50m–100m); see README.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {

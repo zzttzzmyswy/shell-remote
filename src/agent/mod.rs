@@ -7,8 +7,8 @@ pub mod shell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::client::RelayClient;
@@ -19,7 +19,10 @@ use crate::proto::{McpResultPayload, Message};
 /// back to `%USERPROFILE%` (Windows). Used for the file-manager root default
 /// and the PTY child's cwd so the same code path works on both platforms.
 pub(crate) fn home_dir() -> String {
-    home_dir_from(std::env::var("HOME").ok(), std::env::var("USERPROFILE").ok())
+    home_dir_from(
+        std::env::var("HOME").ok(),
+        std::env::var("USERPROFILE").ok(),
+    )
 }
 
 fn home_dir_from(home: Option<String>, userprofile: Option<String>) -> String {
@@ -139,34 +142,52 @@ async fn post_raw(client: &reqwest::Client, send_url: &str, text: &str) {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            tracing::warn!("Agent POST failed ({}): {}", status, &body[..body.len().min(200)]);
+            tracing::warn!(
+                "Agent POST failed ({}): {}",
+                status,
+                &body[..body.len().min(200)]
+            );
         }
         Ok(_) => {}
         Err(e) => tracing::warn!("Agent POST send error: {}", e),
     }
 }
 
+/// Map an I/O error to a coarse kind the relay can translate into an HTTP
+/// status code (404 / 400 / 403 / 500).
+fn kind_for_io(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory => "is_directory",
+        _ => "other",
+    }
+}
+
 /// Post a single error `fs:result` (correlated by `_mcp_request_id`) for a
-/// failed download.
+/// failed download; `kind` categorizes the failure for HTTP status mapping.
 async fn post_fs_err(
     client: &reqwest::Client,
     send_url: &str,
     session_id: &str,
     path: &str,
     mcp_request_id: &Option<String>,
+    kind: &str,
     err: &str,
 ) {
     let payload = serde_json::json!({
-        "success": false, "error": err, "path": path,
+        "success": false, "error": err, "kind": kind, "path": path,
         "_mcp_request_id": mcp_request_id.clone()
     });
-    let msg = serde_json::json!({"type":"fs:result","session_id":session_id,"payload":payload}).to_string();
+    let msg = serde_json::json!({"type":"fs:result","session_id":session_id,"payload":payload})
+        .to_string();
     post_raw(client, send_url, &msg).await;
 }
 
 /// Build a chunked `fs:result` payload envelope for a single download chunk.
 /// Pure function extracted from `stream_file_download` so it can be unit-tested
-/// independently of I/O.
+/// independently of I/O. `file_size` (full file length) rides every chunk so
+/// the relay can emit Content-Length / Content-Range even for the first chunk.
 fn build_download_chunk_payload(
     session_id: &str,
     path: &str,
@@ -174,6 +195,7 @@ fn build_download_chunk_payload(
     idx: u32,
     total: u32,
     mcp_request_id: Option<String>,
+    file_size: u64,
 ) -> serde_json::Value {
     let is_last = idx + 1 >= total;
     let payload = serde_json::json!({
@@ -182,6 +204,7 @@ fn build_download_chunk_payload(
         "chunk_index": idx,
         "total_chunks": total,
         "is_last": is_last,
+        "file_size": file_size,
         "path": path,
         "_mcp_request_id": mcp_request_id.clone()
     });
@@ -213,15 +236,28 @@ async fn stream_file_download(
     mcp_request_id: Option<String>,
     cancel: Option<Arc<AtomicBool>>,
     download_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    offset: u64,
+    limit: Option<u64>,
 ) {
-    const CHUNK_SIZE: usize = 256 * 1024;
-    use std::io::Read;
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    use std::io::{Read, Seek, SeekFrom};
 
     let resolved = match crate::agent::fs::resolve_path(&root, &path) {
         Some(p) => p,
         None => {
-            post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, "Invalid path").await;
-            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
+            post_fs_err(
+                &client,
+                &send_url,
+                &session_id,
+                &path,
+                &mcp_request_id,
+                "invalid_path",
+                "Invalid path",
+            )
+            .await;
+            if let Some(ref cid) = mcp_request_id {
+                let _ = download_cancels.lock().unwrap().remove(cid);
+            }
             return;
         }
     };
@@ -229,30 +265,91 @@ async fn stream_file_download(
     let meta = match std::fs::metadata(&resolved) {
         Ok(m) => m,
         Err(e) => {
-            post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to read file: {}", e)).await;
-            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
+            let kind = kind_for_io(&e);
+            post_fs_err(
+                &client,
+                &send_url,
+                &session_id,
+                &path,
+                &mcp_request_id,
+                kind,
+                &format!("Failed to read file: {}", e),
+            )
+            .await;
+            if let Some(ref cid) = mcp_request_id {
+                let _ = download_cancels.lock().unwrap().remove(cid);
+            }
             return;
         }
     };
     if meta.is_dir() {
-        post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, "Path is a directory").await;
-        if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
+        post_fs_err(
+            &client,
+            &send_url,
+            &session_id,
+            &path,
+            &mcp_request_id,
+            "is_directory",
+            "Path is a directory",
+        )
+        .await;
+        if let Some(ref cid) = mcp_request_id {
+            let _ = download_cancels.lock().unwrap().remove(cid);
+        }
         return;
     }
-    let file_size = meta.len() as usize;
-    let total_chunks = (file_size.div_ceil(CHUNK_SIZE) as u32).max(1);
+    let file_size = meta.len();
 
     let mut f = match std::fs::File::open(&resolved) {
         Ok(f) => f,
         Err(e) => {
-            post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to open file: {}", e)).await;
-            if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
+            let kind = kind_for_io(&e);
+            post_fs_err(
+                &client,
+                &send_url,
+                &session_id,
+                &path,
+                &mcp_request_id,
+                kind,
+                &format!("Failed to open file: {}", e),
+            )
+            .await;
+            if let Some(ref cid) = mcp_request_id {
+                let _ = download_cancels.lock().unwrap().remove(cid);
+            }
             return;
         }
     };
+    // Partial read (HTTP Range): seek to offset, cap the read to `limit`
+    // bytes. An out-of-range offset reads 0 bytes → agent reports success with
+    // an empty body; the relay's 416 check happens against file_size.
+    if offset > 0 {
+        if let Err(e) = f.seek(SeekFrom::Start(offset)) {
+            post_fs_err(
+                &client,
+                &send_url,
+                &session_id,
+                &path,
+                &mcp_request_id,
+                "other",
+                &format!("Failed to seek file: {}", e),
+            )
+            .await;
+            if let Some(ref cid) = mcp_request_id {
+                let _ = download_cancels.lock().unwrap().remove(cid);
+            }
+            return;
+        }
+    }
+    let to_read: u64 = limit.map_or(file_size.saturating_sub(offset), |l| {
+        l.min(file_size.saturating_sub(offset))
+    });
+
+    let total_chunks = (to_read.div_ceil(CHUNK_SIZE as u64) as u32).max(1);
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut idx: u32 = 0;
+    let mut remaining = to_read;
     loop {
         // Check for cancellation before reading/processing each chunk
         if let Some(ref c) = cancel {
@@ -261,28 +358,51 @@ async fn stream_file_download(
                 break;
             }
         }
-        let n = match f.read(&mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                post_fs_err(&client, &send_url, &session_id, &path, &mcp_request_id, &format!("Failed to read file: {}", e)).await;
-                if let Some(ref cid) = mcp_request_id { let _ = download_cancels.lock().unwrap().remove(cid); }
-                return;
+        let want = remaining.min(CHUNK_SIZE as u64) as usize;
+        let n = if remaining == 0 {
+            // Offset starts at/past EOF: still send one empty chunk so the
+            // relay learns file_size and can answer 416 Range Not Satisfiable.
+            0
+        } else {
+            match f.read(&mut buf[..want]) {
+                Ok(n) => n,
+                Err(e) => {
+                    post_fs_err(
+                        &client,
+                        &send_url,
+                        &session_id,
+                        &path,
+                        &mcp_request_id,
+                        "other",
+                        &format!("Failed to read file: {}", e),
+                    )
+                    .await;
+                    if let Some(ref cid) = mcp_request_id {
+                        let _ = download_cancels.lock().unwrap().remove(cid);
+                    }
+                    return;
+                }
             }
         };
+        if n > 0 {
+            remaining -= n as u64;
+        }
         let content_b64 = crate::agent::fs::encode_b64(&buf[..n]);
         let msg = build_download_chunk_payload(
-            &session_id, &path, &content_b64, idx, total_chunks, mcp_request_id.clone(),
+            &session_id,
+            &path,
+            &content_b64,
+            idx,
+            total_chunks,
+            mcp_request_id.clone(),
+            file_size,
         );
         // Independent POST (not via sender_loop) so terminal:output/mcp:result
         // are not starved by download chunks.
         let _ = client.post(&send_url).json(&msg).send().await;
         tokio::task::yield_now().await;
         idx += 1;
-        if idx >= total_chunks {
-            break;
-        }
-        if n == 0 {
-            // file exhausted before total_chunks (size shrank mid-read) — stop
+        if idx >= total_chunks || remaining == 0 || n == 0 {
             break;
         }
     }
@@ -310,7 +430,6 @@ fn handle_upload_abort(
     }
 }
 
-
 ///
 /// Assemble one base64 chunk of a chunked upload into `final_path`.
 /// Chunk 0 opens (truncating) the destination and writes; subsequent chunks
@@ -331,70 +450,101 @@ fn assemble_upload_chunk(
     let is_last = total_chunks > 0 && chunk_index + 1 >= total_chunks;
     let decoded_opt = crate::agent::fs::decode_b64(content_b64);
 
-    let err = |msg: &str| crate::proto::FsResultPayload {
+    let err = |kind: &str, msg: &str| crate::proto::FsResultPayload {
+        kind: Some(kind.to_string()),
         success: false,
         error: Some(msg.to_string()),
-        entries: None, content: None,
-        path: Some(final_path.to_string()), new_path: None,
+        entries: None,
+        content: None,
+        path: Some(final_path.to_string()),
+        new_path: None,
     };
+    let err_no_kind = |msg: &str| err("other", msg);
     let ok = || crate::proto::FsResultPayload {
-        success: true, error: None,
-        entries: None, content: None,
-        path: Some(final_path.to_string()), new_path: None,
+        kind: None,
+        success: true,
+        error: None,
+        entries: None,
+        content: None,
+        path: Some(final_path.to_string()),
+        new_path: None,
     };
 
     if chunk_index == 0 {
         match decoded_opt {
-            None => (err("Invalid base64 content"), false),
+            None => (err_no_kind("Invalid base64 content"), false),
             Some(decoded) => match crate::agent::fs::resolve_path(root, final_path) {
-                None => (err("Invalid destination path"), false),
+                None => (err("invalid_path", "Invalid destination path"), false),
                 Some(p) => match std::fs::OpenOptions::new()
-                    .create(true).write(true).truncate(true).open(&p)
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&p)
                 {
-                    Err(e) => (err(&format!("Failed to open destination: {}", e)), false),
+                    Err(e) => (err(kind_for_io(&e), &format!("Failed to open destination: {}", e)), false),
                     Ok(mut f) => {
                         if f.write_all(&decoded).is_err() {
-                            (err("Failed to write uploaded chunk"), false)
+                            (err_no_kind("Failed to write uploaded chunk"), false)
                         } else if is_last {
                             let _ = f.sync_all();
                             (ok(), false)
                         } else {
-                            reassembly.insert(upload_id.to_string(), UploadReassembly {
-                                file: f,
-                                final_path: final_path.to_string(),
-                                last_activity: std::time::Instant::now(),
-                            });
+                            reassembly.insert(
+                                upload_id.to_string(),
+                                UploadReassembly {
+                                    file: f,
+                                    final_path: final_path.to_string(),
+                                    last_activity: std::time::Instant::now(),
+                                },
+                            );
                             (ok(), true)
                         }
                     }
-                }
+                },
             },
         }
     } else {
         match decoded_opt {
-            None => (err("Invalid base64 content"), false),
+            None => (err_no_kind("Invalid base64 content"), false),
             Some(decoded) => match reassembly.remove(upload_id) {
-                None => (err("Upload chunk received without a preceding chunk 0"), false),
+                None => (
+                    err_no_kind("Upload chunk received without a preceding chunk 0"),
+                    false,
+                ),
                 Some(mut st) => {
                     let fp = st.final_path.clone();
                     if st.file.write_all(&decoded).is_err() {
-                        (err("Failed to write uploaded chunk"), false)
+                        (err_no_kind("Failed to write uploaded chunk"), false)
                     } else if is_last {
                         let _ = st.file.sync_all();
-                        (crate::proto::FsResultPayload {
-                            success: true, error: None,
-                            entries: None, content: None,
-                            path: Some(fp), new_path: None,
-                        }, false)
+                        (
+                            crate::proto::FsResultPayload {
+                                kind: None,
+                                success: true,
+                                error: None,
+                                entries: None,
+                                content: None,
+                                path: Some(fp),
+                                new_path: None,
+                            },
+                            false,
+                        )
                     } else {
                         let mut st = st;
                         st.last_activity = std::time::Instant::now();
                         reassembly.insert(upload_id.to_string(), st);
-                        (crate::proto::FsResultPayload {
-                            success: true, error: None,
-                            entries: None, content: None,
-                            path: Some(fp), new_path: None,
-                        }, true)
+                        (
+                            crate::proto::FsResultPayload {
+                                kind: None,
+                                success: true,
+                                error: None,
+                                entries: None,
+                                content: None,
+                                path: Some(fp),
+                                new_path: None,
+                            },
+                            true,
+                        )
                     }
                 }
             },
@@ -754,6 +904,10 @@ async fn run_session(
                                 "fs:read" => {
                                     let path = msg.payload["path"].as_str().unwrap_or("").to_string();
                                     let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
+                                    // Optional HTTP-Range fields: `offset` (bytes to skip)
+                                    // and `limit` (max bytes). Absent → full file.
+                                    let offset = msg.payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let limit = msg.payload.get("limit").and_then(|v| v.as_u64());
                                     // Stream the file as chunked fs:result messages
                                     // in a separate task so a large/slow download
                                     // can't block the main loop (terminal input).
@@ -778,6 +932,8 @@ async fn run_session(
                                         mcp_request_id,
                                         Some(cancel_token),
                                         dc,
+                                        offset,
+                                        limit,
                                     ));
                                 }
 
@@ -1128,10 +1284,8 @@ mod tests {
 
     #[test]
     fn test_download_chunk_payload_is_last_flag() {
-        let p0 = build_download_chunk_payload(
-            "s", "/x", "AAAA", 0, 3, Some("r".to_string()));
-        let p2 = build_download_chunk_payload(
-            "s", "/x", "AAAA", 2, 3, Some("r".to_string()));
+        let p0 = build_download_chunk_payload("s", "/x", "AAAA", 0, 3, Some("r".to_string()), 15);
+        let p2 = build_download_chunk_payload("s", "/x", "AAAA", 2, 3, Some("r".to_string()), 15);
         assert_eq!(p0["payload"]["is_last"], serde_json::json!(false));
         assert_eq!(p2["payload"]["is_last"], serde_json::json!(true));
         assert_eq!(p2["payload"]["chunk_index"], serde_json::json!(2));
@@ -1157,7 +1311,13 @@ mod tests {
         for (i, ch) in chunks.iter().enumerate() {
             let b64 = crate::agent::fs::encode_b64(ch);
             let (res, more) = assemble_upload_chunk(
-                &mut reassembly, &root, "uid-1", &final_path, &b64, i as u32, total,
+                &mut reassembly,
+                &root,
+                "uid-1",
+                &final_path,
+                &b64,
+                i as u32,
+                total,
             );
             if i as u32 + 1 == total {
                 assert!(!more, "last chunk must be terminal");
@@ -1172,7 +1332,9 @@ mod tests {
 
         let written = std::fs::read(&dest).unwrap();
         let mut expected = Vec::new();
-        for ch in &chunks { expected.extend_from_slice(ch); }
+        for ch in &chunks {
+            expected.extend_from_slice(ch);
+        }
         assert_eq!(written, expected);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1187,7 +1349,8 @@ mod tests {
         let final_path = dest.to_string_lossy().to_string();
         let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
         let b64 = crate::agent::fs::encode_b64(b"hello");
-        let (res, more) = assemble_upload_chunk(&mut reassembly, &root, "uid-2", &final_path, &b64, 0, 1);
+        let (res, more) =
+            assemble_upload_chunk(&mut reassembly, &root, "uid-2", &final_path, &b64, 0, 1);
         assert!(!more);
         assert!(res.success);
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
@@ -1200,7 +1363,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
         let b64 = crate::agent::fs::encode_b64(b"x");
-        let (res, more) = assemble_upload_chunk(&mut reassembly, &tmp, "uid-3", "/tmp/none", &b64, 1, 2);
+        let (res, more) =
+            assemble_upload_chunk(&mut reassembly, &tmp, "uid-3", "/tmp/none", &b64, 1, 2);
         assert!(!more);
         assert!(!res.success);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1373,7 +1537,10 @@ mod tests {
 
         handle_upload_abort(&mut reassembly, &root, "uid-1", &final_path);
 
-        assert!(reassembly.is_empty(), "reassembly entry must be removed on abort");
+        assert!(
+            reassembly.is_empty(),
+            "reassembly entry must be removed on abort"
+        );
         assert!(!dest.exists(), "half-written file must be deleted on abort");
 
         // Idempotent: a second abort (no entry) is a no-op, doesn't panic.
@@ -1408,7 +1575,11 @@ mod tests {
         reassembly.insert(
             "uid-2".to_string(),
             UploadReassembly {
-                file: fs::OpenOptions::new().append(true).create(true).open(&dest).unwrap(),
+                file: fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&dest)
+                    .unwrap(),
                 final_path: "big.bin".to_string(),
                 last_activity: stale,
             },
@@ -1428,7 +1599,9 @@ mod tests {
         );
         assert!(more2, "chunk 1/3 is not last → more expected");
         let after = reassembly.get("uid-2").unwrap().last_activity;
-        assert!(std::time::Instant::now().duration_since(after) < Duration::from_secs(1),
-            "last_activity must be refreshed on non-final append");
+        assert!(
+            std::time::Instant::now().duration_since(after) < Duration::from_secs(1),
+            "last_activity must be refreshed on non-final append"
+        );
     }
 }

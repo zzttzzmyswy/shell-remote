@@ -46,6 +46,7 @@ pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
         Some(p) => p,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Invalid path".to_string()),
                 entries: None,
@@ -94,6 +95,7 @@ pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
             });
 
             FsResultPayload {
+                kind: None,
                 success: true,
                 error: None,
                 entries: Some(file_entries),
@@ -103,6 +105,7 @@ pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
             }
         }
         Err(e) => FsResultPayload {
+            kind: None,
             success: false,
             error: Some(format!("Failed to list directory: {}", e)),
             entries: None,
@@ -119,6 +122,7 @@ pub fn read_file(root: &Path, user_path: &str) -> FsResultPayload {
         Some(p) => p,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Invalid path".to_string()),
                 entries: None,
@@ -131,6 +135,7 @@ pub fn read_file(root: &Path, user_path: &str) -> FsResultPayload {
 
     if !path.is_file() {
         return FsResultPayload {
+            kind: None,
             success: false,
             error: Some("Path is not a file".to_string()),
             entries: None,
@@ -144,6 +149,7 @@ pub fn read_file(root: &Path, user_path: &str) -> FsResultPayload {
         Ok(data) => {
             let content = encode_b64(&data);
             FsResultPayload {
+                kind: None,
                 success: true,
                 error: None,
                 entries: None,
@@ -153,6 +159,7 @@ pub fn read_file(root: &Path, user_path: &str) -> FsResultPayload {
             }
         }
         Err(e) => FsResultPayload {
+            kind: None,
             success: false,
             error: Some(format!("Failed to read file: {}", e)),
             entries: None,
@@ -168,6 +175,7 @@ pub fn write_file(root: &Path, user_path: &str, content_b64: &str) -> FsResultPa
         Some(p) => p,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Invalid path".to_string()),
                 entries: None,
@@ -182,6 +190,7 @@ pub fn write_file(root: &Path, user_path: &str, content_b64: &str) -> FsResultPa
         Some(data) => data,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Invalid base64 content".to_string()),
                 entries: None,
@@ -195,6 +204,7 @@ pub fn write_file(root: &Path, user_path: &str, content_b64: &str) -> FsResultPa
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some(format!("Failed to create parent directory: {}", e)),
                 entries: None,
@@ -207,6 +217,7 @@ pub fn write_file(root: &Path, user_path: &str, content_b64: &str) -> FsResultPa
 
     match fs::write(&path, &content) {
         Ok(()) => FsResultPayload {
+            kind: None,
             success: true,
             error: None,
             entries: None,
@@ -215,6 +226,7 @@ pub fn write_file(root: &Path, user_path: &str, content_b64: &str) -> FsResultPa
             new_path: None,
         },
         Err(e) => FsResultPayload {
+            kind: None,
             success: false,
             error: Some(format!("Failed to write file: {}", e)),
             entries: None,
@@ -232,6 +244,7 @@ pub fn write_file_bytes(root: &Path, user_path: &str, data: &[u8]) -> FsResultPa
         Some(p) => p,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Invalid path".into()),
                 entries: None,
@@ -246,6 +259,7 @@ pub fn write_file_bytes(root: &Path, user_path: &str, data: &[u8]) -> FsResultPa
     }
     match fs::write(&path, data) {
         Ok(()) => FsResultPayload {
+            kind: None,
             success: true,
             error: None,
             entries: None,
@@ -254,6 +268,7 @@ pub fn write_file_bytes(root: &Path, user_path: &str, data: &[u8]) -> FsResultPa
             new_path: None,
         },
         Err(e) => FsResultPayload {
+            kind: None,
             success: false,
             error: Some(format!("Failed to write file: {}", e)),
             entries: None,
@@ -269,6 +284,7 @@ pub fn delete_path(root: &Path, user_path: &str) -> FsResultPayload {
         Some(p) => p,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Invalid path".to_string()),
                 entries: None,
@@ -282,6 +298,7 @@ pub fn delete_path(root: &Path, user_path: &str) -> FsResultPayload {
     let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     if path == root_canonical || path == root {
         return FsResultPayload {
+            kind: None,
             success: false,
             error: Some("Cannot delete root directory".to_string()),
             entries: None,
@@ -299,6 +316,7 @@ pub fn delete_path(root: &Path, user_path: &str) -> FsResultPayload {
 
     match result {
         Ok(()) => FsResultPayload {
+            kind: None,
             success: true,
             error: None,
             entries: None,
@@ -307,6 +325,7 @@ pub fn delete_path(root: &Path, user_path: &str) -> FsResultPayload {
             new_path: None,
         },
         Err(e) => FsResultPayload {
+            kind: None,
             success: false,
             error: Some(format!("Failed to delete: {}", e)),
             entries: None,
@@ -322,6 +341,7 @@ pub fn rename_path(root: &Path, from_path: &str, to_path: &str) -> FsResultPaylo
         Some(p) => p,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Source path resolution failed".to_string()),
                 entries: None,
@@ -336,6 +356,7 @@ pub fn rename_path(root: &Path, from_path: &str, to_path: &str) -> FsResultPaylo
         Some(p) => p,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Destination path resolution failed".to_string()),
                 entries: None,
@@ -348,6 +369,7 @@ pub fn rename_path(root: &Path, from_path: &str, to_path: &str) -> FsResultPaylo
 
     match fs::rename(&from, &to) {
         Ok(()) => FsResultPayload {
+            kind: None,
             success: true,
             error: None,
             entries: None,
@@ -356,6 +378,7 @@ pub fn rename_path(root: &Path, from_path: &str, to_path: &str) -> FsResultPaylo
             new_path: Some(to_path.to_string()),
         },
         Err(e) => FsResultPayload {
+            kind: None,
             success: false,
             error: Some(format!("Failed to rename: {}", e)),
             entries: None,
@@ -390,6 +413,7 @@ pub fn create_dir(root: &Path, user_path: &str) -> FsResultPayload {
         Some(p) => p,
         None => {
             return FsResultPayload {
+                kind: None,
                 success: false,
                 error: Some("Invalid path".into()),
                 entries: None,
@@ -401,6 +425,7 @@ pub fn create_dir(root: &Path, user_path: &str) -> FsResultPayload {
     };
     match fs::create_dir_all(&path) {
         Ok(()) => FsResultPayload {
+            kind: None,
             success: true,
             error: None,
             entries: None,
@@ -409,6 +434,7 @@ pub fn create_dir(root: &Path, user_path: &str) -> FsResultPayload {
             new_path: None,
         },
         Err(e) => FsResultPayload {
+            kind: None,
             success: false,
             error: Some(format!("{}", e)),
             entries: None,

@@ -48,6 +48,10 @@ pub struct FsResultPayload {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Coarse error category for HTTP status mapping: not_found |
+    /// is_directory | invalid_path | permission_denied | other (absent = other).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entries: Option<Vec<FileEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,17 +209,17 @@ mod tests {
         assert!(is_valid_custom_session_id("mydev01"));
         assert!(is_valid_custom_session_id("abcde"));
         assert!(is_valid_custom_session_id("a1b2c3d4e5f6g7h8i9j0")); // exactly 20
-        // too short
+                                                                     // too short
         assert!(!is_valid_custom_session_id("ab"));
         assert!(!is_valid_custom_session_id("abcd")); // 4
-        // too long
+                                                      // too long
         assert!(!is_valid_custom_session_id("a1b2c3d4e5f6g7h8i9j0k")); // 21
-        // non-alphanumeric
+                                                                       // non-alphanumeric
         assert!(!is_valid_custom_session_id("ab cd")); // space
         assert!(!is_valid_custom_session_id("a-b")); // hyphen
         assert!(!is_valid_custom_session_id("dev_01")); // underscore
         assert!(!is_valid_custom_session_id("你好你好你好")); // non-ascii
-        // empty
+                                                              // empty
         assert!(!is_valid_custom_session_id(""));
     }
 
@@ -264,6 +268,7 @@ mod tests {
         let result = FsResultPayload {
             success: true,
             error: None,
+            kind: None,
             entries: Some(vec![entry]),
             content: None,
             path: None,
