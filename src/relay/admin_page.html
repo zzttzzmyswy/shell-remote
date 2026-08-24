@@ -113,6 +113,9 @@
   .rec-kind.cast { background: rgba(137,180,250,.14); color: var(--accent); border: 1px solid rgba(137,180,250,.4); }
   .rec-kind.audit { background: rgba(223,142,29,.14); color: var(--yellow); border: 1px solid rgba(223,142,29,.4); }
   .rec-act { margin-right: 6px; }
+  .pager { display: flex; align-items: center; gap: 8px; justify-content: flex-end; padding: 10px 4px 0; }
+  .page-info { font-size: 12px; color: var(--muted); font-family: ui-monospace, monospace; }
+  .btn:disabled { opacity: .45; cursor: default; }
 
   /* Player modal */
   .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 90; display: flex; align-items: center; justify-content: center; padding: 20px; }
@@ -221,6 +224,11 @@
     </div>
     <div id="recEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_recordings">No recordings.</div>
     <div id="recDisabled" class="alert hidden" data-i18n="recordings_disabled">Recording is off — start the relay with --record-dir to enable.</div>
+    <div id="recPager" class="pager hidden">
+      <button class="btn btn-sm" id="recPrev" type="button" data-i18n="rec_prev">上一页</button>
+      <span class="page-info mono" id="recPageInfo">1 / 1</span>
+      <button class="btn btn-sm" id="recNext" type="button" data-i18n="rec_next">下一页</button>
+    </div>
   </div>
 
   <div class="panel">
@@ -378,6 +386,9 @@
       recordings_count: "项",
       recordings_disabled_short: "off",
       no_recordings: "暂无录像。",
+      rec_prev: "上一页",
+      rec_next: "下一页",
+      rec_page_x_of_y: "第 {page} / {pages} 页",
       recordings_disabled: "录像未开启 —— 请使用 --record-dir 启动 relay 以启用录像。",
       th_rec_time: "录像时间",
       th_size: "大小",
@@ -475,6 +486,9 @@
       recordings_count: "items",
       recordings_disabled_short: "off",
       no_recordings: "No recordings.",
+      rec_prev: "Prev",
+      rec_next: "Next",
+      rec_page_x_of_y: "Page {page} / {pages}",
       recordings_disabled: "Recording is off — start the relay with --record-dir to enable.",
       th_rec_time: "Recorded at",
       th_size: "Size",
@@ -654,24 +668,47 @@
   }
 
   // --- Recordings ---
+  const REC_PAGE_SIZE = 20;
+  let recPage = 1, recPages = 1, recTotal = 0;
+
   async function refreshRecordings() {
     let r;
-    try { r = await api('/api/recordings'); }
+    try { r = await api('/api/recordings?page=' + recPage + '&page_size=' + REC_PAGE_SIZE); }
     catch (_) { return; }
+    recPage = r.page || 1;
+    recPages = r.pages || 1;
+    recTotal = r.total || 0;
     renderRecordings(r.recordings || [], !!r.enabled);
   }
 
   function renderRecordings(recs, enabled) {
     $('recDisabled').classList.toggle('hidden', enabled);
-    if (!enabled) { $('recBody').textContent = ''; $('recEmpty').classList.add('hidden'); $('recCount').textContent = t('recordings_disabled_short'); return; }
-    $('recCount').textContent = String(recs.length);
-    recs.sort((a, b) => b.ts_unix - a.ts_unix);
+    if (!enabled) {
+      $('recBody').textContent = ''; $('recEmpty').classList.add('hidden'); $('recPager').classList.add('hidden');
+      $('recCount').textContent = t('recordings_disabled_short'); return;
+    }
+    $('recCount').textContent = String(recTotal);
     const body = $('recBody');
     body.textContent = '';
-    $('recEmpty').classList.toggle('hidden', recs.length > 0);
+    $('recEmpty').classList.toggle('hidden', recTotal > 0);
     for (const r of recs) {
       body.appendChild(buildRecordRow(r));
     }
+    renderRecPager();
+  }
+
+  function renderRecPager() {
+    $('recPager').classList.toggle('hidden', recPages <= 1);
+    $('recPrev').disabled = recPage <= 1;
+    $('recNext').disabled = recPage >= recPages;
+    $('recPageInfo').textContent = t('rec_page_x_of_y', { page: recPage, pages: recPages });
+  }
+
+  function recGoTo(p) {
+    p = Math.max(1, Math.min(recPages, p));
+    if (p === recPage) return;
+    recPage = p;
+    refreshRecordings();
   }
 
   function fmtBytes(n) {
@@ -726,6 +763,8 @@
     if (!confirm(t('confirm_delete_rec', { name: r.name || '' }))) return;
     try {
       await api('/api/recordings/delete', { method: 'DELETE', body: { file: r.name } });
+      // Deleting the last file of a non-first page would leave it empty; step back.
+      if (recPage > 1 && recTotal - 1 <= (recPage - 1) * REC_PAGE_SIZE) recPage--;
       refreshRecordings();
     } catch (e) { alert(t('err_delete_rec') + e.message); }
   }
@@ -1157,6 +1196,8 @@
     $(id).addEventListener('click', (e) => { if (e.target === e.currentTarget) $(id).classList.add('hidden'); });
   });
   $('recRefresh').addEventListener('click', refreshRecordings);
+  $('recPrev').addEventListener('click', () => recGoTo(recPage - 1));
+  $('recNext').addEventListener('click', () => recGoTo(recPage + 1));
 
   // --- Boot ---
   (async function boot() {
