@@ -1,6 +1,6 @@
 [package]
 name = "shell-remote"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2021"
 description = "Self-hosted collaborative remote SSH tool with MCP support"
 
