@@ -358,12 +358,24 @@ pub async fn set_server_auth_handler(
     Json(json!({"ok": true})).into_response()
 }
 
-/// List every recorded file (terminal `.cast` sessions + MCP `.audit.jsonl`
-/// commands), newest first. Requires `--record-dir`; an empty list when
-/// recording is disabled.
+/// A parsed numeric query param. `axum::extract::Query<Value>` deserializes
+/// query strings through `serde_urlencoded`, which has no type info, so every
+/// value arrives as a JSON string; accept both a JSON number and a parseable
+/// string.
+fn q_u64(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// List recorded files (terminal `.cast` sessions + MCP `.audit.jsonl`
+/// commands), newest first, paginated. Requires `--record-dir`; an empty list
+/// when recording is disabled. Accepts `page` (1-based, default 1) and
+/// `page_size` (default 20, clamped to 1..=100) query params; returns the
+/// current page plus total/page/page_size/pages so the admin panel can render
+/// a pager.
 pub async fn recordings_handler(
     State(state): State<Arc<SharedState>>,
     headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<Value>,
 ) -> Response {
     if !check_admin(&state, &headers).await {
         return unauthorized();
@@ -371,12 +383,32 @@ pub async fn recordings_handler(
     let Some(rec) = &state.recorder else {
         return Json(json!({"recordings": [], "enabled": false})).into_response();
     };
+    // Non-numeric / out-of-range params fall back to defaults rather than
+    // erroring; page 0 or negative is treated as page 1.
+    let page = q_u64(&params["page"]).unwrap_or(1).max(1) as usize;
+    let page_size = q_u64(&params["page_size"]).unwrap_or(20).clamp(1, 100) as usize;
     let views: Vec<crate::relay::recorder::RecordingView> = rec
         .list_recordings()
         .iter()
         .map(crate::relay::recorder::RecordingView::from_file)
         .collect();
-    Json(json!({"recordings": views, "enabled": true})).into_response()
+    let total = views.len();
+    let pages = total.div_ceil(page_size);
+    let start = (page - 1) * page_size;
+    let page_views = if start >= total {
+        Vec::new()
+    } else {
+        views[start..(start + page_size).min(total)].to_vec()
+    };
+    Json(json!({
+        "recordings": page_views,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "enabled": true,
+    }))
+    .into_response()
 }
 
 /// Serve a recording's raw file content (`?file=<name>`). Cast files are
@@ -753,17 +785,30 @@ mod tests {
         recorder.close("ag-s2");
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
 
-        // List
-        let r = recordings_handler(State(state.clone()), h.clone()).await;
+        // List (default pagination: page 1, page_size 20)
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({})),
+        )
+        .await;
         let v = body_json(r).await;
         assert_eq!(v["enabled"], true);
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["page"], 1);
+        assert_eq!(v["pages"], 1);
         assert_eq!(v["recordings"].as_array().unwrap().len(), 2);
         let cast = v["recordings"].as_array().unwrap().iter().find(|x| x["kind"] == "cast").unwrap().clone();
         assert_eq!(cast["session_id"], "ag-s1");
         let cast_name = cast["name"].as_str().unwrap().to_string();
 
         // Content (auth required)
-        let r = recordings_handler(State(state.clone()), HeaderMap::new()).await;
+        let r = recordings_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Query(serde_json::json!({})),
+        )
+        .await;
         assert_eq!(r.status(), 401);
 
         // Content fetch
@@ -816,7 +861,12 @@ mod tests {
             .await
             .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
         let h = cookie_headers_owned("tok");
-        let r = recordings_handler(State(state.clone()), h.clone()).await;
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({})),
+        )
+        .await;
         let v = body_json(r).await;
         assert_eq!(v["enabled"], false);
         assert_eq!(v["recordings"].as_array().unwrap().len(), 0);
@@ -828,5 +878,142 @@ mod tests {
         )
         .await;
         assert_eq!(r.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn test_recordings_pagination() {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-rec-page-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorder = std::sync::Arc::new(crate::relay::recorder::Recorder::new(dir.clone()));
+        let state = Arc::new(crate::relay::SharedState::new(
+            "relay-pw".to_string(),
+            100 * 1024 * 1024,
+            Some("/admin-test".to_string()),
+            "admin".to_string(),
+            "s3cret".to_string(),
+            Some(recorder.clone()),
+        ));
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        let h = cookie_headers_owned("tok");
+
+        // 45 `.cast` files; larger ts suffix sorts first (newest first).
+        for i in 0..45u64 {
+            std::fs::write(dir.join(format!("sess-{i}_{}.cast", 1000 + i)), b"").unwrap();
+        }
+        // One audit file, ignored by the (kind-agnostic) page slice counting
+        // below but confirms kind filtering still works across pages.
+        std::fs::write(dir.join("sess-audit_900.audit.jsonl"), b"{}\n").unwrap();
+
+        // Queries use string values to mirror real HTTP parsing via serde_urlencoded.
+        // Default: page 1, page_size 20.
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({})),
+        )
+        .await;
+        let v = body_json(r).await;
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["total"], 46);
+        assert_eq!(v["pages"], 3);
+        assert_eq!(v["page"], 1);
+        assert_eq!(v["page_size"], 20);
+        let page1 = v["recordings"].as_array().unwrap();
+        assert_eq!(page1.len(), 20);
+        assert_eq!(page1[0]["session_id"], "sess-44");
+        assert_eq!(page1[19]["session_id"], "sess-25");
+
+        // Explicit middle page.
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({"page": "2"})),
+        )
+        .await;
+        let v = body_json(r).await;
+        let page2 = v["recordings"].as_array().unwrap();
+        assert_eq!(page2.len(), 20);
+        assert_eq!(page2[0]["session_id"], "sess-24");
+        assert_eq!(page2[19]["session_id"], "sess-5");
+
+        // Numeric JSON values (e.g. direct handler calls) also work.
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({"page": 2})),
+        )
+        .await;
+        let v = body_json(r).await;
+        assert_eq!(v["page"], 2);
+        assert_eq!(v["page_size"], 20);
+
+        // Last page holds the remainder.
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({"page": "3"})),
+        )
+        .await;
+        let v = body_json(r).await;
+        let page3 = v["recordings"].as_array().unwrap();
+        assert_eq!(page3.len(), 6);
+        assert_eq!(page3[0]["session_id"], "sess-4");
+
+        // Out-of-range page: empty page but real totals.
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({"page": "99"})),
+        )
+        .await;
+        let v = body_json(r).await;
+        assert_eq!(v["total"], 46);
+        assert_eq!(v["pages"], 3);
+        assert_eq!(v["recordings"].as_array().unwrap().len(), 0);
+
+        // Smaller page_size.
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({"page": "1", "page_size": "10"})),
+        )
+        .await;
+        let v = body_json(r).await;
+        assert_eq!(v["page_size"], 10);
+        assert_eq!(v["pages"], 5);
+        assert_eq!(v["recordings"].as_array().unwrap().len(), 10);
+
+        // page_size clamped to the upper bound.
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({"page_size": "999"})),
+        )
+        .await;
+        let v = body_json(r).await;
+        assert_eq!(v["page_size"], 100);
+
+        // Invalid inputs fall back to defaults, never error.
+        let r = recordings_handler(
+            State(state.clone()),
+            h.clone(),
+            axum::extract::Query(serde_json::json!({"page": "0", "page_size": "abc"})),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let v = body_json(r).await;
+        assert_eq!(v["page"], 1);
+        assert_eq!(v["page_size"], 20);
+        assert_eq!(v["recordings"].as_array().unwrap().len(), 20);
     }
 }
