@@ -466,6 +466,50 @@ fn merge_biased(
     }
 }
 
+/// Drop guard for the relay→agent SSE stream. When the stream ends (the
+/// agent's connection dropped), clears this session's agent channel entries —
+/// but only if they still point at THIS connection (`same_channel`), so a
+/// newer reconnect's channels are never clobbered by a stale stream's teardown.
+/// Without this guard, a dead agent keeps a receive-able-looking `cm.agent`,
+/// and MCP `mcp:exec` messages get silently dropped into a closed channel,
+/// making every call hang for the full timeout instead of fast-failing with
+/// "No agent connected".
+struct AgentEventsCleanup {
+    tx: mpsc::Sender<String>,
+    bulk_tx: mpsc::Sender<String>,
+    state: Arc<SharedState>,
+    session_id: String,
+}
+
+impl Drop for AgentEventsCleanup {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let session_id = self.session_id.clone();
+        let tx = self.tx.clone();
+        let bulk_tx = self.bulk_tx.clone();
+        tokio::spawn(async move {
+            let mut broadcast = state.agent_broadcast.write().await;
+            if let Some(cm) = broadcast.get_mut(&session_id) {
+                let mut cleared = false;
+                if cm.agent.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
+                    cm.agent = None;
+                    cleared = true;
+                }
+                if cm.agent_bulk.as_ref().is_some_and(|cur| cur.same_channel(&bulk_tx)) {
+                    cm.agent_bulk = None;
+                    cleared = true;
+                }
+                if cleared {
+                    tracing::info!(
+                        session = %session_id,
+                        "agent SSE disconnected — agent channels cleared"
+                    );
+                }
+            }
+        });
+    }
+}
+
 // ── Agent SSE handler (GET, for HTTP-mode agent receive) ─────────────
 
 pub async fn agent_events_handler(
@@ -508,8 +552,8 @@ pub async fn agent_events_handler(
     {
         let mut broadcast = state.agent_broadcast.write().await;
         if let Some(cm) = broadcast.get_mut(&session_id) {
-            cm.agent = Some(tx);
-            cm.agent_bulk = Some(bulk_tx);
+            cm.agent = Some(tx.clone());
+            cm.agent_bulk = Some(bulk_tx.clone());
         }
     }
 
@@ -529,6 +573,17 @@ pub async fn agent_events_handler(
                 }
             }
         }
+
+        // When this stream ends (agent disconnected), clear the channel-map
+        // entries for this connection so MCP calls fast-fail with "No agent
+        // connected" instead of being dropped into a dead channel and hanging
+        // until the 30s timeout.
+        let _cleanup = AgentEventsCleanup {
+            tx,
+            bulk_tx,
+            state: state_clone.clone(),
+            session_id: sid_clone.clone(),
+        };
 
         let mut merged = Box::pin(merge_biased(rx, bulk_rx));
         while let Some(msg) = merged.next().await {
@@ -1451,5 +1506,78 @@ mod tests {
         // Oldest entries evicted.
         assert_eq!(q.front().unwrap().session, "s100");
         assert_eq!(q.back().unwrap().session, "s599");
+    }
+
+    // ── Agent SSE disconnect cleanup tests ───────────────────────────
+
+    #[tokio::test]
+    async fn test_agent_events_cleanup_clears_stale_channels() {
+        // When the relay→agent SSE stream ends (agent disconnected), the
+        // agent channel entries must be cleared so a later MCP call fast-fails
+        // with "No agent connected" instead of hanging until timeout.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let (tx, _rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (bulk_tx, _bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(tx.clone());
+            cm.agent_bulk = Some(bulk_tx.clone());
+            broadcast.insert(sid.clone(), cm);
+        }
+        // Dropping the guard simulates the SSE stream ending.
+        drop(AgentEventsCleanup {
+            tx,
+            bulk_tx,
+            state: state.clone(),
+            session_id: sid.clone(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let broadcast = state.agent_broadcast.read().await;
+        let cm = broadcast.get(&sid).unwrap();
+        assert!(cm.agent.is_none(), "stale agent channel must be cleared");
+        assert!(
+            cm.agent_bulk.is_none(),
+            "stale bulk channel must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_events_cleanup_preserves_newer_connection() {
+        // A stale stream's cleanup must NOT clear a channel that a newer
+        // (reconnecting) SSE connection has already replaced.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let (old_tx, _old_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (old_bulk, _old_bulk_rx) =
+            mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        let (new_tx, _new_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (new_bulk, _new_bulk_rx) =
+            mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(new_tx.clone());
+            cm.agent_bulk = Some(new_bulk.clone());
+            broadcast.insert(sid.clone(), cm);
+        }
+        // Old stream ends AFTER the newer connection took over the channels.
+        drop(AgentEventsCleanup {
+            tx: old_tx,
+            bulk_tx: old_bulk,
+            state: state.clone(),
+            session_id: sid.clone(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let broadcast = state.agent_broadcast.read().await;
+        let cm = broadcast.get(&sid).unwrap();
+        assert!(
+            cm.agent.is_some(),
+            "cleanup from a stale stream must not clear the newer channel"
+        );
+        assert!(cm.agent_bulk.is_some());
     }
 }

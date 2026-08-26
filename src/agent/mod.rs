@@ -71,16 +71,22 @@ impl Out {
 /// Background sender: drains control + output channels and POSTs to the relay.
 /// Coalesces terminal:output per tab within a short window so a bursting
 /// `cat kern.log` collapses into a handful of messages instead of thousands.
+/// Also POSTs a lightweight `ping` every `heartbeat` so the outbound NAT
+/// mapping stays alive (strict NATs only refresh on agent→relay traffic) and a
+/// dead uplink shows up as repeating POST failures.
 async fn sender_loop(
     client: reqwest::Client,
     send_url: String,
     session_id: String,
     mut control_rx: tokio::sync::mpsc::Receiver<String>,
     mut output_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
+    heartbeat: Duration,
 ) {
     let mut pending: HashMap<String, Vec<u8>> = HashMap::new();
     let mut timer = tokio::time::interval(Duration::from_millis(16));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat_tick = tokio::time::interval(heartbeat);
+    heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -97,6 +103,10 @@ async fn sender_loop(
             },
             _ = timer.tick() => {
                 flush_output(&client, &send_url, &session_id, &mut pending).await;
+            }
+            _ = heartbeat_tick.tick() => {
+                let ping = serde_json::json!({"type": "ping", "session_id": &session_id}).to_string();
+                post_raw(&client, &send_url, &ping).await;
             }
         }
     }
@@ -648,6 +658,7 @@ async fn run_session(
         client.session_id.clone(),
         control_rx,
         output_rx,
+        Duration::from_secs(30),
     ));
     // Keep a control sender for spawned long-running tasks (e.g. mcp:exec).
     let task_control_tx = control_tx;
@@ -1602,6 +1613,60 @@ mod tests {
         assert!(
             std::time::Instant::now().duration_since(after) < Duration::from_secs(1),
             "last_activity must be refreshed on non-final append"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sender_loop_sends_periodic_heartbeat() {
+        // The agent must periodically POST a lightweight ping so the outbound
+        // NAT mapping stays alive and a dead uplink becomes visible via POST
+        // failures — otherwise strict NATs silently kill the relay→agent SSE
+        // and the agent never notices.
+        use std::sync::{Arc as StdArc, Mutex};
+        let calls: StdArc<Mutex<Vec<serde_json::Value>>> = StdArc::new(Mutex::new(Vec::new()));
+        let app = {
+            let calls = calls.clone();
+            axum::Router::new().route(
+                "/agent/send",
+                axum::routing::post(
+                    move |axum::Json(b): axum::Json<serde_json::Value>| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.lock().unwrap().push(b);
+                            axum::http::StatusCode::OK
+                        }
+                    },
+                ),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let client = reqwest::Client::new();
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(64);
+        let url = format!("http://127.0.0.1:{}/agent/send", port);
+        let task = tokio::spawn(sender_loop(
+            client,
+            url,
+            "sess1".to_string(),
+            control_rx,
+            output_rx,
+            std::time::Duration::from_millis(50),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        drop(control_tx);
+        drop(output_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|b| b["type"] == "ping" && b["session_id"] == "sess1"),
+            "sender_loop must send a periodic ping heartbeat, got {:?}",
+            *calls
         );
     }
 }
