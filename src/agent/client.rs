@@ -5,6 +5,67 @@ use tokio_stream::StreamExt;
 
 use crate::proto::Message as ProtoMessage;
 
+/// How long the relay→agent SSE may be silent before the agent treats the
+/// connection as dead and reconnects. The relay sends an SSE keep-alive
+/// comment every ~15s, so this is a comfortable multiple of that.
+const AGENT_SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Read SSE chunks from the relay, forward each `data:` payload to `tx`, and
+/// return when the stream ends, errors, or no bytes arrive within
+/// `idle_timeout`. The idle timeout turns a silently killed (half-open)
+/// connection into a reconnect: without it the agent would block on `recv()`
+/// forever even though the relay→agent path is dead.
+pub(crate) async fn pump_sse_events<S, B, E>(
+    mut stream: S,
+    tx: mpsc::UnboundedSender<String>,
+    idle_timeout: std::time::Duration,
+) where
+    S: tokio_stream::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut buf = String::new();
+    let mut event_count: u64 = 0;
+    loop {
+        let next_chunk = tokio::time::timeout(idle_timeout, stream.next());
+        let chunk = match next_chunk.await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(_))) => {
+                tracing::warn!("agent SSE stream error after {} events", event_count);
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!(
+                    "agent SSE idle for {:.1}s ({} events) — treating relay connection as dead",
+                    idle_timeout.as_secs_f64(),
+                    event_count
+                );
+                break;
+            }
+        };
+        let text = String::from_utf8_lossy(chunk.as_ref());
+        buf.push_str(&text);
+        while let Some(pos) = buf.find("\n\n") {
+            let event_str = buf[..pos].to_string();
+            buf = buf[pos + 2..].to_string();
+            for line in event_str.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    event_count += 1;
+                    if event_count <= 3 {
+                        tracing::debug!(
+                            event = event_count,
+                            "agent SSE event: {}",
+                            data.trim()
+                        );
+                    }
+                    let _ = tx.send(data.trim().to_string());
+                }
+            }
+        }
+    }
+    tracing::debug!("agent SSE stream ended, {} events received", event_count);
+}
+
 struct Transport {
     client: reqwest::Client,
     send_url: String,
@@ -91,7 +152,7 @@ impl RelayClient {
 
         let sse_client = http_client.clone();
         let sse_task = tokio::spawn(async move {
-            let mut stream = match sse_client
+            let stream = match sse_client
                 .get(&events_url)
                 .header("Accept", "text/event-stream")
                 .header("Cache-Control", "no-cache")
@@ -118,38 +179,7 @@ impl RelayClient {
                 }
             };
 
-            let mut buf = String::new();
-            let mut event_count: u64 = 0;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(chunk_bytes) => {
-                        let text = String::from_utf8_lossy(&chunk_bytes);
-                        buf.push_str(&text);
-                        while let Some(pos) = buf.find("\n\n") {
-                            let event_str = buf[..pos].to_string();
-                            buf = buf[pos + 2..].to_string();
-                            for line in event_str.lines() {
-                                if let Some(data) = line.strip_prefix("data:") {
-                                    event_count += 1;
-                                    if event_count <= 3 {
-                                        tracing::debug!(
-                                            event = event_count,
-                                            "agent SSE event: {}",
-                                            data.trim()
-                                        );
-                                    }
-                                    let _ = tx.send(data.trim().to_string());
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!("agent SSE stream error after {} events", event_count);
-                        break;
-                    }
-                }
-            }
-            tracing::debug!("agent SSE stream ended, {} events received", event_count);
+            pump_sse_events(stream, tx, AGENT_SSE_IDLE_TIMEOUT).await;
         });
 
         let mut client = Self {
@@ -283,8 +313,59 @@ impl RelayClient {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_placeholder() {
-        assert!(true);
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pump_sse_events_forwards_data_payloads() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let stream = tokio_stream::iter(vec![
+            Ok::<_, std::io::Error>(b"data: hello\n\ndata: world\n\n".as_slice()),
+        ]);
+        pump_sse_events(stream, tx, std::time::Duration::from_secs(60)).await;
+        assert_eq!(rx.try_recv().unwrap(), "hello");
+        assert_eq!(rx.try_recv().unwrap(), "world");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pump_sse_events_ignores_event_metadata_lines() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let stream = tokio_stream::iter(vec![
+            Ok::<_, std::io::Error>(b"event: message\ndata: payload\n\n".as_slice()),
+        ]);
+        pump_sse_events(stream, tx, std::time::Duration::from_secs(60)).await;
+        assert_eq!(rx.try_recv().unwrap(), "payload");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pump_sse_events_returns_on_idle_timeout() {
+        // A stream that never yields (simulating a silently killed / half-open
+        // relay→agent SSE) must cause the pump to give up after the idle
+        // timeout, so the agent can reconnect instead of blocking forever.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let stream = tokio_stream::pending::<Result<Vec<u8>, std::io::Error>>();
+        let start = std::time::Instant::now();
+        pump_sse_events(stream, tx, std::time::Duration::from_millis(120)).await;
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(100),
+            "must wait for the idle timeout before giving up"
+        );
+        assert!(rx.try_recv().is_err(), "no events on a silent stream");
+    }
+
+    #[tokio::test]
+    async fn test_pump_sse_events_returns_on_stream_end() {
+        // A clean EOF (relay closed the stream) must end immediately, not wait
+        // out the idle timeout.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let stream = tokio_stream::empty::<Result<Vec<u8>, std::io::Error>>();
+        let start = std::time::Instant::now();
+        pump_sse_events(stream, tx, std::time::Duration::from_secs(60)).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "empty stream must end immediately, not wait for the timeout"
+        );
+        assert!(rx.try_recv().is_err());
     }
 }
