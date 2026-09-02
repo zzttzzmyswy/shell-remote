@@ -497,22 +497,50 @@ impl Drop for AgentEventsCleanup {
         let tx = self.tx.clone();
         let bulk_tx = self.bulk_tx.clone();
         tokio::spawn(async move {
-            let mut broadcast = state.agent_broadcast.write().await;
-            if let Some(cm) = broadcast.get_mut(&session_id) {
-                let mut cleared = false;
-                if cm.agent.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
-                    cm.agent = None;
-                    cleared = true;
+            // Capture the browsers to notify while holding the broadcast lock,
+            // then deliver after dropping it (deliver needs the sse_sessions
+            // read lock, and nested lock ordering here is awkward).
+            let notify_browsers: Vec<String> = {
+                let mut broadcast = state.agent_broadcast.write().await;
+                if let Some(cm) = broadcast.get_mut(&session_id) {
+                    let mut cleared = false;
+                    if cm.agent.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
+                        cm.agent = None;
+                        cleared = true;
+                    }
+                    if cm.agent_bulk.as_ref().is_some_and(|cur| cur.same_channel(&bulk_tx)) {
+                        cm.agent_bulk = None;
+                        cleared = true;
+                    }
+                    if cleared {
+                        tracing::info!(
+                            session = %session_id,
+                            "agent SSE disconnected — agent channels cleared"
+                        );
+                        // No newer connection replaced this one → the agent is
+                        // genuinely gone. Tell every connected browser so it can
+                        // show a status and auto-rejoin instead of staring at a
+                        // frozen/empty terminal.
+                        cm.browser_sessions.values().cloned().collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
                 }
-                if cm.agent_bulk.as_ref().is_some_and(|cur| cur.same_channel(&bulk_tx)) {
-                    cm.agent_bulk = None;
-                    cleared = true;
-                }
-                if cleared {
-                    tracing::info!(
-                        session = %session_id,
-                        "agent SSE disconnected — agent channels cleared"
-                    );
+            };
+            if !notify_browsers.is_empty() {
+                let msg = serde_json::json!({
+                    "type": "session:agent_disconnect",
+                    "session_id": session_id,
+                    "payload": {},
+                })
+                .to_string();
+                let sse_sessions = state.sse_sessions.read().await;
+                for sse_sid in notify_browsers {
+                    if let Some(tx) = sse_sessions.get(&sse_sid) {
+                        deliver(tx, "session:agent_disconnect", msg.clone());
+                    }
                 }
             }
         });
@@ -648,6 +676,29 @@ pub async fn browser_sse_handler(
                 .into_response()
         }
     };
+
+    // Fast-fail with a clear error instead of connecting into a session whose
+    // agent link is absent or not yet established — otherwise the browser sits
+    // on a permanently empty terminal (the classic "registered + token issued,
+    // but agent SSE never/again connected" case). The browser client shows the
+    // message and auto-retries until the agent comes back.
+    let agent_alive = {
+        let broadcast = state.agent_broadcast.read().await;
+        broadcast
+            .get(&session_id)
+            .and_then(|cm| cm.agent.as_ref())
+            .is_some()
+    };
+    if !agent_alive {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({
+                "error": "AGENT_NOT_CONNECTED",
+                "message": "agent is not connected"
+            })),
+        )
+            .into_response();
+    }
 
     let user_id = Uuid::new_v4().to_string();
     let sse_sid = format!("bs_{}", Uuid::new_v4());
@@ -1272,6 +1323,53 @@ mod tests {
     // ── browser_send_handler tests ────────────────────────────────────
 
     #[tokio::test]
+    async fn test_browser_sse_rejects_when_agent_absent() {
+        // Registered session (valid token) but no agent channel → the browser
+        // must be rejected with a clear error instead of connecting into an
+        // empty terminal.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_rejects_when_agent_channel_gone() {
+        // Channel map exists but its agent link was cleared (e.g. stale SSE
+        // died) — same rejection, no empty terminal.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            broadcast.insert(sid, ChannelMap::new());
+        }
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_allows_when_agent_connected() {
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        insert_channel_map(&state, &r.session_id).await;
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
     async fn test_browser_send_missing_token() {
         let state = make_state("");
         let body = json!({"type": "terminal:input", "payload": {}});
@@ -1596,6 +1694,40 @@ mod tests {
             cm.agent_bulk.is_none(),
             "stale bulk channel must be cleared"
         );
+    }
+
+    #[tokio::test]
+    async fn test_agent_events_cleanup_notifies_browsers() {
+        // When the agent SSE stream ends (agent gone) and no newer connection
+        // replaced it, every connected browser of that session must receive a
+        // `session:agent_disconnect` event so it can auto-rejoin instead of
+        // staring at a frozen/empty terminal.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let (tx, _rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (bulk_tx, _bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(tx.clone());
+            cm.agent_bulk = Some(bulk_tx.clone());
+            broadcast.insert(sid.clone(), cm);
+        }
+        let mut browser_rx = add_browser(&state, &sid, "user1").await;
+        drop(AgentEventsCleanup {
+            tx,
+            bulk_tx,
+            state: state.clone(),
+            session_id: sid.clone(),
+        });
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), browser_rx.recv())
+            .await
+            .expect("browser must be notified")
+            .unwrap();
+        let v: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["type"], "session:agent_disconnect");
+        assert_eq!(v["session_id"], sid);
     }
 
     #[tokio::test]

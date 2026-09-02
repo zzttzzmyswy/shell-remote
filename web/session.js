@@ -153,8 +153,14 @@
     });
 
     window.shellRemote.on('session:agent_disconnect', function(msg) {
-        disconnectText.textContent = '远程会话已结束';
+        disconnectText.textContent = '设备连接中断，正在自动重连…';
         disconnectOverlay.classList.remove('hidden');
+    });
+
+    window.shellRemote.on('session:error', function(msg) {
+        if (msg.payload && msg.payload.code === 'AGENT_NOT_CONNECTED') {
+            showToast('设备未连接，正在自动重试…', 'error');
+        }
     });
 
     window.shellRemote.on('error', function(msg) {
