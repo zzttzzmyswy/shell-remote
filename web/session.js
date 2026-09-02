@@ -30,6 +30,28 @@
         setTimeout(() => { toast.classList.add('hidden'); }, 3000);
     }
 
+    // Join-ack watchdog: once connected, the agent must answer quickly
+    // (session:users / session:tab_list / any terminal output). If nothing
+    // arrives, the join was silently lost somewhere — surface it and reconnect
+    // instead of leaving a permanently blank terminal (the classic
+    // "registered + token ok, but web stays empty and the agent logs nothing").
+    let joinAckTimer = null;
+    const JOIN_ACK_TIMEOUT = 8000;
+    function armJoinWatchdog() {
+        clearJoinWatchdog();
+        joinAckTimer = setTimeout(() => {
+            joinAckTimer = null;
+            showToast('设备无响应，正在自动重连…', 'error');
+            window.shellRemote.reconnect();
+        }, JOIN_ACK_TIMEOUT);
+    }
+    function clearJoinWatchdog() {
+        if (joinAckTimer) {
+            clearTimeout(joinAckTimer);
+            joinAckTimer = null;
+        }
+    }
+
     function updateOnlineCount() {
         onlineCountEl.textContent = onlineUsers + ' online';
     }
@@ -65,6 +87,7 @@
     window.shellRemote.on('connected', function(msg) {
         sessionNameEl.textContent = '已连接';
         disconnectOverlay.classList.add('hidden');
+        armJoinWatchdog();
         term.focus();
         term.onResize((cols, rows) => {
             window.shellRemote.send('terminal:resize', {
@@ -81,6 +104,7 @@
     });
 
     window.shellRemote.on('terminal:output', function(msg) {
+        clearJoinWatchdog();
         try {
             const binaryStr = atob(msg.payload.data);
             const bytes = Uint8Array.from(binaryStr, c => c.charCodeAt(0));
@@ -94,6 +118,7 @@
     });
 
     window.shellRemote.on('session:tab_list', function(msg) {
+        clearJoinWatchdog();
         tabs = msg.payload.tabs || [];
         if (!activeTabId && tabs.length > 0) {
             activeTabId = tabs[0].tab_id;
@@ -125,6 +150,7 @@
     });
 
     window.shellRemote.on('session:users', function(msg) {
+        clearJoinWatchdog();
         onlineUsers = msg.payload.count || 0;
         updateOnlineCount();
     });
@@ -153,6 +179,7 @@
     });
 
     window.shellRemote.on('session:agent_disconnect', function(msg) {
+        clearJoinWatchdog();
         disconnectText.textContent = '设备连接中断，正在自动重连…';
         disconnectOverlay.classList.remove('hidden');
     });

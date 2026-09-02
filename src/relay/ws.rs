@@ -730,19 +730,53 @@ pub async fn browser_sse_handler(
         }
     }
 
-    // Send session:join to agent
+    // Send session:join to the agent and VERIFY it was actually accepted. A
+    // stale sender (the agent's SSE incarnation died / was replaced, or the
+    // reconnect window before the new SSE lands) makes try_send return Closed;
+    // a never-draining queue makes it return Full. Both are unrecoverable for
+    // THIS join — silently dropping it is exactly the "device registered +
+    // token ok, but the browser terminal stays empty with zero logs on the
+    // agent" failure. Instead, tell this browser (via its own healthy SSE) to
+    // re-join so it keeps retrying until the agent link is real.
     let join_msg = json!({
         "type": "session:join",
         "session_id": session_id,
         "payload": { "user_id": user_id, "permission": perm_str }
     })
     .to_string();
+    let mut join_delivered = false;
     {
         let broadcast = state.agent_broadcast.read().await;
         if let Some(cm) = broadcast.get(&session_id) {
             if let Some(ref agent_tx) = cm.agent {
-                deliver(agent_tx, "session:join", join_msg);
+                match agent_tx.try_send(join_msg) {
+                    Ok(()) => join_delivered = true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            "session:join dropped — agent channel closed (stale SSE); browser will retry"
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            "session:join dropped — agent channel full; browser will retry"
+                        );
+                    }
+                }
             }
+        }
+    }
+    if !join_delivered {
+        let err_msg = serde_json::json!({
+            "type": "session:error",
+            "session_id": session_id,
+            "payload": { "code": "AGENT_NOT_CONNECTED" }
+        })
+        .to_string();
+        let sse_sessions = state.sse_sessions.read().await;
+        if let Some(tx) = sse_sessions.get(&sse_sid) {
+            deliver(tx, "session:error", err_msg);
         }
     }
 
@@ -1367,6 +1401,83 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_join_delivered_to_agent() {
+        // With a live agent channel, session:join must actually reach the
+        // agent receiver — the browser must not be left on a silent terminal.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let (tx, mut agent_rx) = insert_channel_map(&state, &r.session_id).await;
+        let _keep_tx = tx;
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), agent_rx.recv())
+            .await
+            .expect("join must be delivered to the agent")
+            .unwrap();
+        let v: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["type"], "session:join");
+        assert_eq!(v["payload"]["user_id"].as_str().is_some(), true);
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_join_dropped_on_stale_channel_notifies_browser() {
+        // cm.agent still points at a CLOSED sender (stale SSE incarnation from
+        // a reconnect/evict window). The accept check must notice and push a
+        // session:error to this browser so it auto-rejoins instead of staring
+        // at an empty terminal with zero agent-side logs.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let (closed_tx, closed_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        drop(closed_rx); // close the receiving end → sender reports Closed
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(closed_tx);
+            broadcast.insert(sid, cm);
+        }
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200, "agent sender exists, so not a hard 503");
+        // The join cannot be delivered → the browser SSE must carry a
+        // session:error ... read the SSE response stream until we see it.
+        let mut data_stream = resp.into_body().into_data_stream();
+        let mut saw_error = false;
+        use tokio_stream::StreamExt as _;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), data_stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    let text = String::from_utf8_lossy(&chunk).to_string();
+                    for line in text.lines() {
+                        if let Some(json_str) = line.strip_prefix("data: ") {
+                            if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+                                if v["type"] == "session:error"
+                                    && v["payload"]["code"] == "AGENT_NOT_CONNECTED"
+                                {
+                                    saw_error = true;
+                                }
+                            }
+                        }
+                    }
+                    if saw_error {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        drop(data_stream);
+        assert!(saw_error, "browser SSE must carry session:error for a stale agent channel");
     }
 
     #[tokio::test]

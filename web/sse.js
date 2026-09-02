@@ -58,7 +58,9 @@
       });
     },
     getUserId: function() { return userId; },
-    getPermission: function() { return permission; }
+    getPermission: function() { return permission; },
+    // Programmatic reconnect (used by the UI's join-ack watchdog / overlays).
+    reconnect: function() { scheduleReconnect(); }
   };
 
   function scheduleReconnect() {
@@ -119,6 +121,11 @@
     // SSE is still healthy; reconnect so we re-join once the agent is back —
     // until then the relay answers with 503 and we keep retrying.
     if (type === 'session:agent_disconnect') {
+      scheduleReconnect();
+    } else if (type === 'session:error' &&
+               parsed.payload && parsed.payload.code === 'AGENT_NOT_CONNECTED') {
+      // The relay tried to deliver our join but the agent channel was stale
+      // (closed/full). Retry — a rejoin will land once the agent link is real.
       scheduleReconnect();
     }
   }
