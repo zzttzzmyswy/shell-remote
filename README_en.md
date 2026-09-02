@@ -10,6 +10,9 @@ Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust 
 - **Multi-Tab Shells** — Each user independently switches between multiple PTY shells; tab changes never affect others
 - **File Manager** — Side panel with breadcrumb navigation, upload, download, delete, rename, mkdir, refresh
 - **MCP Server** — AI agents (Claude, etc.) execute commands on remote machines via standard MCP SSE Transport
+- **Tabbed Admin Panel** — The admin page is organized into six tabs: Overview / Sessions / Devices / Recordings / Access log / Settings; the active tab is remembered
+- **Device Management** — The Devices tab lists every agent with its probed host info (CPU model, architecture, OS, kernel, hostname) and supports keyword / architecture / status filtering with one-click connect
+- **Connection Self-Healing** — A registered-but-unreachable device no longer leaves the browser on a blank terminal: the session page shows "agent disconnected, reconnecting" and auto-reconnects; the terminal resumes once the agent link is back
 - **SSE+POST Transport** — Full-stack HTTP SSE push + POST send; no WebSocket dependency, works behind any proxy
 - **Single Binary** — All web assets embedded via `rust-embed`; zero external file dependencies
 - **Token Authentication** — Random temporary tokens or fixed keys; read-write and read-only permission levels

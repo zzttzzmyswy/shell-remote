@@ -134,8 +134,9 @@ async fn run_command(args: &[&str]) -> Option<String> {
 }
 
 /// Extract the first CPU model name from a `/proc/cpuinfo` dump. Accepts the
-/// common `model name` line and the arm `Hardware`/`model` fallbacks, mirroring
-/// how `lscpu` shortens overlong strings.
+/// common `model name` line and the arm `Hardware`/`model` fallbacks. Only used
+/// at runtime on unix; `#[allow(dead_code)]` keeps the windows target clean.
+#[allow(dead_code)]
 pub fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
     let mut candidates = Vec::new();
     for line in cpuinfo.lines() {
@@ -169,6 +170,9 @@ pub fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
 
 /// Parse the kernel version out of `cmd /c ver` output:
 /// `Microsoft Windows [Version 10.0.19045.4046]`
+/// Only used at runtime on Windows; kept compiled everywhere so its unit tests
+/// run on any host.
+#[allow(dead_code)]
 pub fn parse_windows_ver(out: &str) -> Option<String> {
     let line = out.lines().next()?;
     let start = line.find("[Version ")? + "[Version ".len();
