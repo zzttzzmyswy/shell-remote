@@ -1,4 +1,5 @@
 pub mod client;
+pub mod device;
 pub mod encoding;
 pub mod exec_sessions;
 pub mod fs;

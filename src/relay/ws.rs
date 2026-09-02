@@ -383,6 +383,15 @@ pub async fn agent_send_handler(
                 .or_insert_with(ChannelMap::new);
         }
 
+        // Store the agent's best-effort host probe (CPU model, arch, OS, …).
+        // Older agents omit `device` entirely → stays None; a malformed object
+        // is ignored rather than failing the registration.
+        let device = body
+            .get("device")
+            .and_then(|v| serde_json::from_value::<crate::proto::DeviceInfo>(v.clone()).ok())
+            .filter(|d| !d.is_empty());
+        state.sessions.set_device(&session_id, device).await;
+
         return Json(json!({
             "type": "agent:registered",
             "session_id": session_id,
@@ -1130,6 +1139,51 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_register_stores_device() {
+        let state = make_state("");
+        let body = json!({
+            "type":"agent:register",
+            "token_type":"rw",
+            "session_id":"devA01",
+            "device": {
+                "hostname": "box-a",
+                "platform": "linux",
+                "arch": "x86_64",
+                "os": "Linux",
+                "kernel": "6.1.0",
+                "cpu_model": "Intel(R) Xeon(R)"
+            }
+        });
+        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let sessions = state.sessions.list_sessions().await;
+        let (sid, info) = &sessions[0];
+        assert_eq!(sid, "devA01");
+        let d = info.device.as_ref().expect("device must be stored");
+        assert_eq!(d.hostname.as_deref(), Some("box-a"));
+        assert_eq!(d.arch.as_deref(), Some("x86_64"));
+        assert_eq!(d.cpu_model.as_deref(), Some("Intel(R) Xeon(R)"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_register_ignores_malformed_device() {
+        let state = make_state("");
+        let body = json!({
+            "type":"agent:register",
+            "token_type":"rw",
+            "device": "not-an-object"
+        });
+        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200, "malformed device must not fail registration");
+        let sessions = state.sessions.list_sessions().await;
+        assert!(sessions[0].1.device.is_none());
     }
 
     #[tokio::test]

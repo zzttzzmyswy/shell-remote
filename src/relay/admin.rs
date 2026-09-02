@@ -167,6 +167,7 @@ pub async fn overview_handler(
             "online": online,
             "is_temporary": info.is_temporary,
             "fixed_key": info.fixed_key,
+            "device": info.device,
             "browser_count": browser_count,
             "last_active_seconds": last_active_seconds,
             "tokens": tokens,
@@ -593,6 +594,38 @@ mod tests {
         assert!(v["sessions"].is_array());
         assert_eq!(v["sessions"][0]["session_id"], sid);
         assert_eq!(v["sessions"][0]["tokens"][0]["permission"], "rw");
+    }
+
+    #[tokio::test]
+    async fn test_overview_includes_device_info() {
+        let state = state_with_admin("admin", "s3cret");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        state
+            .sessions
+            .set_device(
+                &sid,
+                Some(crate::proto::DeviceInfo {
+                    hostname: Some("probe-box".to_string()),
+                    platform: Some("linux".to_string()),
+                    arch: Some("aarch64".to_string()),
+                    os: Some("Linux".to_string()),
+                    kernel: Some("6.1.0".to_string()),
+                    cpu_model: Some("ARMv8".to_string()),
+                }),
+            )
+            .await;
+        state.admin_sessions.write().await.insert(
+            "tok".to_string(),
+            Instant::now() + ADMIN_SESSION_TTL,
+        );
+        let resp = overview_handler(State(state), cookie_headers("tok")).await;
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["sessions"][0]["device"]["hostname"], "probe-box");
+        assert_eq!(v["sessions"][0]["device"]["arch"], "aarch64");
     }
 
     #[tokio::test]
