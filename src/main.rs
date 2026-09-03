@@ -116,7 +116,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 关闭 ANSI 颜色控制符: 在不支持色彩的终端(重定向/日志文件/Windows 旧终端)
+    // 里会产生大量转义序列垃圾。用户要求无法检测时直接关闭。
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )

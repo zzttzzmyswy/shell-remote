@@ -66,6 +66,9 @@
         this.sourceBuffer.addEventListener('updateend', function() {
           self._drain();
         });
+        this.sourceBuffer.addEventListener('error', function() {
+          self.setStatus('MSE 解码错误: 浏览器无法解码该视频流 (codec=' + codec + ')', true);
+        });
       } catch (e) {
         this.setStatus('播放器初始化失败: ' + e.message, true);
         this.disconnect();

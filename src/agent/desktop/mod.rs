@@ -169,6 +169,12 @@ impl Drop for DesktopManager {
 /// would disable the adaptive resolution entirely.
 const SCALES: &[f64] = &[1.0, 0.75, 0.5, 0.375];
 
+/// Frame-stride steps for our own frame skipping (1 = encode every capture
+/// frame). Effective encode fps = `cfg.fps / STRIDES[i]` → 15/7/5/3 fps.
+/// Skipping frames is how we hold the *average* bitrate under the ceiling
+/// without OpenH264's RC jumping in and black-screening the stream.
+const STRIDES: &[u32] = &[1, 2, 3, 5];
+
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
 /// desktops at 200-800 kbps: RC drops nearly every P frame): skipped frames
@@ -235,6 +241,12 @@ async fn run_desktop_pipeline(
     const OBS: usize = 48;
     let mut since_change: u32 = 0;
 
+    // 帧抽取: 高熵内容下先把有效帧率阶梯式降低(15→7→5→3fps), 让平均码率
+    // 在不动分辨率的前提下回到 800k 上限以内(模糊可接受、丢帧我们不 POST)。
+    // stride 到顶仍跳帧时才降分辨率(maybe_rescale)。
+    let mut stride_idx: usize = 0;
+    let mut cap_no: u64 = 0;
+
     tracing::info!(
         width = %w0, height = %h0, fps = %cfg.fps,
         "desktop capture started"
@@ -257,6 +269,17 @@ async fn run_desktop_pipeline(
         tick.tick().await;
         if !running.load(Ordering::SeqCst) {
             break;
+        }
+        // 每 2 秒一个 IDR, 以真实采集帧计算（与 stride 无关）。
+        cap_no += 1;
+        if cap_no % (cfg.fps as u64 * 2) == 0 {
+            enc.force_idr();
+        }
+        let stride = STRIDES[stride_idx];
+        if cap_no % stride as u64 != 0 {
+            // 帧抽取: 本 tick 不编码, 时间线继续推进。
+            pts_ms += frame_ms;
+            continue;
         }
         let fr = match src.next_frame() {
             Ok(f) => {
@@ -296,8 +319,7 @@ async fn run_desktop_pipeline(
         };
         frame_idx += 1;
 
-        // OpenH264 RC 在码率预算不足时跳过帧（输出为空）。空帧不 POST，
-        // 记录跳帧率供自适应决策；时间线继续走，保证输出帧时间戳正确。
+        // 防御：RC 仍可能输出空帧（极少数情况）——空帧不 POST，记录为跳帧。
         if encoded.nalu.is_empty() {
             skip_win.push_back(true);
             while skip_win.len() > OBS {
@@ -307,17 +329,11 @@ async fn run_desktop_pipeline(
             pts_ms += frame_ms;
             if frame_idx % 10 == 0 {
                 let ratio = skipped_ratio(&skip_win);
-                if ratio >= 0.3 {
-                    abr.set_target(cfg.max_bps);
-                }
-                maybe_rescale(
-                    &cfg, &mut enc, &mut scale_idx, &mut enc_w, &mut enc_h, w0, h0,
-                    &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change,
-                    &mut frame_idx, ratio,
+                tune_once(
+                    &cfg, &mut enc, &mut stride_idx, &mut scale_idx,
+                    &mut enc_w, &mut enc_h, w0, h0, &mut mp4_cfg, &mut seq,
+                    &mut skip_win, &mut since_change, &mut frame_idx, ratio,
                 );
-            }
-            if frame_idx % (cfg.fps as u64 * 2) == 0 {
-                enc.force_idr();
             }
             continue;
         }
@@ -359,8 +375,7 @@ async fn run_desktop_pipeline(
             "payload": { "kind": "frag", "key": encoded.is_idr, "data": base64(&frag) }
         }));
 
-        // Adaptive bitrate: 每 10 帧评估一次窗口并下发编码器目标码率。
-        // 跳帧（Ratio >= 0.3）期间把目标钉在上限，让分辨率自适应负责降档。
+        // Adaptive bitrate + 降级决策: 每 10 个编码帧评估一次。
         if frame_idx % 10 == 0 {
             let now = start.elapsed().as_secs_f64();
             let ratio = skipped_ratio(&skip_win);
@@ -374,16 +389,11 @@ async fn run_desktop_pipeline(
                 let target = abr.note_frame(now, encoded.nalu.len());
                 enc.set_bitrate(target);
             }
-            maybe_rescale(
-                &cfg, &mut enc, &mut scale_idx, &mut enc_w, &mut enc_h, w0, h0,
-                &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change,
-                &mut frame_idx, ratio,
+            tune_once(
+                &cfg, &mut enc, &mut stride_idx, &mut scale_idx,
+                &mut enc_w, &mut enc_h, w0, h0, &mut mp4_cfg, &mut seq,
+                &mut skip_win, &mut since_change, &mut frame_idx, ratio,
             );
-        }
-
-        // 让画面持续可随机访问：每 2 秒一个 IDR。
-        if frame_idx % (cfg.fps as u64 * 2) == 0 {
-            enc.force_idr();
         }
     }
 
@@ -396,6 +406,76 @@ fn skipped_ratio(skip_win: &VecDeque<bool>) -> f64 {
         return 0.0;
     }
     skip_win.iter().filter(|&&s| s).count() as f64 / skip_win.len() as f64
+}
+
+/// One step of the high-entropy degradation ladder (called every ~10 encoded
+/// frames, cooldown 30 frames ≈ 2 s):
+/// - skip ratio ≥ 25%: first drop the *effective* frame rate (stride up,
+///   15→7→5→3 fps; we skip frames ourselves so the average bitrate stays
+///   under the ceiling). Once at the lowest frame rate and still skipping,
+///   degrade the encode resolution ([`maybe_rescale`]).
+/// - skip ratio ≤ 3% and stable: restore resolution first, then step the
+///   frame rate back up.
+/// Frame-rate changes only re-model the encoder input rate — no rebuild, no
+/// re-init, so viewers keep their stream uninterrupted.
+#[allow(clippy::too_many_arguments)]
+fn tune_once(
+    cfg: &DesktopConfig,
+    enc: &mut openh264::H264Encoder,
+    stride_idx: &mut usize,
+    scale_idx: &mut usize,
+    enc_w: &mut usize,
+    enc_h: &mut usize,
+    w0: usize,
+    h0: usize,
+    mp4_cfg: &mut Option<mp4::Mp4Config>,
+    seq: &mut u32,
+    skip_win: &mut VecDeque<bool>,
+    since_change: &mut u32,
+    frame_idx: &mut u64,
+    ratio: f64,
+) {
+    if *since_change < 30 {
+        return;
+    }
+    if ratio <= 0.03 {
+        if *scale_idx > 0 {
+            maybe_rescale(
+                cfg, enc, scale_idx, enc_w, enc_h, w0, h0, mp4_cfg, seq,
+                skip_win, since_change, frame_idx, ratio, *stride_idx,
+            );
+        } else if *stride_idx > 0 {
+            *stride_idx -= 1;
+            enc.set_frame_rate(cfg.fps as f32 / STRIDES[*stride_idx] as f32);
+            skip_win.clear();
+            *since_change = 0;
+            tracing::info!(
+                "desktop: restore encode fps to {:.0} (stride={})",
+                cfg.fps as f64 / STRIDES[*stride_idx] as f64,
+                STRIDES[*stride_idx]
+            );
+        }
+        return;
+    }
+    if ratio >= 0.25 {
+        if *stride_idx < STRIDES.len() - 1 {
+            *stride_idx += 1;
+            enc.set_frame_rate(cfg.fps as f32 / STRIDES[*stride_idx] as f32);
+            skip_win.clear();
+            *since_change = 0;
+            tracing::warn!(
+                "desktop: reduce encode fps to {:.0} (stride={}) skip={:.0}%",
+                cfg.fps as f64 / STRIDES[*stride_idx] as f64,
+                STRIDES[*stride_idx],
+                ratio * 100.0
+            );
+        } else {
+            maybe_rescale(
+                cfg, enc, scale_idx, enc_w, enc_h, w0, h0, mp4_cfg, seq,
+                skip_win, since_change, frame_idx, ratio, *stride_idx,
+            );
+        }
+    }
 }
 
 /// Rebuild the encoder at a smaller/larger resolution when the skip ratio is
@@ -417,6 +497,7 @@ fn maybe_rescale(
     since_change: &mut u32,
     frame_idx: &mut u64,
     ratio: f64,
+    stride_idx: usize,
 ) {
     if *since_change < 30 {
         return;
@@ -433,12 +514,14 @@ fn maybe_rescale(
         return;
     }
     match openh264::H264Encoder::new(nw as u32, nh as u32, cfg.max_bps, cfg.fps) {
-        Ok(new_enc) => {
+        Ok(mut new_enc) => {
             tracing::warn!(
                 "desktop: {} encode resolution {enc_w}x{enc_h} -> {nw}x{nh} (skip={:.0}%)",
                 if degrading { "degrade" } else { "restore" },
                 ratio * 100.0
             );
+            // 重建后恢复当前 stride 对应的有效帧率模型。
+            new_enc.set_frame_rate(cfg.fps as f32 / STRIDES[stride_idx] as f32);
             *enc = new_enc;
             *scale_idx = next;
             *enc_w = nw;
@@ -495,7 +578,7 @@ mod tests {
         let mut frame_idx = 40u64;
         maybe_rescale(
             &cfg, &mut enc, &mut scale_idx, &mut enc_w, &mut enc_h, w0, h0,
-            &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change, &mut frame_idx, 0.42,
+            &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change, &mut frame_idx, 0.42, 0,
         );
         assert_eq!(scale_idx, 1, "must degrade one step");
         assert_eq!(enc_w, 1440, "0.75 of 1920");
@@ -521,11 +604,81 @@ mod tests {
         let mut frame_idx = 7u64;
         maybe_rescale(
             &cfg, &mut enc, &mut scale_idx, &mut enc_w, &mut enc_h, w0, h0,
-            &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change, &mut frame_idx, 0.02,
+            &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change, &mut frame_idx, 0.02, 0,
         );
         assert_eq!(scale_idx, 0, "quiet content must restore to full resolution");
         assert_eq!(enc_w, 1920);
         assert_eq!(enc_h, 1080);
+    }
+
+    #[test]
+    fn test_tune_once_prefers_stride_before_resolution() {
+        let cfg = DesktopConfig::default();
+        let mut enc = openh264::H264Encoder::new(1920, 1080, cfg.max_bps, cfg.fps).unwrap();
+        let (w0, h0) = (1920usize, 1080usize);
+        let mut stride_idx = 0usize;
+        let mut scale_idx = 0usize;
+        let (mut enc_w, mut enc_h) = (w0, h0);
+        let mut mp4_cfg: Option<mp4::Mp4Config> = None;
+        let mut seq = 1u32;
+        let mut skip_win: VecDeque<bool> = (0..48).map(|i| i < 13).collect(); // ~27%
+        let mut since_change = 30u32;
+        let mut frame_idx = 1u64;
+        tune_once(
+            &cfg, &mut enc, &mut stride_idx, &mut scale_idx, &mut enc_w, &mut enc_h,
+            w0, h0, &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change,
+            &mut frame_idx, 0.27,
+        );
+        assert_eq!(stride_idx, 1, "high skip must first lower fps (stride up)");
+        assert_eq!(scale_idx, 0, "resolution untouched while stride has room");
+        assert!((enc.fps() - cfg.fps / 2.0).abs() < 1e-9, "encoder fps = {:.1}", enc.fps());
+        assert_eq!(since_change, 0, "cooldown must reset");
+
+        // stride 已到顶(最大)仍高跳帧 → 降分辨率
+        let mut skip_win2: VecDeque<bool> = (0..48).map(|_| true).collect();
+        let mut since_change2 = 30u32;
+        let mut enc2 = openh264::H264Encoder::new(1920, 1080, cfg.max_bps, cfg.fps).unwrap();
+        let mut stride_idx = STRIDES.len() - 1;
+        let mut scale_idx = 0usize;
+        tune_once(
+            &cfg, &mut enc2, &mut stride_idx, &mut scale_idx, &mut enc_w, &mut enc_h,
+            w0, h0, &mut mp4_cfg, &mut seq, &mut skip_win2, &mut since_change2,
+            &mut frame_idx, 0.9,
+        );
+        assert_eq!(stride_idx, STRIDES.len() - 1, "stride stays at max");
+        assert_eq!(scale_idx, 1, "resolution must then degrade");
+    }
+
+    #[test]
+    fn test_tune_once_restores_slowly() {
+        let cfg = DesktopConfig::default();
+        let mut enc = openh264::H264Encoder::new(1440, 810, cfg.max_bps, cfg.fps).unwrap();
+        let (w0, h0) = (1920usize, 1080usize);
+        let mut stride_idx = 2usize;
+        let mut scale_idx = 1usize; // 分辨率与帧率都降过
+        let (mut enc_w, mut enc_h) = (1440usize, 810usize);
+        let mut mp4_cfg: Option<mp4::Mp4Config> = None;
+        let mut seq = 1u32;
+        let mut skip_win: VecDeque<bool> = (0..48).map(|_| false).collect();
+        let mut since_change = 30u32;
+        let mut frame_idx = 1u64;
+        // 稳定低跳帧: 先恢复分辨率, stride 保持
+        tune_once(
+            &cfg, &mut enc, &mut stride_idx, &mut scale_idx, &mut enc_w, &mut enc_h,
+            w0, h0, &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change,
+            &mut frame_idx, 0.0,
+        );
+        assert_eq!(scale_idx, 0, "resolution restores first");
+        assert_eq!(stride_idx, 2, "stride unchanged until resolution is back");
+        // 分辨率已恢复, 再恢复 stride
+        let mut since_change2 = 30u32;
+        tune_once(
+            &cfg, &mut enc, &mut stride_idx, &mut scale_idx, &mut enc_w, &mut enc_h,
+            w0, h0, &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change2,
+            &mut frame_idx, 0.0,
+        );
+        assert_eq!(stride_idx, 1, "stride restores after resolution");
+        assert!((enc.fps() - cfg.fps / 2.0).abs() < 1e-9, "encoder fps = {:.1}", enc.fps());
     }
 
     #[test]
@@ -542,7 +695,7 @@ mod tests {
         let mut frame_idx = 3u64;
         maybe_rescale(
             &cfg, &mut enc, &mut scale_idx, &mut enc_w, &mut enc_h, w0, h0,
-            &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change, &mut frame_idx, 1.0,
+            &mut mp4_cfg, &mut seq, &mut skip_win, &mut since_change, &mut frame_idx, 1.0, 0,
         );
         assert_eq!(scale_idx, 0, "cooldown must block change");
         // 已经是最小档: 极端跳帧也不能再降（scale_idx=3 → 停在 3）
@@ -554,7 +707,7 @@ mod tests {
         let mut frame_idx2 = 0u64;
         maybe_rescale(
             &cfg, &mut enc2, &mut scale_idx, &mut ew, &mut eh, w0, h0,
-            &mut mp4_cfg, &mut seq, &mut skip_win2, &mut since_change2, &mut frame_idx2, 0.95,
+            &mut mp4_cfg, &mut seq, &mut skip_win2, &mut since_change2, &mut frame_idx2, 0.95, 0,
         );
         assert_eq!(scale_idx, SCALES.len() - 1, "must stay at the minimum scale");
     }

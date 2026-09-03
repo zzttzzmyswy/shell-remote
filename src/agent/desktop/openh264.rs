@@ -123,7 +123,12 @@ impl H264Encoder {
         param.sSpatialLayers[0].uiProfileIdc = 0;
         param.uiIntraPeriod = 0; // no periodic IDR; we force IDR explicitly
         param.iNumRefFrame = 1;
-        param.bEnableFrameSkip = true; // keep short bursts inside the bit budget
+        // 关闭 RC 跳帧: openh264 在码率预算不足时会跳过 (几乎) 所有 P 帧,
+        // 导致高熵桌面上 web 端黑屏。宁可每帧硬编码、由调用方通过降低
+        // 有效帧率/分辨率把平均码率压回上限以内。
+        param.bEnableFrameSkip = false;
+        // 允许更高的 QP (更模糊) 而不是爆码率 — 单帧比特被量化上限约束。
+        param.iMaxQp = 42;
         param.bPrefixNalAddingCtrl = false;
         param.bEnableDenoise = false;
         param.bEnableBackgroundDetection = false;
@@ -268,6 +273,21 @@ impl H264Encoder {
         } else {
             self.bitrate_bps
         }
+    }
+
+    /// Dynamically update the encoder's input frame-rate model
+    /// (`ENCODER_OPTION_FRAME_RATE`). Used together with our own frame
+    /// skipping to hold the *average* bitrate under the configured ceiling
+    /// without letting the RC drop frames (which black-screens the stream).
+    pub fn set_frame_rate(&mut self, fps: f32) {
+        unsafe {
+            (self.set_option)(
+                self.enc,
+                ENCODER_OPTION_FRAME_RATE,
+                std::ptr::addr_of!(fps) as *mut c_void,
+            );
+        }
+        self.fps = fps.clamp(1.0, 30.0) as f64;
     }
 
     /// Force the next encoded frame to be an IDR.
