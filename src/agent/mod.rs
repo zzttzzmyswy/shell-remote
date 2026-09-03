@@ -571,6 +571,7 @@ pub async fn start(
     token_type: String,
     shell_path: String,
     session_id: Option<String>,
+    desktop_cfg: crate::agent::desktop::DesktopConfig,
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_secs(1);
     let max_delay = Duration::from_secs(300);
@@ -587,6 +588,7 @@ pub async fn start(
             &shell_path,
             session_id.as_deref(),
             &mut cached_tokens,
+            &desktop_cfg,
         )
         .await
         {
@@ -610,6 +612,7 @@ async fn run_session(
     shell_path: &str,
     session_id: Option<&str>,
     cached_tokens: &mut Option<Vec<(String, String)>>,
+    desktop_cfg: &crate::agent::desktop::DesktopConfig,
 ) -> anyhow::Result<()> {
     // Validate the root directory BEFORE registering with the relay. A bad
     // root must fail fast without minting a session — otherwise the relay
@@ -664,6 +667,25 @@ async fn run_session(
     ));
     // Keep a control sender for spawned long-running tasks (e.g. mcp:exec).
     let task_control_tx = control_tx;
+
+    // Desktop video sharing: control + frame messages are posted through a
+    // single-task FIFO so the fMP4 byte stream reaches the relay in order
+    // (concurrent POSTs could reorder fragments and break MSE playback).
+    let desktop = crate::agent::desktop::DesktopManager::new(desktop_cfg.clone());
+    let (post_tx, mut post_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(128);
+    {
+        let pc = client.http_client().clone();
+        let su = client.send_url().to_string();
+        tokio::spawn(async move {
+            while let Some(msg) = post_rx.recv().await {
+                let _ = pc.post(&su).json(&msg).send().await;
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+    let post_fn: crate::agent::desktop::PostFn = Arc::new(move |msg| {
+        let _ = post_tx.try_send(msg);
+    });
 
     let exec_sessions = crate::agent::exec_sessions::ExecSessionManager::new();
 
@@ -1160,6 +1182,25 @@ async fn run_session(
                                         payload: serde_json::json!({ "tab_id": active_tab_id }),
                                     };
                                     out.control(sw_msg).await;
+
+                                    // Desktop capability snapshot so the web UI can
+                                    // enable/disable the 桌面 button accordingly.
+                                    let caps_msg = Message {
+                                        msg_type: "desktop:capabilities".to_string(),
+                                        session_id: client.session_id.clone(),
+                                        payload: desktop.capabilities_json(),
+                                    };
+                                    out.control(caps_msg).await;
+                                }
+
+                                "desktop:start" => {
+                                    tracing::info!("desktop:start requested");
+                                    desktop.start(post_fn.clone()).await;
+                                }
+
+                                "desktop:stop" => {
+                                    tracing::info!("desktop:stop requested");
+                                    desktop.stop(post_fn.clone()).await;
                                 }
 
                                 "session:leave" => {

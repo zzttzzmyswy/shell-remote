@@ -79,6 +79,31 @@ enum Command {
         /// relay rejects registration and the agent exits. Omit for a random id.
         #[arg(long)]
         session_id: Option<String>,
+
+        /// Desktop capture backend: auto | x11 | wayland | gdi | none.
+        /// `none` disables desktop sharing entirely.
+        #[arg(long, default_value = "auto")]
+        desktop_capture: String,
+
+        /// Desktop encoder codec (only h264 is currently supported).
+        #[arg(long, default_value = "h264")]
+        desktop_codec: String,
+
+        /// Desktop capture frame rate.
+        #[arg(long, default_value_t = 15.0)]
+        desktop_fps: f64,
+
+        /// Maximum encode bitrate in kbps (user request: 最高 800).
+        #[arg(long, default_value_t = 800)]
+        desktop_max_bitrate: u64,
+
+        /// Minimum encode bitrate in kbps (user request: 最低 200).
+        #[arg(long, default_value_t = 200)]
+        desktop_min_bitrate: u64,
+
+        /// X11 display to capture (defaults to $DISPLAY).
+        #[arg(long)]
+        desktop_display: Option<String>,
     },
 }
 
@@ -113,6 +138,12 @@ async fn main() -> anyhow::Result<()> {
             token_type,
             shell,
             session_id,
+            desktop_capture,
+            desktop_codec,
+            desktop_fps,
+            desktop_max_bitrate,
+            desktop_min_bitrate,
+            desktop_display,
         } => {
             let desired = match session_id.as_deref() {
                 Some(s) => {
@@ -125,8 +156,18 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let root = root.unwrap_or_else(agent::home_dir);
-            agent::start(relay_url, key, root, token_type.as_str().to_string(), shell, desired)
-                .await?;
+            let desktop_cfg = crate::agent::desktop::DesktopConfig {
+                capture: desktop_capture,
+                codec: desktop_codec,
+                fps: desktop_fps,
+                min_bps: desktop_min_bitrate * 1000,
+                max_bps: desktop_max_bitrate * 1000,
+                display: desktop_display,
+            };
+            agent::start(
+                relay_url, key, root, token_type.as_str().to_string(), shell, desired, desktop_cfg,
+            )
+            .await?;
         }
     }
 
