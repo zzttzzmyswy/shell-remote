@@ -85,10 +85,16 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                         .or_insert_with(crate::relay::desktop::DesktopStream::new)
                         .clone()
                 };
+                tracing::debug!("desktop:video kind={kind} bytes={}", bytes.len());
                 if kind == "init" {
                     ds.set_init(bytes).await;
                 } else {
-                    ds.push_frag(bytes).await;
+                    let is_key = proto_msg
+                        .payload
+                        .get("key")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    ds.push_frag(is_key, bytes).await;
                 }
             }
             return;

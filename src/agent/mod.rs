@@ -676,15 +676,27 @@ async fn run_session(
     {
         let pc = client.http_client().clone();
         let su = client.send_url().to_string();
+        let sid = client.session_id.clone();
         tokio::spawn(async move {
-            while let Some(msg) = post_rx.recv().await {
-                let _ = pc.post(&su).json(&msg).send().await;
+            while let Some(mut msg) = post_rx.recv().await {
+                // Relay 按 session_id 路由 agent 消息；desktop 消息本身不带该
+                // 字段，这里补上以免 agent_send_handler 400/401 拒绝。
+                msg["session_id"] = serde_json::Value::String(sid.clone());
+                let t = msg["type"].as_str().unwrap_or("?").to_string();
+                match pc.post(&su).json(&msg).send().await {
+                    Ok(r) => tracing::trace!("desk POST {t}: {}", r.status()),
+                    Err(e) => tracing::warn!("desk POST {t} failed: {}", e),
+                }
                 tokio::task::yield_now().await;
             }
         });
     }
     let post_fn: crate::agent::desktop::PostFn = Arc::new(move |msg| {
-        let _ = post_tx.try_send(msg);
+        let t = msg["type"].as_str().unwrap_or("?").to_string();
+        match post_tx.try_send(msg) {
+            Ok(()) => tracing::trace!("post_fn queued {t}"),
+            Err(e) => tracing::warn!("post_fn queue {t} failed: {e:?}"),
+        }
     });
 
     let exec_sessions = crate::agent::exec_sessions::ExecSessionManager::new();

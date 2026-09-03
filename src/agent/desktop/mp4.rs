@@ -77,7 +77,7 @@ fn mvhd(timescale: u32) -> Vec<u8> {
     p.extend_from_slice(&u32b(0x00010000)); // rate
     p.extend_from_slice(&u16b(0x0100)); // volume
     p.extend_from_slice(&[0u8; 2]); // reserved
-    p.extend_from_slice(&[0u8; 10]); // reserved
+    p.extend_from_slice(&[0u8; 8]); // reserved
     p.extend_from_slice(&matrix);
     p.extend_from_slice(&[0u8; 24]); // predefined
     p.extend_from_slice(&u32b(2)); // next_track_id
@@ -155,7 +155,8 @@ fn avcc(cfg: &Mp4Config) -> Vec<u8> {
     p.push(1); // numOfPictureParameterSets
     p.extend_from_slice(&u16b(cfg.pps.len() as u16));
     p.extend_from_slice(&cfg.pps);
-    full_box(b"avcC", 0, [0, 0, 0], &p)
+    // avcC 是普通 box（不含 version/flags），勿用 full_box。
+    box_of(b"avcC", &p)
 }
 
 fn avc1(cfg: &Mp4Config) -> Vec<u8> {
@@ -285,11 +286,14 @@ pub fn mp4_fragment(cfg: &Mp4Config, sample: &[u8], pts_ms: u64, is_key: bool, s
         p.extend_from_slice(&u32b(seq));
         full_box(b"mfhd", 0, [0, 0, 0], &p)
     };
-    // tfhd: flags = default-base-is-moof | track-id-present
+    // tfhd: flags = default-base-is-moof(0x020000)。注意不能带 0x1 —— ffmpeg
+    // 把 0x1 解释为 base-data-offset-present 并强制再读 8 字节，导致 overread；
+    // ISO 语义则 0x1=track-id-present。track_ID 在两种解析器里都是无条件读取，
+    // 因此只置 0x020000 即可让 data_offset 相对 moof 起点。
     let tfhd = {
         let mut p = Vec::new();
         p.extend_from_slice(&u32b(1)); // track_ID
-        full_box(b"tfhd", 0, [2, 0, 1], &p)
+        full_box(b"tfhd", 0, [2, 0, 0], &p)
     };
     // tfdt: version 1, 8-byte baseMediaDecodeTime
     let tfdt = {
@@ -375,7 +379,19 @@ fn find_trun_data_offset(moof: &[u8]) -> usize {
 /// Convert an Annex-B byte stream (start-code separated NAL units) into an
 /// AVCC sample: each NAL prefixed with its 4-byte big-endian length. The
 /// fMP4 `mdat` layout requires length prefixes, not start codes.
+///
+/// SPS/PPS NAL units (types 7/8) are dropped — they live in the `avcC` box
+/// and must not appear in-band (combined in-band+avcC parameter sets are
+/// legal but poorly handled by both MSE and ffmpeg's MP4 demuxer).
+/// Returns `(avcc, has_key)` where `has_key` reports whether the VCL part
+/// contained an IDR slice (type 5).
 pub fn annexb_to_avcc(annexb: &[u8]) -> Vec<u8> {
+    let (out, _) = annexb_to_avcc_detailed(annexb);
+    out
+}
+
+/// Like [`annexb_to_avcc`] but also reports whether an IDR slice was present.
+pub fn annexb_to_avcc_detailed(annexb: &[u8]) -> (Vec<u8>, bool) {
     // Locate every start code (00 00 01).
     let n = annexb.len();
     let mut starts: Vec<usize> = Vec::new();
@@ -394,6 +410,7 @@ pub fn annexb_to_avcc(annexb: &[u8]) -> Vec<u8> {
     }
 
     let mut out = Vec::with_capacity(annexb.len());
+    let mut has_key = false;
     for (k, &s) in starts.iter().enumerate() {
         let e = starts.get(k + 1).copied().unwrap_or(n);
         let mut nal = &annexb[s..e];
@@ -403,10 +420,21 @@ pub fn annexb_to_avcc(annexb: &[u8]) -> Vec<u8> {
         } else if nal.len() >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1 {
             nal = &nal[3..];
         }
+        if nal.is_empty() {
+            continue;
+        }
+        let nal_type = nal[0] & 0x1f;
+        // 7=SPS, 8=PPS —— 参数集不进 sample
+        if nal_type == 7 || nal_type == 8 {
+            continue;
+        }
+        if nal_type == 5 {
+            has_key = true;
+        }
         out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
         out.extend_from_slice(nal);
     }
-    out
+    (out, has_key)
 }
 
 #[cfg(test)]

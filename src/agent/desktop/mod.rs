@@ -228,8 +228,8 @@ async fn run_desktop_loop(cfg: DesktopConfig, running: Arc<AtomicBool>, post: Po
             }
         };
 
-        if encoded.is_idr {
-            // Refresh SPS/PPS-derived mux config on every key frame.
+        if encoded.is_idr && mp4_cfg.is_none() {
+            // 首个 IDR 携带 SPS/PPS，一次性构建 mux config 并下发 init segment。
             if let (Some(sps), Some(pps)) = (&encoded.sps, &encoded.pps) {
                 let c = mp4::Mp4Config {
                     width: w as u32,
@@ -257,7 +257,7 @@ async fn run_desktop_loop(cfg: DesktopConfig, running: Arc<AtomicBool>, post: Po
         pts_ms += frame_ms;
         post(serde_json::json!({
             "type": "desktop:video",
-            "payload": { "kind": "frag", "data": base64(&frag) }
+            "payload": { "kind": "frag", "key": encoded.is_idr, "data": base64(&frag) }
         }));
 
         // Adaptive bitrate: 每 10 帧评估一次窗口并下发编码器目标码率。
@@ -265,7 +265,10 @@ async fn run_desktop_loop(cfg: DesktopConfig, running: Arc<AtomicBool>, post: Po
         if frame_idx % 10 == 0 {
             let now = start.elapsed().as_secs_f64();
             let target = abr.note_frame(now, encoded.nalu.len());
+            let before = enc.bitrate_bps();
             enc.set_bitrate(target);
+            let after = enc.bitrate_bps();
+            tracing::debug!("abr: target={target} before={before} after={after} nalu={}", encoded.nalu.len());
         }
 
         // 让画面持续可随机访问：每 2 秒一个 IDR。

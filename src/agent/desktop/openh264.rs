@@ -337,3 +337,25 @@ mod tests {
         let _ = a;
     }
 }
+#[cfg(test)]
+mod e2e_debug {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn repro_set_bitrate_after_encode() {
+        let mut enc = H264Encoder::new(320, 240, 800_000, 5.0).unwrap();
+        let i420 = vec![128u8; 320 * 240 * 3 / 2];
+        for i in 0..24 {
+            let f = enc.encode(&i420).expect("encode");
+            eprintln!("frame {i}: nalu={} is_idr={}", f.nalu.len(), f.is_idr);
+            if i % 10 == 9 {
+                let before = enc.bitrate_bps();
+                enc.set_bitrate(500_000);
+                let after = enc.bitrate_bps();
+                eprintln!("  bitrate before={before} after={after}");
+            }
+        }
+        eprintln!("DONE");
+    }
+}

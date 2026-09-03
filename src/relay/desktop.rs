@@ -1,18 +1,19 @@
 //! Relay-side desktop video fan-out.
 //!
-//! The agent POSTs `desktop:video` (kind `init` | `frag`, base64 fMP4 bytes).
+//! The agent POSTs `desktop:video` (kind `init` | `frag`, base64 fMP4 bytes;
+//! `frag` carries a `key` flag when the sample is a random-access point).
 //! This module keeps one [`DesktopStream`] per session: an `init` byte cache
-//! (replayed to late joiners) plus the set of currently connected browsers
-//! waiting on `GET /agent/desktop/stream`. Each viewer gets the init bytes
-//! first, then every fragment appended afterwards — exactly the byte layout
-//! browser MSE needs.
+//! (replayed to late joiners) plus the set of connected browsers waiting on
+//! `GET /agent/desktop/stream`. Each viewer receives the init bytes first,
+//! then fragments — and non-key fragments are dropped until the viewer has
+//! seen its first key frame, so every stream starts at an IDR (browser MSE
+//! and ffmpeg both discard media before a random-access point).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::relay::SharedState;
-use axum::body::Bytes;
 
 /// Shared, cloneable fan-out state for one session's desktop stream.
 #[derive(Clone)]
@@ -20,12 +21,19 @@ pub struct DesktopStream {
     inner: Arc<Inner>,
 }
 
+/// One connected viewer: its send channel plus whether a key frame has been
+/// delivered yet (fragments before the first key frame are dropped).
+struct ViewerCtx {
+    tx: mpsc::Sender<Vec<u8>>,
+    key_ok: bool,
+}
+
 struct Inner {
     /// Latest fMP4 init segment (ftyp+moov). New viewers are replayed this
     /// before any fragments.
     init: tokio::sync::RwLock<Option<Vec<u8>>>,
     /// connected viewers, keyed by a per-connection id.
-    viewers: tokio::sync::RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>,
+    viewers: tokio::sync::RwLock<HashMap<String, ViewerCtx>>,
 }
 
 impl Default for DesktopStream {
@@ -48,19 +56,36 @@ impl DesktopStream {
     /// (a re-init after a codec/parameter-set change).
     pub async fn set_init(&self, bytes: Vec<u8>) {
         *self.inner.init.write().await = Some(bytes.clone());
-        self.broadcast(bytes).await;
+        self.broadcast_to_viewers(bytes).await;
     }
 
-    /// Forward one media fragment to all viewers.
-    pub async fn push_frag(&self, bytes: Vec<u8>) {
-        self.broadcast(bytes).await;
+    /// Forward one media fragment. `is_key` marks a random-access frame.
+    pub async fn push_frag(&self, is_key: bool, bytes: Vec<u8>) {
+        let mut viewers = self.inner.viewers.write().await;
+        let mut dead = Vec::new();
+        for (id, ctx) in viewers.iter_mut() {
+            if !ctx.key_ok && !is_key {
+                continue;
+            }
+            ctx.key_ok = true;
+            if ctx.tx.try_send(bytes.clone()).is_err() {
+                dead.push(id.clone());
+            }
+        }
+        drop(viewers);
+        if !dead.is_empty() {
+            let mut w = self.inner.viewers.write().await;
+            for id in dead {
+                w.remove(&id);
+            }
+        }
     }
 
-    async fn broadcast(&self, bytes: Vec<u8>) {
+    async fn broadcast_to_viewers(&self, bytes: Vec<u8>) {
         let viewers = self.inner.viewers.read().await;
         let mut dead = Vec::new();
-        for (id, tx) in viewers.iter() {
-            if tx.try_send(bytes.clone()).is_err() {
+        for (id, ctx) in viewers.iter() {
+            if ctx.tx.try_send(bytes.clone()).is_err() {
                 dead.push(id.clone());
             }
         }
@@ -74,10 +99,15 @@ impl DesktopStream {
     }
 
     /// Register a new viewer. Returns `(viewer_id, receiver, cached_init)`.
+    /// The receiver yields no fragments until the first key frame arrives.
     pub async fn add_viewer(&self) -> (String, mpsc::Receiver<Vec<u8>>, Option<Vec<u8>>) {
         let id = format!("dv_{}", uuid::Uuid::new_v4().simple());
         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
-        self.inner.viewers.write().await.insert(id.clone(), tx);
+        self.inner
+            .viewers
+            .write()
+            .await
+            .insert(id.clone(), ViewerCtx { tx, key_ok: false });
         let init = self.inner.init.read().await.clone();
         (id, rx, init)
     }
@@ -87,143 +117,13 @@ impl DesktopStream {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_init_cached_and_replayed_to_existing_viewer() {
-        let st = DesktopStream::new();
-        let (_vid, mut rx, init) = st.add_viewer().await;
-        assert!(init.is_none());
-        st.set_init(vec![1, 2, 3]).await;
-        st.push_frag(vec![4, 5]).await;
-        assert_eq!(rx.recv().await.unwrap(), vec![1, 2, 3]);
-        assert_eq!(rx.recv().await.unwrap(), vec![4, 5]);
-    }
-
-    #[tokio::test]
-    async fn test_new_viewer_receives_cached_init_as_return_value() {
-        // init 通过 add_viewer 的返回值下发（stream handler 先 yield init 再
-        // 转发 channel 中的 fragments）；channel 只承载 init 之后的碎片。
-        let st = DesktopStream::new();
-        st.set_init(vec![9, 9]).await;
-        let (_vid, mut rx, init) = st.add_viewer().await;
-        assert_eq!(init, Some(vec![9, 9]));
-        st.push_frag(vec![7]).await;
-        assert_eq!(rx.recv().await.unwrap(), vec![7]);
-    }
-
-    #[tokio::test]
-    async fn test_dead_viewer_cleaned_on_broadcast() {
-        let st = DesktopStream::new();
-        let (vid, rx, _) = st.add_viewer().await;
-        drop(rx); // 消费端消失 → try_send 失败
-        st.push_frag(vec![1]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        st.remove_viewer(&vid).await;
-        let viewers = st.inner.viewers.read().await.len();
-        assert_eq!(viewers, 0);
-    }
-
-    // ── stream_handler integration ─────────────────────────────
-
-    use axum::http::HeaderMap;
-
-    fn bearer_headers(token: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
-        h
-    }
-
-    #[tokio::test]
-    async fn test_stream_handler_requires_auth() {
-        let state = Arc::new(crate::relay::SharedState::new(
-            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
-        ));
-        let resp = stream_handler(
-            State(state),
-            HeaderMap::new(),
-            Query(HashMap::new()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn test_stream_handler_valid_token_streams_init_then_frags() {
-        let state = Arc::new(crate::relay::SharedState::new(
-            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
-        ));
-        let r = state.sessions.register(None, "rw", None).await.unwrap();
-        let sid = r.session_id.clone();
-        let token = r.tokens[0].0.clone();
-
-        let ds = DesktopStream::new();
-        ds.set_init(vec![0x1, 0x2, 0x3]).await;
-        state.desktop_streams.write().await.insert(sid.clone(), ds.clone());
-
-        let resp = stream_handler(
-            State(state),
-            bearer_headers(&token),
-            Query(HashMap::new()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        use tokio_stream::StreamExt as _;
-        let mut body = resp.into_body().into_data_stream();
-        // 首个 chunk = 缓存的 init
-        let first = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            body.next(),
-        )
-        .await
-        .expect("init chunk")
-        .unwrap()
-        .unwrap()
-        .to_vec();
-        assert_eq!(first, vec![0x1, 0x2, 0x3]);
-
-        // 随后 agent push frag → 该 viewer 收到
-        ds.push_frag(vec![0xaa, 0xbb]).await;
-        let second = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            body.next(),
-        )
-        .await
-        .expect("frag chunk")
-        .unwrap()
-        .unwrap()
-        .to_vec();
-        assert_eq!(second, vec![0xaa, 0xbb]);
-    }
-
-    #[tokio::test]
-    async fn test_stream_handler_inactive_stream_404() {
-        let state = Arc::new(crate::relay::SharedState::new(
-            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
-        ));
-        let r = state.sessions.register(None, "rw", None).await.unwrap();
-        let token = r.tokens[0].0.clone();
-        let resp = stream_handler(
-            State(state),
-            bearer_headers(&token),
-            Query(HashMap::new()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-}
 // ── GET /agent/desktop/stream ─────────────────────────────────
 
+use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::body::Body;
 use std::convert::Infallible;
 use tokio_stream::StreamExt as _;
 
@@ -237,12 +137,13 @@ pub async fn stream_handler(
     headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let token = match crate::relay::auth::extract_token_from_headers_or_query(&headers, params.get("token")) {
-        Some(t) => t,
-        None => {
-            return (StatusCode::UNAUTHORIZED, "Missing token").into_response();
-        }
-    };
+    let token =
+        match crate::relay::auth::extract_token_from_headers_or_query(&headers, params.get("token")) {
+            Some(t) => t,
+            None => {
+                return (StatusCode::UNAUTHORIZED, "Missing token").into_response();
+            }
+        };
     let (session_id, _perm) = match state.sessions.authenticate(&token).await {
         Some(r) => r,
         None => return (StatusCode::UNAUTHORIZED, "Invalid token").into_response(),
@@ -307,5 +208,143 @@ impl Drop for ViewerGuard {
         tokio::spawn(async move {
             st.remove_viewer(&id).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_init_cached_and_replayed() {
+        let st = DesktopStream::new();
+        let (_vid, mut rx, init) = st.add_viewer().await;
+        assert!(init.is_none());
+        st.set_init(vec![1, 2, 3]).await;
+        st.push_frag(true, vec![4, 5]).await; // key
+        st.push_frag(false, vec![6]).await; // p
+        assert_eq!(rx.recv().await.unwrap(), vec![1, 2, 3]);
+        assert_eq!(rx.recv().await.unwrap(), vec![4, 5]);
+        assert_eq!(rx.recv().await.unwrap(), vec![6]);
+    }
+
+    #[tokio::test]
+    async fn test_new_viewer_gets_init_then_gated_on_key() {
+        let st = DesktopStream::new();
+        st.set_init(vec![9, 9]).await;
+        let (_vid, mut rx, init) = st.add_viewer().await;
+        assert_eq!(init, Some(vec![9, 9]));
+
+        // 关键帧到达前, 非关键帧被丢弃
+        st.push_frag(false, vec![1]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "non-key frag must be gated");
+
+        // 关键帧到达后开始放行（init 通过返回值下发, channel 只有后续帧）
+        st.push_frag(true, vec![2]).await;
+        st.push_frag(false, vec![3]).await;
+        assert_eq!(rx.recv().await.unwrap(), vec![2]);
+        assert_eq!(rx.recv().await.unwrap(), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn test_dead_viewer_cleaned_on_broadcast() {
+        let st = DesktopStream::new();
+        let (vid, rx, _) = st.add_viewer().await;
+        drop(rx);
+        st.push_frag(true, vec![1]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        st.remove_viewer(&vid).await;
+        assert_eq!(st.inner.viewers.read().await.len(), 0);
+    }
+
+    // ── stream_handler integration ─────────────────────────────
+
+    use axum::http::HeaderMap;
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        h
+    }
+
+    #[tokio::test]
+    async fn test_stream_handler_requires_auth() {
+        let state = Arc::new(crate::relay::SharedState::new(
+            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        let resp = stream_handler(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_stream_handler_valid_token_streams_init_then_frags() {
+        let state = Arc::new(crate::relay::SharedState::new(
+            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let token = r.tokens[0].0.clone();
+
+        let ds = DesktopStream::new();
+        ds.set_init(vec![0x1, 0x2, 0x3]).await;
+        state.desktop_streams.write().await.insert(sid.clone(), ds.clone());
+
+        let resp = stream_handler(
+            State(state),
+            bearer_headers(&token),
+            Query(HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        use tokio_stream::StreamExt as _;
+        let mut body = resp.into_body().into_data_stream();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            body.next(),
+        )
+        .await
+        .expect("init chunk")
+        .unwrap()
+        .unwrap()
+        .to_vec();
+        assert_eq!(first, vec![0x1, 0x2, 0x3]);
+
+        ds.push_frag(true, vec![0xaa, 0xbb]).await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            body.next(),
+        )
+        .await
+        .expect("key frag chunk")
+        .unwrap()
+        .unwrap()
+        .to_vec();
+        assert_eq!(second, vec![0xaa, 0xbb]);
+    }
+
+    #[tokio::test]
+    async fn test_stream_handler_inactive_stream_404() {
+        let state = Arc::new(crate::relay::SharedState::new(
+            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let token = r.tokens[0].0.clone();
+        let resp = stream_handler(
+            State(state),
+            bearer_headers(&token),
+            Query(HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
