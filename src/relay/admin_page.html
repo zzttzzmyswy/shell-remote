@@ -172,19 +172,25 @@
 
 <button class="lang-toggle" id="langToggle" title="切换语言 / Switch language">中 / EN</button>
 
-<!-- Login view -->
-<div id="loginView" class="center-screen hidden">
-  <form class="login-card" id="loginForm" autocomplete="off">
-    <h1 data-i18n="app_title">shell-remote admin</h1>
-    <div class="sub" data-i18n="login_sub">Sign in to manage the relay.</div>
-    <label for="lu" data-i18n="username">Username</label>
-    <input id="lu" type="text" autocomplete="username" required>
-    <label for="lp" data-i18n="password">Password</label>
-    <input id="lp" type="password" autocomplete="current-password" required>
-    <button type="submit" class="btn btn-primary btn-block" data-i18n="login">Login</button>
-    <div class="err" id="loginErr"></div>
-  </form>
-</div>
+<!-- Login view. Kept as a template: once logged in the form is REMOVED from
+     the DOM (not just hidden) so the browser's password manager stops treating
+     this page as a credential form. With a username/password form persistently
+     in the tree, Chrome overrides autocomplete=off and autofills saved
+     passwords into the devices search box. Re-mounted on logout. -->
+<template id="loginTmpl">
+  <div id="loginView" class="center-screen hidden">
+    <form class="login-card" id="loginForm" autocomplete="off">
+      <h1 data-i18n="app_title">shell-remote admin</h1>
+      <div class="sub" data-i18n="login_sub">Sign in to manage the relay.</div>
+      <label for="lu" data-i18n="username">Username</label>
+      <input id="lu" type="text" autocomplete="off" name="sr_login_user" required>
+      <label for="lp" data-i18n="password">Password</label>
+      <input id="lp" type="password" autocomplete="off" name="sr_login_pass" required>
+      <button type="submit" class="btn btn-primary btn-block" data-i18n="login">Login</button>
+      <div class="err" id="loginErr"></div>
+    </form>
+  </div>
+</template>
 
 <!-- Dashboard view -->
 <div id="dashView" class="wrap hidden">
@@ -245,7 +251,7 @@
       <span class="filter-count" id="devCount"></span>
     </div>
     <div class="filter-bar">
-      <input type="text" id="devFilter" autocomplete="off" data-i18n-ph="dev_filter_ph" placeholder="Filter devices…">
+      <input type="text" id="devFilter" name="sr_device_filter" autocomplete="off" readonly data-i18n-ph="dev_filter_ph" placeholder="Filter devices…">
       <select id="devArchFilter" title="arch">
         <option value="" data-i18n="dev_arch_all">All arch</option>
       </select>
@@ -399,7 +405,7 @@
   const BASE = location.pathname.replace(/\/$/, '');
 
   const $ = (id) => document.getElementById(id);
-  const loginView = $('loginView'), dashView = $('dashView');
+  const dashView = $('dashView');
 
   // --- i18n ---
   const i18n = {
@@ -730,12 +736,45 @@
 
   function showLogin() {
     dashView.classList.add('hidden');
-    loginView.classList.remove('hidden');
+    mountLogin().classList.remove('hidden');
     $('lu').focus();
   }
   function showDash() {
-    loginView.classList.add('hidden');
+    // Physically drop the login form from the DOM once inside — Chrome keeps
+    // autofilling saved passwords into this single-page app's other text
+    // fields as long as the username/password form remains in the tree.
+    const view = document.getElementById('loginView');
+    if (view) view.remove();
     dashView.classList.remove('hidden');
+  }
+
+  // Mount the login card from the template (re-created on every logout so the
+  // form's ids and listeners stay unique) and bind its submit handler.
+  function mountLogin() {
+    let view = document.getElementById('loginView');
+    if (view) return view;
+    const frag = document.getElementById('loginTmpl').content.cloneNode(true);
+    dashView.insertAdjacentElement('beforebegin', frag.querySelector('#loginView'));
+    view = document.getElementById('loginView');
+    $('loginForm').addEventListener('submit', onLoginSubmit);
+    applyStaticI18n();
+    return view;
+  }
+
+  async function onLoginSubmit(e) {
+    e.preventDefault();
+    const err = $('loginErr');
+    err.textContent = '';
+    const user = $('lu').value, pass = $('lp').value;
+    try {
+      await api('/login', { method: 'POST', body: { user, pass } });
+      $('lp').value = '';
+      showDash();
+      startRefresh();
+      refresh();
+    } catch (ex) {
+      err.textContent = ex.message === t('unauthorized') ? t('invalid_credentials') : (t('login_failed') + ex.message);
+    }
   }
 
   // --- Tabs ---
@@ -797,23 +836,6 @@
     const p = (n) => String(n).padStart(2, '0');
     return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
   }
-
-  // --- Login ---
-  $('loginForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const err = $('loginErr');
-    err.textContent = '';
-    const user = $('lu').value, pass = $('lp').value;
-    try {
-      await api('/login', { method: 'POST', body: { user, pass } });
-      $('lp').value = '';
-      showDash();
-      startRefresh();
-      refresh();
-    } catch (ex) {
-      err.textContent = ex.message === t('unauthorized') ? t('invalid_credentials') : (t('login_failed') + ex.message);
-    }
-  });
 
   $('logoutBtn').addEventListener('click', async () => {
     try { await api('/logout', { method: 'POST' }); } catch (_) {}
@@ -1224,6 +1246,10 @@
   }
 
   $('devFilter').addEventListener('input', (e) => { devQuery = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
+  // The filter box starts `readonly` so Chrome's password manager never fills
+  // saved credentials into it (readonly inputs are skipped by autofill);
+  // once the user interacts it behaves like a normal search box.
+  $('devFilter').addEventListener('focus', function () { this.removeAttribute('readonly'); });
   $('devArchFilter').addEventListener('change', (e) => { devArch = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
   $('devStatusFilter').addEventListener('change', (e) => { devStatus = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
 
