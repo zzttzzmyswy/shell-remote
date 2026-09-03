@@ -2,7 +2,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
-use crate::proto::Permission;
+use crate::proto::{DeviceInfo, Permission};
 
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -10,6 +10,9 @@ pub struct SessionInfo {
     #[allow(dead_code)]
     pub fixed_key: Option<String>,
     pub is_temporary: bool,
+    /// Best-effort host probe reported by the agent at registration. `None`
+    /// for older agents / failed probes.
+    pub device: Option<DeviceInfo>,
 }
 
 pub struct SessionRegistry {
@@ -113,6 +116,7 @@ impl SessionRegistry {
                     tokens: tokens.clone(),
                     fixed_key,
                     is_temporary,
+                    device: None,
                 },
             );
         }
@@ -184,6 +188,7 @@ impl SessionRegistry {
                     tokens: tokens.clone(),
                     fixed_key: None,
                     is_temporary: true,
+                    device: None,
                 },
             );
         }
@@ -217,6 +222,16 @@ impl SessionRegistry {
             .get(session_id)
             .map(|s| s.is_temporary)
             .unwrap_or(false)
+    }
+
+    /// Store/replace the device probe reported by an agent at registration.
+    /// Registered separately from `register` so the registry's token flow stays
+    /// untouched — the agent sends `device` alongside `agent:register` and the
+    /// relay wires it in right after the session is minted.
+    pub async fn set_device(&self, session_id: &str, device: Option<DeviceInfo>) {
+        if let Some(info) = self.sessions.write().await.get_mut(session_id) {
+            info.device = device;
+        }
     }
 
     pub async fn count(&self) -> usize {
@@ -643,6 +658,33 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].0, r.session_id);
         assert_eq!(list[0].1.tokens.len(), 2);
+        assert!(list[0].1.device.is_none(), "no device reported by default");
+    }
+
+    #[tokio::test]
+    async fn test_set_device_stores_and_replaces() {
+        let registry = SessionRegistry::new();
+        let r = registry.register(None, "rw", Some("dev01".to_string())).await.unwrap();
+        let sid = r.session_id.clone();
+        // Unknown session is a silent no-op.
+        registry.set_device("nope", Some(DeviceInfo::default())).await;
+
+        let di = DeviceInfo {
+            hostname: Some("box1".to_string()),
+            platform: Some("linux".to_string()),
+            arch: Some("x86_64".to_string()),
+            os: Some("Linux".to_string()),
+            kernel: Some("6.1.0".to_string()),
+            cpu_model: Some("Intel(R) Xeon(R)".to_string()),
+        };
+        registry.set_device(&sid, Some(di.clone())).await;
+        let list = registry.list_sessions().await;
+        assert_eq!(list[0].1.device, Some(di));
+
+        // Clear it.
+        registry.set_device(&sid, None).await;
+        let list = registry.list_sessions().await;
+        assert!(list[0].1.device.is_none());
     }
 
     #[tokio::test]

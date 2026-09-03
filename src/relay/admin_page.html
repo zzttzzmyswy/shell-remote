@@ -60,6 +60,23 @@
   .card .v { font-size: 22px; font-weight: 600; margin-top: 6px; }
   .card .v small { font-size: 13px; color: var(--muted); font-weight: 400; }
 
+  /* Tabs */
+  .tabbar { display: flex; gap: 2px; flex-wrap: wrap; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+  .tab-btn { background: transparent; border: none; color: var(--muted); padding: 10px 16px; font-size: 14px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 500; }
+  .tab-btn:hover { color: var(--text); background: rgba(137,180,250,.06); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .tab-panel { display: block; }
+
+  /* Device filter bar */
+  .filter-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
+  .filter-bar input[type="text"], .filter-bar select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    color: var(--text); outline: none; font-size: 13px;
+  }
+  .filter-bar input[type="text"] { flex: 1 1 220px; min-width: 180px; }
+  .filter-bar input[type="text"]:focus, .filter-bar select:focus { border-color: var(--accent); }
+  .filter-count { color: var(--muted); font-size: 12px; }
+
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 22px; }
   .panel h2 { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
 
@@ -173,13 +190,25 @@
     <button class="btn" id="logoutBtn" data-i18n="logout">Logout</button>
   </div>
 
+  <nav class="tabbar" id="tabbar">
+    <button class="tab-btn active" type="button" data-tab="overview" data-i18n="tab_overview">Overview</button>
+    <button class="tab-btn" type="button" data-tab="sessions" data-i18n="tab_sessions">Sessions</button>
+    <button class="tab-btn" type="button" data-tab="devices" data-i18n="tab_devices">Devices</button>
+    <button class="tab-btn" type="button" data-tab="recordings" data-i18n="tab_recordings">Recordings</button>
+    <button class="tab-btn" type="button" data-tab="accesslog" data-i18n="tab_accesslog">Access log</button>
+    <button class="tab-btn" type="button" data-tab="settings" data-i18n="tab_settings">Settings</button>
+  </nav>
+
+  <section class="tab-panel" id="tab-overview">
   <div class="cards">
     <div class="card"><div class="k" data-i18n="card_agents">Agents</div><div class="v" id="cAgents">— <small>/ —</small></div></div>
     <div class="card"><div class="k" data-i18n="card_browsers">Browsers</div><div class="v" id="cBrowsers">—</div></div>
     <div class="card"><div class="k" data-i18n="card_uptime">Uptime</div><div class="v" id="cUptime">—</div></div>
     <div class="card"><div class="k" data-i18n="card_version">Version</div><div class="v" id="cVersion">—</div></div>
   </div>
+  </section>
 
+  <section class="tab-panel hidden" id="tab-sessions">
   <div class="panel">
     <h2 data-i18n="sessions">Sessions</h2>
     <div style="overflow-x:auto;">
@@ -200,7 +229,48 @@
     </div>
     <div id="sessEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_sessions">No sessions.</div>
   </div>
+  </section>
 
+  <section class="tab-panel hidden" id="tab-devices">
+  <div class="panel">
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+      <h2 style="margin:0;" data-i18n="devices_title">Devices</h2>
+      <span class="filter-count" id="devCount"></span>
+    </div>
+    <div class="filter-bar">
+      <input type="text" id="devFilter" data-i18n-ph="dev_filter_ph" placeholder="Filter devices…">
+      <select id="devArchFilter" title="arch">
+        <option value="" data-i18n="dev_arch_all">All arch</option>
+      </select>
+      <select id="devStatusFilter" title="status">
+        <option value="" data-i18n="dev_status_all">All status</option>
+        <option value="online" data-i18n="online">Online</option>
+        <option value="offline" data-i18n="offline">Offline</option>
+      </select>
+    </div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th data-i18n="th_status">Status</th>
+            <th data-i18n="th_session_id">Session ID</th>
+            <th data-i18n="th_hostname">Hostname</th>
+            <th data-i18n="th_arch">Arch</th>
+            <th data-i18n="th_system">System</th>
+            <th data-i18n="th_cpu">CPU</th>
+            <th data-i18n="th_type">Type</th>
+            <th data-i18n="th_last_active">Last active</th>
+            <th data-i18n="th_actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="devicesBody"></tbody>
+      </table>
+    </div>
+    <div id="devicesEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_devices">No devices.</div>
+  </div>
+  </section>
+
+  <section class="tab-panel hidden" id="tab-recordings">
   <div class="panel">
     <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
       <h2 style="margin:0 0 0;" data-i18n="recordings">Recordings</h2>
@@ -230,7 +300,9 @@
       <button class="btn btn-sm" id="recNext" type="button" data-i18n="rec_next">下一页</button>
     </div>
   </div>
+  </section>
 
+  <section class="tab-panel hidden" id="tab-accesslog">
   <div class="panel">
     <h2 data-i18n="access_log">Access log</h2>
     <div style="overflow-x:auto;">
@@ -249,7 +321,9 @@
     </div>
     <div id="connLogEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_access_log">No access events yet.</div>
   </div>
+  </section>
 
+  <section class="tab-panel hidden" id="tab-settings">
   <div class="panel">
     <h2 data-i18n="server_password">Server password</h2>
     <div class="srv-row">
@@ -262,6 +336,7 @@
     </div>
     <div class="err" id="srvErr"></div>
   </div>
+  </section>
 </div>
 
 <!-- Player modal -->
@@ -409,7 +484,24 @@
       no_mcp_records: "无命令记录。",
       exit_code: "退出码",
       duration: "耗时",
-      perm: "权限"
+      perm: "权限",
+      tab_overview: "概览",
+      tab_sessions: "会话",
+      tab_devices: "设备",
+      tab_recordings: "录像",
+      tab_accesslog: "访问日志",
+      tab_settings: "设置",
+      devices_title: "设备管理",
+      dev_filter_ph: "搜索设备（会话ID / 主机名 / 架构 / 系统 / CPU）…",
+      dev_arch_all: "全部架构",
+      dev_status_all: "全部状态",
+      th_hostname: "主机名",
+      th_arch: "架构",
+      th_system: "系统",
+      th_cpu: "CPU",
+      no_devices: "暂无设备。",
+      dev_unreported: "（未上报设备信息）",
+      dev_count_x: "共 {n} 台"
     },
     en: {
       app_title: "shell-remote admin",
@@ -509,7 +601,24 @@
       no_mcp_records: "No command records.",
       exit_code: "exit",
       duration: "dur",
-      perm: "perm"
+      perm: "perm",
+      tab_overview: "Overview",
+      tab_sessions: "Sessions",
+      tab_devices: "Devices",
+      tab_recordings: "Recordings",
+      tab_accesslog: "Access log",
+      tab_settings: "Settings",
+      devices_title: "Devices",
+      dev_filter_ph: "Filter (session id / hostname / arch / system / CPU)…",
+      dev_arch_all: "All arch",
+      dev_status_all: "All status",
+      th_hostname: "Hostname",
+      th_arch: "Arch",
+      th_system: "System",
+      th_cpu: "CPU",
+      no_devices: "No devices.",
+      dev_unreported: "(no device info)",
+      dev_count_x: "{n} devices"
     }
   };
 
@@ -543,6 +652,7 @@
     if (lastOverview) {
       renderOverview(lastOverview);
       renderSessions(lastOverview.sessions || []);
+      renderDevices(lastOverview.sessions || []);
       renderConnLog(lastOverview.conn_log || []);
     }
     refreshRecordings();
@@ -576,6 +686,22 @@
     loginView.classList.add('hidden');
     dashView.classList.remove('hidden');
   }
+
+  // --- Tabs ---
+  const TAB_STORE = 'sr_admin_tab';
+  const TAB_IDS = ['overview', 'sessions', 'devices', 'recordings', 'accesslog', 'settings'];
+  function applyTab(name) {
+    if (TAB_IDS.indexOf(name) === -1) name = 'overview';
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('hidden', p.id !== ('tab-' + name)));
+    try { localStorage.setItem(TAB_STORE, name); } catch (_) {}
+  }
+  $('tabbar').addEventListener('click', (e) => {
+    const btn = e.target.closest('.tab-btn');
+    if (!btn) return;
+    applyTab(btn.dataset.tab);
+    if (btn.dataset.tab === 'devices' && lastOverview) renderDevices(lastOverview.sessions || []);
+  });
 
   // --- API ---
   async function api(path, opts) {
@@ -663,6 +789,7 @@
     lastOverview = o;
     renderOverview(o);
     renderSessions(o.sessions || []);
+    renderDevices(o.sessions || []);
     renderConnLog(o.conn_log || []);
     refreshRecordings();
   }
@@ -794,6 +921,145 @@
     }
   }
 
+  // Shared "connect to this session" button for the sessions and devices tables.
+  function buildConnectButton(s) {
+    const connToks = s.tokens || [];
+    const connectToken = (connToks.find(tk => tk.permission === 'rw') || connToks[0] || null);
+    const conn = document.createElement('button'); conn.className = 'btn btn-sm btn-primary';
+    if (connectToken) {
+      const isRo = !connToks.find(tk => tk.permission === 'rw');
+      conn.textContent = isRo ? t('connect_ro') : t('connect');
+      conn.title = t('connect');
+      conn.addEventListener('click', () => {
+        window.open('/?token=' + encodeURIComponent(connectToken.token), '_blank');
+      });
+    } else {
+      conn.textContent = t('no_token');
+      conn.disabled = true;
+    }
+    return conn;
+  }
+
+  // --- Devices table (device-management panel) ---
+  let devQuery = '', devArch = '', devStatus = '';
+
+  function renderDevices(sessions) {
+    sessions = sessions || [];
+    // Rebuild the arch filter dropdown, preserving the current selection.
+    const archSet = new Set();
+    sessions.forEach(s => {
+      const a = (s.device && s.device.arch) || '';
+      if (a) archSet.add(a);
+    });
+    const archSel = $('devArchFilter');
+    const prevArch = devArch;
+    archSel.textContent = '';
+    const optAll = document.createElement('option');
+    optAll.value = ''; optAll.textContent = t('dev_arch_all');
+    archSel.appendChild(optAll);
+    Array.from(archSet).sort().forEach(a => {
+      const o = document.createElement('option');
+      o.value = a; o.textContent = a;
+      archSel.appendChild(o);
+    });
+    devArch = archSet.has(prevArch) ? prevArch : '';
+    archSel.value = devArch;
+
+    const q = devQuery.trim().toLowerCase();
+    const filtered = sessions.filter(s => {
+      if (devStatus === 'online' && !s.online) return false;
+      if (devStatus === 'offline' && s.online) return false;
+      if (devArch && (!s.device || s.device.arch !== devArch)) return false;
+      if (!q) return true;
+      const d = s.device || {};
+      const hay = [s.session_id, d.hostname, d.platform, d.arch, d.os, d.kernel, d.cpu_model]
+        .filter(Boolean).join(' ').toLowerCase();
+      return hay.indexOf(q) !== -1;
+    });
+
+    $('devCount').textContent = t('dev_count_x', { n: filtered.length });
+    const body = $('devicesBody');
+    body.textContent = '';
+    $('devicesEmpty').classList.toggle('hidden', filtered.length > 0);
+    for (const s of filtered) {
+      body.appendChild(buildDeviceRow(s));
+    }
+  }
+
+  function buildDeviceRow(s) {
+    const d = s.device || {};
+    const tr = document.createElement('tr');
+
+    // Status
+    const tdSt = document.createElement('td');
+    const pill = document.createElement('span');
+    pill.className = 'status-pill ' + (s.online ? 'on' : 'off');
+    const dot = document.createElement('span'); dot.className = 'dot' + (s.online ? ' on' : '');
+    pill.appendChild(dot);
+    pill.appendChild(textNode(s.online ? t('online') : t('offline')));
+    tdSt.appendChild(pill);
+    tr.appendChild(tdSt);
+
+    // Session ID
+    const tdId = document.createElement('td');
+    tdId.appendChild(textNode(s.session_id || ''));
+    tr.appendChild(tdId);
+
+    // Hostname
+    const tdH = document.createElement('td');
+    tdH.appendChild(textNode(d.hostname || (s.session_id ? '' : t('dash_placeholder'))));
+    if (!d.hostname && s.device) tdH.appendChild(devUnreportedBadge());
+    tr.appendChild(tdH);
+
+    // Arch
+    const tdA = document.createElement('td'); tdA.className = 'mono';
+    tdA.appendChild(textNode(d.arch || t('dash_placeholder')));
+    tr.appendChild(tdA);
+
+    // System (OS · kernel)
+    const tdSys = document.createElement('td');
+    tdSys.appendChild(textNode([d.os, d.kernel].filter(Boolean).join(' · ') || t('dash_placeholder')));
+    tr.appendChild(tdSys);
+
+    // CPU model
+    const tdCpu = document.createElement('td');
+    tdCpu.appendChild(textNode(d.cpu_model || t('dash_placeholder')));
+    tr.appendChild(tdCpu);
+
+    // Type
+    const tdT = document.createElement('td');
+    tdT.appendChild(textNode(s.is_temporary ? t('type_temporary') : t('type_fixed')));
+    tr.appendChild(tdT);
+
+    // Last active
+    const tdAgo = document.createElement('td');
+    const ago = fmtAgo(s.last_active_seconds);
+    tdAgo.textContent = ago;
+    if (s.online && (s.last_active_seconds ?? 9999) < 60) {
+      tdAgo.className = 'recent';
+    }
+    tr.appendChild(tdAgo);
+
+    // Actions: connect only
+    const tdAct = document.createElement('td'); tdAct.className = 'actions';
+    tdAct.appendChild(buildConnectButton(s));
+    tr.appendChild(tdAct);
+
+    return tr;
+  }
+
+  function devUnreportedBadge() {
+    const b = document.createElement('span');
+    b.className = 'muted';
+    b.style.fontSize = '11px';
+    b.textContent = ' (' + t('dev_unreported') + ')';
+    return b;
+  }
+
+  $('devFilter').addEventListener('input', (e) => { devQuery = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
+  $('devArchFilter').addEventListener('change', (e) => { devArch = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
+  $('devStatusFilter').addEventListener('change', (e) => { devStatus = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
+
   // --- Access log table ---
   function renderConnLog(entries) {
     const body = $('connLogBody');
@@ -874,21 +1140,7 @@
 
     // Actions
     const tdA = document.createElement('td'); tdA.className = 'actions';
-    const connToks = s.tokens || [];
-    const connectToken = (connToks.find(tk => tk.permission === 'rw') || connToks[0] || null);
-    const conn = document.createElement('button'); conn.className = 'btn btn-sm btn-primary';
-    if (connectToken) {
-      const isRo = !connToks.find(tk => tk.permission === 'rw');
-      conn.textContent = isRo ? t('connect_ro') : t('connect');
-      conn.title = t('connect');
-      conn.addEventListener('click', () => {
-        window.open('/?token=' + encodeURIComponent(connectToken.token), '_blank');
-      });
-    } else {
-      conn.textContent = t('no_token');
-      conn.disabled = true;
-    }
-    tdA.appendChild(conn);
+    tdA.appendChild(buildConnectButton(s));
     const regen = document.createElement('button'); regen.className = 'btn btn-sm'; regen.textContent = t('regenerate');
     regen.style.marginLeft = '6px';
     regen.addEventListener('click', () => onRegenerate(s));
@@ -1202,6 +1454,9 @@
   // --- Boot ---
   (async function boot() {
     applyStaticI18n();
+    let savedTab = null;
+    try { savedTab = localStorage.getItem(TAB_STORE); } catch (_) {}
+    applyTab(savedTab || 'overview');
     try {
       await api('/api/overview');
       showDash();

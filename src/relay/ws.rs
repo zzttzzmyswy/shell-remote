@@ -69,6 +69,44 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 }
             }
         }
+        // Desktop video: fan out init/fragments to browsers subscribed on
+        // /agent/desktop/stream. Own channel — never goes through the normal
+        // broadcast list or the replay EventBuffer (fragments are large and
+        // of no use to late SSE joiners — the desktop stream replays its own
+        // init cache).
+        if proto_msg.msg_type == "desktop:video" {
+            let kind = proto_msg.payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let data_b64 = proto_msg.payload.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(bytes) = crate::agent::fs::decode_b64(data_b64) {
+                let ds = {
+                    let mut streams = state.desktop_streams.write().await;
+                    streams
+                        .entry(session_id.to_string())
+                        .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                        .clone()
+                };
+                tracing::debug!("desktop:video kind={kind} bytes={}", bytes.len());
+                if kind == "init" {
+                    ds.set_init(bytes).await;
+                } else {
+                    let is_key = proto_msg
+                        .payload
+                        .get("key")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    ds.push_frag(is_key, bytes).await;
+                }
+            }
+            return;
+        }
+
+        // 桌面控制事件必须回到浏览器（web/session.js 监听这三个）。
+        // desktop:stopped 同时清理该会话的 fan-out 流，避免 DesktopStream
+        // 长期残留在 map 中。
+        if proto_msg.msg_type == "desktop:stopped" {
+            state.desktop_streams.write().await.remove(session_id);
+        }
+
         let broadcast_types = [
             "session:users",
             "session:tab_list",
@@ -77,6 +115,9 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "fs:result",
             "fs:mkdir",
             "mcp:result",
+            "desktop:started",
+            "desktop:stopped",
+            "desktop:capabilities",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {
             // fs:result is browser-facing (file manager reads + downloads).
@@ -383,6 +424,15 @@ pub async fn agent_send_handler(
                 .or_insert_with(ChannelMap::new);
         }
 
+        // Store the agent's best-effort host probe (CPU model, arch, OS, …).
+        // Older agents omit `device` entirely → stays None; a malformed object
+        // is ignored rather than failing the registration.
+        let device = body
+            .get("device")
+            .and_then(|v| serde_json::from_value::<crate::proto::DeviceInfo>(v.clone()).ok())
+            .filter(|d| !d.is_empty());
+        state.sessions.set_device(&session_id, device).await;
+
         return Json(json!({
             "type": "agent:registered",
             "session_id": session_id,
@@ -488,22 +538,50 @@ impl Drop for AgentEventsCleanup {
         let tx = self.tx.clone();
         let bulk_tx = self.bulk_tx.clone();
         tokio::spawn(async move {
-            let mut broadcast = state.agent_broadcast.write().await;
-            if let Some(cm) = broadcast.get_mut(&session_id) {
-                let mut cleared = false;
-                if cm.agent.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
-                    cm.agent = None;
-                    cleared = true;
+            // Capture the browsers to notify while holding the broadcast lock,
+            // then deliver after dropping it (deliver needs the sse_sessions
+            // read lock, and nested lock ordering here is awkward).
+            let notify_browsers: Vec<String> = {
+                let mut broadcast = state.agent_broadcast.write().await;
+                if let Some(cm) = broadcast.get_mut(&session_id) {
+                    let mut cleared = false;
+                    if cm.agent.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
+                        cm.agent = None;
+                        cleared = true;
+                    }
+                    if cm.agent_bulk.as_ref().is_some_and(|cur| cur.same_channel(&bulk_tx)) {
+                        cm.agent_bulk = None;
+                        cleared = true;
+                    }
+                    if cleared {
+                        tracing::info!(
+                            session = %session_id,
+                            "agent SSE disconnected — agent channels cleared"
+                        );
+                        // No newer connection replaced this one → the agent is
+                        // genuinely gone. Tell every connected browser so it can
+                        // show a status and auto-rejoin instead of staring at a
+                        // frozen/empty terminal.
+                        cm.browser_sessions.values().cloned().collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
                 }
-                if cm.agent_bulk.as_ref().is_some_and(|cur| cur.same_channel(&bulk_tx)) {
-                    cm.agent_bulk = None;
-                    cleared = true;
-                }
-                if cleared {
-                    tracing::info!(
-                        session = %session_id,
-                        "agent SSE disconnected — agent channels cleared"
-                    );
+            };
+            if !notify_browsers.is_empty() {
+                let msg = serde_json::json!({
+                    "type": "session:agent_disconnect",
+                    "session_id": session_id,
+                    "payload": {},
+                })
+                .to_string();
+                let sse_sessions = state.sse_sessions.read().await;
+                for sse_sid in notify_browsers {
+                    if let Some(tx) = sse_sessions.get(&sse_sid) {
+                        deliver(tx, "session:agent_disconnect", msg.clone());
+                    }
                 }
             }
         });
@@ -640,6 +718,29 @@ pub async fn browser_sse_handler(
         }
     };
 
+    // Fast-fail with a clear error instead of connecting into a session whose
+    // agent link is absent or not yet established — otherwise the browser sits
+    // on a permanently empty terminal (the classic "registered + token issued,
+    // but agent SSE never/again connected" case). The browser client shows the
+    // message and auto-retries until the agent comes back.
+    let agent_alive = {
+        let broadcast = state.agent_broadcast.read().await;
+        broadcast
+            .get(&session_id)
+            .and_then(|cm| cm.agent.as_ref())
+            .is_some()
+    };
+    if !agent_alive {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({
+                "error": "AGENT_NOT_CONNECTED",
+                "message": "agent is not connected"
+            })),
+        )
+            .into_response();
+    }
+
     let user_id = Uuid::new_v4().to_string();
     let sse_sid = format!("bs_{}", Uuid::new_v4());
     let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
@@ -670,19 +771,53 @@ pub async fn browser_sse_handler(
         }
     }
 
-    // Send session:join to agent
+    // Send session:join to the agent and VERIFY it was actually accepted. A
+    // stale sender (the agent's SSE incarnation died / was replaced, or the
+    // reconnect window before the new SSE lands) makes try_send return Closed;
+    // a never-draining queue makes it return Full. Both are unrecoverable for
+    // THIS join — silently dropping it is exactly the "device registered +
+    // token ok, but the browser terminal stays empty with zero logs on the
+    // agent" failure. Instead, tell this browser (via its own healthy SSE) to
+    // re-join so it keeps retrying until the agent link is real.
     let join_msg = json!({
         "type": "session:join",
         "session_id": session_id,
         "payload": { "user_id": user_id, "permission": perm_str }
     })
     .to_string();
+    let mut join_delivered = false;
     {
         let broadcast = state.agent_broadcast.read().await;
         if let Some(cm) = broadcast.get(&session_id) {
             if let Some(ref agent_tx) = cm.agent {
-                deliver(agent_tx, "session:join", join_msg);
+                match agent_tx.try_send(join_msg) {
+                    Ok(()) => join_delivered = true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            "session:join dropped — agent channel closed (stale SSE); browser will retry"
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            "session:join dropped — agent channel full; browser will retry"
+                        );
+                    }
+                }
             }
+        }
+    }
+    if !join_delivered {
+        let err_msg = serde_json::json!({
+            "type": "session:error",
+            "session_id": session_id,
+            "payload": { "code": "AGENT_NOT_CONNECTED" }
+        })
+        .to_string();
+        let sse_sessions = state.sse_sessions.read().await;
+        if let Some(tx) = sse_sessions.get(&sse_sid) {
+            deliver(tx, "session:error", err_msg);
         }
     }
 
@@ -919,6 +1054,60 @@ mod tests {
         (tx, rx)
     }
 
+    #[tokio::test]
+    async fn test_desktop_stopped_clears_stream_and_broadcasts() {
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        // 预先放入一个 stream，desktop:stopped 到达时应被移除
+        state
+            .desktop_streams
+            .write()
+            .await
+            .insert(sid.clone(), crate::relay::desktop::DesktopStream::new());
+        // 浏览器订阅者能收到 desktop:started/stopped 等控制事件
+        let (_agent_tx, _agent_rx) = insert_channel_map(&state, &sid).await;
+        let mut sse_rx = add_browser(&state, &sid, "brow1").await;
+
+        let stopped = serde_json::json!({
+            "type": "desktop:stopped",
+            "session_id": sid,
+            "payload": {}
+        });
+        route_agent_message(&state, &sid, &stopped.to_string()).await;
+
+        assert!(
+            state.desktop_streams.read().await.is_empty(),
+            "desktop:stopped must remove the fan-out stream"
+        );
+        let got = tokio::time::timeout(std::time::Duration::from_millis(2000), sse_rx.recv())
+            .await
+            .expect("browser must receive desktop:stopped")
+            .unwrap();
+        assert!(got.contains("desktop:stopped"), "got: {got}");
+    }
+
+    #[tokio::test]
+    async fn test_desktop_started_broadcasts_to_browsers() {
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        insert_channel_map(&state, &sid).await;
+        let mut sse_rx = add_browser(&state, &sid, "brow1").await;
+
+        let started = serde_json::json!({
+            "type": "desktop:started",
+            "session_id": sid,
+            "payload": { "codec": "h264", "width": 1280, "height": 720 }
+        });
+        route_agent_message(&state, &sid, &started.to_string()).await;
+        let got = tokio::time::timeout(std::time::Duration::from_millis(2000), sse_rx.recv())
+            .await
+            .expect("browser must receive desktop:started")
+            .unwrap();
+        assert!(got.contains("desktop:started") && got.contains("h264"), "got: {got}");
+    }
+
     async fn add_browser(
         state: &Arc<SharedState>,
         session_id: &str,
@@ -1133,6 +1322,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_send_register_stores_device() {
+        let state = make_state("");
+        let body = json!({
+            "type":"agent:register",
+            "token_type":"rw",
+            "session_id":"devA01",
+            "device": {
+                "hostname": "box-a",
+                "platform": "linux",
+                "arch": "x86_64",
+                "os": "Linux",
+                "kernel": "6.1.0",
+                "cpu_model": "Intel(R) Xeon(R)"
+            }
+        });
+        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let sessions = state.sessions.list_sessions().await;
+        let (sid, info) = &sessions[0];
+        assert_eq!(sid, "devA01");
+        let d = info.device.as_ref().expect("device must be stored");
+        assert_eq!(d.hostname.as_deref(), Some("box-a"));
+        assert_eq!(d.arch.as_deref(), Some("x86_64"));
+        assert_eq!(d.cpu_model.as_deref(), Some("Intel(R) Xeon(R)"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_register_ignores_malformed_device() {
+        let state = make_state("");
+        let body = json!({
+            "type":"agent:register",
+            "token_type":"rw",
+            "device": "not-an-object"
+        });
+        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200, "malformed device must not fail registration");
+        let sessions = state.sessions.list_sessions().await;
+        assert!(sessions[0].1.device.is_none());
+    }
+
+    #[tokio::test]
     async fn test_agent_send_register_reuses_cached_tokens() {
         let state = make_state("");
         let body = json!({
@@ -1216,6 +1450,130 @@ mod tests {
     }
 
     // ── browser_send_handler tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_browser_sse_rejects_when_agent_absent() {
+        // Registered session (valid token) but no agent channel → the browser
+        // must be rejected with a clear error instead of connecting into an
+        // empty terminal.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_rejects_when_agent_channel_gone() {
+        // Channel map exists but its agent link was cleared (e.g. stale SSE
+        // died) — same rejection, no empty terminal.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            broadcast.insert(sid, ChannelMap::new());
+        }
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_allows_when_agent_connected() {
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        insert_channel_map(&state, &r.session_id).await;
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_join_delivered_to_agent() {
+        // With a live agent channel, session:join must actually reach the
+        // agent receiver — the browser must not be left on a silent terminal.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let (tx, mut agent_rx) = insert_channel_map(&state, &r.session_id).await;
+        let _keep_tx = tx;
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), agent_rx.recv())
+            .await
+            .expect("join must be delivered to the agent")
+            .unwrap();
+        let v: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["type"], "session:join");
+        assert_eq!(v["payload"]["user_id"].as_str().is_some(), true);
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_join_dropped_on_stale_channel_notifies_browser() {
+        // cm.agent still points at a CLOSED sender (stale SSE incarnation from
+        // a reconnect/evict window). The accept check must notice and push a
+        // session:error to this browser so it auto-rejoins instead of staring
+        // at an empty terminal with zero agent-side logs.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let (closed_tx, closed_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        drop(closed_rx); // close the receiving end → sender reports Closed
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(closed_tx);
+            broadcast.insert(sid, cm);
+        }
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(State(state), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200, "agent sender exists, so not a hard 503");
+        // The join cannot be delivered → the browser SSE must carry a
+        // session:error ... read the SSE response stream until we see it.
+        let mut data_stream = resp.into_body().into_data_stream();
+        let mut saw_error = false;
+        use tokio_stream::StreamExt as _;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), data_stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    let text = String::from_utf8_lossy(&chunk).to_string();
+                    for line in text.lines() {
+                        if let Some(json_str) = line.strip_prefix("data: ") {
+                            if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+                                if v["type"] == "session:error"
+                                    && v["payload"]["code"] == "AGENT_NOT_CONNECTED"
+                                {
+                                    saw_error = true;
+                                }
+                            }
+                        }
+                    }
+                    if saw_error {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        drop(data_stream);
+        assert!(saw_error, "browser SSE must carry session:error for a stale agent channel");
+    }
 
     #[tokio::test]
     async fn test_browser_send_missing_token() {
@@ -1542,6 +1900,40 @@ mod tests {
             cm.agent_bulk.is_none(),
             "stale bulk channel must be cleared"
         );
+    }
+
+    #[tokio::test]
+    async fn test_agent_events_cleanup_notifies_browsers() {
+        // When the agent SSE stream ends (agent gone) and no newer connection
+        // replaced it, every connected browser of that session must receive a
+        // `session:agent_disconnect` event so it can auto-rejoin instead of
+        // staring at a frozen/empty terminal.
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let (tx, _rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (bulk_tx, _bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(tx.clone());
+            cm.agent_bulk = Some(bulk_tx.clone());
+            broadcast.insert(sid.clone(), cm);
+        }
+        let mut browser_rx = add_browser(&state, &sid, "user1").await;
+        drop(AgentEventsCleanup {
+            tx,
+            bulk_tx,
+            state: state.clone(),
+            session_id: sid.clone(),
+        });
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), browser_rx.recv())
+            .await
+            .expect("browser must be notified")
+            .unwrap();
+        let v: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["type"], "session:agent_disconnect");
+        assert_eq!(v["session_id"], sid);
     }
 
     #[tokio::test]

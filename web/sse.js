@@ -19,6 +19,18 @@
   var controller = null;          // AbortController for the active fetch
   var intentionalClose = false;   // true when we deliberately stop the stream
   var reconnectTimer = null;
+  var reconnectDelay = 1000;      // grows on failure, resets on success
+  var lastSessionError = null;    // dedup identical consecutive error toasts
+
+  function emit(type, obj) {
+    var hs = handlers[type];
+    if (hs) {
+      hs.slice().forEach(function(fn) { fn(obj); });
+    }
+    if (handlers['*']) {
+      handlers['*'].forEach(function(fn) { fn(obj); });
+    }
+  }
 
   window.shellRemote = {
     on: function(type, fn) {
@@ -46,7 +58,9 @@
       });
     },
     getUserId: function() { return userId; },
-    getPermission: function() { return permission; }
+    getPermission: function() { return permission; },
+    // Programmatic reconnect (used by the UI's join-ack watchdog / overlays).
+    reconnect: function() { scheduleReconnect(); }
   };
 
   function scheduleReconnect() {
@@ -55,7 +69,8 @@
     reconnectTimer = setTimeout(function() {
       reconnectTimer = null;
       connectSSE();
-    }, 3000);
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   }
 
   // Parse one SSE block (lines separated by \n) and dispatch to handlers.
@@ -88,24 +103,30 @@
     }
 
     if (eventName === 'connected') {
+      reconnectDelay = 1000; // a live connection resets the backoff
       try {
         userId = parsed.payload.user_id;
         permission = parsed.payload.permission;
       } catch (err) {
         console.warn('Failed to parse connected event:', err);
       }
-      if (handlers['connected']) {
-        handlers['connected'].forEach(function(fn) { fn(parsed); });
-      }
+      emit('connected', parsed);
       return;
     }
 
     var type = parsed.type;
-    if (handlers[type]) {
-      handlers[type].forEach(function(fn) { fn(parsed); });
-    }
-    if (handlers['*']) {
-      handlers['*'].forEach(function(fn) { fn(parsed); });
+    emit(type, parsed);
+
+    // The agent half of the session is gone (relay informed us). The browser
+    // SSE is still healthy; reconnect so we re-join once the agent is back —
+    // until then the relay answers with 503 and we keep retrying.
+    if (type === 'session:agent_disconnect') {
+      scheduleReconnect();
+    } else if (type === 'session:error' &&
+               parsed.payload && parsed.payload.code === 'AGENT_NOT_CONNECTED') {
+      // The relay tried to deliver our join but the agent channel was stale
+      // (closed/full). Retry — a rejoin will land once the agent link is real.
+      scheduleReconnect();
     }
   }
 
@@ -132,8 +153,21 @@
         if (resp.status === 401 || resp.status === 403) {
           window.location.href = '/';
         }
-        throw new Error('SSE HTTP ' + resp.status);
+        return resp.json().catch(function() { return {}; }).then(function(data) {
+          // Registered-but-unreachable agent: tell the UI (toast, dedup'd)
+          // and let the generic catch below keep retrying.
+          if (data.error === 'AGENT_NOT_CONNECTED') {
+            if (lastSessionError !== 'AGENT_NOT_CONNECTED') {
+              lastSessionError = 'AGENT_NOT_CONNECTED';
+              emit('session:error', { payload: { code: 'AGENT_NOT_CONNECTED' } });
+            }
+            throw new Error('AGENT_NOT_CONNECTED');
+          }
+          lastSessionError = null;
+          throw new Error('SSE HTTP ' + resp.status);
+        });
       }
+      lastSessionError = null;
       var reader = resp.body.getReader();
       var decoder = new TextDecoder();
 

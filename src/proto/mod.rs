@@ -126,6 +126,43 @@ pub struct ExecSessionInfo {
     pub started_at: u64,
 }
 
+/// Device/agent metadata probed by the agent at startup and reported in
+/// `agent:register`. All fields are best-effort — an absent/unknowable value
+/// is `None` (older agents omit the whole object). Used by the admin device
+/// management panel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeviceInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// "linux" | "macos" | "windows" | ...
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// CPU architecture as reported by `uname -m` / PROCESSOR_ARCHITECTURE.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    /// OS identity (e.g. "Linux", "Darwin", "Windows").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Kernel release (e.g. "5.15.0-86-generic").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    /// CPU model name (e.g. "Intel(R) Xeon(R) Platinum 8375C").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_model: Option<String>,
+}
+
+impl DeviceInfo {
+    /// True when no field carries a value (nothing was probed).
+    pub fn is_empty(&self) -> bool {
+        self.hostname.is_none()
+            && self.platform.is_none()
+            && self.arch.is_none()
+            && self.os.is_none()
+            && self.kernel.is_none()
+            && self.cpu_model.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserInfo {
     pub user_id: String,
@@ -414,5 +451,47 @@ mod tests {
         assert!(!json.contains("_mcp_request_id"));
         let decoded: ExecStartPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.cmd, "ls");
+    }
+
+    #[test]
+    fn test_device_info_roundtrip() {
+        let info = DeviceInfo {
+            hostname: Some("dev-01".to_string()),
+            platform: Some("linux".to_string()),
+            arch: Some("x86_64".to_string()),
+            os: Some("Linux".to_string()),
+            kernel: Some("5.15.0-86-generic".to_string()),
+            cpu_model: Some("Intel(R) Xeon(R) Platinum 8375C".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: DeviceInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, info);
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn test_device_info_default_empty() {
+        let info = DeviceInfo::default();
+        assert!(info.is_empty());
+        // An empty device object serializes to `{}` and roundtrips to the
+        // same default — the relay can always expect a valid DeviceInfo.
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(json, "{}");
+        let decoded: DeviceInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, DeviceInfo::default());
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_device_info_partial_fields() {
+        // Older agents / partial probes leave missing fields as None but keep
+        // the populated ones — the admin panel must not choke.
+        let json = r#"{"hostname":"box1","arch":"aarch64"}"#;
+        let decoded: DeviceInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.hostname.as_deref(), Some("box1"));
+        assert_eq!(decoded.arch.as_deref(), Some("aarch64"));
+        assert_eq!(decoded.cpu_model, None);
+        assert_eq!(decoded.platform, None);
+        assert!(!decoded.is_empty());
     }
 }

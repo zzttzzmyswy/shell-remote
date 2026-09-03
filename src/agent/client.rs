@@ -94,6 +94,10 @@ impl RelayClient {
 
         let http_client = reqwest::Client::new();
 
+        // Best-effort host probe (CPU model, arch, OS, …) reported with every
+        // registration so the admin device panel reflects the current host.
+        let device = crate::agent::device::probe().await;
+
         // On reconnect, replay the cached tokens so the relay reuses them
         // instead of minting new random ones (keeps shared tokens stable).
         let mut register_msg = if let Some(ct) = cached_tokens {
@@ -103,13 +107,15 @@ impl RelayClient {
                 .collect();
             json!({
                 "type": "agent:register",
-                "tokens": arr
+                "tokens": arr,
+                "device": device,
             })
         } else {
             json!({
                 "type": "agent:register",
                 "key": fixed_key,
-                "token_type": token_type
+                "token_type": token_type,
+                "device": device,
             })
         };
         if let Some(sid) = desired_session_id {

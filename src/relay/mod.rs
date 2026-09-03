@@ -6,6 +6,7 @@ pub mod session;
 pub mod ws;
 pub mod admin;
 pub mod recorder;
+pub mod desktop;
 pub mod file_transfer;
 
 use std::collections::{HashMap, VecDeque};
@@ -74,6 +75,9 @@ pub struct SharedState {
     /// Bounded audit trail of browser/MCP access events (bastion-style
     /// "who accessed which session, when, with what permission").
     pub conn_log: RwLock<std::collections::VecDeque<ConnLogEntry>>,
+    /// Desktop video fan-out per session (lazily created on first
+    /// `desktop:video` message).
+    pub desktop_streams: RwLock<HashMap<String, crate::relay::desktop::DesktopStream>>,
 }
 
 /// One entry in the access audit trail. `conn` is the session id, `prefix` is
@@ -203,6 +207,7 @@ impl SharedState {
             started_at: Instant::now(),
             recorder,
             conn_log: RwLock::new(std::collections::VecDeque::new()),
+            desktop_streams: RwLock::new(HashMap::new()),
         }
     }
 
@@ -337,6 +342,7 @@ mod tests {
             "style.css",
             "term.js",
             "files.js",
+            "desktop.js",
             "session.js",
             "install.sh",
         ];
@@ -968,6 +974,10 @@ pub async fn start(
             axum::routing::put(file_transfer::put_handler),
         )
         .route("/agent/mcp/get", axum::routing::get(file_transfer::get_handler))
+        .route(
+            "/agent/desktop/stream",
+            get(crate::relay::desktop::stream_handler),
+        )
         .route("/agent/install", get(install_script_handler))
         .route("/agent/install.ps1", get(install_script_ps1_handler))
         .route("/", get(static_handler))

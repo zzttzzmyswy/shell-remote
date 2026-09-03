@@ -15,6 +15,7 @@
         </div>
         <div class="toolbar-right">
             <button id="copy-token-btn" class="btn btn-small" title="复制密钥">复制密钥</button>
+            <button id="toggle-desktop-btn" class="btn btn-small" title="打开桌面画面（默认关闭）" disabled>桌面</button>
             <button id="toggle-files-btn" class="btn btn-small">文件</button>
         </div>
     </div>
@@ -24,6 +25,10 @@
     </div>
     <div class="main-content">
         <div id="terminal-container"></div>
+        <div id="desktop-container" class="desktop-container hidden">
+            <video id="desktop-video" autoplay muted playsinline></video>
+            <div id="desktop-status" class="desktop-status"></div>
+        </div>
         <div id="file-resizer" class="file-resizer"></div>
         <div id="file-drawer" class="file-drawer hidden">
             <div class="file-drawer-header">
@@ -59,6 +64,7 @@
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.js"></script>
     <script src="/sse.js"></script>
+    <script src="/desktop.js"></script>
     <script src="/term.js"></script>
     <script src="/files.js"></script>
     <script src="/session.js"></script>
