@@ -47,17 +47,16 @@ impl Abr {
         }
         let first = self.window.front().map_or(now_secs, |&(t, _)| t);
         let last = self.window.back().map_or(now_secs, |&(t, _)| t);
-        let period = if last - first > 0.0 {
-            last - first
-        } else {
-            0.1
-        };
-        // 样本过少(≤2)或时间跨度过短时不做判定, 避免窗口初期估算抖动
-        if self.window.len() < 3 && period < 0.2 {
+        let n = self.window.len();
+        if n < 2 {
             return self.target_bps;
         }
+        // 时长为"末帧时刻-首帧时刻+平均帧间隔"：首帧之前的半个周期也属于
+        // 这组字节的产生时间, 否则首帧密集下会高估码率。
+        let interval = (last - first) / (n - 1) as f64;
+        let duration = last - first + interval;
         let bytes: usize = self.window.iter().map(|&(_, b)| b).sum();
-        let actual = (bytes as f64) * 8.0 / period; // bps
+        let actual = (bytes as f64) * 8.0 / duration; // bps
 
         let target = self.target_bps.max(1) as f64;
         let rel = (actual - target) / target;
