@@ -13,6 +13,10 @@ use std::collections::VecDeque;
 pub struct Abr {
     min_bps: u64,
     max_bps: u64,
+    /// Dynamic effective ceiling (= `max_bps` until the browser reports an
+    /// available-bandwidth estimate; the target is clamped to this on weak
+    /// networks instead of blasting the configured peak).
+    ceiling_bps: u64,
     target_bps: u64,
     window: VecDeque<(f64, usize)>, // (elapsed seconds, frame bytes)
 }
@@ -25,9 +29,23 @@ impl Abr {
         Self {
             min_bps,
             max_bps,
+            ceiling_bps: max_bps,
             target_bps,
             window: VecDeque::new(),
         }
+    }
+
+    /// Adapt the effective ceiling to an observed available bandwidth
+    /// (clamped to `[min, configured_max]`); the target is pulled down with it
+    /// so a weak network stops the encoder from over-shooting.
+    pub fn set_ceiling(&mut self, ceiling: u64) {
+        self.ceiling_bps = ceiling.clamp(self.min_bps, self.max_bps);
+        self.target_bps = self.target_bps.clamp(self.min_bps, self.ceiling_bps);
+    }
+
+    /// Current effective ceiling in bits per second.
+    pub fn ceiling_bps(&self) -> u64 {
+        self.ceiling_bps
     }
 
     /// Current suggested bitrate in bits per second.
@@ -35,10 +53,10 @@ impl Abr {
         self.target_bps
     }
 
-    /// Pin the target to an explicit value (clamped to `[min,max]`). Used to
-    /// hold the bitrate at the ceiling while the encoder is frame-skipping.
+    /// Pin the target to an explicit value (clamped to `[min, ceiling]`). Used
+    /// to hold the bitrate at the ceiling while the encoder is frame-skipping.
     pub fn set_target(&mut self, bps: u64) {
-        self.target_bps = bps.clamp(self.min_bps, self.max_bps);
+        self.target_bps = bps.clamp(self.min_bps, self.ceiling_bps);
     }
 
     /// Record one encoded frame; returns the (possibly updated) target bps.
@@ -69,14 +87,14 @@ impl Abr {
         if rel.abs() <= 0.2 {
             return self.target_bps;
         }
-        let step = (0.02 * self.max_bps as f64 * rel.abs())
-            .clamp(0.01 * self.max_bps as f64, 0.20 * self.max_bps as f64);
+        let step = (0.02 * self.ceiling_bps as f64 * rel.abs())
+            .clamp(0.01 * self.ceiling_bps as f64, 0.20 * self.ceiling_bps as f64);
         let next = if rel > 0.0 {
             self.target_bps.saturating_sub(step as u64)
         } else {
             self.target_bps.saturating_add(step as u64)
         };
-        self.target_bps = next.clamp(self.min_bps, self.max_bps);
+        self.target_bps = next.clamp(self.min_bps, self.ceiling_bps);
         self.target_bps
     }
 }
@@ -135,5 +153,22 @@ mod tests {
                 "noise-free utilization must not churn target: {before} -> {after}"
             );
         }
+    }
+
+    #[test]
+    fn test_set_ceiling_clamps_target_down_and_restores() {
+        let mut a = Abr::new(80_000, 800_000);
+        assert_eq!(a.target_bps(), 440_000); // 中点 (80+800)/2
+        // 弱网回落: 带宽 120k → 天花板 120k, target 随即压到它
+        a.set_ceiling(120_000);
+        assert_eq!(a.ceiling_bps(), 120_000);
+        assert_eq!(a.target_bps(), 120_000);
+        a.set_target(800_000);
+        assert_eq!(a.target_bps(), 120_000, "target cannot exceed the ceiling");
+        // 网络恢复: 天花板恢复, target 允许回升
+        a.set_ceiling(800_000);
+        assert_eq!(a.ceiling_bps(), 800_000);
+        a.set_target(600_000);
+        assert_eq!(a.target_bps(), 600_000);
     }
 }

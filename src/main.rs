@@ -104,8 +104,8 @@ enum Command {
         #[arg(long, default_value_t = 800)]
         desktop_max_bitrate: u64,
 
-        /// Minimum encode bitrate in kbps (user request: 最低 200).
-        #[arg(long, default_value_t = 200)]
+        /// Minimum encode bitrate in kbps (static desktop ~80; dynamic raised by ABR).
+        #[arg(long, default_value_t = 80)]
         desktop_min_bitrate: u64,
 
         /// X11 display to capture (defaults to $DISPLAY).

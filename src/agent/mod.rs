@@ -1290,6 +1290,24 @@ async fn run_session(
                                     desktop.stop(post_fn.clone()).await;
                                 }
 
+                                "desktop:bitrate" => {
+                                    // 浏览器周期性上报的实测可用带宽 → 弱网自适应
+                                    // (把编码码率天花板 clamp 到网络可承受范围)。
+                                    if let Some(kbps) =
+                                        msg.payload["kbps"].as_u64()
+                                    {
+                                        if kbps > 0 {
+                                            desktop.set_bandwidth_bps(kbps * 1000);
+                                        }
+                                    } else if let Some(bps) =
+                                        msg.payload["bps"].as_u64()
+                                    {
+                                        if bps > 0 {
+                                            desktop.set_bandwidth_bps(bps);
+                                        }
+                                    }
+                                }
+
                                 "session:leave" => {
                                     let user_id = msg.payload["user_id"].as_str().unwrap_or("");
                                     tracing::info!("User {} left", user_id);

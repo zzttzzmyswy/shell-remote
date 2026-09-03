@@ -20,6 +20,8 @@
       this.codec = 'avc1.42E01E'; // OpenH264 baseline profile default
       this.connected = false;
       this._streamRetries = 0;
+      this._bpsBytes = 0;
+      this._bpsTs = 0;
     }
 
     // relay 预建桌面流的时机略晚于 desktop:started 广播; 遇到 404 时短暂
@@ -42,6 +44,26 @@
     _codecSupported(codec) {
       return typeof MediaSource !== 'undefined' &&
         MediaSource.isTypeSupported('video/mp4; codecs="' + codec + '"');
+    }
+
+    // 弱网自适应：用拉流速度估计可用带宽，每 ~2.5s 上报给 agent，
+    // agent 把编码码率天花板 clamp 到该值（桌面帧允许丢旧保新）。
+    _trackBandwidth(bytes) {
+      const now = Date.now();
+      if (!this._bpsTs) {
+        this._bpsTs = now;
+        this._bpsBytes = 0;
+      }
+      this._bpsBytes += bytes;
+      const dt = (now - this._bpsTs) / 1000;
+      if (dt >= 2.5) {
+        const kbps = Math.round(this._bpsBytes * 8 / dt / 1000);
+        this._bpsTs = now;
+        this._bpsBytes = 0;
+        if (kbps > 0 && window.shellRemote && window.shellRemote.send) {
+          window.shellRemote.send('desktop:bitrate', { kbps: kbps });
+        }
+      }
     }
 
     connect() {
@@ -150,6 +172,7 @@
               const buf = v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
               self.pendingChunks.push(buf);
               self._drain();
+              self._trackBandwidth(v.byteLength);
             }
             return pump();
           }).catch(function(e) {
@@ -200,6 +223,8 @@
       if (this.reader) { this.reader.cancel().catch(function() {}); this.reader = null; }
       this.connected = false;
       if (resetRetries !== false) this._streamRetries = 0;
+      this._bpsBytes = 0;
+      this._bpsTs = 0;
       this.queue = [];
       this.pendingChunks = [];
       this.codecResolved = false;

@@ -47,7 +47,8 @@ impl Default for DesktopConfig {
             capture: "auto".to_string(),
             codec: "h264".to_string(),
             fps: 15.0,
-            min_bps: 200_000,
+            // 静态桌面 ~80k 足够 (openh264 实测 84k 满帧); 动态由 ABR 拉回
+            min_bps: 80_000,
             max_bps: 800_000,
             display: None,
         }
@@ -71,15 +72,26 @@ pub struct DesktopManager {
     config: DesktopConfig,
     running: Arc<AtomicBool>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 最近一次浏览器实测的可用带宽(bps), 用于弱网下把码率天花板压回
+    /// 网络可承受的范围; 从未上报时保持配置上限。
+    bandwidth: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DesktopManager {
     pub fn new(config: DesktopConfig) -> Self {
+        let bps = config.max_bps;
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
             task: tokio::sync::Mutex::new(None),
+            bandwidth: Arc::new(std::sync::atomic::AtomicU64::new(bps)),
         }
+    }
+
+    /// Browser-reported available bandwidth (bps) feedback (weak networks).
+    pub fn set_bandwidth_bps(&self, bps: u64) {
+        use std::sync::atomic::Ordering as O;
+        self.bandwidth.store(bps.max(1), O::Relaxed);
     }
 
     pub fn is_running(&self) -> bool {
@@ -106,8 +118,9 @@ impl DesktopManager {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let cfg = self.config.clone();
+        let bandwidth = self.bandwidth.clone();
         let task = tokio::task::spawn(async move {
-            run_desktop_loop(cfg, running, post).await;
+            run_desktop_loop(cfg, running, post, bandwidth).await;
         });
         *self.task.lock().await = Some(task);
     }
@@ -182,7 +195,12 @@ const STRIDES: &[u32] = &[1, 2, 3, 5];
 /// a persistently high skip ratio degrades the encode resolution until the
 /// encoder can actually produce frames again (a fresh init segment is then
 /// replayed to every viewer). Quiet scenes restore the resolution step by step.
-async fn run_desktop_loop(cfg: DesktopConfig, running: Arc<AtomicBool>, post: PostFn) {
+async fn run_desktop_loop(
+    cfg: DesktopConfig,
+    running: Arc<AtomicBool>,
+    post: PostFn,
+    bandwidth: Arc<std::sync::atomic::AtomicU64>,
+) {
     let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok(s) => s,
         Err(e) => {
@@ -194,7 +212,7 @@ async fn run_desktop_loop(cfg: DesktopConfig, running: Arc<AtomicBool>, post: Po
             return;
         }
     };
-    run_desktop_pipeline(cfg, running, post, src).await;
+    run_desktop_pipeline(cfg, running, post, src, bandwidth).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -204,6 +222,7 @@ async fn run_desktop_pipeline(
     running: Arc<AtomicBool>,
     post: PostFn,
     mut src: Box<dyn capture::FrameSource>,
+    bandwidth: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let (w0, h0) = src.resolution();
     if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
@@ -379,15 +398,21 @@ async fn run_desktop_pipeline(
         if frame_idx % 10 == 0 {
             let now = start.elapsed().as_secs_f64();
             let ratio = skipped_ratio(&skip_win);
-            if ratio >= 0.3 {
-                abr.set_target(cfg.max_bps);
-                let cur = enc.bitrate_bps();
-                if cur != cfg.max_bps {
-                    enc.set_bitrate(cfg.max_bps);
+            // 弱网：以浏览器实测带宽为动态天花板(clamp 到 [min, 配置峰值])。
+            {
+                use std::sync::atomic::Ordering as O;
+                let eff_max = bandwidth.load(O::Relaxed).min(cfg.max_bps).max(cfg.min_bps);
+                abr.set_ceiling(eff_max);
+                if ratio >= 0.3 {
+                    abr.set_target(eff_max);
+                    let cur = enc.bitrate_bps();
+                    if cur != eff_max {
+                        enc.set_bitrate(eff_max);
+                    }
+                } else {
+                    let target = abr.note_frame(now, encoded.nalu.len());
+                    enc.set_bitrate(target);
                 }
-            } else {
-                let target = abr.note_frame(now, encoded.nalu.len());
-                enc.set_bitrate(target);
             }
             tune_once(
                 &cfg, &mut enc, &mut stride_idx, &mut scale_idx,
@@ -884,7 +909,14 @@ mod tests {
         let src: Box<dyn capture::FrameSource> = Box::new(FailingSource);
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, running, post, src));
+            let bw = cfg.max_bps;
+            let handle = tokio::spawn(run_desktop_pipeline(
+                cfg,
+                running,
+                post,
+                src,
+                Arc::new(std::sync::atomic::AtomicU64::new(bw)),
+            ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
                 .expect("pipeline must terminate on its own");
@@ -922,7 +954,8 @@ mod tests {
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src));
+            let bw = cfg.max_bps;
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw))));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -961,7 +994,8 @@ mod tests {
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src));
+            let bw = cfg.max_bps;
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw))));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
