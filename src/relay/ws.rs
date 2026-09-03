@@ -949,7 +949,9 @@ pub async fn agent_events_handler(
     };
 
     let mut response = axum::response::sse::Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::default())
+        .keep_alive(axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(5))
+            .text("k"))
         .into_response();
     response.headers_mut().insert(
         axum::http::header::HeaderName::from_static("x-accel-buffering"),

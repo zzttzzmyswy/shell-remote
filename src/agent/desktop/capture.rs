@@ -46,7 +46,7 @@ pub fn open_source(kind: &str, display: Option<&str>) -> Result<Box<dyn FrameSou
         ),
         #[cfg(windows)]
         "dxgi" => crate::agent::desktop::dxgi::DxgiSource::open()
-            .map(|s| Box::new(s) as Box<dyn FrameSource>),
+            .map(|s| Box::new(s) as Box<dyn FrameSource>),  // 显式指定时尊重用户选择（不验证首帧）
         #[cfg(not(windows))]
         "dxgi" => Err("DXGI capture is Windows-only".to_string()),
         "gdi" | "windows" => open_gdi(),
@@ -60,7 +60,7 @@ pub fn open_source(kind: &str, display: Option<&str>) -> Result<Box<dyn FrameSou
 fn open_auto(display: Option<&str>) -> Result<Box<dyn FrameSource>, String> {
     #[cfg(windows)]
     {
-        match crate::agent::desktop::dxgi::DxgiSource::open() {
+        match crate::agent::desktop::dxgi::DxgiSource::open_verified() {
             Ok(s) => Ok(Box::new(s) as Box<dyn FrameSource>),
             Err(e) => {
                 tracing::warn!("dxgi capture unavailable ({e}) — falling back to GDI");

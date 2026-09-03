@@ -96,8 +96,10 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
 
-        /// Desktop capture backend: auto | x11 | wayland | gdi | none.
-        /// `none` disables desktop sharing entirely.
+        /// Desktop capture backend: auto | dxgi | gdi | x11 | wayland | none.
+        /// Windows: dxgi (Desktop Duplication, 60fps capable) with automatic
+        /// GDI fallback; Linux: wayland portal (if built with --features
+        /// wayland) then X11. `none` disables desktop sharing entirely.
         #[arg(long, default_value = "auto")]
         desktop_capture: String,
 

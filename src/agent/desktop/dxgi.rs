@@ -17,7 +17,7 @@
 
 use super::capture::{Frame, FrameSource};
 
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -33,6 +33,8 @@ pub struct DxgiSource {
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     staging: ID3D11Texture2D,
+    /// 上一帧（静止桌面 WAIT_TIMEOUT 时复用）。
+    last_frame: Vec<u8>,
 }
 
 unsafe impl Send for DxgiSource {}
@@ -68,12 +70,15 @@ impl DxgiSource {
         let output1 = output1.unwrap();
 
         // 2. D3D11 device on the duplication adapter (must match, else
-        // DuplicateOutput fails with E_INVALIDARG). Hardware first, WARP for
+        // DuplicateOutput fails with E_INVALIDARG). When creating on an
+        // explicit adapter the driver type MUST be UNKNOWN (0) — passing
+        // HARDWARE with a non-null padapter is E_INVALIDARG (0x80070057),
+        // the classic Desktop Duplication pitfall. Hardware first, WARP for
         // machines without a usable GPU driver.
         let mut device: Option<ID3D11Device> = None;
         let hr = D3D11CreateDevice(
             &adapter,
-            D3D_DRIVER_TYPE_HARDWARE,
+            D3D_DRIVER_TYPE_UNKNOWN,
             Default::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             None,
@@ -96,7 +101,7 @@ impl DxgiSource {
                 None,
             );
             if hr2.is_err() || device.is_none() {
-                return Err(format!("D3D11CreateDevice: {hr2:?} (hardware: {hr:?})"));
+                return Err(format!("D3D11CreateDevice: {hr2:?} (unknown-driver: {hr:?})"));
             }
         }
         let device: ID3D11Device = device.ok_or("no d3d11 device")?;
@@ -153,17 +158,30 @@ impl DxgiSource {
             context,
             duplication,
             staging,
+            last_frame: Vec::new(),
         })
     }
 
     /// Acquire → CopyResource → Map → packed BGRA rows. `timeout_ms` bounds
     /// the wait for a desktop change.
+    ///
+    /// `DXGI_ERROR_WAIT_TIMEOUT` on a static desktop is NOT an error —
+    /// Desktop Duplication only presents a new frame when something changed.
+    /// We replay the last frame so the encode clock keeps advancing (the
+    /// encoder outputs an empty frame for unchanged content which the
+    /// heartbeat-IDR path absorbs), exactly like the Wayland backend.
     unsafe fn capture_once(&mut self, timeout_ms: u32) -> Result<Vec<u8>, String> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        self.duplication
-            .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
-            .map_err(|e| format!("AcquireNextFrame: {e}"))?;
+        let acquired = self.duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource);
+        match acquired {
+            Ok(()) => {}
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                // Static desktop: no new frame in this window.
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(format!("AcquireNextFrame: {e}")),
+        }
         let resource = resource.ok_or("AcquireNextFrame returned no resource")?;
         let tex: ID3D11Texture2D = resource.cast().map_err(|e| format!("cast: {e}"))?;
         self.context.CopyResource(&self.staging, &tex);
@@ -183,7 +201,31 @@ impl DxgiSource {
             bgra.extend_from_slice(std::slice::from_raw_parts(src.add(start), w * 4));
         }
         self.context.Unmap(&self.staging, 0);
+        // 全 0 像素 = 这个输出上实际没有桌面内容（虚拟显示器/无信号输出
+        // 上 DuplicateOutput 成功但永不出帧, 或出黑帧）。当作无效帧。
         Ok(bgra)
+    }
+}
+
+impl DxgiSource {
+    /// Open duplication AND prove it actually delivers frames: after
+    /// DuplicateOutput succeeds we wait once for the first frame. On virtual
+    /// display adapters (GameViewer/basic display) the API can succeed but
+    /// never present a frame — returning that as `Ok` would black-screen the
+    /// stream, so we surface a clear error the auto chain turns into a GDI
+    /// fallback.
+    pub fn open_verified() -> Result<Self, String> {
+        let mut s = Self::open()?;
+        let first = unsafe { s.capture_once(1500)? };
+        if first.is_empty() {
+            return Err(
+                "duplication established but no frame within 1.5s (virtual display adapter / \
+                 idle GPU?) — GDI fallback recommended"
+                    .to_string(),
+            );
+        }
+        s.last_frame = first;
+        Ok(s)
     }
 }
 
@@ -195,11 +237,37 @@ impl FrameSource for DxgiSource {
     fn next_frame(&mut self) -> Result<Frame, String> {
         unsafe {
             match self.capture_once(200) {
-                Ok(bgra) => Ok(Frame {
-                    bgra,
-                    width: self.width,
-                    height: self.height,
-                }),
+                // Empty vec = WAIT_TIMEOUT（静止桌面）: 复用上一帧, 编码时钟
+                // 照常推进（重复帧编码输出空帧, 心跳 IDR 路径吸收）。
+                Ok(bgra) if bgra.is_empty() => {
+                    if self.last_frame.is_empty() {
+                        // 尚未捕获到任何帧: 延长超时再试一次拿首帧。
+                        let first = self.capture_once(1000)?;
+                        if first.is_empty() {
+                            return Err("no frame from desktop duplication yet".to_string());
+                        }
+                        self.last_frame = first.clone();
+                        Ok(Frame {
+                            bgra: first,
+                            width: self.width,
+                            height: self.height,
+                        })
+                    } else {
+                        Ok(Frame {
+                            bgra: self.last_frame.clone(),
+                            width: self.width,
+                            height: self.height,
+                        })
+                    }
+                }
+                Ok(bgra) => {
+                    self.last_frame = bgra.clone();
+                    Ok(Frame {
+                        bgra,
+                        width: self.width,
+                        height: self.height,
+                    })
+                }
                 Err(e) => {
                     // Access lost / device removed → rebuild the whole
                     // duplication once (mode switch, session reconnect).
@@ -217,6 +285,10 @@ impl FrameSource for DxgiSource {
                             }
                         }
                         let bgra = self.capture_once(1000)?;
+                        if bgra.is_empty() {
+                            return Err("no frame after dxgi rebuild".to_string());
+                        }
+                        self.last_frame = bgra.clone();
                         return Ok(Frame {
                             bgra,
                             width: self.width,

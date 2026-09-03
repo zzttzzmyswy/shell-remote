@@ -356,6 +356,7 @@ mod tests {
             "term.js",
             "files.js",
             "desktop.js",
+            "desktop-mse.js",
             "session.js",
             "install.sh",
         ];
