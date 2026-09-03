@@ -13,6 +13,6 @@ pub mod color;
 
 // The remaining modules are added by later tasks:
 pub mod rate;
-// pub mod openh264;
+pub mod openh264;
 // pub mod mp4;
 // pub mod capture;
