@@ -25,7 +25,12 @@ async function probeOnce(codec, token, tag) {
     const t0 = Date.now();
     const timer = setInterval(() => {
       let extra = '';
-      if (sb && sb.buffered && sb.buffered.length) extra = ' buf['+sb.buffered.start(0).toFixed(2)+','+sb.buffered.end(0).toFixed(2)+']';
+      if (sb && sb.buffered && sb.buffered.length) {
+        const s0 = sb.buffered.start(0);
+        // 实时流对齐: 首帧 pts 可能非 0, 播放头需 seek 到缓冲起点
+        if (v.currentTime < s0 - 0.05) v.currentTime = s0;
+        extra = ' buf['+sb.buffered.start(0).toFixed(2)+','+sb.buffered.end(0).toFixed(2)+']';
+      }
       log('  ['+tag+'] t='+v.currentTime.toFixed(2)+extra, '');
       if (Date.now()-t0 > 6000) { clearInterval(timer); fin('timeout(6s) currentTime='+v.currentTime.toFixed(2)); }
     }, 700);
@@ -82,6 +87,23 @@ function codecFromInit(buf){
   return null;
 }
 
+async function ensureStream(token){
+  // 若桌面流不在运行(404), 用该 token 触发 desktop:start 后重试
+  for (let attempt=0; attempt<2; attempt++){
+    const resp = await fetch('/agent/desktop/stream', { headers: {'Authorization':'Bearer '+token} });
+    if (resp.ok) return resp;
+    log('stream HTTP '+resp.status + (attempt===0 ? ' → 触发 desktop:start…' : ''));
+    if (resp.status===404 && attempt===0){
+      await fetch('/agent/session/send', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ token, type:'desktop:start', payload:{} })
+      });
+      await new Promise(r=>setTimeout(r,2000));
+    } else return resp;
+  }
+  return null;
+}
+
 async function run(){
   $('out').innerHTML = ''; out.length = 0;
   const token = $('tok').value.trim() || 'testkey';
@@ -91,10 +113,9 @@ async function run(){
   for (const c of cands) {
     log('isTypeSupported('+c+') = '+MediaSource.isTypeSupported('video/mp4; codecs="'+c+'"'));
   }
-  // 先抓 init 解析真实 codec
-  const resp = await fetch('/agent/desktop/stream', { headers: {'Authorization':'Bearer '+token} });
-  log('stream HTTP '+resp.status);
-  if(!resp.ok){ return; }
+  // 确保桌面流在跑(404 时自动 desktop:start)并抓 init
+  const resp = await ensureStream(token);
+  if(!resp){ log('stream 不可用(两次尝试后仍非 200)', 'bad'); return; }
   const reader = resp.body.getReader();
   const r0 = await reader.read();
   const init = r0.value.buffer.slice(r0.value.byteOffset, r0.value.byteOffset+r0.value.byteLength);

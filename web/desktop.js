@@ -91,6 +91,7 @@
         this.sourceBuffer = this.mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
         this.sourceBuffer.addEventListener('updateend', function() {
           self._drain();
+          self._syncPlayhead();
         });
         this.sourceBuffer.addEventListener('error', function() {
           // 附上浏览器标识与当前 UA，便于远程定位是哪类内核拒绝解码。
@@ -114,6 +115,23 @@
         self.video.removeEventListener('error', onVErr);
       });
       this._drain();
+    }
+
+    // 实时流对齐：agent 端时间戳从本会话累计，浏览器是"中途加入"——首帧
+    // pts 通常远大于 0（如 10s）。MSE 播放器默认停在 currentTime=0，该处
+    // 无缓冲 → 黑屏。这里把播放头对齐到缓冲窗口起点（实时流标准做法）。
+    _syncPlayhead() {
+      const sb = this.sourceBuffer;
+      const v = this.video;
+      if (!sb || !v || v.seeking || v.readyState === 0) return;
+      let bl = 0;
+      try { bl = sb.buffered ? sb.buffered.length : 0; } catch (e) { return; }
+      if (bl === 0) return;
+      let start = 0;
+      try { start = sb.buffered.start(0); } catch (e) { return; }
+      if (v.currentTime < start - 0.05) {
+        v.currentTime = start;
+      }
     }
 
     // 从 init 段 (ftyp/moov 内含 avcC) 解析浏览器实际需要的 codec 串。
