@@ -188,6 +188,13 @@ const SCALES: &[f64] = &[1.0, 0.75, 0.5, 0.375];
 /// without OpenH264's RC jumping in and black-screening the stream.
 const STRIDES: &[u32] = &[1, 2, 3, 5];
 
+/// 连续捕获失败次数上限：超过则终止循环并回传 `desktop:error`。
+///
+/// 设 150 而不是 30：Windows 上屏幕 DC 句柄会在锁屏/安全桌面/显示模式
+/// 切换后失效（BitBlt err=6），GDI 捕获自愈需要重建上下文，得给足重试
+/// 窗口（约 10s @ 15fps）才能跨过瞬时失效而非误杀整个桌面流。
+const MAX_CAPTURE_ERRORS: u32 = 150;
+
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
 /// desktops at 200-800 kbps: RC drops nearly every P frame): skipped frames
@@ -306,11 +313,12 @@ async fn run_desktop_pipeline(
                 f
             }
             Err(e) => {
-                // 持续性捕获失败（例如 XWayland 下 root GetImage 抛 BadMatch）
-                // 无限重试只会刷屏且永远黑屏。连续失败 30 次（约 2s）后终止,
-                // 并把原因回传给浏览器展示。
+                // 持续性捕获失败（例如 XWayland 下 root GetImage 抛 BadMatch、
+                // Windows 屏幕 DC 失效且重建失败）。无限重试只会刷屏且永远
+                // 黑屏。连续失败 MAX_CAPTURE_ERRORS 帧后终止, 并把原因回传
+                // 给浏览器展示。
                 err_count += 1;
-                if err_count >= 30 {
+                if err_count >= MAX_CAPTURE_ERRORS {
                     tracing::error!("desktop capture failed {err_count} frames in a row — giving up: {e}");
                     (post)(serde_json::json!({
                         "type": "desktop:error",
@@ -318,7 +326,7 @@ async fn run_desktop_pipeline(
                     }));
                     break;
                 }
-                tracing::warn!("capture frame error: {} — retrying ({}/30)", e, err_count);
+                tracing::warn!("capture frame error: {} — retrying ({}/{MAX_CAPTURE_ERRORS})", e, err_count);
                 continue;
             }
         };
@@ -896,12 +904,12 @@ mod tests {
         }
     }
 
-    /// 连续捕获失败（≥30 次）必须终止循环并回传 desktop:error，
+    /// 连续捕获失败（≥MAX_CAPTURE_ERRORS 次）必须终止循环并回传 desktop:error，
     /// 而不是无限重试刷屏 + 浏览器永久黑屏。
     #[test]
     fn pipeline_failing_source_posts_error_and_stops() {
         let mut cfg = DesktopConfig::default();
-        cfg.fps = 60.0; // 加速 30 次失败收敛
+        cfg.fps = 60.0; // 加速 MAX_CAPTURE_ERRORS 次失败收敛（150 帧 ≈ 2.5s）
         let running = Arc::new(AtomicBool::new(true));
         let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
         let p2 = posted.clone();

@@ -310,7 +310,6 @@ mod gdi {
     pub struct GdiSource {
         width: usize,
         height: usize,
-        screen_dc: HDC,
         mem_dc: HDC,
         bmp: HBITMAP,
     }
@@ -319,24 +318,115 @@ mod gdi {
 
     impl GdiSource {
         pub fn open() -> Result<Self, String> {
-            unsafe {
-                let width = GetSystemMetrics(SM_CXSCREEN) as usize;
-                let height = GetSystemMetrics(SM_CYSCREEN) as usize;
-                let screen_dc = GetDC(std::ptr::null_mut());
-                let mem_dc = CreateCompatibleDC(screen_dc);
-                let bmp = CreateCompatibleBitmap(screen_dc, width as i32, height as i32);
-                if screen_dc.is_null() || mem_dc.is_null() || bmp.is_null() {
-                    return Err(format!("GDI init failed (err={})", GetLastError()));
-                }
-                SelectObject(mem_dc, bmp);
-                Ok(Self {
-                    width,
-                    height,
-                    screen_dc,
-                    mem_dc,
-                    bmp,
-                })
+            let mut s = Self {
+                width: 0,
+                height: 0,
+                mem_dc: std::ptr::null_mut(),
+                bmp: std::ptr::null_mut(),
+            };
+            unsafe { s.rebuild()? };
+            Ok(s)
+        }
+
+        /// (Re)create the compatible DC + bitmap sized to the *current*
+        /// screen, and refresh the cached resolution. Called at open and
+        /// again to self-heal when a capture fails (e.g. display mode
+        /// changed or a screen-DC handle went stale).
+        unsafe fn rebuild(&mut self) -> Result<(), String> {
+            if !self.bmp.is_null() {
+                DeleteObject(self.bmp);
+                self.bmp = std::ptr::null_mut();
             }
+            if !self.mem_dc.is_null() {
+                DeleteDC(self.mem_dc);
+                self.mem_dc = std::ptr::null_mut();
+            }
+            let width = GetSystemMetrics(SM_CXSCREEN) as usize;
+            let height = GetSystemMetrics(SM_CYSCREEN) as usize;
+            let screen_dc = GetDC(std::ptr::null_mut());
+            if screen_dc.is_null() {
+                return Err(format!("GetDC failed (err={})", GetLastError()));
+            }
+            let mem_dc = CreateCompatibleDC(screen_dc);
+            let bmp = CreateCompatibleBitmap(screen_dc, width as i32, height as i32);
+            let err = GetLastError();
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            if mem_dc.is_null() || bmp.is_null() {
+                return Err(format!("GDI init failed (err={err})"));
+            }
+            SelectObject(mem_dc, bmp);
+            self.width = width;
+            self.height = height;
+            self.mem_dc = mem_dc;
+            self.bmp = bmp;
+            Ok(())
+        }
+
+        /// Copy the current desktop into the compatible bitmap.
+        ///
+        /// The screen DC (`GetDC(NULL)`) must be acquired fresh on every
+        /// frame and released right after: a DC obtained once and held
+        /// long-term goes stale when the session/desktop changes (lock
+        /// screen, UAC secure desktop, display-mode switch, screen off),
+        /// after which every `BitBlt` fails with `ERROR_INVALID_HANDLE`
+        /// (err=6) and the desktop freezes on the first frame. On failure we
+        /// rebuild the GDI context once (fresh size + handles) and retry —
+        /// transient session switches self-heal instead of killing the feed.
+        unsafe fn blit(&mut self) -> Result<(), String> {
+            let screen_dc = GetDC(std::ptr::null_mut());
+            if screen_dc.is_null() {
+                return Err(format!("GetDC failed (err={})", GetLastError()));
+            }
+            let w = self.width as i32;
+            let h = self.height as i32;
+            let ok = BitBlt(self.mem_dc, 0, 0, w, h, screen_dc, 0, 0, SRCCOPY);
+            let err1 = GetLastError();
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            if ok != 0 {
+                return Ok(());
+            }
+            if let Err(e) = self.rebuild() {
+                return Err(format!("BitBlt failed (err={err1}); rebuild failed: {e}"));
+            }
+            let screen_dc = GetDC(std::ptr::null_mut());
+            if screen_dc.is_null() {
+                return Err(format!("GetDC failed (err={})", GetLastError()));
+            }
+            let w = self.width as i32;
+            let h = self.height as i32;
+            let ok = BitBlt(self.mem_dc, 0, 0, w, h, screen_dc, 0, 0, SRCCOPY);
+            let err2 = GetLastError();
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            if ok == 0 {
+                return Err(format!("BitBlt failed (err={err2})"));
+            }
+            Ok(())
+        }
+
+        unsafe fn read_pixels(&self) -> Result<Vec<u8>, String> {
+            let w = self.width as i32;
+            let h = self.height as i32;
+            let mut bmi: BITMAPINFO = std::mem::zeroed();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h; // top-down
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            if GetDIBits(
+                self.mem_dc,
+                self.bmp,
+                0,
+                h as u32,
+                pixels.as_mut_ptr() as *mut _,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            ) == 0
+            {
+                return Err(format!("GetDIBits failed (err={})", GetLastError()));
+            }
+            Ok(pixels)
         }
     }
 
@@ -347,35 +437,14 @@ mod gdi {
 
         fn next_frame(&mut self) -> Result<Frame, String> {
             unsafe {
-                let w = self.width as i32;
-                let h = self.height as i32;
-                if BitBlt(self.mem_dc, 0, 0, w, h, self.screen_dc, 0, 0, SRCCOPY) == 0 {
-                    return Err(format!("BitBlt failed (err={})", GetLastError()));
-                }
-                let mut bmi: BITMAPINFO = std::mem::zeroed();
-                bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-                bmi.bmiHeader.biWidth = w;
-                bmi.bmiHeader.biHeight = -h; // top-down
-                bmi.bmiHeader.biPlanes = 1;
-                bmi.bmiHeader.biBitCount = 32;
-                bmi.bmiHeader.biCompression = BI_RGB;
-                let mut pixels = vec![0u8; (w * h * 4) as usize];
-                if GetDIBits(
-                    self.mem_dc,
-                    self.bmp,
-                    0,
-                    h as u32,
-                    pixels.as_mut_ptr() as *mut _,
-                    &mut bmi,
-                    DIB_RGB_COLORS,
-                ) == 0
-                {
-                    return Err(format!("GetDIBits failed (err={})", GetLastError()));
-                }
+                self.blit()?;
+                let h = self.height;
+                let (w, h) = (self.width, h);
+                let bgra = self.read_pixels()?;
                 Ok(Frame {
-                    bgra: pixels,
-                    width: self.width,
-                    height: self.height,
+                    bgra,
+                    width: w,
+                    height: h,
                 })
             }
         }
@@ -384,9 +453,12 @@ mod gdi {
     impl Drop for GdiSource {
         fn drop(&mut self) {
             unsafe {
-                DeleteObject(self.bmp);
-                DeleteDC(self.mem_dc);
-                ReleaseDC(std::ptr::null_mut(), self.screen_dc);
+                if !self.bmp.is_null() {
+                    DeleteObject(self.bmp);
+                }
+                if !self.mem_dc.is_null() {
+                    DeleteDC(self.mem_dc);
+                }
             }
         }
     }
