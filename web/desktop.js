@@ -8,6 +8,10 @@
 (function() {
   'use strict';
 
+  // 低延迟追帧余量（秒）：播放头被钳到 缓冲尾部-该值。0.3s 在"足够平滑
+  // 不卡顿"和"延时 <1s"之间取的平衡点（RustDesk web 端类似量级）。
+  const LIVE_EDGE_LAG = 0.3;
+
   window.DesktopView = class {
     constructor() {
       this.video = document.getElementById('desktop-video');
@@ -24,14 +28,17 @@
       this._bpsTs = 0;
     }
 
-    // relay 预建桌面流的时机略晚于 desktop:started 广播; 遇到 404 时短暂
-    // 重试(最多 5 次)等待流就绪, 返回 true 表示已接管重试。
+    // relay 预建桌面流的时机略晚于 desktop:started 广播; 遇到 404 时重试
+    // (指数退避, 上限 10 次约 3.5 分钟)等待流就绪, 返回 true 表示已接管重试。
+    // 之前上限 5 次太紧: agent 静止超时被 relay 收流后再重建的窗口里,
+    // 5 次 700ms 重试耗尽后视图永久停住, 用户必须刷新页面。
     _retryDesktopStream() {
-      if (this._streamRetries >= 5) return false;
+      if (this._streamRetries >= 10) return false;
       this._streamRetries += 1;
       const self = this;
       this.setStatus('等待桌面流就绪… (' + this._streamRetries + ')', false);
-      setTimeout(function() { self.connect(); }, 700);
+      const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000);
+      setTimeout(function() { self.connect(); }, delay);
       return true;
     }
 
@@ -132,6 +139,15 @@
       if (v.currentTime < start - 0.05) {
         v.currentTime = start;
       }
+      // 低延迟追帧：实时桌面流不允许缓冲堆积。播放头若落后缓冲尾部超过
+      // LIVE_EDGE_LAG 秒，直接跳到 尾部-LIVE_EDGE_LAG 处，防止延时单调
+      // 增长到秒级（之前 7s 延时的根因：只在落后起点时 seek，从不追尾）。
+      // 参考 RustDesk frame_controller 的持续追帧策略。
+      let end = 0;
+      try { end = sb.buffered.end(bl - 1); } catch (e) { return; }
+      if (v.currentTime < end - LIVE_EDGE_LAG) {
+        v.currentTime = end - LIVE_EDGE_LAG;
+      }
     }
 
     // 从 init 段 (ftyp/moov 内含 avcC) 解析浏览器实际需要的 codec 串。
@@ -196,13 +212,15 @@
           if (controller.signal.aborted) return Promise.resolve();
           return reader.read().then(function(result) {
             if (result.done) {
-              // relay 可能在 init 长时间未收到时主动结束本 viewer 流;
-              // 视图仍激活则自动重连(MSE 重新从 init 建流), 而不是停在黑屏。
-              if (self.mediaSource && self._streamRetries < 5) {
+              // relay 可能在 init 长时间未收到/流空闲超时后主动结束本
+              // viewer 流; 视图仍激活则自动重连(MSE 重新从 init 建流),
+              // 而不是停在黑屏。上限 10 次 + 退避, 覆盖 agent 重建窗口。
+              if (self.mediaSource && self._streamRetries < 10) {
                 self._streamRetries += 1;
                 self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
                 self.disconnect(false);
-                setTimeout(function() { self.connect(); }, 700);
+                const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000);
+                setTimeout(function() { self.connect(); }, delay);
               } else {
                 self.setStatus('桌面流已结束', true);
               }

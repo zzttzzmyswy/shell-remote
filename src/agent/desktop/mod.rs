@@ -195,6 +195,11 @@ const STRIDES: &[u32] = &[1, 2, 3, 5];
 /// 窗口（约 10s @ 15fps）才能跨过瞬时失效而非误杀整个桌面流。
 const MAX_CAPTURE_ERRORS: u32 = 150;
 
+/// 静止心跳间隔（毫秒）。桌面静止时 OpenH264 输出空帧不上行，超过
+/// relay 观看者空闲超时（30s）会被误判断流；确保每 1.5s 至少编一个
+/// IDR 心跳帧，让流上始终有字节（静止桌面一个 IDR 仅几 KB）。
+const HEARTBEAT_INTERVAL_MS: u64 = 1500;
+
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
 /// desktops at 200-800 kbps: RC drops nearly every P frame): skipped frames
@@ -290,6 +295,9 @@ async fn run_desktop_pipeline(
     let start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
     let mut err_count: u32 = 0;
+    // 上次实际 POST 视频帧的 pts。静止桌面空帧不上行, 用它判断是否该发
+    // 心跳 IDR（保证 relay 观看者流上始终有字节, 不被空闲超时误杀）。
+    let mut last_posted_ms: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         tick.tick().await;
@@ -300,12 +308,16 @@ async fn run_desktop_pipeline(
         cap_no += 1;
         if cap_no % (cfg.fps as u64 * 2) == 0 {
             enc.force_idr();
-        }
-        let stride = STRIDES[stride_idx];
+        }        let stride = STRIDES[stride_idx];
         if cap_no % stride as u64 != 0 {
             // 帧抽取: 本 tick 不编码, 时间线继续推进。
             pts_ms += frame_ms;
-            continue;
+            // 跳帧期间也可能长期无上行（静止桌面 + 高 stride）: 到心跳
+            // 间隔则不跳本帧, 强制编一个 IDR。
+            if last_posted_ms + HEARTBEAT_INTERVAL_MS > pts_ms {
+                continue;
+            }
+            enc.force_idr();
         }
         let fr = match src.next_frame() {
             Ok(f) => {
@@ -396,6 +408,7 @@ async fn run_desktop_pipeline(
         let sample = mp4::annexb_to_avcc(&encoded.nalu);
         let frag = mp4::mp4_fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq);
         seq += 1;
+        last_posted_ms = pts_ms;
         pts_ms += frame_ms;
         post(serde_json::json!({
             "type": "desktop:video",
