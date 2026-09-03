@@ -1290,6 +1290,19 @@ async fn run_session(
                                     desktop.stop(post_fn.clone()).await;
                                 }
 
+                                "desktop:mouse" => {
+                                    // 浏览器键鼠注入：desktop:mouse
+                                    // {type,x,y,button,dx,dy}（RW 权限校验
+                                    // 已在 relay requires_write 完成）。
+                                    desktop.handle_mouse(&msg.payload).await;
+                                }
+
+                                "desktop:key" => {
+                                    // desktop:key {code,down}（browser
+                                    // KeyboardEvent.code 直传）。
+                                    desktop.handle_key(&msg.payload).await;
+                                }
+
                                 "desktop:bitrate" => {
                                     // 浏览器周期性上报的实测可用带宽 → 弱网自适应
                                     // (把编码码率天花板 clamp 到网络可承受范围)。

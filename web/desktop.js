@@ -26,6 +26,7 @@
       this._streamRetries = 0;
       this._bpsBytes = 0;
       this._bpsTs = 0;
+      this._inputBound = false;
     }
 
     // relay 预建桌面流的时机略晚于 desktop:started 广播; 遇到 404 时重试
@@ -204,6 +205,7 @@
         }
         self._streamRetries = 0;
         self.connected = true;
+        self._bindInput(); // 流就绪后开始采集键鼠事件
         self.setStatus('桌面已连接', false);
         const reader = resp.body.getReader();
         self.reader = reader;
@@ -283,6 +285,7 @@
       this._bpsTs = 0;
       this.queue = [];
       this.pendingChunks = [];
+      this._unbindInput();
       if (this.mediaSource) {
         if (this.mediaSource.readyState === 'open') {
           try { this.mediaSource.endOfStream(); } catch (e) { /* ignore */ }
@@ -294,6 +297,92 @@
       this.video.pause();
       this.video.removeAttribute('src');
       this.setStatus('', false);
+    }
+
+    // ── 键鼠输入注入 ─────────────────────────────────────────────
+    // 在 <video> 上采集 pointer/键盘事件, 缩放到桌面坐标后发给 agent
+    // (desktop:mouse / desktop:key)。指针坐标换算参考 RustDesk 的
+    // canvas→remote 缩放: video 实际渲染尺寸 → 视频原始分辨率。
+    _bindInput() {
+      if (this._inputBound) return;
+      this._inputBound = true;
+      const v = this.video;
+      const self = this;
+
+      const send = function(type, payload) {
+        if (!self.connected) return;
+        if (window.shellRemote && window.shellRemote.send) {
+          window.shellRemote.send(type, payload);
+        }
+      };
+
+      // 视频渲染坐标 → 桌面像素坐标（object-fit: contain 的信箱区域剔除）
+      this._toDesktopXY = function(e) {
+        const vw = v.videoWidth, vh = v.videoHeight;
+        if (!vw || !vh) return null;
+        const rect = v.getBoundingClientRect();
+        const scale = Math.min(rect.width / vw, rect.height / vh);
+        const drawW = vw * scale, drawH = vh * scale;
+        const offX = (rect.width - drawW) / 2, offY = (rect.height - drawH) / 2;
+        const x = (e.clientX - rect.left - offX) / scale;
+        const y = (e.clientY - rect.top - offY) / scale;
+        if (x < 0 || y < 0 || x >= vw || y >= vh) return null;
+        return { x: Math.round(x), y: Math.round(y) };
+      };
+
+      this._onPointerMove = function(e) {
+        const p = self._toDesktopXY(e);
+        if (p) send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
+      };
+      this._onPointerDown = function(e) {
+        const p = self._toDesktopXY(e);
+        if (!p) return;
+        send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
+        send('desktop:mouse', { type: 'down', button: e.button });
+        v.setPointerCapture(e.pointerId);
+        e.preventDefault();
+      };
+      this._onPointerUp = function(e) {
+        send('desktop:mouse', { type: 'up', button: e.button });
+        e.preventDefault();
+      };
+      this._onWheel = function(e) {
+        // 浏览器 wheel deltaY 正值=向下; agent scroll 正值=向上（RustDesk 语义）
+        const lines = Math.round(e.deltaY / 100 * 3);
+        if (lines) send('desktop:mouse', { type: 'wheel', dx: 0, dy: -lines });
+        e.preventDefault();
+      };
+      this._onContextMenu = function(e) { e.preventDefault(); };
+      this._onKey = function(down) {
+        return function(e) {
+          // 过滤浏览器自身快捷键（F5 刷新/Ctrl+W 关标签等由浏览器处理）
+          send('desktop:key', { code: e.code, down: down });
+          if (['F5', 'F12'].indexOf(e.code) < 0) e.preventDefault();
+        };
+      };
+
+      v.addEventListener('pointermove', this._onPointerMove);
+      v.addEventListener('pointerdown', this._onPointerDown);
+      v.addEventListener('pointerup', this._onPointerUp);
+      v.addEventListener('wheel', this._onWheel, { passive: false });
+      v.addEventListener('contextmenu', this._onContextMenu);
+      v.addEventListener('keydown', this._onKey(true));
+      v.addEventListener('keyup', this._onKey(false));
+      // 键盘焦点: video 不是天然可聚焦元素, 点击后手动聚焦才能收 key 事件
+      v.tabIndex = 0;
+    }
+
+    _unbindInput() {
+      if (!this._inputBound) return;
+      this._inputBound = false;
+      const v = this.video;
+      v.removeEventListener('pointermove', this._onPointerMove);
+      v.removeEventListener('pointerdown', this._onPointerDown);
+      v.removeEventListener('pointerup', this._onPointerUp);
+      v.removeEventListener('wheel', this._onWheel);
+      v.removeEventListener('contextmenu', this._onContextMenu);
+      v.removeEventListener('keydown', this._onKey(true));
+      v.removeEventListener('keyup', this._onKey(false));
     }
   };
 })();

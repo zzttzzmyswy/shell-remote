@@ -1,6 +1,6 @@
 [package]
 name = "shell-remote"
-version = "0.20.13"
+version = "0.20.14"
 edition = "2021"
 description = "Self-hosted collaborative remote SSH tool with MCP support"
 
@@ -30,6 +30,7 @@ sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["io"] }
 openh264-sys2 = { version = "0.9.8", features = ["source"] }
 x11rb = { version = "0.14", features = ["image", "composite"] }
+enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -13,6 +13,7 @@
 
 pub mod capture;
 pub mod color;
+pub mod input;
 pub mod mp4;
 pub mod openh264;
 pub mod rate;
@@ -75,6 +76,9 @@ pub struct DesktopManager {
     /// 最近一次浏览器实测的可用带宽(bps), 用于弱网下把码率天花板压回
     /// 网络可承受的范围; 从未上报时保持配置上限。
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
+    /// 键鼠注入器。惰性创建：首个输入事件到达时才 spawn 注入线程
+    /// （纯观看会话不付这个代价）。
+    injector: tokio::sync::Mutex<Option<input::InputInjector>>,
 }
 
 impl DesktopManager {
@@ -85,6 +89,7 @@ impl DesktopManager {
             running: Arc::new(AtomicBool::new(false)),
             task: tokio::sync::Mutex::new(None),
             bandwidth: Arc::new(std::sync::atomic::AtomicU64::new(bps)),
+            injector: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -92,6 +97,22 @@ impl DesktopManager {
     pub fn set_bandwidth_bps(&self, bps: u64) {
         use std::sync::atomic::Ordering as O;
         self.bandwidth.store(bps.max(1), O::Relaxed);
+    }
+
+    /// Handle one `desktop:mouse` payload from a browser (inject locally).
+    pub async fn handle_mouse(&self, payload: &serde_json::Value) {
+        let Some(ev) = input::parse_mouse(payload) else { return };
+        let mut g = self.injector.lock().await;
+        let inj = g.get_or_insert_with(input::InputInjector::start);
+        inj.send(ev);
+    }
+
+    /// Handle one `desktop:key` payload from a browser (inject locally).
+    pub async fn handle_key(&self, payload: &serde_json::Value) {
+        let Some(ev) = input::parse_key(payload) else { return };
+        let mut g = self.injector.lock().await;
+        let inj = g.get_or_insert_with(input::InputInjector::start);
+        inj.send(ev);
     }
 
     pub fn is_running(&self) -> bool {

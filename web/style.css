@@ -870,6 +870,10 @@ body {
     width: auto;
     height: auto;
     background: #000;
+    /* 键鼠注入：可聚焦（keydown 需要焦点）+ 隐藏本地光标（远端画面
+       自带光标，本地双光标会干扰） */
+    cursor: none;
+    outline: none;
 }
 .desktop-status {
     position: absolute;
