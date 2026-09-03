@@ -15,4 +15,4 @@ pub mod color;
 pub mod rate;
 pub mod openh264;
 pub mod mp4;
-// pub mod capture;
+pub mod capture;
