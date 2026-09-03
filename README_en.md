@@ -13,6 +13,7 @@ Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust 
 - **Tabbed Admin Panel** — The admin page is organized into six tabs: Overview / Sessions / Devices / Recordings / Access log / Settings; the active tab is remembered
 - **Device Management** — The Devices tab lists every agent with its probed host info (CPU model, architecture, OS, kernel, hostname) and supports keyword / architecture / status filtering with one-click connect
 - **Connection Self-Healing** — A registered-but-unreachable device no longer leaves the browser on a blank terminal: the session page shows "agent disconnected, reconnecting" and auto-reconnects; the terminal resumes once the agent link is back. If a join cannot be delivered because the agent channel is stale (reconnect/eviction window), the relay tells the browser to re-join, and the browser-side join-ack watchdog reconnects after 8s without an agent reply — no silent failure can leave a permanently empty terminal
+- **Desktop Sharing** — Agent captures the real X11/Windows desktop, encodes H.264 (openh264 software encoder) with adaptive bitrate 800–200 kbps, and streams fragmented MP4 to browsers over MSE; the session page switches freely between terminal and desktop views (desktop is off by default; click a button to open it)
 - **SSE+POST Transport** — Full-stack HTTP SSE push + POST send; no WebSocket dependency, works behind any proxy
 - **Single Binary** — All web assets embedded via `rust-embed`; zero external file dependencies
 - **Token Authentication** — Random temporary tokens or fixed keys; read-write and read-only permission levels
@@ -85,6 +86,12 @@ cargo build --release
 | `--token-type` | `rw` | Token type: `rw`, `ro`, or `both` |
 | `--shell` | `/bin/bash` | Shell binary path |
 | `--session-id` | — | Custom session id (5-20 alphanumeric) shown in admin to distinguish devices; **reusable** — a new agent registering with the same id takes over the old session (old tokens invalidated), no more conflict error |
+| `--desktop-capture` | `auto` | Desktop capture backend: `auto` / `x11` / `wayland` / `gdi` / `none` (`none` disables desktop; native Wayland capture needs xdg-desktop-portal, not yet implemented — use X11/XWayland) |
+| `--desktop-codec` | `h264` | Desktop video codec (H.264 only for now; see "Desktop Sharing") |
+| `--desktop-fps` | `15` | Desktop capture frame rate |
+| `--desktop-max-bitrate` | `800` | Maximum encode bitrate (kbps, 800 as specified) |
+| `--desktop-min-bitrate` | `200` | Minimum encode bitrate (kbps, 200 as specified) |
+| `--desktop-display` | `$DISPLAY` | Selected X11 display (e.g. `:1`), defaults to `$DISPLAY` |
 
 Output:
 
@@ -96,6 +103,24 @@ session: a1b2c3d4
 ### Browser Access
 
 Open `http://<relay-ip>:3000`, enter server password and token. Main area: xterm.js terminal. Right drawer: file manager.
+
+## Desktop Sharing
+
+Share the agent's real desktop in agent mode: click the "Desktop" button in the browser session page to open the stream; the picture is H.264-encoded in real time and forwarded over the relay (`/agent/desktop/stream`).
+
+- Start: click the "Desktop" toolbar button in the session page (off by default, click to open) → on `desktop:started`, the browser auto-connects the video stream; click "Terminal" to switch back.
+- Permission: starting/stopping the stream needs an rw token (`requires_write`); watching the stream works with rw or ro.
+- Bitrate: adaptive, **max 800 kbps, min 200 kbps** (`--desktop-max-bitrate` / `--desktop-min-bitrate`, default 800/200).
+- Encoding: software (openh264, BSD license) with `--desktop-codec h264`. **Hardware encoding (VAAPI / Windows Media Foundation) is a planned extension — current version is pure software.**
+- Capture: X11 (incl. XWayland) and Windows GDI are implemented; native Wayland needs xdg-desktop-portal + PipeWire, not included here (the agent prints a clear error; use XWayland).
+- Transport: fragmented MP4 streamed to browser MSE; late joiners start at the most recent key frame (IDR).
+- Other codecs (VP8/VP9/HEVC): omitted to keep the binary small and browsers compatible (x265/libvpx are large and HEVC MSE support is spotty). H.264 has the widest MSE support, matching the requirement "if encoders are too large, ship only the format that compresses well and every browser can decode".
+
+```bash
+./shell-remote agent --relay-url https://relay.example.com \
+  --desktop-capture auto --desktop-fps 15 \
+  --desktop-max-bitrate 800 --desktop-min-bitrate 200
+```
 
 ## Windows Agent
 

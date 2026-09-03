@@ -13,6 +13,7 @@
 - **管理后台多标签页** — 后台按 概览 / 会话 / 设备 / 录像 / 访问日志 / 设置 六个标签页组织，选中页自动记忆
 - **设备管理** — 后台"设备"面板展示每台 agent 探测上报的主机信息（CPU 型号、系统架构、系统、内核、主机名），支持关键字 / 架构 / 在线状态筛选，逐台一键连接
 - **连接自愈** — 设备已注册但 agent 链路未建立或断开时不再僵死在空白终端：终端页提示"设备连接中断，正在自动重连"并自动重连，agent 恢复后终端自动回放续上；若 join 因 agent 通道失效（重连/顶替窗口）无法送达，relay 会通知浏览器重连；浏览器侧另有 join 应答看门狗，8s 无应答即自动重连——任何链路静默丢失都不会留下永久的空白终端
+- **桌面共享** — agent 捕获 X11/Windows 桌面，H.264（openh264 软编）实时编码，动态码率 800–200kbps 自适应，浏览器 MSE 播放；会话页可在"终端/桌面"间任意切换（桌面默认关闭，点击按钮开流）
 - **SSE+POST 协议** — 全链路使用 HTTP SSE 推送 + POST 发送，兼容性好，不依赖 WebSocket
 - **单二进制** — 所有 Web 资源通过 `rust-embed` 编译嵌入，零外部文件依赖
 - **Token 鉴权** — 随机临时 Token 或固定密钥；支持读写和只读两种权限
@@ -89,6 +90,12 @@ cargo build --release
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
 | `--shell` | `/bin/bash` | Shell 路径 |
 | `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；**可重复使用**——新的 agent 用相同 ID 注册会顶替旧会话（旧 Token 失效），不再报冲突 |
+| `--desktop-capture` | `auto` | 桌面捕获后端：`auto` / `x11` / `wayland` / `gdi` / `none`（`none` 关闭桌面功能；Wayland 需要 xdg-desktop-portal，暂未实现，建议 X11/XWayland） |
+| `--desktop-codec` | `h264` | 桌面编码格式（当前仅 H.264；VP8/VP9/HEVC 因许可与浏览器兼容原因未内置，见下） |
+| `--desktop-fps` | `15` | 桌面捕获帧率 |
+| `--desktop-max-bitrate` | `800` | 最大编码码率（kbps，用户需求原数值 800） |
+| `--desktop-min-bitrate` | `200` | 最小编码码率（kbps，用户需求原数值 200） |
+| `--desktop-display` | `$DISPLAY` | 指定 X11 显示（如 `:1`），默认取 `$DISPLAY` |
 
 输出示例：
 
@@ -103,6 +110,26 @@ session: a1b2c3d4
 ### 浏览器访问
 
 打开 `http://<relay-ip>:3000`，输入服务器密码及 Token 即可连接。主区域为 xterm.js 终端，右侧为文件管理器。
+
+## 桌面共享
+
+在 agent 模式下共享设备真实桌面：浏览器端"桌面"按钮开流，画面以 H.264 实时编码后经 relay 转发播放（`/agent/desktop/stream`）。
+
+- 启动：浏览器会话页点击工具栏"桌面"按钮（默认关闭、点击才开流）→ 收到 `desktop:started` 后自动连接视频流；再点"终端"切回。
+- 权限：开流/关流需 rw Token（`requires_write`）；观看桌面画面 rw/ro 均可。
+- 码率：按用户需求 **最高 800kbps、最低 200kbps** 自适应动态调整（`--desktop-max-bitrate` / `--desktop-min-bitrate`，单位 kbps，默认 800/200）。
+- 编码：软件编码（openh264，BSD 许可）兜底；`--desktop-codec h264`。**硬件编码（VAAPI / Windows Media Foundation）按"软编兜底、尽可能硬编"的需求预留为后续扩展**，当前版本为纯软编。
+- 捕获：X11（含 XWayland）与 Windows GDI 已实现；Wayland 原生捕获需 xdg-desktop-portal + PipeWire 运行时，本版本未内置（agent 会给出明确错误提示，可用 XWayland 走 X11 后端）。
+- 传输：fMP4（fragmented MP4）流式推给浏览器 MSE，新加入的观者从最近一个关键帧（IDR）开始接收，无需等待下一个 GOP。
+- 其它编码格式（VP8/VP9/HEVC）：考虑二进制体积与许可（x265/libvpx 体积大且 HEVC 浏览器兼容面窄），当前仅内置 H.264——它对全浏览器 MSE 兼容性最好，符合"编码器过大则只选压缩效率足够且浏览器可解"的要求。
+
+### 桌面共享 CLI 示例
+
+```bash
+./shell-remote agent --relay-url https://relay.example.com \
+  --desktop-capture auto --desktop-fps 15 \
+  --desktop-max-bitrate 800 --desktop-min-bitrate 200
+```
 
 ## Windows Agent
 
