@@ -11,11 +11,20 @@
     let onlineUsers = 0;
     let tabs = [];
 
+    // Desktop view state. 桌面默认关闭：仅在点击"桌面"按钮后才开启。
+    let desktopEnabled = false;   // agent 能力可用
+    let desktopActive = false;    // 当前处于桌面视图
+    let desktopStarting = false;  // 已发 desktop:start 等待回复
     const term = new TerminalManager('terminal-container');
     const files = new FileManager('file-tree');
+    const desktopView = new DesktopView();
 
     const onlineCountEl = document.getElementById('online-count');
     const sessionNameEl = document.getElementById('session-name');
+    const toggleDesktopBtn = document.getElementById('toggle-desktop-btn');
+    const terminalContainer = document.getElementById('terminal-container');
+    const desktopContainer = document.getElementById('desktop-container');
+    const tabBarEl = document.getElementById('tab-bar');
     const disconnectOverlay = document.getElementById('disconnect-overlay');
     const disconnectText = document.getElementById('disconnect-text');
     const toast = document.getElementById('toast');
@@ -55,6 +64,52 @@
     function updateOnlineCount() {
         onlineCountEl.textContent = onlineUsers + ' online';
     }
+
+    // ── Desktop view control ──────────────────────────────────
+
+    function showDesktopView() {
+        desktopActive = true;
+        terminalContainer.classList.add('hidden');
+        desktopContainer.classList.remove('hidden');
+        tabBarEl.classList.add('hidden');
+        toggleDesktopBtn.textContent = '终端';
+    }
+
+    function showTerminalView() {
+        desktopActive = false;
+        terminalContainer.classList.remove('hidden');
+        desktopContainer.classList.add('hidden');
+        tabBarEl.classList.remove('hidden');
+        toggleDesktopBtn.textContent = '桌面';
+        setTimeout(() => { term.resize(); }, 50);
+    }
+
+    function setDesktopEnabled(available) {
+        desktopEnabled = !!available;
+        toggleDesktopBtn.disabled = !desktopEnabled;
+        if (!desktopEnabled) {
+            toggleDesktopBtn.title = '设备不支持桌面共享（未启用桌面捕获）';
+        } else {
+            toggleDesktopBtn.title = '打开桌面画面（默认关闭）';
+        }
+    }
+
+    toggleDesktopBtn.addEventListener('click', function() {
+        if (!desktopEnabled) return;
+        if (desktopActive) {
+            // 切回终端：停流
+            desktopView.disconnect();
+            window.shellRemote.send('desktop:stop', {});
+            desktopStarting = false;
+            showTerminalView();
+            return;
+        }
+        if (desktopStarting) return;
+        desktopStarting = true;
+        toggleDesktopBtn.disabled = true;
+        toggleDesktopBtn.textContent = '连接中…';
+        window.shellRemote.send('desktop:start', {});
+    });
 
     function renderTabs() {
         tabListEl.innerHTML = '';
@@ -155,6 +210,36 @@
         updateOnlineCount();
     });
 
+    window.shellRemote.on('desktop:capabilities', function(msg) {
+        clearJoinWatchdog();
+        setDesktopEnabled(msg.payload && msg.payload.available);
+        if (msg.payload && msg.payload.running && !desktopActive && !desktopStarting) {
+            // 其它浏览器已开启桌面：本地直接进入观看
+            showDesktopView();
+            desktopView.connect();
+        }
+    });
+
+    window.shellRemote.on('desktop:started', function(msg) {
+        desktopStarting = false;
+        toggleDesktopBtn.disabled = !desktopEnabled;
+        if (msg.payload && msg.payload.error) {
+            showToast('桌面启动失败: ' + msg.payload.error, 'error');
+            showTerminalView();
+            return;
+        }
+        showDesktopView();
+        desktopView.connect();
+    });
+
+    window.shellRemote.on('desktop:stopped', function(msg) {
+        if (desktopActive) {
+            desktopView.disconnect();
+            showTerminalView();
+            showToast('桌面已关闭', 'success');
+        }
+    });
+
     window.shellRemote.on('fs:result', function(msg) {
         if (msg.payload._upload_id) {
             const t = document.getElementById('toast');
@@ -180,6 +265,8 @@
 
     window.shellRemote.on('session:agent_disconnect', function(msg) {
         clearJoinWatchdog();
+        desktopView.disconnect();
+        showTerminalView();
         disconnectText.textContent = '设备连接中断，正在自动重连…';
         disconnectOverlay.classList.remove('hidden');
     });

@@ -342,6 +342,7 @@ mod tests {
             "style.css",
             "term.js",
             "files.js",
+            "desktop.js",
             "session.js",
             "install.sh",
         ];
