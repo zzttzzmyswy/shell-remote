@@ -240,6 +240,18 @@
         }
     });
 
+    window.shellRemote.on('desktop:error', function(msg) {
+        // 捕获/编码器持续失败（例如 Wayland 下 XWayland root 无法 GetImage）
+        desktopStarting = false;
+        if (desktopActive) {
+            desktopView.disconnect();
+            showTerminalView();
+        }
+        if (msg.payload && msg.payload.error) {
+            showToast('桌面捕获失败: ' + msg.payload.error, 'error');
+        }
+    });
+
     window.shellRemote.on('fs:result', function(msg) {
         if (msg.payload._upload_id) {
             const t = document.getElementById('toast');

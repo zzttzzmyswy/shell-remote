@@ -29,7 +29,7 @@ encoding_rs = "0.8"
 sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["io"] }
 openh264-sys2 = { version = "0.9.8", features = ["source"] }
-x11rb = { version = "0.14", features = ["image"] }
+x11rb = { version = "0.14", features = ["image", "composite"] }
 
 [dev-dependencies]
 tempfile = "3"

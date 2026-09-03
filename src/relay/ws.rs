@@ -128,6 +128,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "mcp:result",
             "desktop:started",
             "desktop:stopped",
+            "desktop:error",
             "desktop:capabilities",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {

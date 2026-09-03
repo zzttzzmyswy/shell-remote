@@ -251,6 +251,7 @@ async fn run_desktop_pipeline(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
+    let mut err_count: u32 = 0;
 
     while running.load(Ordering::SeqCst) {
         tick.tick().await;
@@ -258,9 +259,24 @@ async fn run_desktop_pipeline(
             break;
         }
         let fr = match src.next_frame() {
-            Ok(f) => f,
+            Ok(f) => {
+                err_count = 0;
+                f
+            }
             Err(e) => {
-                tracing::warn!("capture frame error: {} — retrying", e);
+                // 持续性捕获失败（例如 XWayland 下 root GetImage 抛 BadMatch）
+                // 无限重试只会刷屏且永远黑屏。连续失败 30 次（约 2s）后终止,
+                // 并把原因回传给浏览器展示。
+                err_count += 1;
+                if err_count >= 30 {
+                    tracing::error!("desktop capture failed {err_count} frames in a row — giving up: {e}");
+                    (post)(serde_json::json!({
+                        "type": "desktop:error",
+                        "payload": { "error": format!("capture failed: {e}") }
+                    }));
+                    break;
+                }
+                tracing::warn!("capture frame error: {} — retrying ({}/30)", e, err_count);
                 continue;
             }
         };
@@ -688,6 +704,50 @@ mod tests {
         fn resolution(&self) -> (usize, usize) {
             (self.w, self.h)
         }
+    }
+
+    /// 始终失败的捕获源：模拟 XWayland 下 root GetImage 抛 BadMatch。
+    struct FailingSource;
+
+    impl capture::FrameSource for FailingSource {
+        fn next_frame(&mut self) -> Result<capture::Frame, String> {
+            Err("get_image reply: X11 error Match".to_string())
+        }
+        fn resolution(&self) -> (usize, usize) {
+            (1920, 1080)
+        }
+    }
+
+    /// 连续捕获失败（≥30 次）必须终止循环并回传 desktop:error，
+    /// 而不是无限重试刷屏 + 浏览器永久黑屏。
+    #[test]
+    fn pipeline_failing_source_posts_error_and_stops() {
+        let mut cfg = DesktopConfig::default();
+        cfg.fps = 60.0; // 加速 30 次失败收敛
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let src: Box<dyn capture::FrameSource> = Box::new(FailingSource);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, running, post, src));
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .expect("pipeline must terminate on its own");
+        });
+        let list = posted.lock().unwrap();
+        let errs: Vec<_> = list
+            .iter()
+            .filter(|v| v["type"] == "desktop:error")
+            .collect();
+        assert!(!errs.is_empty(), "must post desktop:error, got: {list:?}");
+        assert!(errs[0]["payload"]["error"].as_str().is_some());
+        // 终止循环后仍需广播 stopped
+        assert!(
+            list.iter().any(|v| v["type"] == "desktop:stopped"),
+            "must also broadcast desktop:stopped after giving up"
+        );
     }
 
     /// 修复回归：真实桌面模式（中等动态）在 200-800kbps 下必须持续出帧，

@@ -35,8 +35,10 @@ pub fn open_source(kind: &str, display: Option<&str>) -> Result<Box<dyn FrameSou
         "none" => Err("desktop capture disabled".to_string()),
         "x11" => X11Source::open(display).map(|s| Box::new(s) as Box<dyn FrameSource>),
         "wayland" => Err(
-            "Wayland native capture needs xdg-desktop-portal + PipeWire support which is not \
-             implemented yet; run the agent under X11 or XWayland (--desktop-capture x11)"
+            "Wayland native capture (xdg-desktop-portal + PipeWire) is not implemented yet; the \
+             X11 backend cannot capture the native Wayland desktop. Run the agent in a real X11 \
+             session (Xorg or Xvfb), or keep --desktop-capture x11 to at least attempt capturing \
+             the XWayland root (limited to X11 windows)"
                 .to_string(),
         ),
         "gdi" | "windows" => open_gdi(),
@@ -47,6 +49,14 @@ pub fn open_source(kind: &str, display: Option<&str>) -> Result<Box<dyn FrameSou
             }
             #[cfg(not(windows))]
             {
+                if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
+                    tracing::warn!(
+                        "Wayland session detected: the X11 backend cannot capture the native \
+                         Wayland desktop (only the XWayland root). Prefer a real X11 session \
+                         (Xorg/Xvfb); full Wayland capture needs the portal backend (not yet \
+                         implemented)"
+                    );
+                }
                 if display.is_some() || std::env::var("DISPLAY").is_ok() {
                     X11Source::open(display).map(|s| Box::new(s) as Box<dyn FrameSource>)
                 } else {
@@ -77,6 +87,13 @@ fn open_gdi() -> Result<Box<dyn FrameSource>, String> {
 
 /// X11 frame source (uses `GetImage`; the server returns the root window's
 /// pixel data, already composed including overlapping windows).
+///
+/// Some composited servers — including the XWayland root under a Wayland
+/// compositor — refuse `GetImage` on the root window with a `BadMatch` error.
+/// When that happens we fall back to the same technique as `ffmpeg x11grab`:
+/// `XCompositeRedirectWindow(root, Automatic)` + `XCompositeNameWindowPixmap`,
+/// then `GetImage` on the named pixmap (which reads the window backing store
+/// and works on composited servers).
 pub struct X11Source {
     conn: x11rb::rust_connection::RustConnection,
     screen_num: usize,
@@ -84,6 +101,8 @@ pub struct X11Source {
     width: u16,
     height: u16,
     depth: u8,
+    /// Lazily-initialised XComposite backend used when root `GetImage` fails.
+    composite: Option<x11rb::protocol::xproto::Pixmap>,
 }
 
 impl X11Source {
@@ -113,6 +132,7 @@ impl X11Source {
             width,
             height,
             depth,
+            composite: None,
         })
     }
 
@@ -124,24 +144,56 @@ impl X11Source {
             _ => BitsPerPixel::B32, // depth 24/30/32 all come back as 32-bit pixels
         }
     }
-}
 
-impl FrameSource for X11Source {
-    fn resolution(&self) -> (usize, usize) {
-        (self.width as usize, self.height as usize)
+    /// Set up the XComposite fallback: redirect the root's children into
+    /// off-screen storage and name the root's backing pixmap (the standard
+    /// screen-capture sequence used by `maim`/`scrot` and `ffmpeg x11grab`).
+    /// The pixmap is reused across frames.
+    fn ensure_composite(&mut self) -> Result<(), String> {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::composite::{self, ConnectionExt as _};
+        if self.composite.is_some() {
+            return Ok(());
+        }
+        self.conn
+            .composite_query_version(0, 7)
+            .map_err(|e| format!("composite query: {e}"))?
+            .reply()
+            .map_err(|e| format!("composite query reply: {e}"))?;
+        // 不能直接 RedirectWindow(root)（规范禁止, 返回 BadMatch）——
+        // 重定向所有子窗口即可让 root 拥有可命名的后备 pixmap。
+        self.conn
+            .composite_redirect_subwindows(self.root, composite::Redirect::AUTOMATIC)
+            .map_err(|e| format!("composite redirect: {e}"))?
+            .check()
+            .map_err(|e| format!("composite redirect reply: {e}"))?;
+        let pixmap = self
+            .conn
+            .generate_id()
+            .map_err(|e| format!("generate pixmap id: {e}"))?;
+        self.conn
+            .composite_name_window_pixmap(self.root, pixmap)
+            .map_err(|e| format!("composite name pixmap: {e}"))?
+            .check()
+            .map_err(|e| format!("composite name pixmap reply: {e}"))?;
+        self.composite = Some(pixmap);
+        Ok(())
     }
 
-    fn next_frame(&mut self) -> Result<Frame, String> {
+    /// `GetImage` on a drawable and return packed BGRA rows for the capture
+    /// region (see `next_frame` for the depth/stride contract).
+    fn capture_impl(&self, drawable: impl Into<x11rb::protocol::xproto::Drawable>) -> Result<Vec<u8>, String> {
         use x11rb::connection::Connection as _;
         use x11rb::image::{BitsPerPixel, Image, ImageOrder, ScanlinePad};
         use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
         use std::borrow::Cow;
 
+        let drawable: x11rb::protocol::xproto::Drawable = drawable.into();
         let w = self.width as u16;
         let h = self.height as u16;
         let reply = self
             .conn
-            .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, !0)
+            .get_image(ImageFormat::Z_PIXMAP, drawable, 0, 0, w, h, !0)
             .map_err(|e| format!("get_image cookie: {e}"))?
             .reply()
             .map_err(|e| format!("get_image reply: {e}"))?;
@@ -200,12 +252,45 @@ impl FrameSource for X11Source {
                 w as usize * h as usize * 4
             ));
         }
-        let _ = self.screen_num;
+        Ok(bgra)
+    }
+}
+
+impl FrameSource for X11Source {
+    fn resolution(&self) -> (usize, usize) {
+        (self.width as usize, self.height as usize)
+    }
+
+    fn next_frame(&mut self) -> Result<Frame, String> {
+        let bgra = match self.capture_impl(self.root) {
+            Ok(b) => b,
+            Err(root_err) => match self.composite_capture() {
+                Ok(b) => b,
+                Err(comp_err) => {
+                    return Err(format!(
+                        "X11 capture failed: GetImage on root — {root_err}; \
+                         XComposite fallback — {comp_err}. If this is a Wayland session (XWayland), \
+                         the X11 root has no image data — the native Wayland desktop cannot be \
+                         captured over X11; run the agent in a real X11 session (Xorg/Xvfb) instead"
+                    ));
+                }
+            },
+        };
         Ok(Frame {
             bgra,
-            width: w as usize,
-            height: h as usize,
+            width: self.width as usize,
+            height: self.height as usize,
         })
+    }
+}
+
+impl X11Source {
+    fn composite_capture(&mut self) -> Result<Vec<u8>, String> {
+        self.ensure_composite()?;
+        let pixmap = self
+            .composite
+            .ok_or_else(|| "composite pixmap missing after ensure".to_string())?;
+        self.capture_impl(pixmap)
     }
 }
 
@@ -353,6 +438,32 @@ mod tests {
         if non_zero == 0 {
             eprintln!("X11 frame is all-black {}x{} (Xvfb root unpainted)", w, h);
         }
+    }
+
+    /// XComposite fallback path (used when the root `GetImage` fails, e.g.
+    /// composited XWayland): redirect the root and read the named pixmap.
+    /// Xvfb ships the Composite extension, so this runs against :99.
+    #[test]
+    fn test_x11_composite_capture_on_xvfb() {
+        let display = std::env::var("SR_XTEST_DISPLAY").unwrap_or_else(|_| ":99".into());
+        let mut src = match X11Source::open(Some(&display)) {
+            Ok(s) => s,
+            Err(e) => {
+                if e.contains("connect") && std::env::var("SR_NO_XTEST").is_ok() {
+                    return;
+                }
+                panic!("x11 open failed: {e}");
+            }
+        };
+        if let Err(e) = src.ensure_composite() {
+            // 无 Composite 扩展的服务器直接跳过（不是断言失败）
+            eprintln!("composite unavailable, skipping: {e}");
+            return;
+        }
+        let (w, h) = src.resolution();
+        let bgra = src.composite_capture().expect("composite capture");
+        assert_eq!(bgra.len(), w * h * 4, "composite capture must match size");
+        // 与主路径尺寸一致即可；内容允许全黑（Xvfb root 未上色）
     }
 
     #[cfg(windows)]
