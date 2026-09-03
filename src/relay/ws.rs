@@ -69,6 +69,31 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 }
             }
         }
+        // Desktop video: fan out init/fragments to browsers subscribed on
+        // /agent/desktop/stream. Own channel — never goes through the normal
+        // broadcast list or the replay EventBuffer (fragments are large and
+        // of no use to late SSE joiners — the desktop stream replays its own
+        // init cache).
+        if proto_msg.msg_type == "desktop:video" {
+            let kind = proto_msg.payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let data_b64 = proto_msg.payload.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(bytes) = crate::agent::fs::decode_b64(data_b64) {
+                let ds = {
+                    let mut streams = state.desktop_streams.write().await;
+                    streams
+                        .entry(session_id.to_string())
+                        .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                        .clone()
+                };
+                if kind == "init" {
+                    ds.set_init(bytes).await;
+                } else {
+                    ds.push_frag(bytes).await;
+                }
+            }
+            return;
+        }
+
         let broadcast_types = [
             "session:users",
             "session:tab_list",
