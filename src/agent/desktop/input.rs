@@ -177,7 +177,7 @@ fn worker(rx: mpsc::Receiver<InputEvent>) {
             return;
         }
     };
-    use enigo::{Axis, Coordinate, Direction, Enigo, Keyboard, Mouse};
+    use enigo::{Axis, Coordinate, Direction, Keyboard, Mouse};
     for ev in rx {
         let r: Result<(), Box<dyn std::error::Error>> = (|| {
             match ev {

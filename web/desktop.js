@@ -8,9 +8,9 @@
 (function() {
   'use strict';
 
-  // 低延迟追帧余量（秒）：播放头被钳到 缓冲尾部-该值。0.3s 在"足够平滑
-  // 不卡顿"和"延时 <1s"之间取的平衡点（RustDesk web 端类似量级）。
-  const LIVE_EDGE_LAG = 0.3;
+  // 低延迟追帧余量（秒）：播放头被钳到 缓冲尾部-该值。60fps 下 0.15s
+  // （≈9 帧）平滑且延时最低; 若卡顿明显可回调（MYS-886 延时优化）。
+  const LIVE_EDGE_LAG = 0.15;
 
   window.DesktopView = class {
     constructor() {

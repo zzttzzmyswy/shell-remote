@@ -47,7 +47,7 @@ impl Default for DesktopConfig {
         Self {
             capture: "auto".to_string(),
             codec: "h264".to_string(),
-            fps: 30.0,
+            fps: 60.0,
             // 静态桌面 ~80k 足够 (openh264 实测 84k 满帧); 动态由 ABR 拉回
             min_bps: 80_000,
             max_bps: 800_000,
@@ -335,15 +335,15 @@ async fn run_desktop_pipeline(
         cap_no += 1;
         if cap_no % (cfg.fps as u64 * 2) == 0 {
             enc.force_idr();
-        }        let stride = STRIDES[stride_idx];
-        wall_ms += frame_ms; // 墙上时间每个 tick 都推进
-        if cap_no % stride as u64 != 0 {
-            // 帧抽取: 本 tick 不编码（pts 不动, 保持时间线连续）。
-            // 跳帧期间也可能长期无上行（静止桌面 + 高 stride）: 到心跳
-            // 间隔则不跳本帧, 强制编一个 IDR。
-            if last_posted_wall + HEARTBEAT_INTERVAL_MS > wall_ms {
-                continue;
-            }
+        }
+        // 低延时管线（MYS-886）: **编码不跳帧**——每个 tick 都捕获+编码。
+        // 帧率阶梯（STRIDES）与降分辨率不再作用于编码路径, 编码器始终
+        // 以满帧率输出; 码率控制交给 ABR 的 set_bitrate。跳帧只发生在
+        // 上行（批量 POST 的丢旧保新, 见 agent::mod 的 batch 逻辑）和
+        // relay→浏览器（非关键帧丢弃）——两者都不破坏解码器状态。
+        // 心跳保活: 静止桌面 OpenH264 输出空帧不上行, 到间隔强制 IDR。
+        wall_ms += frame_ms;
+        if last_posted_wall + HEARTBEAT_INTERVAL_MS <= wall_ms {
             enc.force_idr();
         }
         let fr = match src.next_frame() {
