@@ -125,6 +125,7 @@ use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::convert::Infallible;
+use std::time::Duration;
 use tokio_stream::StreamExt as _;
 
 /// Streaming endpoint for one session's fMP4 desktop video.
@@ -179,8 +180,16 @@ pub async fn stream_handler(
         if let Some(init) = init {
             yield Ok::<_, Infallible>(Bytes::from(init));
         }
-        while let Some(chunk) = rx.recv().await {
-            yield Ok::<_, Infallible>(Bytes::from(chunk));
+        // 空闲超时：健康流每秒都有帧（最差每 2s 一个 IDR），
+        // 30s 无字节说明 agent 侧已停/崩溃、或上行中断，主动收尾
+        // 让浏览器 fetch 结束、viewer 条目被清理，避免永久悬挂。
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+                Ok(Some(chunk)) => {
+                    yield Ok::<_, Infallible>(Bytes::from(chunk));
+                }
+                _ => break,
+            }
         }
         drop(guard);
     };

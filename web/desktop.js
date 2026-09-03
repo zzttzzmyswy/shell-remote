@@ -54,21 +54,39 @@
       const self = this;
       ms.addEventListener('sourceopen', function onOpen() {
         ms.removeEventListener('sourceopen', onOpen);
-        try {
-          self.sourceBuffer = ms.addSourceBuffer('video/mp4; codecs="' + self.codec + '"');
-          self.sourceBuffer.addEventListener('updateend', function() {
-            if (self.queue.length > 0) {
-              const next = self.queue.shift();
-              self._append(next);
-            }
-          });
-        } catch (e) {
-          self.setStatus('播放器初始化失败: ' + e.message, true);
-          self.disconnect();
-          return;
-        }
+        self._createSourceBuffer(self.codec);
         self._startFetch();
       });
+    }
+
+    _createSourceBuffer(codec) {
+      const self = this;
+      try {
+        this.sourceBuffer = this.mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
+        this.sourceBuffer.addEventListener('updateend', function() {
+          self._drain();
+        });
+      } catch (e) {
+        this.setStatus('播放器初始化失败: ' + e.message, true);
+        this.disconnect();
+        return;
+      }
+      this._drain();
+    }
+
+    // 从 init 段 (ftyp/moov 内含 avcC) 解析浏览器实际需要的 codec 串。
+    // OpenH264 输出的 SPS profile/level 可能与本文件预设不同
+    // (avc1.42E01E 是保守默认)；解析到真实值后按需重建 SourceBuffer，
+    // 避免严格 MSE (如 Safari) 因 codec 串与实际流不匹配而拒播。
+    _codecFromInit(buf) {
+      const u8 = new Uint8Array(buf);
+      for (let i = 0; i + 8 <= u8.length; i++) {
+        if (u8[i] === 0x61 && u8[i + 1] === 0x76 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) {
+          const hex = (b) => b.toString(16).padStart(2, '0').toUpperCase();
+          return 'avc1.' + hex(u8[i + 5]) + hex(u8[i + 6]) + hex(u8[i + 7]);
+        }
+      }
+      return null;
     }
 
     _startFetch() {
@@ -79,6 +97,9 @@
       }
       const controller = new AbortController();
       this.controller = controller;
+
+      this.pendingChunks = [];
+      this.codecResolved = false;
 
       const self = this;
       fetch('/agent/desktop/stream', {
@@ -105,7 +126,8 @@
             const v = result.value;
             if (v && v.byteLength) {
               const buf = v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
-              self._append(buf);
+              self.pendingChunks.push(buf);
+              self._drain();
             }
             return pump();
           }).catch(function(e) {
@@ -122,15 +144,30 @@
       });
     }
 
-    _append(buf) {
+    _drain() {
       const sb = this.sourceBuffer;
-      if (!sb) return;
-      if (sb.updating || this.queue.length > 0) {
-        this.queue.push(buf);
-        return;
+      if (!sb || sb.updating) return;
+      if (this.pendingChunks.length === 0) return;
+
+      // 首个 chunk 是 init 段；先在 append 前解析真实 codec，按需换 SourceBuffer
+      if (!this.codecResolved && this.pendingChunks.length > 0) {
+        const actual = this._codecFromInit(this.pendingChunks[0]);
+        if (actual) {
+          this.codecResolved = true;
+          if (actual !== this.codec && this._codecSupported(actual)) {
+            this.codec = actual;
+            try {
+              this.mediaSource.removeSourceBuffer(this.sourceBuffer);
+            } catch (e) { /* ignore */ }
+            this._createSourceBuffer(actual);
+            return;
+          }
+        }
       }
+
+      const next = this.pendingChunks.shift();
       try {
-        sb.appendBuffer(buf);
+        sb.appendBuffer(next);
       } catch (e) {
         console.warn('appendBuffer failed:', e);
       }
@@ -141,6 +178,8 @@
       if (this.reader) { this.reader.cancel().catch(function() {}); this.reader = null; }
       this.connected = false;
       this.queue = [];
+      this.pendingChunks = [];
+      this.codecResolved = false;
       if (this.mediaSource) {
         if (this.mediaSource.readyState === 'open') {
           try { this.mediaSource.endOfStream(); } catch (e) { /* ignore */ }

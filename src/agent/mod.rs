@@ -683,9 +683,32 @@ async fn run_session(
                 // 字段，这里补上以免 agent_send_handler 400/401 拒绝。
                 msg["session_id"] = serde_json::Value::String(sid.clone());
                 let t = msg["type"].as_str().unwrap_or("?").to_string();
-                match pc.post(&su).json(&msg).send().await {
-                    Ok(r) => tracing::trace!("desk POST {t}: {}", r.status()),
-                    Err(e) => tracing::warn!("desk POST {t} failed: {}", e),
+                // 串行、短重试的上行通道。必须消费完整响应体：只读 status
+                // 会让 reqwest 复用悬挂连接，实测导致 POST 间歇挂死、队列
+                // 满后被 try_send 丢帧。media 帧允许丢（relay 按 viewer
+                // 门控），所以最多重试一次避免堆积阻塞后续帧。
+                // 硬超时保护上行通道：reqwest 在连接复用异常时可能让 send()
+                // 无限期挂起（实测），必须用 timeout 兜底——media 帧允许丢，
+                // 但绝不能因为一条卡死的 POST 阻塞后续所有帧。超时直接丢弃
+                // 本条并继续，不进入阻塞式重试。
+                let send_outcome = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    pc.post(&su).json(&msg).send(),
+                )
+                .await;
+                match send_outcome {
+                    Ok(Ok(r)) => {
+                        let status = r.status();
+                        let body_len = tokio::time::timeout(Duration::from_secs(2), r.bytes())
+                            .await
+                            .map(|b| b.map(|b| b.len()).unwrap_or(0))
+                            .unwrap_or(0);
+                        tracing::trace!("desk POST {t}: {status} body={body_len}");
+                    }
+                    Ok(Err(e)) => tracing::warn!("desk POST {t} failed: {e}"),
+                    Err(_) => {
+                        tracing::warn!("desk POST {t} timed out after 5s, dropping message");
+                    }
                 }
                 tokio::task::yield_now().await;
             }

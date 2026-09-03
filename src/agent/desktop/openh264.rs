@@ -227,27 +227,46 @@ impl H264Encoder {
     }
 
     /// Dynamically update the target bitrate (bits per second).
+    ///
+    /// `ENCODER_OPTION_BITRATE` expects an `SBitrateInfo*` (iLayer + iBitrate),
+    /// not a bare `c_int*` — passing the wrong shape makes OpenH264 read past
+    /// the pointer and reject the update (observed as
+    /// `SetOption():ENCODER_OPTION_BITRATE, iBitrate = <garbage>`).
     pub fn set_bitrate(&mut self, bps: u64) {
         if bps == 0 {
             return;
         }
-        let val = bps as c_int;
+        let mut bi = SBitrateInfo {
+            iLayer: 0,
+            iBitrate: bps.min(c_int::MAX as u64) as c_int,
+        };
         unsafe {
-            (self.set_option)(self.enc, ENCODER_OPTION_BITRATE, std::ptr::addr_of!(val) as *mut c_void);
+            (self.set_option)(
+                self.enc,
+                ENCODER_OPTION_BITRATE,
+                std::ptr::addr_of_mut!(bi) as *mut c_void,
+            );
         }
         self.bitrate_bps = bps;
     }
 
     /// Read back the current target bitrate from the encoder.
     pub fn bitrate_bps(&self) -> u64 {
-        let mut val: c_int = 0;
-        unsafe {
-            (self.get_option)(self.enc, ENCODER_OPTION_BITRATE, std::ptr::addr_of_mut!(val) as *mut c_void);
-        }
-        if val <= 0 {
-            self.bitrate_bps
+        let mut bi = SBitrateInfo {
+            iLayer: 0,
+            iBitrate: 0,
+        };
+        let rc = unsafe {
+            (self.get_option)(
+                self.enc,
+                ENCODER_OPTION_BITRATE,
+                std::ptr::addr_of_mut!(bi) as *mut c_void,
+            )
+        };
+        if rc == 0 && bi.iBitrate > 0 {
+            bi.iBitrate as u64
         } else {
-            val as u64
+            self.bitrate_bps
         }
     }
 
@@ -314,12 +333,21 @@ mod tests {
 
     #[test]
     fn test_set_bitrate_readback() {
-        let mut enc = H264Encoder::new(320, 240, 200_000, 15.0).unwrap();
+        // 初始化时用 max_bps（生产路径即 ABR 上限 800k），随后在范围内
+        // 动态下调——OpenH264 只接受 ≤ iMaxSpatialBitrate 的目标。
+        let mut enc = H264Encoder::new(320, 240, 800_000, 15.0).unwrap();
+        enc.set_bitrate(500_000);
+        let rb = enc.bitrate_bps();
+        assert!(
+            (400_000..=600_000).contains(&rb),
+            "bitrate readback outside expected range: {rb}"
+        );
+        // 上调回上限也应被接受
         enc.set_bitrate(800_000);
         let rb = enc.bitrate_bps();
         assert!(
             (700_000..=900_000).contains(&rb),
-            "bitrate readback outside tolerance: {rb}"
+            "bitrate readback after raise outside range: {rb}"
         );
     }
 

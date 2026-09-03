@@ -100,6 +100,13 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             return;
         }
 
+        // 桌面控制事件必须回到浏览器（web/session.js 监听这三个）。
+        // desktop:stopped 同时清理该会话的 fan-out 流，避免 DesktopStream
+        // 长期残留在 map 中。
+        if proto_msg.msg_type == "desktop:stopped" {
+            state.desktop_streams.write().await.remove(session_id);
+        }
+
         let broadcast_types = [
             "session:users",
             "session:tab_list",
@@ -108,6 +115,9 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "fs:result",
             "fs:mkdir",
             "mcp:result",
+            "desktop:started",
+            "desktop:stopped",
+            "desktop:capabilities",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {
             // fs:result is browser-facing (file manager reads + downloads).
@@ -1042,6 +1052,60 @@ mod tests {
             .await
             .insert(session_id.to_string(), cm);
         (tx, rx)
+    }
+
+    #[tokio::test]
+    async fn test_desktop_stopped_clears_stream_and_broadcasts() {
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        // 预先放入一个 stream，desktop:stopped 到达时应被移除
+        state
+            .desktop_streams
+            .write()
+            .await
+            .insert(sid.clone(), crate::relay::desktop::DesktopStream::new());
+        // 浏览器订阅者能收到 desktop:started/stopped 等控制事件
+        let (_agent_tx, _agent_rx) = insert_channel_map(&state, &sid).await;
+        let mut sse_rx = add_browser(&state, &sid, "brow1").await;
+
+        let stopped = serde_json::json!({
+            "type": "desktop:stopped",
+            "session_id": sid,
+            "payload": {}
+        });
+        route_agent_message(&state, &sid, &stopped.to_string()).await;
+
+        assert!(
+            state.desktop_streams.read().await.is_empty(),
+            "desktop:stopped must remove the fan-out stream"
+        );
+        let got = tokio::time::timeout(std::time::Duration::from_millis(2000), sse_rx.recv())
+            .await
+            .expect("browser must receive desktop:stopped")
+            .unwrap();
+        assert!(got.contains("desktop:stopped"), "got: {got}");
+    }
+
+    #[tokio::test]
+    async fn test_desktop_started_broadcasts_to_browsers() {
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        insert_channel_map(&state, &sid).await;
+        let mut sse_rx = add_browser(&state, &sid, "brow1").await;
+
+        let started = serde_json::json!({
+            "type": "desktop:started",
+            "session_id": sid,
+            "payload": { "codec": "h264", "width": 1280, "height": 720 }
+        });
+        route_agent_message(&state, &sid, &started.to_string()).await;
+        let got = tokio::time::timeout(std::time::Duration::from_millis(2000), sse_rx.recv())
+            .await
+            .expect("browser must receive desktop:started")
+            .unwrap();
+        assert!(got.contains("desktop:started") && got.contains("h264"), "got: {got}");
     }
 
     async fn add_browser(

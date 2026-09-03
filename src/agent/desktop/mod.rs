@@ -148,6 +148,22 @@ impl DesktopManager {
     }
 }
 
+/// The manager owns the capture+encode loop lifecycle. When the session that
+/// created it is torn down (agent reconnect / run_session exit), dropping the
+/// manager must stop any still-running loop — otherwise a reconnect leaves the
+/// old loop encoding and POSTing forever (observed as multiple parallel full
+/// desktop encode loops after a relay restart).
+impl Drop for DesktopManager {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        // tokio::sync::Mutex::get_mut is available because `&mut self` proves
+        // exclusive ownership (no other holder can be in a scope).
+        if let Some(task) = self.task.get_mut().take() {
+            task.abort();
+        }
+    }
+}
+
 /// The capture → convert → encode → mux → post loop.
 async fn run_desktop_loop(cfg: DesktopConfig, running: Arc<AtomicBool>, post: PostFn) {
     let mut src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
@@ -314,6 +330,31 @@ mod tests {
         assert!(cfg.supports_codec("h264"));
         assert!(!cfg.supports_codec("vp9"));
         assert!(!cfg.supports_codec("hevc"));
+    }
+
+    #[test]
+    fn test_drop_stops_running_loop() {
+        // Dropping the manager (session teardown / reconnect) must clear the
+        // running flag so any spawned loop exits and no new captures start.
+        let dm = DesktopManager::new(DesktopConfig::default());
+        let running = dm.running.clone();
+        running.store(true, Ordering::SeqCst);
+        assert!(running.load(Ordering::SeqCst));
+        drop(dm);
+        assert!(!running.load(Ordering::SeqCst), "drop must clear running");
+    }
+
+    #[test]
+    fn test_drop_after_start_on_disabled_capture_is_safe() {
+        let mut cfg = DesktopConfig::default();
+        cfg.capture = "none".to_string();
+        let dm = DesktopManager::new(cfg);
+        let post: PostFn = Arc::new(|_| {});
+        // 在真实编码环境中，start 会 spawn 循环；disabled 路径不 spawn——
+        // 确保两种情况下的 drop 都不 panic。
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async { dm.start(post).await; });
+        drop(dm);
     }
 
     #[tokio::test]

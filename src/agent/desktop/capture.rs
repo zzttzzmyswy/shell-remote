@@ -147,6 +147,14 @@ impl FrameSource for X11Source {
             .map_err(|e| format!("get_image reply: {e}"))?;
 
         let depth = if reply.depth > 0 { reply.depth } else { self.depth };
+        // depth 30 (10-bit per channel) is NOT byte-addressable BGRA: treating
+        // it as 32bpp would silently produce wrong colors. Fail loudly instead.
+        // 8/16-bit depths are likewise unsupported for the packed-BGRA contract.
+        if depth != 24 && depth != 32 {
+            return Err(format!(
+                "unsupported X11 root depth {depth}: only 24/32-bit (packed BGRA) captures are supported"
+            ));
+        }
         let bpp = Self::bpp(depth);
         let byte_order = ImageOrder::try_from(self.conn.setup().image_byte_order)
             .unwrap_or(ImageOrder::LsbFirst);
