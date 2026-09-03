@@ -77,6 +77,13 @@
   .filter-bar input[type="text"]:focus, .filter-bar select:focus { border-color: var(--accent); }
   .filter-count { color: var(--muted); font-size: 12px; }
 
+  /* Agent upgrade status in the devices table */
+  .upg-status { font-size: 12px; display: inline-block; }
+  .upg-status.upg-done { color: var(--green); }
+  .upg-status.upg-fail { color: var(--red); }
+  .upg-list { margin: 0; padding-left: 18px; }
+  .upg-list li { margin: 4px 0; }
+
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 22px; }
   .panel h2 { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
 
@@ -238,7 +245,7 @@
       <span class="filter-count" id="devCount"></span>
     </div>
     <div class="filter-bar">
-      <input type="text" id="devFilter" data-i18n-ph="dev_filter_ph" placeholder="Filter devices…">
+      <input type="text" id="devFilter" autocomplete="off" data-i18n-ph="dev_filter_ph" placeholder="Filter devices…">
       <select id="devArchFilter" title="arch">
         <option value="" data-i18n="dev_arch_all">All arch</option>
       </select>
@@ -259,6 +266,7 @@
             <th data-i18n="th_system">System</th>
             <th data-i18n="th_cpu">CPU</th>
             <th data-i18n="th_type">Type</th>
+            <th data-i18n="th_version">Version</th>
             <th data-i18n="th_last_active">Last active</th>
             <th data-i18n="th_actions">Actions</th>
           </tr>
@@ -331,10 +339,19 @@
       <button class="btn btn-sm" id="srvShow" data-i18n="show">Show</button>
     </div>
     <div class="srv-row" style="margin-top:12px;">
-      <input id="srvInput" type="password" class="srv-input" data-i18n-ph="new_server_password" placeholder="New server password">
+      <input id="srvInput" type="password" autocomplete="new-password" class="srv-input" data-i18n-ph="new_server_password" placeholder="New server password">
       <button class="btn btn-primary btn-sm" id="srvUpdate" data-i18n="update">Update</button>
     </div>
     <div class="err" id="srvErr"></div>
+  </div>
+  <div class="panel">
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
+      <h2 style="margin:0;" data-i18n="upg_artifacts">Agent updates</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-sm" id="upgRefresh" data-i18n="refresh">Refresh</button>
+    </div>
+    <div class="muted" style="margin-bottom:10px; font-size:12px;" data-i18n="upg_hint">Stage new agent binaries in the relay's --agent-upgrade-dir, then upgrade devices from the Devices tab.</div>
+    <div id="upgList"></div>
   </div>
   </section>
 </div>
@@ -499,9 +516,26 @@
       th_arch: "架构",
       th_system: "系统",
       th_cpu: "CPU",
+      th_version: "版本",
       no_devices: "暂无设备。",
       dev_unreported: "（未上报设备信息）",
-      dev_count_x: "共 {n} 台"
+      dev_count_x: "共 {n} 台",
+      upg: "升级",
+      upg_offline: "设备离线",
+      upg_not_enabled: "未启用升级（需 --agent-upgrade-dir）",
+      upg_no_artifact: "无匹配升级文件",
+      upg_confirm: "确定升级设备 {id}？将下载并校验、原子替换 agent 二进制，随后 agent 自动重启（版本 {v}）。",
+      upg_err: "升级失败：",
+      upg_artifacts: "Agent 升级",
+      upg_hint: "将新版本二进制放到 relay 的 --agent-upgrade-dir 目录（命名 shell-remote-<arch>，Windows 为 .exe，可选 shell-remote-<arch>.version 标注版本），再到「设备」页对目标设备点击升级。",
+      upg_no_artifacts: "未启用（--agent-upgrade-dir）或无升级文件。",
+      upg_dir: "目录：",
+      upg_stage_started: "已触发",
+      upg_stage_downloading: "下载中",
+      upg_stage_verifying: "校验中",
+      upg_stage_installing: "安装重启中",
+      upg_failed: "升级失败",
+      upg_done_suffix: "已升级 "
     },
     en: {
       app_title: "shell-remote admin",
@@ -616,9 +650,26 @@
       th_arch: "Arch",
       th_system: "System",
       th_cpu: "CPU",
+      th_version: "Version",
       no_devices: "No devices.",
       dev_unreported: "(no device info)",
-      dev_count_x: "{n} devices"
+      dev_count_x: "{n} devices",
+      upg: "Upgrade",
+      upg_offline: "device offline",
+      upg_not_enabled: "upgrades disabled (needs --agent-upgrade-dir)",
+      upg_no_artifact: "no matching artifact",
+      upg_confirm: "Upgrade device {id}? The agent will download, verify and atomically replace its binary, then restart (version {v}).",
+      upg_err: "Upgrade failed: ",
+      upg_artifacts: "Agent updates",
+      upg_hint: "Stage new agent binaries in the relay's --agent-upgrade-dir (named shell-remote-<arch>, .exe on Windows; an optional shell-remote-<arch>.version marks the version), then click Upgrade on the device.",
+      upg_no_artifacts: "Not enabled (no --agent-upgrade-dir) or no artifacts staged.",
+      upg_dir: "Dir: ",
+      upg_stage_started: "started",
+      upg_stage_downloading: "downloading",
+      upg_stage_verifying: "verifying",
+      upg_stage_installing: "installing",
+      upg_failed: "upgrade failed",
+      upg_done_suffix: "upgraded "
     }
   };
 
@@ -789,6 +840,9 @@
     lastOverview = o;
     renderOverview(o);
     renderSessions(o.sessions || []);
+    // Upgrade eligibility shapes the devices table's row buttons/status, so
+    // the artifacts list is fetched before the devices table is rebuilt.
+    await refreshUpgradeArtifacts();
     renderDevices(o.sessions || []);
     renderConnLog(o.conn_log || []);
     refreshRecordings();
@@ -1031,6 +1085,11 @@
     tdT.appendChild(textNode(s.is_temporary ? t('type_temporary') : t('type_fixed')));
     tr.appendChild(tdT);
 
+    // Version + upgrade status
+    const tdVer = document.createElement('td');
+    tdVer.appendChild(buildUpgradeStatus(s));
+    tr.appendChild(tdVer);
+
     // Last active
     const tdAgo = document.createElement('td');
     const ago = fmtAgo(s.last_active_seconds);
@@ -1040,9 +1099,17 @@
     }
     tr.appendChild(tdAgo);
 
-    // Actions: connect only
+    // Actions: connect + upgrade
     const tdAct = document.createElement('td'); tdAct.className = 'actions';
     tdAct.appendChild(buildConnectButton(s));
+    const upg = document.createElement('button');
+    upg.className = 'btn btn-sm'; upg.textContent = t('upg');
+    upg.style.marginLeft = '6px';
+    const elig = upgradeEligible(s);
+    upg.disabled = !elig.ok;
+    upg.title = elig.ok ? t('upg') : elig.reason;
+    upg.addEventListener('click', () => onUpgrade(s));
+    tdAct.appendChild(upg);
     tr.appendChild(tdAct);
 
     return tr;
@@ -1054,6 +1121,106 @@
     b.style.fontSize = '11px';
     b.textContent = ' (' + t('dev_unreported') + ')';
     return b;
+  }
+
+  // --- Agent self-upgrade (devices panel) ---
+  let upgradeArtifacts = null; // {enabled, dir, artifacts:[{arch,filename,size,windows,version}]}
+
+  function artifactArchKey(a) {
+    const k = String(a || '').trim().toLowerCase();
+    if (k === 'amd64' || k === 'x64') return 'x86_64';
+    if (k === 'arm64') return 'aarch64';
+    if (k === 'armv7l' || k === 'armv7') return 'armv7';
+    return k;
+  }
+
+  function artifactFor(s) {
+    if (!upgradeArtifacts || !upgradeArtifacts.enabled) return null;
+    const d = s.device || {};
+    const key = artifactArchKey(d.arch);
+    const win = d.platform === 'windows';
+    return (upgradeArtifacts.artifacts || []).find(a => a.arch === key && a.windows === win) || null;
+  }
+
+  function upgradeEligible(s) {
+    if (!s.online) return { ok: false, reason: t('upg_offline') };
+    if (!upgradeArtifacts || !upgradeArtifacts.enabled) return { ok: false, reason: t('upg_not_enabled') };
+    if (!artifactFor(s)) return { ok: false, reason: t('upg_no_artifact') };
+    return { ok: true, reason: '' };
+  }
+
+  function buildUpgradeStatus(s) {
+    const u = s.upgrade;
+    const cur = s.agent_version ? 'v' + s.agent_version : t('dash_placeholder');
+    const wrap = document.createElement('span');
+    wrap.className = 'upg-status';
+    if (!u) { wrap.textContent = cur; return wrap; }
+    if (u.stage === 'failed') {
+      wrap.className += ' upg-fail';
+      wrap.appendChild(textNode('✗ ' + (u.error || t('upg_failed'))));
+      return wrap;
+    }
+    if (s.agent_version && u.version && s.agent_version === u.version) {
+      wrap.className += ' upg-done';
+      wrap.appendChild(textNode('✓ ' + t('upg_done_suffix') + cur));
+      return wrap;
+    }
+    wrap.appendChild(textNode(t('upg_stage_' + (u.stage || 'started'))));
+    if (u.percent != null) wrap.appendChild(textNode(' ' + u.percent + '%'));
+    if (u.detail) {
+      const dd = document.createElement('span');
+      dd.className = 'muted';
+      dd.textContent = ' · ' + u.detail;
+      wrap.appendChild(dd);
+    }
+    return wrap;
+  }
+
+  async function onUpgrade(s) {
+    const art = artifactFor(s);
+    if (!art) return;
+    if (!confirm(t('upg_confirm', { id: s.session_id || '', v: art.version || s.agent_version || '' }))) return;
+    try {
+      const r = await api('/api/agent/upgrade', { method: 'POST', body: { session_id: s.session_id } });
+      if (!r.ok) throw new Error(r.error || 'failed');
+      refresh();
+    } catch (e) { alert(t('upg_err') + e.message); }
+  }
+
+  async function refreshUpgradeArtifacts() {
+    try {
+      const r = await api('/api/agent/upgrade/artifacts');
+      upgradeArtifacts = r;
+    } catch (_) {}
+    renderUpgradeArtifacts();
+  }
+
+  function renderUpgradeArtifacts() {
+    const box = $('upgList'); if (!box) return;
+    box.textContent = '';
+    if (!upgradeArtifacts || !upgradeArtifacts.enabled) {
+      box.appendChild(textNode(t('upg_no_artifacts')));
+      return;
+    }
+    const items = upgradeArtifacts.artifacts || [];
+    if (items.length === 0) {
+      box.appendChild(textNode(t('upg_no_artifacts')));
+      const dirHint = textNode(t('upg_dir') + (upgradeArtifacts.dir || ''));
+      dirHint.className = 'muted';
+      box.appendChild(dirHint);
+      return;
+    }
+    const ul = document.createElement('ul'); ul.className = 'upg-list';
+    for (const a of items) {
+      const li = document.createElement('li');
+      const arch = document.createElement('span'); arch.className = 'mono';
+      arch.textContent = a.arch + (a.windows ? ' (win)' : '');
+      const meta = document.createElement('span'); meta.className = 'muted';
+      meta.textContent = ' — ' + a.filename + ' · ' + fmtBytes(a.size) + ' · ' + a.version;
+      li.appendChild(arch); li.appendChild(meta);
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
   }
 
   $('devFilter').addEventListener('input', (e) => { devQuery = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
@@ -1448,6 +1615,7 @@
     $(id).addEventListener('click', (e) => { if (e.target === e.currentTarget) $(id).classList.add('hidden'); });
   });
   $('recRefresh').addEventListener('click', refreshRecordings);
+  $('upgRefresh').addEventListener('click', refreshUpgradeArtifacts);
   $('recPrev').addEventListener('click', () => recGoTo(recPage - 1));
   $('recNext').addEventListener('click', () => recGoTo(recPage + 1));
 

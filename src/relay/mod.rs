@@ -78,6 +78,13 @@ pub struct SharedState {
     /// Desktop video fan-out per session (lazily created on first
     /// `desktop:video` message).
     pub desktop_streams: RwLock<HashMap<String, crate::relay::desktop::DesktopStream>>,
+    /// Last `agent:upgrade_progress` payload per session (drives the admin
+    /// device panel's upgrade status cell). Keyed by session id.
+    pub agent_upgrades: RwLock<HashMap<String, serde_json::Value>>,
+    /// Directory holding staged agent upgrade artifacts
+    /// (`shell-remote-<arch>[.exe]`, plus an optional `shell-remote-<arch>.version`
+    /// companion). `None` when `--agent-upgrade-dir` is unset (upgrades off).
+    pub upgrade_dir: RwLock<Option<std::path::PathBuf>>,
 }
 
 /// One entry in the access audit trail. `conn` is the session id, `prefix` is
@@ -208,6 +215,8 @@ impl SharedState {
             recorder,
             conn_log: RwLock::new(std::collections::VecDeque::new()),
             desktop_streams: RwLock::new(HashMap::new()),
+            agent_upgrades: RwLock::new(HashMap::new()),
+            upgrade_dir: RwLock::new(None),
         }
     }
 
@@ -893,6 +902,7 @@ pub async fn start(
     admin_user: Option<String>,
     admin_pass: Option<String>,
     record_dir: Option<String>,
+    agent_upgrade_dir: Option<String>,
 ) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -947,6 +957,18 @@ pub async fn start(
         recorder,
     ));
 
+    // Agent self-upgrade artifacts: `--agent-upgrade-dir` stages binaries
+    // (`shell-remote-<arch>[.exe]`). Create the dir up front so a bad path
+    // fails fast at startup.
+    if let Some(dir) = agent_upgrade_dir.filter(|d| !d.is_empty()) {
+        let dir = std::path::PathBuf::from(dir);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("--agent-upgrade-dir {:?}: {}", dir, e))?;
+        tracing::info!(dir = %dir.display(), "agent self-upgrade artifacts enabled");
+        *state.upgrade_dir.write().await = Some(dir);
+    }
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -977,6 +999,10 @@ pub async fn start(
         .route(
             "/agent/desktop/stream",
             get(crate::relay::desktop::stream_handler),
+        )
+        .route(
+            "/agent/upgrade/blob/:filename",
+            get(ws::upgrade_blob_handler),
         )
         .route("/agent/install", get(install_script_handler))
         .route("/agent/install.ps1", get(install_script_ps1_handler))
@@ -1010,6 +1036,8 @@ pub async fn start(
             .route(&format!("{}/api/recordings", ap), get(admin::recordings_handler))
             .route(&format!("{}/api/recordings/content", ap), get(admin::recording_content_handler))
             .route(&format!("{}/api/recordings/delete", ap), axum::routing::delete(admin::recording_delete_handler))
+            .route(&format!("{}/api/agent/upgrade", ap), axum::routing::post(admin::agent_upgrade_handler))
+            .route(&format!("{}/api/agent/upgrade/artifacts", ap), get(admin::upgrade_artifacts_handler))
     } else {
         app
     };

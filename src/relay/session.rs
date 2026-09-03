@@ -13,6 +13,9 @@ pub struct SessionInfo {
     /// Best-effort host probe reported by the agent at registration. `None`
     /// for older agents / failed probes.
     pub device: Option<DeviceInfo>,
+    /// Agent binary version reported at registration (`CARGO_PKG_VERSION`).
+    /// `None` for older agents that predate version reporting.
+    pub agent_version: Option<String>,
 }
 
 pub struct SessionRegistry {
@@ -117,6 +120,7 @@ impl SessionRegistry {
                     fixed_key,
                     is_temporary,
                     device: None,
+                    agent_version: None,
                 },
             );
         }
@@ -189,6 +193,7 @@ impl SessionRegistry {
                     fixed_key: None,
                     is_temporary: true,
                     device: None,
+                    agent_version: None,
                 },
             );
         }
@@ -232,6 +237,20 @@ impl SessionRegistry {
         if let Some(info) = self.sessions.write().await.get_mut(session_id) {
             info.device = device;
         }
+    }
+
+    /// Store/replace the agent version reported at registration (drives the
+    /// admin device panel's version column and upgrade completion display).
+    pub async fn set_agent_version(&self, session_id: &str, version: Option<String>) {
+        if let Some(info) = self.sessions.write().await.get_mut(session_id) {
+            info.agent_version = version;
+        }
+    }
+
+    /// Look up one session's info (used by the admin upgrade trigger to learn
+    /// the device arch / platform and pick the matching artifact).
+    pub async fn get(&self, session_id: &str) -> Option<SessionInfo> {
+        self.sessions.read().await.get(session_id).cloned()
     }
 
     pub async fn count(&self) -> usize {

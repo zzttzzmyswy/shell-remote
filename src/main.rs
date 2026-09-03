@@ -9,7 +9,7 @@ mod relay;
 mod web;
 
 #[derive(Parser)]
-#[command(name = "shell-remote", about = "Collaborative remote shell tool")]
+#[command(name = "shell-remote", about = "Collaborative remote shell tool", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -45,6 +45,13 @@ enum Command {
         /// disables recording entirely.
         #[arg(long)]
         record_dir: Option<String>,
+
+        /// Directory with staged agent upgrade artifacts
+        /// (`shell-remote-<arch>[.exe]`, plus an optional
+        /// `shell-remote-<arch>.version` companion). When set, the admin
+        /// device panel can trigger atomic agent self-upgrades.
+        #[arg(long)]
+        agent_upgrade_dir: Option<String>,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -128,8 +135,18 @@ async fn main() -> anyhow::Result<()> {
             admin_user,
             admin_pass,
             record_dir,
+            agent_upgrade_dir,
         } => {
-            relay::start(bind, auth, admin_path, admin_user, admin_pass, record_dir).await?;
+            relay::start(
+                bind,
+                auth,
+                admin_path,
+                admin_user,
+                admin_pass,
+                record_dir,
+                agent_upgrade_dir,
+            )
+            .await?;
         }
         Command::Agent {
             relay_url,

@@ -56,6 +56,17 @@ pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) {
 
 pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, text_str: &str) {
     if let Ok(proto_msg) = serde_json::from_str::<ProtoMessage>(text_str) {
+        // Agent self-upgrade progress: capture it for the admin panel's
+        // devices page (polled via /api/overview) and stop here — the frame
+        // is relay→admin telemetry, not something browsers or MCP callers see.
+        if proto_msg.msg_type == "agent:upgrade_progress" {
+            state
+                .agent_upgrades
+                .write()
+                .await
+                .insert(session_id.to_string(), proto_msg.payload.clone());
+            return;
+        }
         // Recording: capture terminal:output for the session's cast file.
         if proto_msg.msg_type == "terminal:output" {
             if let Some(rec) = &state.recorder {
@@ -433,6 +444,18 @@ pub async fn agent_send_handler(
             .filter(|d| !d.is_empty());
         state.sessions.set_device(&session_id, device).await;
 
+        // Agent binary version (drives the admin upgrade UI). Older agents
+        // omit it entirely → None.
+        let agent_version = body
+            .get("agent_version")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        state
+            .sessions
+            .set_agent_version(&session_id, agent_version)
+            .await;
+
         return Json(json!({
             "type": "agent:registered",
             "session_id": session_id,
@@ -585,6 +608,89 @@ impl Drop for AgentEventsCleanup {
                 }
             }
         });
+    }
+}
+
+// ── Agent self-upgrade artifact download ─────────────────────────────
+
+/// Serve a staged agent upgrade artifact to the agent performing its atomic
+/// self-upgrade. Auth mirrors the file-transfer endpoints: an `X-SR-Token`
+/// header carrying a valid read-write token (the agent sends its own).
+pub async fn upgrade_blob_handler(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let token = headers
+        .get("x-sr-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    match state.sessions.authenticate(token).await {
+        Some((_sid, Permission::ReadWrite)) => {}
+        Some((_, Permission::ReadOnly)) => {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(json!({"error": "read-write token required"})),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "invalid token"})),
+            )
+                .into_response();
+        }
+    }
+    if !crate::relay::admin::valid_artifact_filename(&filename) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid artifact name"})),
+        )
+            .into_response();
+    }
+    let dir = match &*state.upgrade_dir.read().await {
+        Some(d) => d.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "upgrades disabled"})),
+            )
+                .into_response();
+        }
+    };
+    let path = dir.join(&filename);
+    match tokio::fs::File::open(&path).await {
+        Ok(file) => {
+            let metadata = match file.metadata().await {
+                Ok(m) => m,
+                Err(_) => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "cannot stat artifact"})),
+                    )
+                        .into_response();
+                }
+            };
+            let stream = tokio_util::io::ReaderStream::new(file);
+            axum::http::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/octet-stream",
+                )
+                .header(
+                    axum::http::header::CONTENT_LENGTH,
+                    metadata.len().to_string(),
+                )
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap()
+        }
+        Err(_) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "artifact not found"})),
+        )
+            .into_response(),
     }
 }
 
