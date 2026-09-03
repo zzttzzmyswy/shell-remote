@@ -93,13 +93,26 @@
           self._drain();
         });
         this.sourceBuffer.addEventListener('error', function() {
-          self.setStatus('MSE 解码错误: 浏览器无法解码该视频流 (codec=' + codec + ')', true);
+          // 附上浏览器标识与当前 UA，便于远程定位是哪类内核拒绝解码。
+          let ua = '';
+          try { ua = ' UA=' + navigator.userAgent; } catch (e) {}
+          self.setStatus('MSE 解码错误: 浏览器无法解码该视频流 (codec=' + codec + ')' + ua, true);
         });
       } catch (e) {
         this.setStatus('播放器初始化失败: ' + e.message, true);
         this.disconnect();
         return;
       }
+      // video 元素错误（MEDIA_ERR_* code）比 SourceBuffer 事件更有信息量
+      this.video.addEventListener('error', function onVErr() {
+        const m = self.video.error;
+        if (m) {
+          let ua = '';
+          try { ua = ' UA=' + navigator.userAgent; } catch (e) {}
+          self.setStatus('播放错误 code=' + m.code + ' (' + m.message + ')' + ua, true);
+        }
+        self.video.removeEventListener('error', onVErr);
+      });
       this._drain();
     }
 
