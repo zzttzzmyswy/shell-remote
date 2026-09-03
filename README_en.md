@@ -71,6 +71,7 @@ cargo build --release
 | `--bind` | `0.0.0.0:3000` | Listen address |
 | `--auth` | none | Server password (required) |
 | `--record-dir` | none | Directory to record terminal sessions (asciinema cast v2); unset disables |
+| `--download-dir` | none | Offline binary distribution directory: place per-platform agent binaries by file name (e.g. `shell-remote-x86_64`, `shell-remote-aarch64`, `shell-remote-armv7`, `shell-remote-x86_64.exe`), served at `/download/<name>`. The install scripts download from this relay **first**, falling back to GitHub mirrors — for intranet / restricted networks |
 | `--agent-upgrade-dir` | none | Directory with staged agent upgrade artifacts (`shell-remote-<arch>[.exe]`, optional `shell-remote-<arch>.version` companion); unset disables the upgrade button |
 
 ### Start Agent

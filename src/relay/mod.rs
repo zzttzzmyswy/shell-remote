@@ -53,6 +53,9 @@ pub struct SharedState {
     pub pending_mcp: RwLock<HashMap<String, (String, oneshot::Sender<String>)>>,
     pub download_streams: RwLock<HashMap<String, crate::relay::file_transfer::DownloadSink>>,
     pub last_activity: RwLock<HashMap<String, Instant>>,
+    /// Directory served at `/download/<filename>` (optional offline binary
+    /// distribution; the install scripts try this relay before GitHub).
+    pub download_dir: Option<std::path::PathBuf>,
     /// Server access password (`--auth`). Wrapped in a RwLock so the admin
     /// panel can rotate it live; reads on the hot auth path take a read lock.
     pub server_auth: RwLock<String>,
@@ -201,6 +204,7 @@ impl SharedState {
             agent_broadcast: RwLock::new(HashMap::new()),
             pending_mcp: RwLock::new(HashMap::new()),
             download_streams: RwLock::new(HashMap::new()),
+            download_dir: None,
             last_activity: RwLock::new(HashMap::new()),
             server_auth: RwLock::new(server_auth),
             agent_event_buffers: RwLock::new(HashMap::new()),
@@ -501,6 +505,86 @@ mod tests {
         assert!(text.contains("agent --relay-url"));
         assert!(text.contains("Invoke-WebRequest"));
         assert!(text.contains("--download-only"));
+    }
+
+    #[tokio::test]
+    async fn test_install_scripts_prefer_relay_download() {
+        // 安装脚本第一下载源必须是本 relay 的 /download/<bin>。
+        let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", "relay.example".parse().unwrap());
+
+        let body = install_script_handler(State(state.clone()), headers.clone())
+            .await
+            .into_response();
+        let text = String::from_utf8(
+            axum::body::to_bytes(body.into_body(), 1024 * 1024).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        // URLS 列表内: relay 自身下载端点必须在任何 github mirror 之前。
+        // 脚本里 `${RELAY_URL}` 是运行时变量(字面保留), 以 "${RELAY_URL}/download"
+        // 作为 relay 源标记; github mirror 以 "github.com" 标记。
+        let u = text.find("URLS=").expect("URLS block");
+        let seg = &text[u..];
+        let rd = seg.find("${RELAY_URL}/download").expect("relay first URL");
+        let gh = seg.find("github.com").unwrap_or(usize::MAX);
+        assert!(rd < gh, "relay download must be tried before GitHub mirrors:\n{seg}");
+
+        let body2 = install_script_ps1_handler(State(state), headers)
+            .await
+            .into_response();
+        let text2 = String::from_utf8(
+            axum::body::to_bytes(body2.into_body(), 1024 * 1024).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        let u2 = text2.find("$URLS").expect("ps1 URLS");
+        let seg2 = &text2[u2..];
+        let rd2 = seg2.find("$RELAY_URL/download/").expect("ps1 relay first URL");
+        let gh2 = seg2.find("github.com").unwrap_or(usize::MAX);
+        assert!(rd2 < gh2, "ps1 must try relay download first:\n{seg2}");
+    }
+
+    #[tokio::test]
+    async fn test_download_handler_serves_and_protects() {
+        let dir = std::env::temp_dir().join(format!("sr-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shell-remote-x86_64"), b"\x7fELF-fake-bin").unwrap();
+        std::fs::write(dir.join("shell-remote-x86_64.exe"), b"MZ-fake-exe").unwrap();
+
+        let mk = || {
+            let mut st = SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None);
+            st.download_dir = Some(dir.clone());
+            Arc::new(st)
+        };
+
+        // 正常下载
+        let resp = download_handler(State(mk()), axum::extract::Path("shell-remote-x86_64".into()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(&bytes[..], b"\x7fELF-fake-bin");
+
+        // 路径穿越被拒
+        let resp = download_handler(State(mk()), axum::extract::Path("../secret".into()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 400);
+
+        // 不存在的文件
+        let resp = download_handler(State(mk()), axum::extract::Path("nope.bin".into()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 404);
+
+        // 未配置 download-dir → 404
+        let state_no = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
+        let resp = download_handler(State(state_no), axum::extract::Path("shell-remote-x86_64".into()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -895,6 +979,43 @@ pub async fn install_script_ps1_handler(
     )
 }
 
+/// Serve binaries staged in `--download-dir` at `/download/<filename>` — the
+/// first place the install scripts try (they fall back to GitHub mirrors).
+/// Path traversal is rejected up front (single file name only).
+pub async fn download_handler(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(dir) = &state.download_dir else {
+        return (axum::http::StatusCode::NOT_FOUND, "downloads not enabled").into_response();
+    };
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid filename",
+        )
+        .into_response();
+    }
+    let path = dir.join(&filename);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream",
+            )
+            .header(axum::http::header::CONTENT_LENGTH, bytes.len().to_string())
+            .header(axum::http::header::CACHE_CONTROL, "no-cache")
+            .body(axum::body::Body::from(bytes))
+            .unwrap(),
+        Err(_) => (axum::http::StatusCode::NOT_FOUND, "binary not found").into_response(),
+    }
+}
+
 pub async fn start(
     bind: String,
     server_auth: Option<String>,
@@ -903,6 +1024,7 @@ pub async fn start(
     admin_pass: Option<String>,
     record_dir: Option<String>,
     agent_upgrade_dir: Option<String>,
+    download_dir: Option<String>,
 ) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -948,14 +1070,20 @@ pub async fn start(
         _ => None,
     };
 
-    let state = Arc::new(SharedState::new(
+    let mut st = SharedState::new(
         auth,
         100 * 1024 * 1024,
         admin_path_v.clone(),
         admin_user_v.clone().unwrap_or_default(),
         admin_pass_v.clone().unwrap_or_default(),
         recorder,
-    ));
+    );
+    // Optional offline binary distribution over `/download/<name>`
+    // (`--download-dir`); the install scripts prefer this relay first.
+    st.download_dir = download_dir
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from);
+    let state = Arc::new(st);
 
     // Agent self-upgrade artifacts: `--agent-upgrade-dir` stages binaries
     // (`shell-remote-<arch>[.exe]`). Create the dir up front so a bad path
@@ -1006,6 +1134,7 @@ pub async fn start(
         )
         .route("/agent/install", get(install_script_handler))
         .route("/agent/install.ps1", get(install_script_ps1_handler))
+        .route("/download/:filename", get(download_handler))
         .route("/", get(static_handler))
         .route("/session", get(static_handler))
         .route("/style.css", get(static_handler))

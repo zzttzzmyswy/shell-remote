@@ -52,6 +52,15 @@ enum Command {
         /// device panel can trigger atomic agent self-upgrades.
         #[arg(long)]
         agent_upgrade_dir: Option<String>,
+
+        /// Directory with per-platform agent binaries served at
+        /// `/download/<filename>` (e.g. shell-remote-x86_64,
+        /// shell-remote-aarch64, shell-remote-armv7, shell-remote-x86_64.exe,
+        /// shell-remote-darwin-aarch64). When set, the install scripts download
+        /// from this relay first and only fall back to GitHub mirrors;
+        /// binaries can be staged out-of-band (e.g. scp/CI) into this dir.
+        #[arg(long)]
+        download_dir: Option<String>,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -139,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             admin_pass,
             record_dir,
             agent_upgrade_dir,
+            download_dir,
         } => {
             relay::start(
                 bind,
@@ -148,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
                 admin_pass,
                 record_dir,
                 agent_upgrade_dir,
+                download_dir,
             )
             .await?;
         }

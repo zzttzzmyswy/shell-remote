@@ -76,6 +76,7 @@ cargo build --release
 | `--bind` | `0.0.0.0:3000` | 监听地址 |
 | `--auth` | 无默认值 | 服务器密码（必填） |
 | `--record-dir` | 无 | 终端会话录制目录（asciinema cast v2）；不设则不录制 |
+| `--download-dir` | 无 | 离线二进制分发目录：目录内按文件名（如 `shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`、`shell-remote-x86_64.exe`）放置各平台 agent 二进制，经 `/download/<文件名>` 对外提供；**安装脚本会优先从本 relay 下载**，GitHub 镜像仅作回退（适合内网/镜像受限环境） |
 | `--agent-upgrade-dir` | 无 | agent 自升级制品目录（`shell-remote-<arch>[.exe]`，可选 `shell-remote-<arch>.version` 标注版本）；不设则"设备"页升级功能不可用 |
 
 ### 启动 Agent

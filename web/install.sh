@@ -36,6 +36,7 @@ fi
 
 BASE="https://github.com/zzttzzmyswy/shell-remote/releases/latest/download"
 URLS="
+${RELAY_URL}/download/shell-remote-${BIN_ARCH}
 ${BASE}/shell-remote-${BIN_ARCH}
 https://edgeone.gh-proxy.com/${BASE}/shell-remote-${BIN_ARCH}
 https://hk.gh-proxy.com/${BASE}/shell-remote-${BIN_ARCH}

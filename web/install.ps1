@@ -28,6 +28,7 @@ if ($downloadOnly) {
 
 $BASE = "https://github.com/zzttzzmyswy/shell-remote/releases/latest/download"
 $URLS = @(
+    "$RELAY_URL/download/$ASSET",
     "$BASE/$ASSET",
     "https://edgeone.gh-proxy.com/$BASE/$ASSET",
     "https://hk.gh-proxy.com/$BASE/$ASSET",
