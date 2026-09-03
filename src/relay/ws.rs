@@ -323,6 +323,47 @@ pub async fn agent_send_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Batch transport (v0.20.5+): the agent coalesces several messages into a
+    // JSON array so the desktop video uplink is no longer rate-limited by one
+    // HTTP round-trip per frame. Each element is routed like a single message
+    // (it carries its own `session_id`).
+    if let Some(messages) = body.as_array() {
+        if messages.is_empty() {
+            return axum::http::StatusCode::OK.into_response();
+        }
+        // 认证与单条路径共用：每个 batch 元素都带 session_id，任意一个不
+        // 属于已知会话则拒绝整个 batch（防未认证注入）。
+        for m in messages {
+            let sid = m["session_id"].as_str().unwrap_or("");
+            if sid.is_empty() || !state.agent_broadcast.read().await.contains_key(sid) {
+                let auth_header = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .unwrap_or("");
+                let body_auth = m["auth"].as_str().unwrap_or("");
+                let server_auth = state.server_auth.read().await.clone();
+                if !server_auth.is_empty()
+                    && !crate::relay::auth::constant_time_eq(auth_header, &server_auth)
+                    && !crate::relay::auth::constant_time_eq(body_auth, &server_auth)
+                {
+                    return (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        "Invalid server password",
+                    )
+                        .into_response();
+                }
+            }
+        }
+        for m in messages {
+            let sid = m["session_id"].as_str().unwrap_or("").to_string();
+            let text = serde_json::to_string(m).unwrap_or_default();
+            state.last_activity.write().await.insert(sid.clone(), Instant::now());
+            route_agent_message(&state, &sid, &text).await;
+        }
+        return axum::http::StatusCode::OK.into_response();
+    }
+
     let msg_type = body["type"].as_str().unwrap_or("");
 
     // agent:register is allowed without server auth (agents use keys for identity)
@@ -1556,6 +1597,52 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_batch_routes_all_messages() {
+        // v0.20.5 批量上行: 一个 POST 携带多条消息(含 desktop:video 帧),
+        // 不再受"每帧一个 HTTP 往返"限制。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let (_agent_tx, mut agent_rx) = insert_channel_map(&state, &sid).await;
+
+        let batch = json!([
+            {
+                "type": "desktop:started",
+                "session_id": sid,
+                "payload": { "codec": "h264" }
+            },
+            {
+                "type": "desktop:video",
+                "session_id": sid,
+                "payload": { "kind": "init", "data": "AQID" }
+            },
+            {
+                "type": "desktop:video",
+                "session_id": sid,
+                "payload": { "kind": "frag", "key": true, "data": "AgME" }
+            }
+        ]);
+        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(batch))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200, "batch must return 200");
+
+        // started 预建扇出流, init 写入缓存; 数组消息逐条路由生效。
+        let ds = state.desktop_streams.read().await.get(&sid).cloned().expect("pre-created stream");
+        let (_vid, mut rx, init) = ds.add_viewer().await;
+        assert_eq!(init, Some(vec![0x01, 0x02, 0x03]), "init must be cached");
+        // 晚加入的 viewer 不接收 batch 处理期之前的普通帧(仅缓存 init),
+        // 流本身可用: 新到达的关键帧正常送达。
+        ds.push_frag(true, vec![0x02, 0x03, 0x04]).await;
+        let frag = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("key frag must be pushed")
+            .unwrap();
+        assert_eq!(frag, vec![0x02, 0x03, 0x04]);
+        let _ = &mut agent_rx;
     }
 
     // ── agent_events_handler tests ───────────────────────────────────

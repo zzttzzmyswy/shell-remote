@@ -673,28 +673,69 @@ async fn run_session(
     // single-task FIFO so the fMP4 byte stream reaches the relay in order
     // (concurrent POSTs could reorder fragments and break MSE playback).
     let desktop = crate::agent::desktop::DesktopManager::new(desktop_cfg.clone());
-    let (post_tx, mut post_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(128);
+    let (post_tx, mut post_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     {
         let pc = client.http_client().clone();
         let su = client.send_url().to_string();
         let sid = client.session_id.clone();
         tokio::spawn(async move {
-            while let Some(mut msg) = post_rx.recv().await {
-                // Relay 按 session_id 路由 agent 消息；desktop 消息本身不带该
-                // 字段，这里补上以免 agent_send_handler 400/401 拒绝。
-                msg["session_id"] = serde_json::Value::String(sid.clone());
-                let t = msg["type"].as_str().unwrap_or("?").to_string();
-                // 串行、短重试的上行通道。必须消费完整响应体：只读 status
-                // 会让 reqwest 复用悬挂连接，实测导致 POST 间歇挂死、队列
-                // 满后被 try_send 丢帧。media 帧允许丢（relay 按 viewer
-                // 门控），所以最多重试一次避免堆积阻塞后续帧。
-                // 硬超时保护上行通道：reqwest 在连接复用异常时可能让 send()
-                // 无限期挂起（实测），必须用 timeout 兜底——media 帧允许丢，
-                // 但绝不能因为一条卡死的 POST 阻塞后续所有帧。超时直接丢弃
-                // 本条并继续，不进入阻塞式重试。
+            // 批量上行：每 ~80ms 攒一批消息做一次 HTTP POST。桌面视频 15fps
+            // 时若按"每帧一个 POST"，公网 round-trip 一旦超过 60ms 上行便
+            // 跟不上（旧实现 128 队满后 try_send 丢帧 → 浏览器卡在第一帧）。
+            // 批量后吞吐只取决于 batch 大小，不再受单条 RTT 限制。
+            // 积压保护：只保留每批最新的 24 帧 media，控制消息（started/
+            // stopped/error 等）绝不丢弃；丢旧帧由 muxer 的递增序号与 viewer
+            // 门控自然吸收。
+            const BATCH_WINDOW_MS: u64 = 80;
+            const MAX_MEDIA_PER_BATCH: usize = 24;
+            loop {
+                let first = match post_rx.recv().await {
+                    Some(m) => m,
+                    None => return, // 通道关闭（会话结束）
+                };
+                let mut batch = vec![first];
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_millis(BATCH_WINDOW_MS);
+                while batch.len() < 32 {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::select! {
+                        m = post_rx.recv() => match m {
+                            Some(v) => batch.push(v),
+                            None => return,
+                        },
+                        _ = tokio::time::sleep(remaining) => break,
+                    }
+                }
+                // 丢旧保新：media 只留最新 N 条，控制消息全保留。
+                let mut media: Vec<serde_json::Value> = Vec::new();
+                let mut ctrl: Vec<serde_json::Value> = Vec::new();
+                for m in batch {
+                    if m["type"] == "desktop:video" {
+                        media.push(m);
+                    } else {
+                        ctrl.push(m);
+                    }
+                }
+                if media.len() > MAX_MEDIA_PER_BATCH {
+                    let drop = media.len() - MAX_MEDIA_PER_BATCH;
+                    media.drain(..drop);
+                    tracing::debug!("batch dropped {drop} oldest media frames (uplink backpressure)");
+                }
+                let mut out: Vec<serde_json::Value> = ctrl;
+                out.extend(media);
+                if out.is_empty() {
+                    continue;
+                }
+                for m in &mut out {
+                    m["session_id"] = serde_json::Value::String(sid.clone());
+                }
+                let batch: serde_json::Value = serde_json::Value::Array(out);
                 let send_outcome = tokio::time::timeout(
                     Duration::from_secs(5),
-                    pc.post(&su).json(&msg).send(),
+                    pc.post(&su).json(&batch).send(),
                 )
                 .await;
                 match send_outcome {
@@ -704,11 +745,11 @@ async fn run_session(
                             .await
                             .map(|b| b.map(|b| b.len()).unwrap_or(0))
                             .unwrap_or(0);
-                        tracing::trace!("desk POST {t}: {status} body={body_len}");
+                        tracing::trace!("desk POST batch {status} body={body_len}");
                     }
-                    Ok(Err(e)) => tracing::warn!("desk POST {t} failed: {e}"),
+                    Ok(Err(e)) => tracing::warn!("desk POST batch failed: {e}"),
                     Err(_) => {
-                        tracing::warn!("desk POST {t} timed out after 5s, dropping message");
+                        tracing::warn!("desk POST batch timed out after 5s, dropping batch")
                     }
                 }
                 tokio::task::yield_now().await;
@@ -717,10 +758,8 @@ async fn run_session(
     }
     let post_fn: crate::agent::desktop::PostFn = Arc::new(move |msg| {
         let t = msg["type"].as_str().unwrap_or("?").to_string();
-        match post_tx.try_send(msg) {
-            Ok(()) => tracing::trace!("post_fn queued {t}"),
-            Err(e) => tracing::warn!("post_fn queue {t} failed: {e:?}"),
-        }
+        let _ = post_tx.send(msg); // unbounded: 不会失败, 由 consumer 批内丢旧
+        tracing::trace!("post_fn queued {t}");
     });
 
     let exec_sessions = crate::agent::exec_sessions::ExecSessionManager::new();
