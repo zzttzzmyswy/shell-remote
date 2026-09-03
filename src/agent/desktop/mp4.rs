@@ -272,12 +272,22 @@ fn frame_duration(cfg: &Mp4Config) -> u32 {
     ((1000.0 / cfg.fps).round() as u32).max(1)
 }
 
-/// Build one media fragment: `moof` (mfhd + traf/tfhd+tfdt+trun) + `mdat`.
+/// Build one media fragment: `moof` (mfhd + traf/tfhd+tfdt+trun+srtc) + `mdat`.
 ///
 /// `sample` must be an AVCC sample: the frame's NAL units each prefixed with
 /// a 4-byte big-endian length (no start codes). `seq` is the monotonically
-/// increasing fragment sequence number.
-pub fn mp4_fragment(cfg: &Mp4Config, sample: &[u8], pts_ms: u64, is_key: bool, seq: u32) -> Vec<u8> {
+/// increasing fragment sequence number. `capture_epoch_ms` is the frame's
+/// wall-clock capture timestamp; it rides a custom `srtc` box inside `traf`
+/// (ISO-BMFF mandates unknown boxes be skipped, so MSE/ffmpeg ignore it)
+/// letting the browser compute true end-to-end latency on the WebCodecs path.
+pub fn mp4_fragment(
+    cfg: &Mp4Config,
+    sample: &[u8],
+    pts_ms: u64,
+    is_key: bool,
+    seq: u32,
+    capture_epoch_ms: u64,
+) -> Vec<u8> {
     let duration = frame_duration(cfg);
 
     // mfhd
@@ -317,11 +327,17 @@ pub fn mp4_fragment(cfg: &Mp4Config, sample: &[u8], pts_ms: u64, is_key: bool, s
     trun_payload.extend_from_slice(&u32b(sample.len() as u32));
     let trun = box_of(b"trun", &trun_payload);
 
+    // srtc (screen remote capture time, custom box): 8-byte capture epoch ms.
+    // Browsers parse and skip unknown boxes per ISO-BMFF, so this is invisible
+    // to MSE/ffmpeg but extractable by our WebCodecs player for e2e latency.
+    let srtc = box_of(b"srtc", &capture_epoch_ms.to_be_bytes());
+
     let traf = {
         let mut inner = Vec::new();
         inner.extend_from_slice(&tfhd);
         inner.extend_from_slice(&tfdt);
         inner.extend_from_slice(&trun);
+        inner.extend_from_slice(&srtc);
         box_of(b"traf", &inner)
     };
 
@@ -486,7 +502,7 @@ mod tests {
     fn test_fragment_structure_and_trun_offset() {
         let cfg = cfg();
         let sample = annexb_to_avcc(&b"\x00\x00\x00\x01\x65\x88\x84\x01\x41\x00\x00\x00\x01\x67\x42"[..]);
-        let frag = mp4_fragment(&cfg, &sample, 33, true, 1);
+        let frag = mp4_fragment(&cfg, &sample, 33, true, 1, 1_700_000_000_000);
         assert_eq!(&frag[4..8], b"moof");
         assert_eq!(&frag[12..16], b"mfhd");
         assert!(frag.windows(4).any(|w| w == b"traf"));
@@ -498,6 +514,14 @@ mod tests {
         let expected = moof_len + 8;
         let actual = u32::from_be_bytes([frag[field], frag[field + 1], frag[field + 2], frag[field + 3]]);
         assert_eq!(actual, expected, "trun data_offset must point into mdat payload");
+
+        // srtc 自定义 box: 编码了 capture epoch ms, 且位于 traf 内。
+        let srtc_pos = frag.windows(8).position(|w| &w[4..8] == b"srtc").unwrap();
+        assert_eq!(
+            u64::from_be_bytes(frag[srtc_pos + 8..srtc_pos + 16].try_into().unwrap()),
+            1_700_000_000_000,
+            "srtc must carry the capture epoch ms verbatim"
+        );
     }
 
     #[test]

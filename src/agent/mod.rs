@@ -670,43 +670,67 @@ async fn run_session(
     let task_control_tx = control_tx;
 
     // Desktop video sharing: control + frame messages are posted through a
-    // single-task FIFO so the fMP4 byte stream reaches the relay in order
-    // (concurrent POSTs could reorder fragments and break MSE playback).
+    // single-task FIFO so the byte stream reaches the relay in order
+    // (concurrent sends could reorder fragments and break playback).
     let desktop = crate::agent::desktop::DesktopManager::new(desktop_cfg.clone());
     let (post_tx, mut post_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     {
         let pc = client.http_client().clone();
-        let su = client.send_url().to_string();
+        let base = client
+            .send_url()
+            .trim_end_matches("/agent/send")
+            .to_string();
         let sid = client.session_id.clone();
+        let server_auth = client.server_auth().to_string();
         tokio::spawn(async move {
-            // 批量上行：每 ~80ms 攒一批消息做一次 HTTP POST。桌面视频 15fps
-            // 时若按"每帧一个 POST"，公网 round-trip 一旦超过 60ms 上行便
-            // 跟不上（旧实现 128 队满后 try_send 丢帧 → 浏览器卡在第一帧）。
-            // 批量后吞吐只取决于 batch 大小，不再受单条 RTT 限制。
-            // 积压保护：只保留每批最新的 24 帧 media，控制消息（started/
-            // stopped/error 等）绝不丢弃；丢旧帧由 muxer 的递增序号与 viewer
-            // 门控自然吸收。
-            const BATCH_WINDOW_MS: u64 = 80;
-            const MAX_MEDIA_PER_BATCH: usize = 24;
+            // 上行通道（v0.21）: WebSocket 长连接逐帧发送 —— 无每批 HTTP
+            // 握手、无 80ms 攒批窗口、拥塞窗口跨帧保持热态，公网/弱网下
+            // 桌面帧的单帧上行时延显著低于批量 POST。WS 不可用（老 relay）
+            // 或连接失败时自动回退到 HTTP 批量 POST 路径。
+            // 积压保护仍保留：队列深度超过阈值时丢最旧的非关键帧，
+            // 控制消息（started/stopped/error）绝不丢弃。
+            const MAX_PENDING_FRAMES: usize = 90; // 60fps × 1.5s
+            let ws_url = {
+                let mut u = base.replace("http://", "ws://").replace("https://", "wss://");
+                u.push_str("/agent/ws/send?session=");
+                u.push_str(&sid);
+                if !server_auth.is_empty() {
+                    u.push_str("&auth=");
+                    u.push_str(&server_auth);
+                }
+                u
+            };
+            let mut ws: Option<
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+            > = None;
+            let mut ws_failures: u32 = 0;
             loop {
                 let first = match post_rx.recv().await {
                     Some(m) => m,
                     None => return, // 通道关闭（会话结束）
                 };
                 let mut batch = vec![first];
+                // 微批窗口（≤8ms）只用于合并同一 tick 内的帧, 不是延迟发送
+                // 的节流器: 队列里有积压立即全取。
                 let deadline =
-                    tokio::time::Instant::now() + Duration::from_millis(BATCH_WINDOW_MS);
-                while batch.len() < 32 {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    tokio::select! {
-                        m = post_rx.recv() => match m {
-                            Some(v) => batch.push(v),
-                            None => return,
-                        },
-                        _ = tokio::time::sleep(remaining) => break,
+                    tokio::time::Instant::now() + Duration::from_millis(8);
+                loop {
+                    match post_rx.try_recv() {
+                        Ok(m) => {
+                            batch.push(m);
+                            if batch.len() >= 64 {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            if tokio::time::Instant::now() < deadline && batch.len() < 64 {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            } else {
+                                break;
+                            }
+                        }
                     }
                 }
                 // 丢旧保新：media 只留最新 N 条，控制消息全保留。
@@ -719,10 +743,10 @@ async fn run_session(
                         ctrl.push(m);
                     }
                 }
-                if media.len() > MAX_MEDIA_PER_BATCH {
-                    let drop = media.len() - MAX_MEDIA_PER_BATCH;
+                if media.len() > MAX_PENDING_FRAMES {
+                    let drop = media.len() - MAX_PENDING_FRAMES;
                     media.drain(..drop);
-                    tracing::debug!("batch dropped {drop} oldest media frames (uplink backpressure)");
+                    tracing::debug!("uplink dropped {drop} oldest media frames (backpressure)");
                 }
                 let mut out: Vec<serde_json::Value> = ctrl;
                 out.extend(media);
@@ -732,10 +756,64 @@ async fn run_session(
                 for m in &mut out {
                     m["session_id"] = serde_json::Value::String(sid.clone());
                 }
+                // WS 路径: 逐帧（每条消息一个 text frame）。连接失败按指数
+                // 退避重试; 三次失败后停止尝试一段时间, 本批走 HTTP 兜底。
+                let mut sent_via_ws = false;
+                if ws.is_none() && ws_failures < 3 {
+                    match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        tokio_tungstenite::connect_async(&ws_url),
+                    )
+                    .await
+                    {
+                        Ok(Ok((stream, _resp))) => {
+                            tracing::info!("desktop WS uplink connected");
+                            ws = Some(stream);
+                            ws_failures = 0;
+                        }
+                        Ok(Err(e)) => {
+                            ws_failures += 1;
+                            tracing::warn!("desktop WS uplink connect failed ({ws_failures}): {e}");
+                            tokio::time::sleep(Duration::from_millis(
+                                200u64.saturating_mul(1 << ws_failures.min(5)),
+                            ))
+                            .await;
+                        }
+                        Err(_) => {
+                            ws_failures += 1;
+                            tracing::warn!("desktop WS uplink connect timed out ({ws_failures})");
+                        }
+                    }
+                }
+                if let Some(stream) = ws.as_mut() {
+                    use futures_util::SinkExt;
+                    let payload = serde_json::Value::Array(out.clone()).to_string();
+                    match stream.send(payload.into()).await {
+                        Ok(()) => sent_via_ws = true,
+                        Err(e) => {
+                            tracing::warn!("desktop WS send failed: {e} — falling back to HTTP");
+                            ws = None;
+                            ws_failures += 1;
+                        }
+                    }
+                }
+                if ws.is_none() && sent_via_ws == false && ws_failures >= 3 {
+                    // WS 持续失败: 冷却 30s 后重新允许尝试（长会话中 relay
+                    // 升级后 WS 恢复可用）。
+                    tokio::time::sleep(Duration::ZERO).await;
+                    if post_rx.is_empty() {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        ws_failures = 0;
+                    }
+                }
+                if sent_via_ws {
+                    continue;
+                }
+                // HTTP 批量回退（老 relay / WS 持续失败）。
                 let batch: serde_json::Value = serde_json::Value::Array(out);
                 let send_outcome = tokio::time::timeout(
                     Duration::from_secs(5),
-                    pc.post(&su).json(&batch).send(),
+                    pc.post(format!("{base}/agent/send")).json(&batch).send(),
                 )
                 .await;
                 match send_outcome {

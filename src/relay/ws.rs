@@ -11,6 +11,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use axum::http::StatusCode;
+
 use crate::proto::{requires_write, Message as ProtoMessage, Permission, TokenType};
 
 use crate::relay::{ChannelMap, SharedState, MAX_SESSIONS, SSE_CHANNEL_CAPACITY};
@@ -314,6 +316,118 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             }
         }
     }
+}
+
+// ── Agent WS uplink (agent → relay, replaces per-batch HTTP POST) ────
+
+/// WebSocket upgrade for the agent's desktop uplink.
+///
+/// Auth mirrors `/agent/send`: the query string must carry the server
+/// password (`?auth=...`) OR the session must already be registered (the
+/// agent registers over HTTP before opening this socket). Text frames carry
+/// one JSON message each (same shape as a `/agent/send` body element) and are
+/// routed through [`route_agent_message`]. Binary frames are rejected.
+///
+/// Latency win over batched HTTP POST: no per-message TCP+TLS handshake, no
+/// 80ms coalescing window on the agent, and TCP congestion control stays warm
+/// across frames.
+pub async fn agent_ws_send_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    let session_id = match params.get("session") {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => return (StatusCode::BAD_REQUEST, "missing ?session=").into_response(),
+    };
+    // Registered session OR server password. A not-yet-registered session id
+    // is rejected so an unauthenticated client cannot inject messages.
+    let registered = state.agent_broadcast.read().await.contains_key(&session_id);
+    if !registered {
+        let auth = params
+            .get("auth")
+            .map(|s| s.as_str())
+            .or_else(|| {
+                headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+            })
+            .unwrap_or("");
+        let server_auth = state.server_auth.read().await.clone();
+        if !server_auth.is_empty()
+            && !crate::relay::auth::constant_time_eq(auth, &server_auth)
+        {
+            return (StatusCode::UNAUTHORIZED, "Invalid server password").into_response();
+        }
+    }
+    ws.on_upgrade(move |socket| handle_agent_ws_uplink(state, session_id, socket))
+}
+
+/// One established uplink socket. Forwards every text frame into the relay
+/// router; replies to pings so NATs keep the mapping alive.
+async fn handle_agent_ws_uplink(
+    state: Arc<SharedState>,
+    session_id: String,
+    mut socket: axum::extract::ws::WebSocket,
+) {
+    use axum::extract::ws::Message;
+    tracing::info!(session = %session_id, "agent WS uplink connected");
+    // Periodic server-side ping: keeps the socket alive through idle proxies
+    // and detects a dead agent within ~35s.
+    let mut ping = tokio::time::interval(std::time::Duration::from_secs(20));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(vec![])).await.is_err() {
+                    break;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        state
+                            .last_activity
+                            .write()
+                            .await
+                            .insert(session_id.clone(), Instant::now());
+                        // Single object (normal case); tolerate an array for
+                        // symmetry with the batch HTTP transport.
+                        if text.trim_start().starts_with('[') {
+                            if let Ok(items) =
+                                serde_json::from_str::<Vec<Value>>(&text)
+                            {
+                                for m in items {
+                                    let sid = m["session_id"].as_str().unwrap_or("").to_string();
+                                    let t = serde_json::to_string(&m).unwrap_or_default();
+                                    route_agent_message(&state, &sid, &t).await;
+                                }
+                            }
+                        } else {
+                            let sid = serde_json::from_str::<Value>(&text)
+                                .ok()
+                                .and_then(|v| {
+                                    v["session_id"].as_str().map(|s| s.to_string())
+                                })
+                                .unwrap_or_else(|| session_id.clone());
+                            route_agent_message(&state, &sid, &text).await;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        if socket.send(Message::Pong(p)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => { /* binary frames are not part of the protocol */ }
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+    tracing::info!(session = %session_id, "agent WS uplink disconnected");
 }
 
 // ── Agent send handler (POST, for HTTP-mode agents) ──────────────────

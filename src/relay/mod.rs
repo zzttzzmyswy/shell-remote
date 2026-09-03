@@ -1109,6 +1109,7 @@ pub async fn start(
             axum::routing::post(ws::browser_send_handler),
         )
         .route("/agent/send", axum::routing::post(ws::agent_send_handler))
+        .route("/agent/ws/send", axum::routing::get(ws::agent_ws_send_handler))
         .route("/agent/events", get(ws::agent_events_handler))
         .route(
             "/agent/upload",

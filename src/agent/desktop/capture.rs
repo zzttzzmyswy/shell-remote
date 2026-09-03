@@ -2,15 +2,16 @@
 //!
 //! `FrameSource::next_frame()` yields a packed BGRA frame (B,G,R,A per byte,
 //! 4 bytes/pixel) that the pipeline feeds to `bgra_to_i420` and then the
-//! encoder. Two backends ship:
+//! encoder. Backends:
+//! - Windows: DXGI Desktop Duplication (`dxgi`, default — GPU composed
+//!   surface, supports 60fps) with GDI `BitBlt` fallback (`gdi`).
 //! - X11: pure-Rust `x11rb` (any Unix with an X server; works under Xvfb and
 //!   through XWayland for Wayland sessions).
-//! - Windows: GDI `BitBlt` into a compose bitmap read via `GetDIBits`
-//!   (32-bit BGRA), `cfg(windows)` only.
+//! - Wayland native: xdg-desktop-portal ScreenCast → PipeWire (`wayland`,
+//!   `cfg(target_os = "linux")` only).
 //!
-//! Wayland native capture (xdg-desktop-portal + PipeWire) is not yet
-//! implemented; `open_source` returns a clear error for it and recommends the
-//! X11/XWayland path.
+//! `open_source` resolves `auto` per-platform: Windows tries dxgi→gdi, Linux
+//! tries wayland (when a portal is reachable) then X11.
 
 /// One captured frame: packed BGRA (little-endian byte order B,G,R,A).
 pub struct Frame {
@@ -28,48 +29,68 @@ pub trait FrameSource: Send {
 }
 
 /// Open a capture source. `kind` is one of `auto`, `x11`, `wayland`,
-/// `gdi`/`windows` or `none`; `display` optionally overrides the X11 display
-/// (falls back to `DISPLAY` then the X default).
+/// `dxgi`, `gdi`/`windows` or `none`; `display` optionally overrides the X11
+/// display (falls back to `DISPLAY` then the X default).
 pub fn open_source(kind: &str, display: Option<&str>) -> Result<Box<dyn FrameSource>, String> {
     match kind {
         "none" => Err("desktop capture disabled".to_string()),
         "x11" => X11Source::open(display).map(|s| Box::new(s) as Box<dyn FrameSource>),
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
+        "wayland" => wayland::WaylandSource::open()
+            .map(|s| Box::new(s) as Box<dyn FrameSource>),
+        #[cfg(not(all(target_os = "linux", feature = "wayland")))]
         "wayland" => Err(
-            "Wayland native capture (xdg-desktop-portal + PipeWire) is not implemented yet; the \
-             X11 backend cannot capture the native Wayland desktop. Run the agent in a real X11 \
-             session (Xorg or Xvfb), or keep --desktop-capture x11 to at least attempt capturing \
-             the XWayland root (limited to X11 windows)"
+            "Wayland native capture requires a Linux build with the `wayland` feature \
+             (xdg-desktop-portal + PipeWire). Use an X11 session or Xvfb otherwise"
                 .to_string(),
         ),
+        #[cfg(windows)]
+        "dxgi" => crate::agent::desktop::dxgi::DxgiSource::open()
+            .map(|s| Box::new(s) as Box<dyn FrameSource>),
+        #[cfg(not(windows))]
+        "dxgi" => Err("DXGI capture is Windows-only".to_string()),
         "gdi" | "windows" => open_gdi(),
-        "auto" => {
-            #[cfg(windows)]
-            {
+        "auto" => open_auto(display),
+        other => Err(format!("unknown capture kind: {}", other)),
+    }
+}
+
+/// Platform auto-detect: Windows prefers dxgi (60fps capable) then GDI;
+/// Linux prefers wayland-portal when running under a Wayland session, else X11.
+fn open_auto(display: Option<&str>) -> Result<Box<dyn FrameSource>, String> {
+    #[cfg(windows)]
+    {
+        match crate::agent::desktop::dxgi::DxgiSource::open() {
+            Ok(s) => Ok(Box::new(s) as Box<dyn FrameSource>),
+            Err(e) => {
+                tracing::warn!("dxgi capture unavailable ({e}) — falling back to GDI");
                 open_gdi()
             }
-            #[cfg(not(windows))]
-            {
-                if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
-                    tracing::warn!(
-                        "Wayland session detected: the X11 backend cannot capture the native \
-                         Wayland desktop (only the XWayland root). Prefer a real X11 session \
-                         (Xorg/Xvfb); full Wayland capture needs the portal backend (not yet \
-                         implemented)"
-                    );
-                }
-                if display.is_some() || std::env::var("DISPLAY").is_ok() {
-                    X11Source::open(display).map(|s| Box::new(s) as Box<dyn FrameSource>)
-                } else {
-                    Err(
-                        "no DISPLAY found; desktop capture requires an X11 session \
-                         (Xvfb works too). Wayland support requires xdg-desktop-portal \
-                         (not yet implemented)"
-                            .to_string(),
-                    )
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let wayland_session = std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+            || std::env::var("WAYLAND_DISPLAY").is_ok();
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
+        if wayland_session {
+            match wayland::WaylandSource::open() {
+                Ok(s) => return Ok(Box::new(s) as Box<dyn FrameSource>),
+                Err(e) => {
+                    tracing::warn!("wayland portal capture unavailable ({e}) — falling back to X11/XWayland")
                 }
             }
         }
-        other => Err(format!("unknown capture kind: {}", other)),
+        if display.is_some() || std::env::var("DISPLAY").is_ok() {
+            X11Source::open(display).map(|s| Box::new(s) as Box<dyn FrameSource>)
+        } else {
+            Err(
+                "no DISPLAY found; desktop capture requires an X11 session (Xvfb works \
+                 too) or a Wayland session with xdg-desktop-portal (build with the \
+                 `wayland` feature)"
+                    .to_string(),
+            )
+        }
     }
 }
 
@@ -487,12 +508,19 @@ mod tests {
     }
 
     #[test]
-    fn test_wayland_reports_not_implemented() {
-        let err = match open_source("wayland", None) {
-            Ok(_) => panic!("wayland capture must not silently succeed"),
-            Err(e) => e,
-        };
-        assert!(err.contains("portal"), "err: {err}");
+    fn test_wayland_reports_actionable_error() {
+        // 未启用 wayland feature 的构建必须给出可操作错误（而不是 panic）。
+        match open_source("wayland", None) {
+            Ok(_) => {
+                // 启用了 feature 且环境恰好可用的构建：允许成功。
+            }
+            Err(e) => {
+                assert!(
+                    e.contains("wayland") || e.contains("portal") || e.contains("Wayland"),
+                    "err: {e}"
+                );
+            }
+        }
     }
 
     /// X11 capture smoke test against a real X server (Xvfb :99).

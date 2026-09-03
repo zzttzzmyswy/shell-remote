@@ -18,6 +18,11 @@ pub mod mp4;
 pub mod openh264;
 pub mod rate;
 
+#[cfg(windows)]
+pub mod dxgi;
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+pub mod wayland;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -433,7 +438,13 @@ async fn run_desktop_pipeline(
             continue;
         };
         let sample = mp4::annexb_to_avcc(&encoded.nalu);
-        let frag = mp4::mp4_fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq);
+        // 捕获时刻的墙上时间（epoch ms）随分片下发（srtc box），WebCodecs
+        // 播放端用它计算真实端到端延时（播放时钟与编码时钟无关）。
+        let capture_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let frag = mp4::mp4_fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq, capture_ms);
         seq += 1;
         last_posted_wall = wall_ms;
         pts_ms += frame_ms; // 只有真实 POST 的帧推进 fMP4 时间线

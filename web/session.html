@@ -26,6 +26,7 @@
     <div class="main-content">
         <div id="terminal-container"></div>
         <div id="desktop-container" class="desktop-container hidden">
+            <canvas id="desktop-canvas" class="desktop-canvas"></canvas>
             <video id="desktop-video" autoplay muted playsinline></video>
             <div id="desktop-status" class="desktop-status"></div>
             <div id="desktop-metrics" class="desktop-metrics hidden">
@@ -34,7 +35,7 @@
                 <div class="metrics-row"><span>当前码率</span><b id="metric-bitrate">-</b></div>
                 <div class="metrics-row"><span>分辨率</span><b id="metric-res">-</b></div>
                 <div class="metrics-row"><span>渲染帧率</span><b id="metric-fps">-</b></div>
-                <div class="metrics-row"><span>缓冲区</span><b id="metric-buffer">-</b></div>
+                <div class="metrics-row"><span>解码队列</span><b id="metric-buffer">-</b></div>
                 <div class="metrics-row"><span>丢帧</span><b id="metric-dropped">-</b></div>
             </div>
         </div>
@@ -73,6 +74,7 @@
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.js"></script>
     <script src="/sse.js"></script>
+    <script src="/desktop-mse.js"></script>
     <script src="/desktop.js"></script>
     <script src="/term.js"></script>
     <script src="/files.js"></script>

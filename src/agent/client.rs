@@ -69,6 +69,9 @@ pub(crate) async fn pump_sse_events<S, B, E>(
 struct Transport {
     client: reqwest::Client,
     send_url: String,
+    /// Server password captured at registration ("" when key-mode), used to
+    /// authenticate the desktop WS uplink socket.
+    server_auth: String,
     events_rx: mpsc::UnboundedReceiver<String>,
     #[allow(dead_code)]
     last_event_id: Option<u64>,
@@ -193,6 +196,7 @@ impl RelayClient {
             transport: Transport {
                 client: http_client,
                 send_url,
+                server_auth: fixed_key.unwrap_or_default(),
                 events_rx: rx,
                 last_event_id: None,
                 _task: sse_task,
@@ -296,6 +300,12 @@ impl RelayClient {
 
     pub(crate) fn send_url(&self) -> &str {
         &self.transport.send_url
+    }
+
+    /// The `--key` value used at registration ("" when unset). The desktop
+    /// WS uplink reuses it for socket authentication.
+    pub(crate) fn server_auth(&self) -> &str {
+        &self.transport.server_auth
     }
 
     async fn recv_raw(&mut self) -> Option<String> {

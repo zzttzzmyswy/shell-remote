@@ -312,6 +312,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ws_uplink_routes_desktop_video() {
+        // WS 上行（v0.21）: 真实 axum server + tungstenite 客户端走完整的
+        // upgrade → text frame → route_agent_message 路径, 验证 batch 数组
+        // 也被正确路由到桌面 fan-out。
+        let state = Arc::new(crate::relay::SharedState::new(
+            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+
+        // 预注册 channel map（模拟 agent 已注册）。
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert(sid.clone(), crate::relay::ChannelMap::new());
+
+        let app: axum::Router = axum::Router::new()
+            .route(
+                "/agent/ws/send",
+                axum::routing::get(super::super::ws::agent_ws_send_handler),
+            )
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // 客户端：tungstenite 直接连。
+        use futures_util::SinkExt;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/agent/ws/send?session={sid}"
+        ))
+        .await
+        .expect("ws connect");
+        let batch = serde_json::json!([{
+            "type": "desktop:started",
+            "session_id": sid,
+            "payload": { "codec": "h264" }
+        }]);
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            batch.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let streams = state.desktop_streams.read().await;
+        assert!(
+            streams.contains_key(&sid),
+            "WS uplink text frame must reach route_agent_message (pre-created stream)"
+        );
+    }
+
+    #[tokio::test]
     async fn test_stream_handler_requires_auth() {
         let state = Arc::new(crate::relay::SharedState::new(
             "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
