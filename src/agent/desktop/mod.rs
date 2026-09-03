@@ -47,7 +47,7 @@ impl Default for DesktopConfig {
         Self {
             capture: "auto".to_string(),
             codec: "h264".to_string(),
-            fps: 15.0,
+            fps: 30.0,
             // 静态桌面 ~80k 足够 (openh264 实测 84k 满帧); 动态由 ABR 拉回
             min_bps: 80_000,
             max_bps: 800_000,
@@ -282,8 +282,14 @@ async fn run_desktop_pipeline(
     // encode resolution; a resolution change rebuilds both.
     let mut mp4_cfg: Option<mp4::Mp4Config> = None;
     let mut seq: u32 = 1;
+    // fMP4 时间线只按"实际 POST 的帧"推进：跳帧/空帧不推 pts。否则
+    // moof 之间出现时间空洞 → 浏览器 SourceBuffer range 断裂成 N 段,
+    // 播放头掉进空洞尾部 stall（实测 readyState=1 + 22s lag、11 个
+    // range）。连续时间线是 MSE 实时流的硬要求。
     let mut pts_ms: u64 = 0;
     let frame_ms = (1000.0 / cfg.fps).round() as u64;
+    // 墙上时间跟踪（心跳与"多久没 POST"的判断用真实时间, 不用 pts）。
+    let mut wall_ms: u64 = 0;
 
     // Adaptive encode resolution.
     let mut scale_idx: usize = 0;
@@ -316,9 +322,9 @@ async fn run_desktop_pipeline(
     let start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
     let mut err_count: u32 = 0;
-    // 上次实际 POST 视频帧的 pts。静止桌面空帧不上行, 用它判断是否该发
-    // 心跳 IDR（保证 relay 观看者流上始终有字节, 不被空闲超时误杀）。
-    let mut last_posted_ms: u64 = 0;
+    // 上次实际 POST 视频帧的墙上时间。静止桌面空帧不上行, 用它判断是否
+    // 该发心跳 IDR（保证 relay 观看者流上始终有字节, 不被空闲超时误杀）。
+    let mut last_posted_wall: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         tick.tick().await;
@@ -330,12 +336,12 @@ async fn run_desktop_pipeline(
         if cap_no % (cfg.fps as u64 * 2) == 0 {
             enc.force_idr();
         }        let stride = STRIDES[stride_idx];
+        wall_ms += frame_ms; // 墙上时间每个 tick 都推进
         if cap_no % stride as u64 != 0 {
-            // 帧抽取: 本 tick 不编码, 时间线继续推进。
-            pts_ms += frame_ms;
+            // 帧抽取: 本 tick 不编码（pts 不动, 保持时间线连续）。
             // 跳帧期间也可能长期无上行（静止桌面 + 高 stride）: 到心跳
             // 间隔则不跳本帧, 强制编一个 IDR。
-            if last_posted_ms + HEARTBEAT_INTERVAL_MS > pts_ms {
+            if last_posted_wall + HEARTBEAT_INTERVAL_MS > wall_ms {
                 continue;
             }
             enc.force_idr();
@@ -380,13 +386,13 @@ async fn run_desktop_pipeline(
         frame_idx += 1;
 
         // 防御：RC 仍可能输出空帧（极少数情况）——空帧不 POST，记录为跳帧。
+        // （pts 不动：空帧不产生 moof, 推 pts 会造成时间线空洞。）
         if encoded.nalu.is_empty() {
             skip_win.push_back(true);
             while skip_win.len() > OBS {
                 skip_win.pop_front();
             }
             since_change += 1;
-            pts_ms += frame_ms;
             if frame_idx % 10 == 0 {
                 let ratio = skipped_ratio(&skip_win);
                 tune_once(
@@ -429,8 +435,8 @@ async fn run_desktop_pipeline(
         let sample = mp4::annexb_to_avcc(&encoded.nalu);
         let frag = mp4::mp4_fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq);
         seq += 1;
-        last_posted_ms = pts_ms;
-        pts_ms += frame_ms;
+        last_posted_wall = wall_ms;
+        pts_ms += frame_ms; // 只有真实 POST 的帧推进 fMP4 时间线
         post(serde_json::json!({
             "type": "desktop:video",
             "payload": { "kind": "frag", "key": encoded.is_idr, "data": base64(&frag) }

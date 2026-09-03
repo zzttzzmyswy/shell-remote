@@ -42,6 +42,13 @@ for entry in "${PLATFORMS[@]}"; do
       cargo build --release --target "$target" --manifest-path "$ROOT/Cargo.toml"
 done
 
+# Windows agent 嵌入 requireAdministrator manifest: 让 SendInput 能操作
+# 提权窗口/多数弹窗(360 等)。UAC 安全桌面本身仍需服务级组件(后续)。
+echo "== embedding windows manifest =="
+x86_64-w64-mingw32-windres "$ROOT/build/embed-manifest.rc" -O coff -o "$ROOT/build/agent_manifest.o"
+RUSTFLAGS="-C link-args=$ROOT/build/agent_manifest.o -C target-feature=+crt-static" \
+    cargo build --release --target x86_64-pc-windows-gnu --manifest-path "$ROOT/Cargo.toml"
+
 echo "== staging releases =="
 mkdir -p "$ROOT/dist"
 cp "$ROOT"/target/x86_64-unknown-linux-musl/release/shell-remote            "$ROOT/dist/shell-remote-x86_64"

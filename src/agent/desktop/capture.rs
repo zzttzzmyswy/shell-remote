@@ -310,6 +310,10 @@ mod gdi {
     pub struct GdiSource {
         width: usize,
         height: usize,
+        /// Cached screen DC (see `blit`): per-frame GetDC is 3-4x slower and
+        /// starves high-fps capture; the cache is dropped on BitBlt failure
+        /// via `rebuild`.
+        screen_dc: HDC,
         mem_dc: HDC,
         bmp: HBITMAP,
     }
@@ -321,6 +325,7 @@ mod gdi {
             let mut s = Self {
                 width: 0,
                 height: 0,
+                screen_dc: std::ptr::null_mut(),
                 mem_dc: std::ptr::null_mut(),
                 bmp: std::ptr::null_mut(),
             };
@@ -340,6 +345,10 @@ mod gdi {
             if !self.mem_dc.is_null() {
                 DeleteDC(self.mem_dc);
                 self.mem_dc = std::ptr::null_mut();
+            }
+            if !self.screen_dc.is_null() {
+                ReleaseDC(std::ptr::null_mut(), self.screen_dc);
+                self.screen_dc = std::ptr::null_mut();
             }
             let width = GetSystemMetrics(SM_CXSCREEN) as usize;
             let height = GetSystemMetrics(SM_CYSCREEN) as usize;
@@ -364,41 +373,37 @@ mod gdi {
 
         /// Copy the current desktop into the compatible bitmap.
         ///
-        /// The screen DC (`GetDC(NULL)`) must be acquired fresh on every
-        /// frame and released right after: a DC obtained once and held
-        /// long-term goes stale when the session/desktop changes (lock
-        /// screen, UAC secure desktop, display-mode switch, screen off),
-        /// after which every `BitBlt` fails with `ERROR_INVALID_HANDLE`
-        /// (err=6) and the desktop freezes on the first frame. On failure we
-        /// rebuild the GDI context once (fresh size + handles) and retry —
-        /// transient session switches self-heal instead of killing the feed.
+        /// The screen DC is cached between frames for speed (GetDC/ReleaseDC
+        /// per frame costs 3-4x on high fps and starved 25-30fps capture on
+        /// real hardware). A cached DC does go stale when the session/desktop
+        /// changes (lock screen, UAC secure desktop, mode switch, screen
+        /// off) — BitBlt then fails with `ERROR_INVALID_HANDLE` (err=6) —
+        /// so on failure we rebuild the whole GDI context (fresh screen DC
+        /// + size) once and retry; transient switches self-heal instead of
+        /// freezing the feed.
         unsafe fn blit(&mut self) -> Result<(), String> {
-            let screen_dc = GetDC(std::ptr::null_mut());
-            if screen_dc.is_null() {
-                return Err(format!("GetDC failed (err={})", GetLastError()));
+            if self.screen_dc.is_null() {
+                self.screen_dc = GetDC(std::ptr::null_mut());
+                if self.screen_dc.is_null() {
+                    return Err(format!("GetDC failed (err={})", GetLastError()));
+                }
             }
             let w = self.width as i32;
             let h = self.height as i32;
-            let ok = BitBlt(self.mem_dc, 0, 0, w, h, screen_dc, 0, 0, SRCCOPY);
-            let err1 = GetLastError();
-            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            let ok = BitBlt(self.mem_dc, 0, 0, w, h, self.screen_dc, 0, 0, SRCCOPY);
             if ok != 0 {
                 return Ok(());
             }
+            let err1 = GetLastError();
+            // stale DC — rebuild everything (drops the cached screen_dc too)
             if let Err(e) = self.rebuild() {
                 return Err(format!("BitBlt failed (err={err1}); rebuild failed: {e}"));
             }
-            let screen_dc = GetDC(std::ptr::null_mut());
-            if screen_dc.is_null() {
-                return Err(format!("GetDC failed (err={})", GetLastError()));
-            }
             let w = self.width as i32;
             let h = self.height as i32;
-            let ok = BitBlt(self.mem_dc, 0, 0, w, h, screen_dc, 0, 0, SRCCOPY);
-            let err2 = GetLastError();
-            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            let ok = BitBlt(self.mem_dc, 0, 0, w, h, self.screen_dc, 0, 0, SRCCOPY);
             if ok == 0 {
-                return Err(format!("BitBlt failed (err={err2})"));
+                return Err(format!("BitBlt failed (err={})", GetLastError()));
             }
             Ok(())
         }
@@ -458,6 +463,9 @@ mod gdi {
                 }
                 if !self.mem_dc.is_null() {
                     DeleteDC(self.mem_dc);
+                }
+                if !self.screen_dc.is_null() {
+                    ReleaseDC(std::ptr::null_mut(), self.screen_dc);
                 }
             }
         }

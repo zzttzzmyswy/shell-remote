@@ -895,3 +895,34 @@ body {
 #tab-bar.hidden {
     display: none !important;
 }
+
+/* 桌面性能指标面板（点击视频切换显隐） */
+.desktop-metrics {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    z-index: 30;
+    background: rgba(20, 24, 32, 0.92);
+    border: 1px solid #3a4152;
+    border-radius: 8px;
+    padding: 10px 14px;
+    min-width: 200px;
+    font-size: 12px;
+    color: #b8c0cc;
+    user-select: none;
+    pointer-events: auto;
+}
+.desktop-metrics .metrics-title {
+    font-weight: 600;
+    color: #e8ecf2;
+    margin-bottom: 6px;
+    font-size: 13px;
+}
+.desktop-metrics .metrics-hint { font-weight: 400; color: #6b7484; font-size: 11px; }
+.desktop-metrics .metrics-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 18px;
+    padding: 2px 0;
+}
+.desktop-metrics .metrics-row b { color: #7ec8a2; font-variant-numeric: tabular-nums; }

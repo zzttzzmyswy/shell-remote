@@ -66,6 +66,7 @@
       const dt = (now - this._bpsTs) / 1000;
       if (dt >= 2.5) {
         const kbps = Math.round(this._bpsBytes * 8 / dt / 1000);
+        this._lastKbps = kbps; // 指标面板展示当前值
         this._bpsTs = now;
         this._bpsBytes = 0;
         if (kbps > 0 && window.shellRemote && window.shellRemote.send) {
@@ -147,8 +148,19 @@
       let end = 0;
       try { end = sb.buffered.end(bl - 1); } catch (e) { return; }
       if (v.currentTime < end - LIVE_EDGE_LAG) {
-        v.currentTime = end - LIVE_EDGE_LAG;
+        // 落后太多(>2s)时说明 seek 到了空洞（跳帧策略在 30fps 高码率下
+        // 产生的缓冲碎片）或长期停滞——直接跳到尾部最新处重新开始,
+        // 避免停留在旧 range 的缝里越拖越远。
+        v.currentTime = v.currentTime < end - 2.0 ? end - 0.05 : end - LIVE_EDGE_LAG;
       }
+      // 缓冲修剪：实时流不需要回看。播放头之后的旧缓冲持续移除,
+      // 限制 SourceBuffer 内存并减少 range 碎片（碎片会让 seek 落进空洞）。
+      try {
+        const keep = Math.max(start, v.currentTime - 2);
+        if (keep > start + 1 && !sb.updating) {
+          sb.remove(start, keep);
+        }
+      } catch (e) { /* remove 中断无害 */ }
     }
 
     // 从 init 段 (ftyp/moov 内含 avcC) 解析浏览器实际需要的 codec 串。
@@ -206,6 +218,7 @@
         self._streamRetries = 0;
         self.connected = true;
         self._bindInput(); // 流就绪后开始采集键鼠事件
+        self._startMetrics(); // 性能指标面板
         self.setStatus('桌面已连接', false);
         const reader = resp.body.getReader();
         self.reader = reader;
@@ -286,6 +299,9 @@
       this.queue = [];
       this.pendingChunks = [];
       this._unbindInput();
+      this._stopMetrics();
+      const panel = document.getElementById('desktop-metrics');
+      if (panel) panel.classList.add('hidden');
       if (this.mediaSource) {
         if (this.mediaSource.readyState === 'open') {
           try { this.mediaSource.endOfStream(); } catch (e) { /* ignore */ }
@@ -297,6 +313,79 @@
       this.video.pause();
       this.video.removeAttribute('src');
       this.setStatus('', false);
+    }
+
+    // ── 性能指标面板 ─────────────────────────────────────────────
+    // 点击视频切换显隐; 显示端到端延时(缓冲尾部-播放头)、码率、分辨率、
+    // 渲染 fps、缓冲长度、丢帧。数据源全部本地可得, 无需 agent 配合。
+    _startMetrics() {
+      if (this._metricsTimer) return;
+      const v = this.video;
+      const panel = document.getElementById('desktop-metrics');
+      if (!panel) return;
+      const self = this;
+
+      // 双击/长按会与鼠标注入冲突——用"单击视频"切换面板; 但单击也会
+      // 发送一个 left click 注入。约定: 点击画面左上角 64x32 安全区切换
+      // (该区域面板本身挡住, 不会误触远端)。
+      this._onToggleMetrics = function(e) {
+        const rect = v.getBoundingClientRect();
+        if (e.clientX - rect.left < 64 && e.clientY - rect.top < 32) {
+          panel.classList.toggle('hidden');
+          e.stopPropagation();
+          e.preventDefault();
+        }
+      };
+      v.addEventListener('pointerdown', this._onToggleMetrics, true); // capture 先于注入
+
+      let frames = 0;
+      // requestVideoFrameCallback 计渲染帧率(可用时)
+      if (v.requestVideoFrameCallback) {
+        const cb = function() {
+          frames += 1;
+          v.requestVideoFrameCallback(cb);
+        };
+        v.requestVideoFrameCallback(cb);
+      }
+
+      this._metricsTimer = setInterval(function() {
+        if (!self.connected) return;
+        const lag = document.getElementById('metric-lag');
+        const br = document.getElementById('metric-bitrate');
+        const res = document.getElementById('metric-res');
+        const fps = document.getElementById('metric-fps');
+        const buf = document.getElementById('metric-buffer');
+        const drop = document.getElementById('metric-dropped');
+        if (!lag) return;
+
+        try {
+          const b = v.buffered;
+          if (b && b.length) {
+            const end = b.end(b.length - 1);
+            const ms = Math.round((end - v.currentTime) * 1000);
+            lag.textContent = ms + ' ms';
+            const total = (b.end(b.length - 1) - b.start(0));
+            buf.textContent = total.toFixed(1) + ' s';
+          } else {
+            lag.textContent = '-'; buf.textContent = '-';
+          }
+          res.textContent = v.videoWidth + 'x' + v.videoHeight;
+          fps.textContent = frames; // 1s 间隔, 数值即 fps
+          frames = 0;
+          if (v.getVideoPlaybackQuality) {
+            drop.textContent = v.getVideoPlaybackQuality().droppedVideoFrames;
+          } else { drop.textContent = '-'; }
+          // 码率: 复用带宽跟踪的计数窗口(2.5s), 折算当前值
+          br.textContent = self._lastKbps ? self._lastKbps + ' kbps' : '-';
+        } catch (e) { /* 面板只是展示, 不因异常中断播放 */ }
+      }, 1000);
+    }
+
+    _stopMetrics() {
+      if (this._metricsTimer) {
+        clearInterval(this._metricsTimer);
+        this._metricsTimer = null;
+      }
     }
 
     // ── 键鼠输入注入 ─────────────────────────────────────────────
@@ -347,9 +436,22 @@
         e.preventDefault();
       };
       this._onWheel = function(e) {
-        // 浏览器 wheel deltaY 正值=向下; agent scroll 正值=向上（RustDesk 语义）
-        const lines = Math.round(e.deltaY / 100 * 3);
-        if (lines) send('desktop:mouse', { type: 'wheel', dx: 0, dy: -lines });
+        // 浏览器 deltaY 正=向下。enigo scroll 单位是"格"(1 格 = Windows
+        // WHEEL_DELTA=120 / X11 一次 button click)；浏览器一次滚轮的
+        // deltaY ~100px(deltaMode==0)或 1~3 行(deltaMode==1)，都映射为
+        // 1~3 格。dy 语义=正向下（与 enigo win/x11 一致——之前取了负
+        // 号导致方向相反）。
+        var unit = 100;
+        if (e.deltaMode === 1) unit = 33; // 行模式: 3 行/格
+        else if (e.deltaMode === 2) unit = 100; // 页模式按 1 格处理
+        var clicks = Math.round(Math.abs(e.deltaY) / unit) || 1;
+        var dy = e.deltaY > 0 ? clicks : -clicks;
+        var dx = 0;
+        if (e.deltaX) {
+          var c2 = Math.round(Math.abs(e.deltaX) / unit) || 1;
+          dx = e.deltaX > 0 ? c2 : -c2;
+        }
+        send('desktop:mouse', { type: 'wheel', dx: dx, dy: dy });
         e.preventDefault();
       };
       this._onContextMenu = function(e) { e.preventDefault(); };

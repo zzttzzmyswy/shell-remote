@@ -28,6 +28,15 @@
         <div id="desktop-container" class="desktop-container hidden">
             <video id="desktop-video" autoplay muted playsinline></video>
             <div id="desktop-status" class="desktop-status"></div>
+            <div id="desktop-metrics" class="desktop-metrics hidden">
+                <div class="metrics-title">性能指标 <span class="metrics-hint">(点击视频关闭)</span></div>
+                <div class="metrics-row"><span>端到端延时</span><b id="metric-lag">-</b></div>
+                <div class="metrics-row"><span>当前码率</span><b id="metric-bitrate">-</b></div>
+                <div class="metrics-row"><span>分辨率</span><b id="metric-res">-</b></div>
+                <div class="metrics-row"><span>渲染帧率</span><b id="metric-fps">-</b></div>
+                <div class="metrics-row"><span>缓冲区</span><b id="metric-buffer">-</b></div>
+                <div class="metrics-row"><span>丢帧</span><b id="metric-dropped">-</b></div>
+            </div>
         </div>
         <div id="file-resizer" class="file-resizer"></div>
         <div id="file-drawer" class="file-drawer hidden">

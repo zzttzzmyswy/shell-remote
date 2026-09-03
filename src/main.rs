@@ -106,7 +106,7 @@ enum Command {
         desktop_codec: String,
 
         /// Desktop capture frame rate.
-        #[arg(long, default_value_t = 15.0)]
+        #[arg(long, default_value_t = 30.0)]
         desktop_fps: f64,
 
         /// Maximum encode bitrate in kbps (user request: 最高 800).

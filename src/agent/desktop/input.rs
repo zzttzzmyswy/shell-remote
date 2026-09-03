@@ -191,11 +191,14 @@ fn worker(rx: mpsc::Receiver<InputEvent>) {
                     enigo.button(btn(button).ok_or("button")?, Direction::Release)?
                 }
                 InputEvent::Scroll { dx, dy } => {
-                    if dx != 0 {
-                        enigo.scroll(dx, Axis::Horizontal)?;
-                    }
+                    // dy/dx 语义: 正=向下/向右（与浏览器一致; enigo 的
+                    // scroll 单位即"格"——win 侧 1 格=WHEEL_DELTA，X11 侧
+                    // 一次 button click, 无需再取负号）。
                     if dy != 0 {
                         enigo.scroll(dy, Axis::Vertical)?;
+                    }
+                    if dx != 0 {
+                        enigo.scroll(dx, Axis::Horizontal)?;
                     }
                 }
                 InputEvent::KeyDown { code } => {
