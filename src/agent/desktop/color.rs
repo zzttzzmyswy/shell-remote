@@ -45,6 +45,63 @@ pub fn bgra_to_i420(bgra: &[u8], w: usize, h: usize, stride: usize) -> Vec<u8> {
     yuv
 }
 
+/// Box-filter downscale of a BGRA frame straight into I420 at a smaller size.
+///
+/// `(w0,h0)` is the source capture size, `(w1,h1) ≤ (w0,h0)` the encode size.
+/// Each target pixel averages its mapped source region (integer box filter, no
+/// floating point). Both sizes must be even; `w1` and `h1` can be equal to
+/// `w0/h0` (then this is identical to [`bgra_to_i420`]).
+pub fn bgra_to_i420_scaled(
+    bgra: &[u8],
+    w0: usize,
+    h0: usize,
+    stride: usize,
+    w1: usize,
+    h1: usize,
+) -> Vec<u8> {
+    assert!(w0 % 2 == 0 && h0 % 2 == 0 && w1 % 2 == 0 && h1 % 2 == 0);
+    assert!(w1 <= w0 && h1 <= h0, "upscale unsupported: {w0}x{h0} -> {w1}x{h1}");
+    assert!(bgra.len() >= h0 * stride, "source buffer too small");
+    let y_len = w1 * h1;
+    let uv_len = y_len / 4;
+    let mut yuv = vec![0u8; y_len + 2 * uv_len];
+    let (y_part, uv_part) = yuv.split_at_mut(y_len);
+    let (u_part, v_part) = uv_part.split_at_mut(uv_len);
+    let sw1 = w1 / 2;
+    for ty in 0..h1 {
+        let y0 = ty * h0 / h1;
+        let y1 = ((ty + 1) * h0 / h1).max(y0 + 1);
+        for tx in 0..w1 {
+            let x0 = tx * w0 / w1;
+            let x1 = ((tx + 1) * w0 / w1).max(x0 + 1);
+            let (mut r, mut g, mut b, mut n) = (0i32, 0i32, 0i32, 0u32);
+            for sy in y0..y1 {
+                let base = sy * stride;
+                for sx in x0..x1 {
+                    let src = base + sx * 4;
+                    b += bgra[src] as i32;
+                    g += bgra[src + 1] as i32;
+                    r += bgra[src + 2] as i32;
+                    n += 1;
+                }
+            }
+            let n = n as i32;
+            let r = r / n;
+            let g = g / n;
+            let b = b / n;
+            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            y_part[ty * w1 + tx] = y.clamp(16, 235) as u8;
+            if tx % 2 == 0 && ty % 2 == 0 {
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                u_part[(ty / 2) * sw1 + tx / 2] = u.clamp(16, 240) as u8;
+                v_part[(ty / 2) * sw1 + tx / 2] = v.clamp(16, 240) as u8;
+            }
+        }
+    }
+    yuv
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +164,42 @@ mod tests {
         }
         let yuv = bgra_to_i420(&bgra, w, h, stride);
         assert!(yuv[0] > 200, "padded stride frame should be white");
+    }
+
+    #[test]
+    fn test_scaled_dimensions_and_value() {
+        // 8x8 纯白源 → 4x4 目标, 尺寸正确且像素仍为白
+        let w0 = 8;
+        let h0 = 8;
+        let mut bgra = vec![0u8; w0 * h0 * 4];
+        for px in 0..(w0 * h0) {
+            bgra[px * 4..px * 4 + 3].copy_from_slice(&[255, 255, 255]);
+            bgra[px * 4 + 3] = 255;
+        }
+        let yuv = bgra_to_i420_scaled(&bgra, w0, h0, w0 * 4, 4, 4);
+        assert_eq!(yuv.len(), 4 * 4 + 2 * (4 / 2) * (4 / 2));
+        assert!(yuv[0] > 200, "downscaled white should stay white, got {}", yuv[0]);
+    }
+
+    #[test]
+    fn test_scaled_averages_source_region() {
+        // 2x4 源: 上半两行白, 下半两行黑 → 缩为 1x2 (每目标像素平均 2x4 区域)
+        // 目标 (0,0)=白, (0,1)=黑
+        let w0 = 2;
+        let h0 = 4;
+        let mut bgra = vec![0u8; w0 * h0 * 4];
+        for row in 0..2 {
+            for px in 0..w0 {
+                let i = row * (w0 * 4) + px * 4;
+                bgra[i] = 255;
+                bgra[i + 1] = 255;
+                bgra[i + 2] = 255;
+                bgra[i + 3] = 255;
+            }
+        }
+        let yuv = bgra_to_i420_scaled(&bgra, w0, h0, w0 * 4, 2, 2);
+        assert!(yuv[0] > 200, "top target should be white, got {}", yuv[0]);
+        let bottom = yuv[2];
+        assert!(bottom < 80, "bottom target should be black, got {}", bottom);
     }
 }

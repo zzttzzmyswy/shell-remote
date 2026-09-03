@@ -35,6 +35,12 @@ impl Abr {
         self.target_bps
     }
 
+    /// Pin the target to an explicit value (clamped to `[min,max]`). Used to
+    /// hold the bitrate at the ceiling while the encoder is frame-skipping.
+    pub fn set_target(&mut self, bps: u64) {
+        self.target_bps = bps.clamp(self.min_bps, self.max_bps);
+    }
+
     /// Record one encoded frame; returns the (possibly updated) target bps.
     pub fn note_frame(&mut self, now_secs: f64, encoded_bytes: usize) -> u64 {
         self.window.push_back((now_secs, encoded_bytes));
