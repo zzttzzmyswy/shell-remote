@@ -68,27 +68,19 @@
 
     connect() {
       this.disconnect(false); // 重试保留 _streamRetries 计数; 主动断开才清零
-      if (!this._codecSupported(this.codec)) {
-        // 部分浏览器对高 profile 的字符串更宽松；再试一个通用串。
-        if (!this._codecSupported('avc1.64001E')) {
-          this.setStatus('当前浏览器不支持 H.264 MSE 播放', true);
-          return;
-        }
-        this.codec = 'avc1.64001E';
-      }
       if (typeof MediaSource === 'undefined') {
         this.setStatus('当前浏览器不支持 MediaSource', true);
         return;
       }
-
       const ms = new MediaSource();
       this.mediaSource = ms;
       this.video.src = URL.createObjectURL(ms);
-
       const self = this;
       ms.addEventListener('sourceopen', function onOpen() {
         ms.removeEventListener('sourceopen', onOpen);
-        self._createSourceBuffer(self.codec);
+        // 不在这里用预设 codec 建 SourceBuffer：必须先拿到 init 段、解析
+        // SPS 的真实 profile/level 再建。用 avc1.42E01E(level 3.0) 建而实际
+        // 1080p 码流是 level 4.0 时, 严格浏览器会拒绝解码(黑屏)。
         self._startFetch();
       });
     }
@@ -112,9 +104,9 @@
     }
 
     // 从 init 段 (ftyp/moov 内含 avcC) 解析浏览器实际需要的 codec 串。
-    // OpenH264 输出的 SPS profile/level 可能与本文件预设不同
-    // (avc1.42E01E 是保守默认)；解析到真实值后按需重建 SourceBuffer，
-    // 避免严格 MSE (如 Safari) 因 codec 串与实际流不匹配而拒播。
+    // OpenH264 输出的 SPS profile/level 可能与预设不同；解析到真实值后
+    // 用 true codec 建 SourceBuffer，避免严格 MSE 因 codec 串与实际流不
+    // 匹配而拒播（1080p 实际是 level 4.0，avc1.42E01E 是 level 3.0）。
     _codecFromInit(buf) {
       const u8 = new Uint8Array(buf);
       for (let i = 0; i + 8 <= u8.length; i++) {
@@ -124,6 +116,16 @@
         }
       }
       return null;
+    }
+
+    _resolveCodec(initBuf) {
+      const actual = this._codecFromInit(initBuf);
+      if (actual && this._codecSupported(actual)) return actual;
+      // fallback：默认串 / 高 profile 串
+      if (this._codecSupported(this.codec)) return this.codec;
+      if (this._codecSupported('avc1.64001E')) return 'avc1.64001E';
+      if (this._codecSupported('avc1.42C028')) return 'avc1.42C028'; // 1080p level 4.0
+      return 'avc1.640028';
     }
 
     _startFetch() {
@@ -136,7 +138,6 @@
       this.controller = controller;
 
       this.pendingChunks = [];
-      this.codecResolved = false;
 
       const self = this;
       fetch('/agent/desktop/stream', {
@@ -170,6 +171,14 @@
             const v = result.value;
             if (v && v.byteLength) {
               const buf = v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+              // 用 init 段解析真实 codec 后再建 SourceBuffer(首个 chunk)。
+              if (!self.sourceBuffer) {
+                self.pendingChunks.push(buf);
+                self.codec = self._resolveCodec(buf);
+                self._createSourceBuffer(self.codec);
+                self._trackBandwidth(v.byteLength);
+                return pump();
+              }
               self.pendingChunks.push(buf);
               self._drain();
               self._trackBandwidth(v.byteLength);
@@ -194,27 +203,16 @@
       if (!sb || sb.updating) return;
       if (this.pendingChunks.length === 0) return;
 
-      // 首个 chunk 是 init 段；先在 append 前解析真实 codec，按需换 SourceBuffer
-      if (!this.codecResolved && this.pendingChunks.length > 0) {
-        const actual = this._codecFromInit(this.pendingChunks[0]);
-        if (actual) {
-          this.codecResolved = true;
-          if (actual !== this.codec && this._codecSupported(actual)) {
-            this.codec = actual;
-            try {
-              this.mediaSource.removeSourceBuffer(this.sourceBuffer);
-            } catch (e) { /* ignore */ }
-            this._createSourceBuffer(actual);
-            return;
-          }
-        }
-      }
-
       const next = this.pendingChunks.shift();
       try {
         sb.appendBuffer(next);
       } catch (e) {
-        console.warn('appendBuffer failed:', e);
+        // SourceBuffer 被移除/更换(如 codec 重建)时: 丢弃该队列并下次重连重建。
+        if (e && e.name === 'InvalidStateError') {
+          this.pendingChunks = [];
+        } else {
+          console.warn('appendBuffer failed:', e);
+        }
       }
     }
 
@@ -227,7 +225,6 @@
       this._bpsTs = 0;
       this.queue = [];
       this.pendingChunks = [];
-      this.codecResolved = false;
       if (this.mediaSource) {
         if (this.mediaSource.readyState === 'open') {
           try { this.mediaSource.endOfStream(); } catch (e) { /* ignore */ }

@@ -407,3 +407,34 @@ mod e2e_debug {
         eprintln!("DONE");
     }
 }
+#[cfg(test)]
+mod static_bitrate_probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn probe_static_80k() {
+        // 静态桌面模拟：内容几乎不动（每 3 帧小变化一次），
+        // 测 openh264 在 80k/15fps 目标下的实际码率与输出。
+        for &target in &[80_000u64, 150_000, 200_000, 400_000] {
+            let mut enc = H264Encoder::new(1920, 1080, target, 15.0).unwrap();
+            let (mut bytes, mut out) = (0usize, 0usize);
+            for t in 0..90 {
+                // 静态基线 + 周期性极小更新（光标/时钟）
+                let mut buf = vec![128u8; 1920 * 1080 * 3 / 2];
+                if t % 3 == 0 {
+                    for i in (0..buf.len()).step_by(97) {
+                        buf[i] = 90;
+                    }
+                }
+                let f = enc.encode(&buf).unwrap();
+                if !f.nalu.is_empty() {
+                    bytes += f.nalu.len();
+                    out += 1;
+                }
+            }
+            let kbps = bytes as f64 * 8.0 / (90.0 / 15.0) / 1000.0;
+            eprintln!("static @{}k: actual={kbps:.0}kbps out_frames={out}/90", target / 1000);
+        }
+    }
+}
