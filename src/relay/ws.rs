@@ -114,6 +114,18 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
         // 桌面控制事件必须回到浏览器（web/session.js 监听这三个）。
         // desktop:stopped 同时清理该会话的 fan-out 流，避免 DesktopStream
         // 长期残留在 map 中。
+        // desktop:started 要**预建** fan-out 流：浏览器收到 started 后立即
+        // GET /agent/desktop/stream，若此时流尚未被首个 desktop:video(init)
+        // 懒创建，会立刻 404 → 黑屏（真实用户复现）。预建后 viewer 加入即
+        // 挂起等待，init 一到就全量广播。
+        if proto_msg.msg_type == "desktop:started" {
+            state
+                .desktop_streams
+                .write()
+                .await
+                .entry(session_id.to_string())
+                .or_insert_with(crate::relay::desktop::DesktopStream::new);
+        }
         if proto_msg.msg_type == "desktop:stopped" {
             state.desktop_streams.write().await.remove(session_id);
         }
@@ -1159,6 +1171,38 @@ mod tests {
             .await
             .insert(session_id.to_string(), cm);
         (tx, rx)
+    }
+
+    #[tokio::test]
+    async fn test_desktop_started_precreates_stream() {
+        // 竞态回归: 浏览器收到 desktop:started 后立即 GET /agent/desktop/stream。
+        // relay 必须在 started 时就预建 fan-out 流, 否则在首个 desktop:video
+        // (init) 到达前浏览器会吃到 404 → 黑屏。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let started = serde_json::json!({
+            "type": "desktop:started",
+            "session_id": sid,
+            "payload": { "codec": "h264", "width": 1920, "height": 1080 }
+        });
+        route_agent_message(&state, &sid, &started.to_string()).await;
+        let streams = state.desktop_streams.read().await;
+        assert!(
+            streams.contains_key(&sid),
+            "desktop:started must pre-create the fan-out stream"
+        );
+        drop(streams);
+        // 预建的流应能立刻接纳 viewer（即使 init 尚未到达）
+        let ds = state.desktop_streams.read().await.get(&sid).cloned().unwrap();
+        let (_vid, mut rx, init) = ds.add_viewer().await;
+        assert!(init.is_none(), "no init yet");
+        ds.set_init(vec![0x1, 0x2, 0x3]).await;
+        let got = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("init must be replayed to pre-registered viewer")
+            .unwrap();
+        assert_eq!(got, vec![0x1, 0x2, 0x3]);
     }
 
     #[tokio::test]

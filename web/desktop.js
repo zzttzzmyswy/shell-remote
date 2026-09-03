@@ -19,6 +19,18 @@
       this.queue = [];
       this.codec = 'avc1.42E01E'; // OpenH264 baseline profile default
       this.connected = false;
+      this._streamRetries = 0;
+    }
+
+    // relay 预建桌面流的时机略晚于 desktop:started 广播; 遇到 404 时短暂
+    // 重试(最多 5 次)等待流就绪, 返回 true 表示已接管重试。
+    _retryDesktopStream() {
+      if (this._streamRetries >= 5) return false;
+      this._streamRetries += 1;
+      const self = this;
+      this.setStatus('等待桌面流就绪… (' + this._streamRetries + ')', false);
+      setTimeout(function() { self.connect(); }, 700);
+      return true;
     }
 
     setStatus(text, isError) {
@@ -33,7 +45,7 @@
     }
 
     connect() {
-      this.disconnect();
+      this.disconnect(false); // 重试保留 _streamRetries 计数; 主动断开才清零
       if (!this._codecSupported(this.codec)) {
         // 部分浏览器对高 profile 的字符串更宽松；再试一个通用串。
         if (!this._codecSupported('avc1.64001E')) {
@@ -110,10 +122,17 @@
       }).then(function(resp) {
         if (controller.signal.aborted) return null;
         if (!resp.ok || !resp.body) {
+          // relay 在 desktop:started 预建流、首个 init 分片随后到达;
+          // 若本请求赶在 init 之前打到 relay, 会得到 404。短暂重试等待
+          // 流就绪, 而不是直接判失败。
+          if (resp.status === 404 && self._retryDesktopStream()) {
+            return null;
+          }
           self.setStatus('桌面流不可用 (HTTP ' + resp.status + ')，请重试', true);
           self.disconnect();
           return null;
         }
+        self._streamRetries = 0;
         self.connected = true;
         self.setStatus('桌面已连接', false);
         const reader = resp.body.getReader();
@@ -176,10 +195,11 @@
       }
     }
 
-    disconnect() {
+    disconnect(resetRetries) {
       if (this.controller) { this.controller.abort(); this.controller = null; }
       if (this.reader) { this.reader.cancel().catch(function() {}); this.reader = null; }
       this.connected = false;
+      if (resetRetries !== false) this._streamRetries = 0;
       this.queue = [];
       this.pendingChunks = [];
       this.codecResolved = false;
