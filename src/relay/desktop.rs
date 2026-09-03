@@ -115,6 +115,23 @@ impl DesktopStream {
     pub async fn remove_viewer(&self, id: &str) {
         self.inner.viewers.write().await.remove(id);
     }
+
+    /// Wait for the first init segment to be cached (a viewer that joins right
+    /// after `desktop:started` can otherwise receive a fragment as its first
+    /// chunk, which breaks MSE parsing — the init must always come first).
+    /// Returns `None` if no init arrives within `timeout`.
+    pub async fn wait_first_init(&self, timeout: std::time::Duration) -> Option<Vec<u8>> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(v) = self.inner.init.read().await.as_ref() {
+                return Some(v.clone());
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 }
 
 // ── GET /agent/desktop/stream ─────────────────────────────────
@@ -176,6 +193,16 @@ pub async fn stream_handler(
         let guard = ViewerGuard {
             stream: ds.clone(),
             id: vid.clone(),
+        };
+        // 浏览器在中途加入时, 首块必须是 init 段(ftyp+moov+avcC), MSE 才会开始
+        // 解析。若 init 尚未被 agent 首次推送(desktop:started 预建流之后、
+        // 首个 init 到达之前加入的 viewer), 等待它出现, 而不是把第一个 fragment
+        // 直接发给浏览器(那会触发 CHUNK_DEMUXER_ERROR_APPEND_FAILED)。
+        // 放在流内执行: 首段字节被消费时才等待, 通常几十 ms 内 agent 的 init
+        // 即到达。
+        let init = match init {
+            Some(i) => Some(i),
+            None => ds.wait_first_init(Duration::from_secs(5)).await,
         };
         if let Some(init) = init {
             yield Ok::<_, Infallible>(Bytes::from(init));
@@ -339,6 +366,52 @@ mod tests {
         .unwrap()
         .to_vec();
         assert_eq!(second, vec![0xaa, 0xbb]);
+    }
+
+    #[tokio::test]
+    async fn test_stream_handler_waits_for_first_init() {
+        // 竞态回归: viewer 在 desktop:started 预建流后、首个 init 到达前
+        // 加入。首块必须是 init(否则浏览器 MSE 收到 fragment 开头 →
+        // CHUNK_DEMUXER_ERROR_APPEND_FAILED)。等在 5s 内 init 到来应作为
+        // 第一块被发出, 而非任何其它字节。
+        let state = Arc::new(crate::relay::SharedState::new(
+            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let token = r.tokens[0].0.clone();
+
+        let ds = DesktopStream::new(); // 尚未 set_init
+        state.desktop_streams.write().await.insert(sid.clone(), ds.clone());
+
+        let resp = stream_handler(
+            State(state),
+            bearer_headers(&token),
+            Query(HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        use tokio_stream::StreamExt as _;
+        let mut body = resp.into_body().into_data_stream();
+
+        // 先推一个 key 分片: 若 handler 未等 init, 它会被当成首块。
+        ds.push_frag(true, vec![0xbb, 0xbb]).await;
+
+        // 然后 init 才到达 → 首块必须是 init
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        ds.set_init(vec![0x1, 0x2, 0x3]).await;
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            body.next(),
+        )
+        .await
+        .expect("first block must be the init")
+        .unwrap()
+        .unwrap()
+        .to_vec();
+        assert_eq!(first, vec![0x1, 0x2, 0x3], "first block must be init, got frag");
     }
 
     #[tokio::test]
