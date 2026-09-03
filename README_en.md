@@ -11,7 +11,8 @@ Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust 
 - **File Manager** — Side panel with breadcrumb navigation, upload, download, delete, rename, mkdir, refresh
 - **MCP Server** — AI agents (Claude, etc.) execute commands on remote machines via standard MCP SSE Transport
 - **Tabbed Admin Panel** — The admin page is organized into six tabs: Overview / Sessions / Devices / Recordings / Access log / Settings; the active tab is remembered
-- **Device Management** — The Devices tab lists every agent with its probed host info (CPU model, architecture, OS, kernel, hostname) and supports keyword / architecture / status filtering with one-click connect
+- **Device Management** — The Devices tab lists every agent with its probed host info (CPU model, architecture, OS, kernel, hostname, agent version) and supports keyword / architecture / status filtering with one-click connect
+- **Atomic Agent Self-Upgrade** — One-click per-device upgrade from the Devices tab: the agent downloads the new binary from the relay, verifies its SHA-256, smoke-tests executability, atomically replaces itself and restarts with its original arguments; progress is shown live in the device row and any failure keeps the old binary with a clear error
 - **Connection Self-Healing** — A registered-but-unreachable device no longer leaves the browser on a blank terminal: the session page shows "agent disconnected, reconnecting" and auto-reconnects; the terminal resumes once the agent link is back. If a join cannot be delivered because the agent channel is stale (reconnect/eviction window), the relay tells the browser to re-join, and the browser-side join-ack watchdog reconnects after 8s without an agent reply — no silent failure can leave a permanently empty terminal
 - **Desktop Sharing** — Agent captures the real X11/Windows desktop, encodes H.264 (openh264 software encoder) with adaptive bitrate 800–200 kbps, and streams fragmented MP4 to browsers over MSE; the session page switches freely between terminal and desktop views (desktop is off by default; click a button to open it)
 - **SSE+POST Transport** — Full-stack HTTP SSE push + POST send; no WebSocket dependency, works behind any proxy
@@ -70,6 +71,7 @@ cargo build --release
 | `--bind` | `0.0.0.0:3000` | Listen address |
 | `--auth` | none | Server password (required) |
 | `--record-dir` | none | Directory to record terminal sessions (asciinema cast v2); unset disables |
+| `--agent-upgrade-dir` | none | Directory with staged agent upgrade artifacts (`shell-remote-<arch>[.exe]`, optional `shell-remote-<arch>.version` companion); unset disables the upgrade button |
 
 ### Start Agent
 
@@ -222,6 +224,25 @@ Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in 
 - Two layers: secret path (hidden entry) + user/password login.
 - Admin sessions live in memory only; relay restart requires re-login.
 - Known limitation: after revoking/regenerating a token, an agent that reconnects via `register_existing` (replaying its cached tokens) may re-introduce that token; does not affect the live session.
+
+## Atomic Agent Self-Upgrade
+
+Enable with `--agent-upgrade-dir <dir>` on the relay, then stage new agent binaries in that directory with the same naming as the release artifacts (see `scripts/build-releases.sh`): `shell-remote-x86_64`, `shell-remote-aarch64`, `shell-remote-armv7`, or `shell-remote-x86_64.exe` on Windows. An optional `shell-remote-<arch>.version` file (e.g. `0.19.0`) labels the target version in the UI.
+
+Every online device in the admin **Devices** tab has an **Upgrade** button. Clicking it:
+
+1. The relay picks the artifact matching the device's reported architecture, hashes it (SHA-256), and sends `agent:upgrade` to that agent.
+2. The agent downloads the artifact from the relay (authenticated with its own read-write token), reporting progress percentages.
+3. The SHA-256 is verified — a mismatch aborts and keeps the old binary.
+4. On Unix the new binary is smoke-tested with `--version` to confirm it actually runs on this platform (guards against wrong-arch or truncated artifacts); Windows skips this (SHA-256 is the integrity gate).
+5. The binary is atomically replaced in its own directory (atomic `rename` on Unix; on Windows, when the running `.exe` blocks replacement, a helper `.bat` defers the swap), then the agent re-launches itself with its original arguments and the old process exits.
+
+Progress is shown live in the device row's version cell (started / downloading n% / verifying / installing / failure reason); once upgraded it shows a green "upgraded v<version>" and the version column reflects the new agent version.
+
+Notes:
+
+- The agent's binary directory must be writable (`rename` needs write permission on it); failures surface clearly in the panel.
+- The restarted process re-registers with its fixed `--key`, keeping its identity; agents started with a temporary token (no `--key`) get freshly minted tokens after the restart, invalidating old ones.
 
 ## Session Recording
 

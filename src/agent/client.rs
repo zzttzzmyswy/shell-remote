@@ -121,6 +121,7 @@ impl RelayClient {
         if let Some(sid) = desired_session_id {
             register_msg["session_id"] = json!(sid);
         }
+        register_msg["agent_version"] = json!(env!("CARGO_PKG_VERSION"));
 
         let resp = http_client
             .post(&send_url)

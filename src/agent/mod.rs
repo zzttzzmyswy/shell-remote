@@ -5,6 +5,7 @@ pub mod encoding;
 pub mod exec_sessions;
 pub mod fs;
 pub mod shell;
+pub mod upgrade;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -728,6 +729,18 @@ async fn run_session(
 
     let is_readonly = token_type == "ro";
 
+    // Only one self-upgrade may run per session; the flag is held by the whole
+    // run_session lifetime and cleared by the task on failure (on success the
+    // process replaces itself via exec, so nothing to clear).
+    let upgrade_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Canonical path of the running executable, resolved once at startup so a
+    // later in-place rebuild/rotation of this file cannot make the
+    // self-upgrade resolver (`/proc/self/exe`) fail mid-upgrade.
+    let self_exe: Option<std::path::PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok());
+
     let first_tab_id = uuid::Uuid::new_v4().to_string();
     let mut tabs: HashMap<String, TabState> = HashMap::new();
     let mut active_tab_id = first_tab_id.clone();
@@ -1241,6 +1254,84 @@ async fn run_session(
                                 "session:leave" => {
                                     let user_id = msg.payload["user_id"].as_str().unwrap_or("");
                                     tracing::info!("User {} left", user_id);
+                                }
+
+                                "agent:upgrade" => {
+                                    // Admin panel triggered an atomic self-upgrade:
+                                    // download → verify SHA-256 → smoke test → atomic
+                                    // replace → restart with the same argv. Runs in a
+                                    // spawned task so a slow download cannot freeze the
+                                    // terminal; on success the process replaces itself.
+                                    let req = match crate::agent::upgrade::UpgradeRequest::from_payload(&msg.payload) {
+                                        Some(r) => r,
+                                        None => {
+                                            let err = Message {
+                                                msg_type: "error".to_string(),
+                                                session_id: client.session_id.clone(),
+                                                payload: serde_json::json!({
+                                                    "code": "UPGRADE_BAD_PAYLOAD",
+                                                    "message": "agent:upgrade missing version/url/sha256"
+                                                }),
+                                            };
+                                            out.control(err).await;
+                                            continue;
+                                        }
+                                    };
+                                    if upgrade_in_progress.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                        let err = Message {
+                                            msg_type: "error".to_string(),
+                                            session_id: client.session_id.clone(),
+                                            payload: serde_json::json!({
+                                                "code": "UPGRADE_IN_FLIGHT",
+                                                "message": "an upgrade is already running"
+                                            }),
+                                        };
+                                        out.control(err).await;
+                                        continue;
+                                    }
+                                    let guard = upgrade_in_progress.clone();
+                                    let http = client.http_client().clone();
+                                    let relay_base = client
+                                        .send_url()
+                                        .trim_end_matches("/agent/send")
+                                        .to_string();
+                                    let token = client
+                                        .tokens
+                                        .iter()
+                                        .find(|(_, p)| p == "rw")
+                                        .map(|(t, _)| t.clone())
+                                        .or_else(|| client.tokens.first().map(|(t, _)| t.clone()))
+                                        .unwrap_or_default();
+                                    let sid = client.session_id.clone();
+                                    let ctrl = task_control_tx.clone();
+                                    match self_exe.clone() {
+                                        Some(exe) => {
+                                            tokio::spawn(async move {
+                                                crate::agent::upgrade::perform_upgrade(
+                                                    http, relay_base, token, sid, ctrl, req, exe,
+                                                )
+                                                .await;
+                                                // Only reached on failure — success exits the process.
+                                                guard.store(
+                                                    false,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            });
+                                        }
+                                        None => {
+                                            guard.store(false, std::sync::atomic::Ordering::SeqCst);
+                                            let err = Message {
+                                                msg_type: "error".to_string(),
+                                                session_id: client.session_id.clone(),
+                                                payload: serde_json::json!({
+                                                    "code": "UPGRADE_NO_EXE",
+                                                    "message": "cannot resolve the running executable path"
+                                                }),
+                                            };
+                                            out.control(err).await;
+                                            continue;
+                                        }
+                                    }
                                 }
 
                                 other => {

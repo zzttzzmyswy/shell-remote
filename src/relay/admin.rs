@@ -142,6 +142,7 @@ pub async fn overview_handler(
     let sessions = state.sessions.list_sessions().await;
     let broadcasts = state.agent_broadcast.read().await;
     let activity = state.last_activity.read().await;
+    let upgrades = state.agent_upgrades.read().await;
     let now = Instant::now();
     let mut sess_json: Vec<Value> = Vec::with_capacity(sessions.len());
     let mut agent_online = 0usize;
@@ -168,6 +169,8 @@ pub async fn overview_handler(
             "is_temporary": info.is_temporary,
             "fixed_key": info.fixed_key,
             "device": info.device,
+            "agent_version": info.agent_version,
+            "upgrade": upgrades.get(sid),
             "browser_count": browser_count,
             "last_active_seconds": last_active_seconds,
             "tokens": tokens,
@@ -177,6 +180,7 @@ pub async fn overview_handler(
     }
     drop(activity);
     drop(broadcasts);
+    drop(upgrades);
 
     // Access-audit trail (browser/MCP connections), newest first.
     let conn_log: Vec<Value> = state
@@ -488,6 +492,210 @@ pub async fn recording_delete_handler(
         )
             .into_response(),
     }
+}
+
+// ── Agent self-upgrade (device panel) ────────────────────────────────
+
+/// Canonical artifact arch key for a device-reported arch. Release binaries
+/// are named `shell-remote-{key}` with key x86_64 / aarch64 / armv7 — the
+/// `uname -m` variants (armv7l, amd64, arm64, …) map onto them.
+pub fn artifact_arch_key(arch: &str) -> String {
+    match arch.trim().to_ascii_lowercase().as_str() {
+        "x86_64" | "amd64" | "x64" => "x86_64".to_string(),
+        "aarch64" | "arm64" => "aarch64".to_string(),
+        "armv7l" | "armv7" => "armv7".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse a staged artifact filename into (arch key, windows). Returns `None`
+/// for anything that is not `shell-remote-<arch>[.exe]`.
+pub fn parse_artifact_name(name: &str) -> Option<(String, bool)> {
+    let rest = name.strip_prefix("shell-remote-")?;
+    let windows = rest.ends_with(".exe");
+    let arch = rest.strip_suffix(".exe").unwrap_or(rest);
+    if arch.is_empty() || arch.contains('.') || arch.contains('/') || arch.contains('\\') {
+        return None;
+    }
+    Some((arch.to_string(), windows))
+}
+
+/// True when `name` is a valid staged artifact filename. The blob download
+/// endpoint uses this as its only path guard — it must reject every traversal
+/// or separator trick.
+pub fn valid_artifact_filename(name: &str) -> bool {
+    parse_artifact_name(name).is_some()
+}
+
+/// File a device with `arch`/`platform` should upgrade from, if staged.
+fn artifact_file_for(
+    dir: &std::path::Path,
+    arch: &str,
+    platform: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let key = artifact_arch_key(arch);
+    if platform == Some("windows") {
+        let p = dir.join(format!("shell-remote-{key}.exe"));
+        p.is_file().then_some(p)
+    } else {
+        let p = dir.join(format!("shell-remote-{key}"));
+        p.is_file().then_some(p)
+    }
+}
+
+/// Version label for a staged artifact: the `shell-remote-<key>.version`
+/// companion file if present, else a generic label.
+fn artifact_version(dir: &std::path::Path, key: &str) -> String {
+    std::fs::read_to_string(dir.join(format!("shell-remote-{key}.version")))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "v?".to_string())
+}
+
+/// List the staged agent upgrade artifacts (`--agent-upgrade-dir`). Purely
+/// file-metadata based (no hashing) so it is cheap enough for the admin page's
+/// periodic refresh.
+pub async fn upgrade_artifacts_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let Some(dir) = state.upgrade_dir.read().await.clone() else {
+        return Json(json!({"enabled": false, "artifacts": []})).into_response();
+    };
+    let mut artifacts: Vec<Value> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some((arch, windows)) = parse_artifact_name(&name) {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        artifacts.push(json!({
+                            "arch": arch,
+                            "filename": name,
+                            "size": meta.len(),
+                            "windows": windows,
+                            "version": artifact_version(&dir, &arch),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    artifacts.sort_by(|a, b| a["arch"].as_str().cmp(&b["arch"].as_str()));
+    Json(json!({
+        "enabled": true,
+        "dir": dir.display().to_string(),
+        "artifacts": artifacts,
+    }))
+    .into_response()
+}
+
+/// Trigger an atomic self-upgrade for one device: hash the staged artifact for
+/// the device's arch and deliver `agent:upgrade` over the session's agent
+/// channel. The agent then downloads, verifies and atomically replaces itself.
+pub async fn agent_upgrade_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let sid = body["session_id"].as_str().unwrap_or("").to_string();
+    if sid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "missing session_id"})),
+        )
+            .into_response();
+    }
+    let Some(info) = state.sessions.get(&sid).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": "session not found"})),
+        )
+            .into_response();
+    };
+    let (arch, platform) = match info.device.as_ref() {
+        Some(d) => (d.arch.clone().unwrap_or_default(), d.platform.clone()),
+        None => (String::new(), None),
+    };
+    if arch.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "device arch unknown — cannot pick an artifact"})),
+        )
+            .into_response();
+    }
+    let Some(dir) = state.upgrade_dir.read().await.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "agent upgrades disabled (--agent-upgrade-dir unset)"})),
+        )
+            .into_response();
+    };
+    let Some(path) = artifact_file_for(&dir, &arch, platform.as_deref()) else {
+        let key = artifact_arch_key(&arch);
+        let want = if platform.as_deref() == Some("windows") {
+            format!("shell-remote-{key}.exe")
+        } else {
+            format!("shell-remote-{key}")
+        };
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": format!("no upgrade artifact for arch {arch} (expected {want} in {})", dir.display())})),
+        )
+            .into_response();
+    };
+    // Hash + version at trigger time (one-shot, per click).
+    let sha256 = match crate::agent::upgrade::sha256_hex_file(&path) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": format!("cannot hash artifact: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let arch_key = artifact_arch_key(&arch);
+    let version = artifact_version(&dir, &arch_key);
+
+    let text = serde_json::to_string(&json!({
+        "type": "agent:upgrade",
+        "session_id": sid,
+        "payload": {
+            "version": version,
+            "url": format!("/agent/upgrade/blob/{}", filename),
+            "sha256": sha256,
+        }
+    }))
+    .unwrap_or_default();
+    {
+        let broadcast = state.agent_broadcast.read().await;
+        match broadcast.get(&sid).and_then(|cm| cm.agent.as_ref()) {
+            Some(tx) => crate::relay::ws::deliver(tx, "agent:upgrade", text),
+            None => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"ok": false, "error": "agent offline"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    // Reflect the trigger immediately in the overview until the agent's first
+    // progress frame replaces this entry.
+    state.agent_upgrades.write().await.insert(
+        sid.clone(),
+        json!({"stage": "started", "version": version, "detail": "upgrade triggered"}),
+    );
+    Json(json!({"ok": true, "version": version, "arch": arch_key})).into_response()
 }
 
 #[cfg(test)]
@@ -1048,5 +1256,292 @@ mod tests {
         assert_eq!(v["page"], 1);
         assert_eq!(v["page_size"], 20);
         assert_eq!(v["recordings"].as_array().unwrap().len(), 20);
+    }
+
+    #[test]
+    fn test_artifact_arch_key_normalization() {
+        assert_eq!(artifact_arch_key("x86_64"), "x86_64");
+        assert_eq!(artifact_arch_key("amd64"), "x86_64");
+        assert_eq!(artifact_arch_key("aarch64"), "aarch64");
+        assert_eq!(artifact_arch_key("arm64"), "aarch64");
+        assert_eq!(artifact_arch_key("armv7l"), "armv7");
+        assert_eq!(artifact_arch_key("riscv64"), "riscv64");
+        assert_eq!(artifact_arch_key("ARM64"), "aarch64"); // case-insensitive
+    }
+
+    #[test]
+    fn test_parse_artifact_name() {
+        let name = parse_artifact_name("shell-remote-x86_64").unwrap();
+        assert_eq!(name, ("x86_64".to_string(), false));
+        let name = parse_artifact_name("shell-remote-aarch64.exe").unwrap();
+        assert_eq!(name, ("aarch64".to_string(), true));
+        assert!(parse_artifact_name("other.file").is_none());
+        assert!(parse_artifact_name("shell-remote-").is_none());
+        assert!(parse_artifact_name("../../etc/passwd").is_none());
+        assert!(parse_artifact_name("shell-remote-x86_64.extra").is_none()); // dot in arch
+        assert!(!valid_artifact_filename("shell-remote-../x"));
+        assert!(valid_artifact_filename("shell-remote-armv7"));
+        assert!(valid_artifact_filename("shell-remote-x86_64.exe"));
+    }
+
+    fn upgrade_dir_with_artifacts() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-upg-admin-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shell-remote-x86_64"), b"new-binary-x86").unwrap();
+        std::fs::write(dir.join("shell-remote-aarch64.exe"), b"new-exe-aarch64").unwrap();
+        std::fs::write(dir.join("shell-remote-armv7"), b"new-armv7").unwrap();
+        std::fs::write(dir.join("shell-remote-x86_64.version"), "0.20.0").unwrap();
+        std::fs::write(dir.join("README.txt"), b"ignored noise").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_artifacts_handler_lists_staged_binaries() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_admin("admin", "s3cret");
+        *state.upgrade_dir.write().await = Some(dir.clone());
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        let h = cookie_headers("tok");
+
+        let r = upgrade_artifacts_handler(State(state.clone()), h.clone()).await;
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["enabled"], true);
+        let arts = v["artifacts"].as_array().unwrap();
+        assert_eq!(arts.len(), 3, "noise files must be excluded");
+        let x86 = arts
+            .iter()
+            .find(|a| a["arch"] == "x86_64")
+            .expect("x86_64 artifact listed");
+        assert_eq!(x86["filename"], "shell-remote-x86_64");
+        assert_eq!(x86["version"], "0.20.0", "companion .version file is used");
+        assert_eq!(x86["windows"], false);
+        let win = arts
+            .iter()
+            .find(|a| a["windows"] == true)
+            .expect("windows artifact listed");
+        assert_eq!(win["arch"], "aarch64");
+
+        // Auth required
+        let r = upgrade_artifacts_handler(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(r.status(), 401);
+
+        // Disabled relay (no upgrade dir) → empty list, not an error.
+        let state2 = state_with_admin("admin", "s3cret");
+        state2
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        let r = upgrade_artifacts_handler(State(state2), cookie_headers("tok")).await;
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["artifacts"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_requires_admin() {
+        let state = state_with_admin("admin", "s3cret");
+        let r = agent_upgrade_handler(
+            State(state),
+            HeaderMap::new(),
+            Json(json!({"session_id": "x"})),
+        )
+        .await;
+        assert_eq!(r.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_offline_agent_is_conflict() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_admin("admin", "s3cret");
+        *state.upgrade_dir.write().await = Some(dir.clone());
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        let h = cookie_headers("tok");
+
+        let reg = state
+            .sessions
+            .register(None, "rw", Some("devbox9".to_string()))
+            .await
+            .unwrap();
+        state
+            .sessions
+            .set_device(
+                &reg.session_id,
+                Some(crate::proto::DeviceInfo {
+                    hostname: None,
+                    platform: Some("linux".to_string()),
+                    arch: Some("x86_64".to_string()),
+                    os: None,
+                    kernel: None,
+                    cpu_model: None,
+                }),
+            )
+            .await;
+
+        // No agent channel → offline → 409.
+        let r = agent_upgrade_handler(
+            State(state.clone()),
+            h.clone(),
+            Json(json!({"session_id": reg.session_id})),
+        )
+        .await;
+        assert_eq!(r.status(), 409);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_delivers_upgrade_message() {
+        let dir = upgrade_dir_with_artifacts();
+        let expected_digest = crate::agent::upgrade::sha256_hex_file(&dir.join("shell-remote-x86_64"))
+            .unwrap();
+        let state = state_with_admin("admin", "s3cret");
+        *state.upgrade_dir.write().await = Some(dir.clone());
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        let h = cookie_headers("tok");
+
+        let reg = state
+            .sessions
+            .register(None, "rw", Some("devbox9".to_string()))
+            .await
+            .unwrap();
+        state
+            .sessions
+            .set_device(
+                &reg.session_id,
+                Some(crate::proto::DeviceInfo {
+                    hostname: None,
+                    platform: Some("linux".to_string()),
+                    arch: Some("x86_64".to_string()),
+                    os: None,
+                    kernel: None,
+                    cpu_model: None,
+                }),
+            )
+            .await;
+
+        // A live agent SSE channel so the relay can deliver the message.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        state.agent_broadcast.write().await.insert(
+            reg.session_id.clone(),
+            crate::relay::ChannelMap {
+                agent: Some(tx.clone()),
+                agent_bulk: None,
+                browser_sessions: std::collections::HashMap::new(),
+            },
+        );
+
+        let r = agent_upgrade_handler(
+            State(state.clone()),
+            h.clone(),
+            Json(json!({"session_id": reg.session_id})),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let got = rx.try_recv().expect("agent channel must receive the upgrade msg");
+        let v: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["type"], "agent:upgrade");
+        assert_eq!(v["session_id"], reg.session_id);
+        let payload = &v["payload"];
+        assert_eq!(payload["version"], "0.20.0");
+        assert_eq!(payload["url"], "/agent/upgrade/blob/shell-remote-x86_64");
+        assert_eq!(payload["sha256"], expected_digest);
+
+        // Trigger is reflected in the overview immediately.
+        let resp = overview_handler(State(state.clone()), h.clone()).await;
+        let ov: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        let sess = ov["sessions"]
+            .as_array()
+            .unwrap()
+            .into_iter()
+            .find(|s| s["session_id"] == reg.session_id)
+            .unwrap();
+        assert_eq!(sess["upgrade"]["stage"], "started");
+        assert_eq!(sess["upgrade"]["version"], "0.20.0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_missing_artifact_reports_clear_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-upg-none-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // only an armv7 artifact — an x86_64 device must be told explicitly.
+        std::fs::write(dir.join("shell-remote-armv7"), b"x").unwrap();
+        let state = state_with_admin("admin", "s3cret");
+        *state.upgrade_dir.write().await = Some(dir.clone());
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        let reg = state
+            .sessions
+            .register(None, "rw", Some("devbox9".to_string()))
+            .await
+            .unwrap();
+        state
+            .sessions
+            .set_device(
+                &reg.session_id,
+                Some(crate::proto::DeviceInfo {
+                    hostname: None,
+                    platform: Some("linux".to_string()),
+                    arch: Some("x86_64".to_string()),
+                    os: None,
+                    kernel: None,
+                    cpu_model: None,
+                }),
+            )
+            .await;
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        state.agent_broadcast.write().await.insert(
+            reg.session_id.clone(),
+            crate::relay::ChannelMap {
+                agent: Some(tx),
+                agent_bulk: None,
+                browser_sessions: std::collections::HashMap::new(),
+            },
+        );
+        let r = agent_upgrade_handler(
+            State(state.clone()),
+            cookie_headers("tok"),
+            Json(json!({"session_id": reg.session_id})),
+        )
+        .await;
+        assert_eq!(r.status(), 404);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
