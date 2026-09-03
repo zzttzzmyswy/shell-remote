@@ -33,7 +33,11 @@ x11rb = { version = "0.14", features = ["image", "composite"] }
 enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
 tokio-tungstenite = { version = "0.23", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 futures-util = "0.3.34"
+# Wayland 原生捕获（可选 feature，Linux 才有意义）: xdg-desktop-portal
+# ScreenCast D-Bus 会话 + PipeWire 视频流（经 gstreamer appsink 读帧）。
 zbus = { version = "3", optional = true }
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -53,4 +57,6 @@ windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi", "Win32_Found
 windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Foundation", "Win32_System_Threading"] }
 
 [features]
-zbus = ["dep:zbus"]
+# Wayland 原生捕获: portal + PipeWire（构建需 zbus/gstreamer 与系统的
+# xdg-desktop-portal；未启用时 --desktop-capture wayland 给出可操作错误）。
+wayland = ["dep:zbus", "dep:gstreamer", "dep:gstreamer-app"]

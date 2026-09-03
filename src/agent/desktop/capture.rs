@@ -36,7 +36,7 @@ pub fn open_source(kind: &str, display: Option<&str>) -> Result<Box<dyn FrameSou
         "none" => Err("desktop capture disabled".to_string()),
         "x11" => X11Source::open(display).map(|s| Box::new(s) as Box<dyn FrameSource>),
         #[cfg(all(target_os = "linux", feature = "wayland"))]
-        "wayland" => wayland::WaylandSource::open()
+        "wayland" => crate::agent::desktop::wayland::WaylandSource::open()
             .map(|s| Box::new(s) as Box<dyn FrameSource>),
         #[cfg(not(all(target_os = "linux", feature = "wayland")))]
         "wayland" => Err(
@@ -74,7 +74,7 @@ fn open_auto(display: Option<&str>) -> Result<Box<dyn FrameSource>, String> {
             || std::env::var("WAYLAND_DISPLAY").is_ok();
         #[cfg(all(target_os = "linux", feature = "wayland"))]
         if wayland_session {
-            match wayland::WaylandSource::open() {
+            match crate::agent::desktop::wayland::WaylandSource::open() {
                 Ok(s) => return Ok(Box::new(s) as Box<dyn FrameSource>),
                 Err(e) => {
                     tracing::warn!("wayland portal capture unavailable ({e}) — falling back to X11/XWayland")
