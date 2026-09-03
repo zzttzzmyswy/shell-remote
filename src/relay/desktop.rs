@@ -198,15 +198,19 @@ pub async fn stream_handler(
         // 解析。若 init 尚未被 agent 首次推送(desktop:started 预建流之后、
         // 首个 init 到达之前加入的 viewer), 等待它出现, 而不是把第一个 fragment
         // 直接发给浏览器(那会触发 CHUNK_DEMUXER_ERROR_APPEND_FAILED)。
-        // 放在流内执行: 首段字节被消费时才等待, 通常几十 ms 内 agent 的 init
-        // 即到达。
+        // 放…在流内执行: 首段字节被消费时才等待。若超时仍未等到 init, 结束本
+        // viewer 的流(不发送任何片段)——浏览器会收到流结束并自动重连, 而不会
+        // 收到一个 demux 失败的首块。给到 10s: Windows agent GDI+编码器首帧
+        // 初始化可能超过 5s。
         let init = match init {
             Some(i) => Some(i),
-            None => ds.wait_first_init(Duration::from_secs(5)).await,
+            None => ds.wait_first_init(Duration::from_secs(10)).await,
         };
-        if let Some(init) = init {
-            yield Ok::<_, Infallible>(Bytes::from(init));
-        }
+        let Some(init) = init else {
+            drop(guard);
+            return;
+        };
+        yield Ok::<_, Infallible>(Bytes::from(init));
         // 空闲超时：健康流每秒都有帧（最差每 2s 一个 IDR），
         // 30s 无字节说明 agent 侧已停/崩溃、或上行中断，主动收尾
         // 让浏览器 fetch 结束、viewer 条目被清理，避免永久悬挂。

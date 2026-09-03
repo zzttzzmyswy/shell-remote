@@ -196,7 +196,16 @@
           if (controller.signal.aborted) return Promise.resolve();
           return reader.read().then(function(result) {
             if (result.done) {
-              self.setStatus('桌面流已结束', true);
+              // relay 可能在 init 长时间未收到时主动结束本 viewer 流;
+              // 视图仍激活则自动重连(MSE 重新从 init 建流), 而不是停在黑屏。
+              if (self.mediaSource && self._streamRetries < 5) {
+                self._streamRetries += 1;
+                self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
+                self.disconnect(false);
+                setTimeout(function() { self.connect(); }, 700);
+              } else {
+                self.setStatus('桌面流已结束', true);
+              }
               return;
             }
             const v = result.value;
