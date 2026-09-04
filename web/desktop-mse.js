@@ -488,12 +488,13 @@
         }
       };
 
-      // 视频渲染坐标 → 桌面像素坐标（object-fit: contain 的信箱区域剔除）
+      // 视频渲染坐标 → 桌面像素坐标（object-fit: cover —— 铺满容器, 超出裁切;
+      // 与 contain 的信箱区不同, 这里 scale 取 max, 元素 box 即完整画面映射）
       this._toDesktopXY = function(e) {
         const vw = v.videoWidth, vh = v.videoHeight;
         if (!vw || !vh) return null;
         const rect = v.getBoundingClientRect();
-        const scale = Math.min(rect.width / vw, rect.height / vh);
+        const scale = Math.max(rect.width / vw, rect.height / vh);
         const drawW = vw * scale, drawH = vh * scale;
         const offX = (rect.width - drawW) / 2, offY = (rect.height - drawH) / 2;
         const x = (e.clientX - rect.left - offX) / scale;

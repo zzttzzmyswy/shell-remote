@@ -865,24 +865,23 @@ body {
     overflow: hidden;
 }
 #desktop-video {
-    max-width: 100%;
-    max-height: 100%;
-    width: auto;
-    height: auto;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
     background: #000;
     /* 键鼠注入：可聚焦（keydown 需要焦点）。本地光标保留可见：GDI/DXGI
        捕获默认不含硬件光标，隐藏本地光标会让两端都看不到指针
-       （MYS-886 问题2）。 */
+       （MYS-886 问题2）。cover 与 1280x720/640x360 等比桌面在等宽窗口下
+       无裁剪无黑边; 窗口比例偏离桌面时放大到铺满（超出的收裁切）。 */
     cursor: default;
     outline: none;
 }
 /* WebCodecs 路径渲染目标（desktop.js 优先用 canvas；MSE 回退用 video）。
    两者同尺寸规则，未激活的隐藏。 */
 #desktop-canvas {
-    max-width: 100%;
-    max-height: 100%;
-    width: auto;
-    height: auto;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
     background: #000;
     cursor: default;
     outline: none;

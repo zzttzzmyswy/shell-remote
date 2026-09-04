@@ -606,7 +606,9 @@
         const vw = self._videoW(), vh = self._videoH();
         if (!vw || !vh) return null;
         const rect = v.getBoundingClientRect();
-        const scale = Math.min(rect.width / vw, rect.height / vh);
+        // CSS object-fit: cover —— 画面铺满容器, 比例不一致时裁切超出部分。
+        // 像素→桌面坐标取 max(scale): 显示区恰好覆盖整个元素 box。
+        const scale = Math.max(rect.width / vw, rect.height / vh);
         const drawW = vw * scale, drawH = vh * scale;
         const offX = (rect.width - drawW) / 2, offY = (rect.height - drawH) / 2;
         const x = (e.clientX - rect.left - offX) / scale;
