@@ -122,6 +122,13 @@ impl H264Encoder {
         // Let the encoder pick profile/level automatically for screen content.
         param.sSpatialLayers[0].uiProfileIdc = 0;
         param.uiIntraPeriod = 0; // no periodic IDR; we force IDR explicitly
+        // 低延迟多线程：screen-content 高熵帧（移动窗口）默认单线程编码
+        // 单帧可达 40ms+，在 30fps tick(33ms) 内超时 → MissedTickBehavior::Skip
+        // 使帧率塌陷、上行变稀疏突发（实测 909ms 黑洞），浏览器端表现为
+        // 移动窗口卡顿/延迟打转。iMultipleThreadIdc=4 让 OpenH264 内部并行
+        // 编码宏块，显著压缩单帧耗时；LOR 复杂度优先低延迟而非画质。
+        param.iMultipleThreadIdc = 4;
+        param.iComplexityMode = openh264_sys2::LOW_COMPLEXITY;
         param.iNumRefFrame = 1;
         // 关闭 RC 跳帧: openh264 在码率预算不足时会跳过 (几乎) 所有 P 帧,
         // 导致高熵桌面上 web 端黑屏。宁可每帧硬编码、由调用方通过降低
