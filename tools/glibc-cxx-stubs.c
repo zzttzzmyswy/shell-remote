@@ -13,6 +13,21 @@
 
 int __libc_single_threaded = 1;
 
+// musl 的文件接口本身是 64 位偏移；glibc 的 _FILE_OFFSET_BITS=64 把 fopen
+// 映射到 fopen64，musl 没有这个导出符号 → 包一份转发。mingw 自带 *64
+// 声明与实现(_off64_t)，不需要、也不能重复定义。
+#ifndef _WIN32
+FILE *fopen64(const char *path, const char *mode) {
+    return fopen(path, mode);
+}
+int fseeko64(FILE *stream, long off, int whence) {
+    return fseeko(stream, off, whence);
+}
+long ftello64(FILE *stream) {
+    return ftello(stream);
+}
+#endif
+
 unsigned long __isoc23_strtoul(const char *nptr, char **endptr, int base) {
     return strtoul(nptr, endptr, base);
 }

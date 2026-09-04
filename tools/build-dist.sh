@@ -37,7 +37,20 @@ for entry in "${PLATFORMS[@]}"; do
   ( cd "$dir/x" && rm -f ./*.o 2>/dev/null; ar x "$stdlib" )
   ar rc "$dir/libstdc++.a" "$dir"/x/*.o "$dir/stub.o"
 
-  env CC="$cc" CXX="$cxx" AR="$ar" \
+  # VP9 (libvpx): prefer a prebuilt static libvpx for this target (built by
+  # tools/build-libvpx.sh → $CACHE/libvpx-<target>/). Fall back to the default
+  # vp9 feature pulling pkg-config libvpx (dev builds). When neither exists,
+  # build with vp9 disabled so the binary still links.
+  LIBVPX_FLAGS=()
+  if [ -d "$CACHE/libvpx-$target" ]; then
+    LIBVPX_FLAGS=("LIBVPX_DIR=$CACHE/libvpx-$target")
+    echo "static libvpx: $CACHE/libvpx-$target"
+  else
+    echo "WARNING: no static libvpx for $target ($CACHE/libvpx-$target) — building without VP9"
+    LIBVPX_FLAGS=()
+  fi
+
+  env CC="$cc" CXX="$cxx" AR="$ar" "${LIBVPX_FLAGS[@]}" \
       RUSTFLAGS="-C link-arg=-L$dir" \
       cargo build --release --target "$target" --manifest-path "$ROOT/Cargo.toml"
 done
@@ -46,8 +59,18 @@ done
 # 提权窗口/多数弹窗(360 等)。UAC 安全桌面本身仍需服务级组件(后续)。
 echo "== embedding windows manifest =="
 x86_64-w64-mingw32-windres "$ROOT/build/embed-manifest.rc" -O coff -o "$ROOT/build/agent_manifest.o"
+WIN_DIR="$CACHE/libvpx-x86_64-pc-windows-gnu"
+WIN_LIBVPX=()
+if [ -d "$WIN_DIR" ]; then
+  WIN_LIBVPX=("LIBVPX_DIR=$WIN_DIR")
+  # 触碰 build.rs 强制重跑 build script: cargo 按 (package, RUSTFLAGS) 缓存
+  # build-script 输出, manifest 段 RUSTFLAGS 与主循环不同, LIBVPX_DIR 的值
+  # 相同时不会触发 rerun-if-env-changed, 复用无 vpx 的旧输出 → 链接缺 -lvpx。
+  touch "$ROOT/build.rs"
+fi
 RUSTFLAGS="-C link-args=$ROOT/build/agent_manifest.o -C target-feature=+crt-static" \
-    cargo build --release --target x86_64-pc-windows-gnu --manifest-path "$ROOT/Cargo.toml"
+  env "${WIN_LIBVPX[@]}" \
+  cargo build --release --target x86_64-pc-windows-gnu --manifest-path "$ROOT/Cargo.toml"
 
 echo "== staging releases =="
 mkdir -p "$ROOT/dist"

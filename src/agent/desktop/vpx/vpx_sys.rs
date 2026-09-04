@@ -113,38 +113,7 @@ pub struct vpx_image {
     pub self_allocd: ::std::os::raw::c_int,
     pub fb_priv: *mut ::std::os::raw::c_void,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_image"][::std::mem::size_of::<vpx_image>() - 136usize];
-    ["Alignment of vpx_image"][::std::mem::align_of::<vpx_image>() - 8usize];
-    ["Offset of field: vpx_image::fmt"][::std::mem::offset_of!(vpx_image, fmt) - 0usize];
-    ["Offset of field: vpx_image::cs"][::std::mem::offset_of!(vpx_image, cs) - 4usize];
-    ["Offset of field: vpx_image::range"][::std::mem::offset_of!(vpx_image, range) - 8usize];
-    ["Offset of field: vpx_image::w"][::std::mem::offset_of!(vpx_image, w) - 12usize];
-    ["Offset of field: vpx_image::h"][::std::mem::offset_of!(vpx_image, h) - 16usize];
-    ["Offset of field: vpx_image::bit_depth"]
-        [::std::mem::offset_of!(vpx_image, bit_depth) - 20usize];
-    ["Offset of field: vpx_image::d_w"][::std::mem::offset_of!(vpx_image, d_w) - 24usize];
-    ["Offset of field: vpx_image::d_h"][::std::mem::offset_of!(vpx_image, d_h) - 28usize];
-    ["Offset of field: vpx_image::r_w"][::std::mem::offset_of!(vpx_image, r_w) - 32usize];
-    ["Offset of field: vpx_image::r_h"][::std::mem::offset_of!(vpx_image, r_h) - 36usize];
-    ["Offset of field: vpx_image::x_chroma_shift"]
-        [::std::mem::offset_of!(vpx_image, x_chroma_shift) - 40usize];
-    ["Offset of field: vpx_image::y_chroma_shift"]
-        [::std::mem::offset_of!(vpx_image, y_chroma_shift) - 44usize];
-    ["Offset of field: vpx_image::planes"][::std::mem::offset_of!(vpx_image, planes) - 48usize];
-    ["Offset of field: vpx_image::stride"][::std::mem::offset_of!(vpx_image, stride) - 80usize];
-    ["Offset of field: vpx_image::bps"][::std::mem::offset_of!(vpx_image, bps) - 96usize];
-    ["Offset of field: vpx_image::user_priv"]
-        [::std::mem::offset_of!(vpx_image, user_priv) - 104usize];
-    ["Offset of field: vpx_image::img_data"]
-        [::std::mem::offset_of!(vpx_image, img_data) - 112usize];
-    ["Offset of field: vpx_image::img_data_owner"]
-        [::std::mem::offset_of!(vpx_image, img_data_owner) - 120usize];
-    ["Offset of field: vpx_image::self_allocd"]
-        [::std::mem::offset_of!(vpx_image, self_allocd) - 124usize];
-    ["Offset of field: vpx_image::fb_priv"][::std::mem::offset_of!(vpx_image, fb_priv) - 128usize];
-};
+
 pub type vpx_image_t = vpx_image;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -154,15 +123,7 @@ pub struct vpx_image_rect {
     pub w: ::std::os::raw::c_uint,
     pub h: ::std::os::raw::c_uint,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_image_rect"][::std::mem::size_of::<vpx_image_rect>() - 16usize];
-    ["Alignment of vpx_image_rect"][::std::mem::align_of::<vpx_image_rect>() - 4usize];
-    ["Offset of field: vpx_image_rect::x"][::std::mem::offset_of!(vpx_image_rect, x) - 0usize];
-    ["Offset of field: vpx_image_rect::y"][::std::mem::offset_of!(vpx_image_rect, y) - 4usize];
-    ["Offset of field: vpx_image_rect::w"][::std::mem::offset_of!(vpx_image_rect, w) - 8usize];
-    ["Offset of field: vpx_image_rect::h"][::std::mem::offset_of!(vpx_image_rect, h) - 12usize];
-};
+
 pub type vpx_image_rect_t = vpx_image_rect;
 unsafe extern "C" {
     pub fn vpx_img_alloc(
@@ -245,36 +206,8 @@ pub union vpx_codec_ctx__bindgen_ty_1 {
     pub enc: *const vpx_codec_enc_cfg,
     pub raw: *const ::std::os::raw::c_void,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_codec_ctx__bindgen_ty_1"]
-        [::std::mem::size_of::<vpx_codec_ctx__bindgen_ty_1>() - 8usize];
-    ["Alignment of vpx_codec_ctx__bindgen_ty_1"]
-        [::std::mem::align_of::<vpx_codec_ctx__bindgen_ty_1>() - 8usize];
-    ["Offset of field: vpx_codec_ctx__bindgen_ty_1::dec"]
-        [::std::mem::offset_of!(vpx_codec_ctx__bindgen_ty_1, dec) - 0usize];
-    ["Offset of field: vpx_codec_ctx__bindgen_ty_1::enc"]
-        [::std::mem::offset_of!(vpx_codec_ctx__bindgen_ty_1, enc) - 0usize];
-    ["Offset of field: vpx_codec_ctx__bindgen_ty_1::raw"]
-        [::std::mem::offset_of!(vpx_codec_ctx__bindgen_ty_1, raw) - 0usize];
-};
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_codec_ctx"][::std::mem::size_of::<vpx_codec_ctx>() - 56usize];
-    ["Alignment of vpx_codec_ctx"][::std::mem::align_of::<vpx_codec_ctx>() - 8usize];
-    ["Offset of field: vpx_codec_ctx::name"][::std::mem::offset_of!(vpx_codec_ctx, name) - 0usize];
-    ["Offset of field: vpx_codec_ctx::iface"]
-        [::std::mem::offset_of!(vpx_codec_ctx, iface) - 8usize];
-    ["Offset of field: vpx_codec_ctx::err"][::std::mem::offset_of!(vpx_codec_ctx, err) - 16usize];
-    ["Offset of field: vpx_codec_ctx::err_detail"]
-        [::std::mem::offset_of!(vpx_codec_ctx, err_detail) - 24usize];
-    ["Offset of field: vpx_codec_ctx::init_flags"]
-        [::std::mem::offset_of!(vpx_codec_ctx, init_flags) - 32usize];
-    ["Offset of field: vpx_codec_ctx::config"]
-        [::std::mem::offset_of!(vpx_codec_ctx, config) - 40usize];
-    ["Offset of field: vpx_codec_ctx::priv_"]
-        [::std::mem::offset_of!(vpx_codec_ctx, priv_) - 48usize];
-};
+
+
 pub type vpx_codec_ctx_t = vpx_codec_ctx;
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -337,35 +270,7 @@ pub struct VpxTplBlockStats {
     pub intra_pred_err: i64,
     pub ref_frame_index: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of VpxTplBlockStats"][::std::mem::size_of::<VpxTplBlockStats>() - 80usize];
-    ["Alignment of VpxTplBlockStats"][::std::mem::align_of::<VpxTplBlockStats>() - 8usize];
-    ["Offset of field: VpxTplBlockStats::row"]
-        [::std::mem::offset_of!(VpxTplBlockStats, row) - 0usize];
-    ["Offset of field: VpxTplBlockStats::col"]
-        [::std::mem::offset_of!(VpxTplBlockStats, col) - 2usize];
-    ["Offset of field: VpxTplBlockStats::intra_cost"]
-        [::std::mem::offset_of!(VpxTplBlockStats, intra_cost) - 8usize];
-    ["Offset of field: VpxTplBlockStats::inter_cost"]
-        [::std::mem::offset_of!(VpxTplBlockStats, inter_cost) - 16usize];
-    ["Offset of field: VpxTplBlockStats::mv_r"]
-        [::std::mem::offset_of!(VpxTplBlockStats, mv_r) - 24usize];
-    ["Offset of field: VpxTplBlockStats::mv_c"]
-        [::std::mem::offset_of!(VpxTplBlockStats, mv_c) - 26usize];
-    ["Offset of field: VpxTplBlockStats::srcrf_rate"]
-        [::std::mem::offset_of!(VpxTplBlockStats, srcrf_rate) - 32usize];
-    ["Offset of field: VpxTplBlockStats::srcrf_dist"]
-        [::std::mem::offset_of!(VpxTplBlockStats, srcrf_dist) - 40usize];
-    ["Offset of field: VpxTplBlockStats::pred_error"]
-        [::std::mem::offset_of!(VpxTplBlockStats, pred_error) - 48usize];
-    ["Offset of field: VpxTplBlockStats::inter_pred_err"]
-        [::std::mem::offset_of!(VpxTplBlockStats, inter_pred_err) - 56usize];
-    ["Offset of field: VpxTplBlockStats::intra_pred_err"]
-        [::std::mem::offset_of!(VpxTplBlockStats, intra_pred_err) - 64usize];
-    ["Offset of field: VpxTplBlockStats::ref_frame_index"]
-        [::std::mem::offset_of!(VpxTplBlockStats, ref_frame_index) - 72usize];
-};
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct VpxTplFrameStats {
@@ -374,34 +279,14 @@ pub struct VpxTplFrameStats {
     pub num_blocks: ::std::os::raw::c_int,
     pub block_stats_list: *mut VpxTplBlockStats,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of VpxTplFrameStats"][::std::mem::size_of::<VpxTplFrameStats>() - 24usize];
-    ["Alignment of VpxTplFrameStats"][::std::mem::align_of::<VpxTplFrameStats>() - 8usize];
-    ["Offset of field: VpxTplFrameStats::frame_width"]
-        [::std::mem::offset_of!(VpxTplFrameStats, frame_width) - 0usize];
-    ["Offset of field: VpxTplFrameStats::frame_height"]
-        [::std::mem::offset_of!(VpxTplFrameStats, frame_height) - 4usize];
-    ["Offset of field: VpxTplFrameStats::num_blocks"]
-        [::std::mem::offset_of!(VpxTplFrameStats, num_blocks) - 8usize];
-    ["Offset of field: VpxTplFrameStats::block_stats_list"]
-        [::std::mem::offset_of!(VpxTplFrameStats, block_stats_list) - 16usize];
-};
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct VpxTplGopStats {
     pub size: ::std::os::raw::c_int,
     pub frame_stats_list: *mut VpxTplFrameStats,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of VpxTplGopStats"][::std::mem::size_of::<VpxTplGopStats>() - 16usize];
-    ["Alignment of VpxTplGopStats"][::std::mem::align_of::<VpxTplGopStats>() - 8usize];
-    ["Offset of field: VpxTplGopStats::size"]
-        [::std::mem::offset_of!(VpxTplGopStats, size) - 0usize];
-    ["Offset of field: VpxTplGopStats::frame_stats_list"]
-        [::std::mem::offset_of!(VpxTplGopStats, frame_stats_list) - 8usize];
-};
+
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum vpx_rc_type {
@@ -451,15 +336,7 @@ pub struct sb_parameters {
     pub q_index: ::std::os::raw::c_int,
     pub rdmult: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of sb_parameters"][::std::mem::size_of::<sb_parameters>() - 8usize];
-    ["Alignment of sb_parameters"][::std::mem::align_of::<sb_parameters>() - 4usize];
-    ["Offset of field: sb_parameters::q_index"]
-        [::std::mem::offset_of!(sb_parameters, q_index) - 0usize];
-    ["Offset of field: sb_parameters::rdmult"]
-        [::std::mem::offset_of!(sb_parameters, rdmult) - 4usize];
-};
+
 pub type sb_params = sb_parameters;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -469,21 +346,7 @@ pub struct vpx_rc_encodeframe_decision {
     pub delta_q_uv: ::std::os::raw::c_int,
     pub sb_params_list: *mut sb_params,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_encodeframe_decision"]
-        [::std::mem::size_of::<vpx_rc_encodeframe_decision>() - 24usize];
-    ["Alignment of vpx_rc_encodeframe_decision"]
-        [::std::mem::align_of::<vpx_rc_encodeframe_decision>() - 8usize];
-    ["Offset of field: vpx_rc_encodeframe_decision::q_index"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_decision, q_index) - 0usize];
-    ["Offset of field: vpx_rc_encodeframe_decision::rdmult"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_decision, rdmult) - 4usize];
-    ["Offset of field: vpx_rc_encodeframe_decision::delta_q_uv"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_decision, delta_q_uv) - 8usize];
-    ["Offset of field: vpx_rc_encodeframe_decision::sb_params_list"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_decision, sb_params_list) - 16usize];
-};
+
 pub type vpx_rc_encodeframe_decision_t = vpx_rc_encodeframe_decision;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -497,28 +360,7 @@ pub struct vpx_rc_encodeframe_info {
     pub gop_size: ::std::os::raw::c_int,
     pub use_alt_ref: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_encodeframe_info"][::std::mem::size_of::<vpx_rc_encodeframe_info>() - 48usize];
-    ["Alignment of vpx_rc_encodeframe_info"]
-        [::std::mem::align_of::<vpx_rc_encodeframe_info>() - 4usize];
-    ["Offset of field: vpx_rc_encodeframe_info::frame_type"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_info, frame_type) - 0usize];
-    ["Offset of field: vpx_rc_encodeframe_info::show_index"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_info, show_index) - 4usize];
-    ["Offset of field: vpx_rc_encodeframe_info::coding_index"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_info, coding_index) - 8usize];
-    ["Offset of field: vpx_rc_encodeframe_info::gop_index"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_info, gop_index) - 12usize];
-    ["Offset of field: vpx_rc_encodeframe_info::ref_frame_coding_indexes"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_info, ref_frame_coding_indexes) - 16usize];
-    ["Offset of field: vpx_rc_encodeframe_info::ref_frame_valid_list"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_info, ref_frame_valid_list) - 28usize];
-    ["Offset of field: vpx_rc_encodeframe_info::gop_size"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_info, gop_size) - 40usize];
-    ["Offset of field: vpx_rc_encodeframe_info::use_alt_ref"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_info, use_alt_ref) - 44usize];
-};
+
 pub type vpx_rc_encodeframe_info_t = vpx_rc_encodeframe_info;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -526,17 +368,7 @@ pub struct vpx_rc_encodeframe_result {
     pub bit_count: i64,
     pub actual_encoding_qindex: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_encodeframe_result"]
-        [::std::mem::size_of::<vpx_rc_encodeframe_result>() - 16usize];
-    ["Alignment of vpx_rc_encodeframe_result"]
-        [::std::mem::align_of::<vpx_rc_encodeframe_result>() - 8usize];
-    ["Offset of field: vpx_rc_encodeframe_result::bit_count"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_result, bit_count) - 0usize];
-    ["Offset of field: vpx_rc_encodeframe_result::actual_encoding_qindex"]
-        [::std::mem::offset_of!(vpx_rc_encodeframe_result, actual_encoding_qindex) - 8usize];
-};
+
 pub type vpx_rc_encodeframe_result_t = vpx_rc_encodeframe_result;
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -575,63 +407,7 @@ pub struct vpx_rc_frame_stats {
     pub count: f64,
     pub new_mv_count: f64,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_frame_stats"][::std::mem::size_of::<vpx_rc_frame_stats>() - 208usize];
-    ["Alignment of vpx_rc_frame_stats"][::std::mem::align_of::<vpx_rc_frame_stats>() - 8usize];
-    ["Offset of field: vpx_rc_frame_stats::frame"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, frame) - 0usize];
-    ["Offset of field: vpx_rc_frame_stats::weight"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, weight) - 8usize];
-    ["Offset of field: vpx_rc_frame_stats::intra_error"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, intra_error) - 16usize];
-    ["Offset of field: vpx_rc_frame_stats::coded_error"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, coded_error) - 24usize];
-    ["Offset of field: vpx_rc_frame_stats::sr_coded_error"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, sr_coded_error) - 32usize];
-    ["Offset of field: vpx_rc_frame_stats::frame_noise_energy"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, frame_noise_energy) - 40usize];
-    ["Offset of field: vpx_rc_frame_stats::pcnt_inter"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, pcnt_inter) - 48usize];
-    ["Offset of field: vpx_rc_frame_stats::pcnt_motion"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, pcnt_motion) - 56usize];
-    ["Offset of field: vpx_rc_frame_stats::pcnt_second_ref"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, pcnt_second_ref) - 64usize];
-    ["Offset of field: vpx_rc_frame_stats::pcnt_neutral"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, pcnt_neutral) - 72usize];
-    ["Offset of field: vpx_rc_frame_stats::pcnt_intra_low"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, pcnt_intra_low) - 80usize];
-    ["Offset of field: vpx_rc_frame_stats::pcnt_intra_high"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, pcnt_intra_high) - 88usize];
-    ["Offset of field: vpx_rc_frame_stats::intra_skip_pct"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, intra_skip_pct) - 96usize];
-    ["Offset of field: vpx_rc_frame_stats::intra_smooth_pct"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, intra_smooth_pct) - 104usize];
-    ["Offset of field: vpx_rc_frame_stats::inactive_zone_rows"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, inactive_zone_rows) - 112usize];
-    ["Offset of field: vpx_rc_frame_stats::inactive_zone_cols"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, inactive_zone_cols) - 120usize];
-    ["Offset of field: vpx_rc_frame_stats::MVr"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, MVr) - 128usize];
-    ["Offset of field: vpx_rc_frame_stats::mvr_abs"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, mvr_abs) - 136usize];
-    ["Offset of field: vpx_rc_frame_stats::MVc"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, MVc) - 144usize];
-    ["Offset of field: vpx_rc_frame_stats::mvc_abs"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, mvc_abs) - 152usize];
-    ["Offset of field: vpx_rc_frame_stats::MVrv"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, MVrv) - 160usize];
-    ["Offset of field: vpx_rc_frame_stats::MVcv"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, MVcv) - 168usize];
-    ["Offset of field: vpx_rc_frame_stats::mv_in_out_count"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, mv_in_out_count) - 176usize];
-    ["Offset of field: vpx_rc_frame_stats::duration"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, duration) - 184usize];
-    ["Offset of field: vpx_rc_frame_stats::count"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, count) - 192usize];
-    ["Offset of field: vpx_rc_frame_stats::new_mv_count"]
-        [::std::mem::offset_of!(vpx_rc_frame_stats, new_mv_count) - 200usize];
-};
+
 pub type vpx_rc_frame_stats_t = vpx_rc_frame_stats;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -639,16 +415,7 @@ pub struct vpx_rc_firstpass_stats {
     pub frame_stats: *mut vpx_rc_frame_stats_t,
     pub num_frames: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_firstpass_stats"][::std::mem::size_of::<vpx_rc_firstpass_stats>() - 16usize];
-    ["Alignment of vpx_rc_firstpass_stats"]
-        [::std::mem::align_of::<vpx_rc_firstpass_stats>() - 8usize];
-    ["Offset of field: vpx_rc_firstpass_stats::frame_stats"]
-        [::std::mem::offset_of!(vpx_rc_firstpass_stats, frame_stats) - 0usize];
-    ["Offset of field: vpx_rc_firstpass_stats::num_frames"]
-        [::std::mem::offset_of!(vpx_rc_firstpass_stats, num_frames) - 8usize];
-};
+
 pub type vpx_rc_firstpass_stats_t = vpx_rc_firstpass_stats;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -668,39 +435,7 @@ pub struct vpx_rc_config {
     pub max_base_q_index: ::std::os::raw::c_int,
     pub base_qp: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_config"][::std::mem::size_of::<vpx_rc_config>() - 56usize];
-    ["Alignment of vpx_rc_config"][::std::mem::align_of::<vpx_rc_config>() - 4usize];
-    ["Offset of field: vpx_rc_config::frame_width"]
-        [::std::mem::offset_of!(vpx_rc_config, frame_width) - 0usize];
-    ["Offset of field: vpx_rc_config::frame_height"]
-        [::std::mem::offset_of!(vpx_rc_config, frame_height) - 4usize];
-    ["Offset of field: vpx_rc_config::show_frame_count"]
-        [::std::mem::offset_of!(vpx_rc_config, show_frame_count) - 8usize];
-    ["Offset of field: vpx_rc_config::max_gf_interval"]
-        [::std::mem::offset_of!(vpx_rc_config, max_gf_interval) - 12usize];
-    ["Offset of field: vpx_rc_config::min_gf_interval"]
-        [::std::mem::offset_of!(vpx_rc_config, min_gf_interval) - 16usize];
-    ["Offset of field: vpx_rc_config::target_bitrate_kbps"]
-        [::std::mem::offset_of!(vpx_rc_config, target_bitrate_kbps) - 20usize];
-    ["Offset of field: vpx_rc_config::frame_rate_num"]
-        [::std::mem::offset_of!(vpx_rc_config, frame_rate_num) - 24usize];
-    ["Offset of field: vpx_rc_config::frame_rate_den"]
-        [::std::mem::offset_of!(vpx_rc_config, frame_rate_den) - 28usize];
-    ["Offset of field: vpx_rc_config::rc_mode"]
-        [::std::mem::offset_of!(vpx_rc_config, rc_mode) - 32usize];
-    ["Offset of field: vpx_rc_config::overshoot_percent"]
-        [::std::mem::offset_of!(vpx_rc_config, overshoot_percent) - 36usize];
-    ["Offset of field: vpx_rc_config::undershoot_percent"]
-        [::std::mem::offset_of!(vpx_rc_config, undershoot_percent) - 40usize];
-    ["Offset of field: vpx_rc_config::min_base_q_index"]
-        [::std::mem::offset_of!(vpx_rc_config, min_base_q_index) - 44usize];
-    ["Offset of field: vpx_rc_config::max_base_q_index"]
-        [::std::mem::offset_of!(vpx_rc_config, max_base_q_index) - 48usize];
-    ["Offset of field: vpx_rc_config::base_qp"]
-        [::std::mem::offset_of!(vpx_rc_config, base_qp) - 52usize];
-};
+
 pub type vpx_rc_config_t = vpx_rc_config;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -708,15 +443,7 @@ pub struct vpx_rc_ref_frame {
     pub index: [::std::os::raw::c_int; 4usize],
     pub name: [vpx_rc_ref_name_t; 4usize],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_ref_frame"][::std::mem::size_of::<vpx_rc_ref_frame>() - 32usize];
-    ["Alignment of vpx_rc_ref_frame"][::std::mem::align_of::<vpx_rc_ref_frame>() - 4usize];
-    ["Offset of field: vpx_rc_ref_frame::index"]
-        [::std::mem::offset_of!(vpx_rc_ref_frame, index) - 0usize];
-    ["Offset of field: vpx_rc_ref_frame::name"]
-        [::std::mem::offset_of!(vpx_rc_ref_frame, name) - 16usize];
-};
+
 pub type vpx_rc_ref_frame_t = vpx_rc_ref_frame;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -728,23 +455,7 @@ pub struct vpx_rc_gop_decision {
     pub update_ref_index: [::std::os::raw::c_int; 252usize],
     pub ref_frame_list: [vpx_rc_ref_frame_t; 252usize],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_gop_decision"][::std::mem::size_of::<vpx_rc_gop_decision>() - 10092usize];
-    ["Alignment of vpx_rc_gop_decision"][::std::mem::align_of::<vpx_rc_gop_decision>() - 4usize];
-    ["Offset of field: vpx_rc_gop_decision::gop_coding_frames"]
-        [::std::mem::offset_of!(vpx_rc_gop_decision, gop_coding_frames) - 0usize];
-    ["Offset of field: vpx_rc_gop_decision::use_alt_ref"]
-        [::std::mem::offset_of!(vpx_rc_gop_decision, use_alt_ref) - 4usize];
-    ["Offset of field: vpx_rc_gop_decision::use_key_frame"]
-        [::std::mem::offset_of!(vpx_rc_gop_decision, use_key_frame) - 8usize];
-    ["Offset of field: vpx_rc_gop_decision::update_type"]
-        [::std::mem::offset_of!(vpx_rc_gop_decision, update_type) - 12usize];
-    ["Offset of field: vpx_rc_gop_decision::update_ref_index"]
-        [::std::mem::offset_of!(vpx_rc_gop_decision, update_ref_index) - 1020usize];
-    ["Offset of field: vpx_rc_gop_decision::ref_frame_list"]
-        [::std::mem::offset_of!(vpx_rc_gop_decision, ref_frame_list) - 2028usize];
-};
+
 pub type vpx_rc_gop_decision_t = vpx_rc_gop_decision;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -752,17 +463,7 @@ pub struct vpx_rc_key_frame_decision {
     pub key_frame_show_index: ::std::os::raw::c_int,
     pub key_frame_group_size: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_key_frame_decision"]
-        [::std::mem::size_of::<vpx_rc_key_frame_decision>() - 8usize];
-    ["Alignment of vpx_rc_key_frame_decision"]
-        [::std::mem::align_of::<vpx_rc_key_frame_decision>() - 4usize];
-    ["Offset of field: vpx_rc_key_frame_decision::key_frame_show_index"]
-        [::std::mem::offset_of!(vpx_rc_key_frame_decision, key_frame_show_index) - 0usize];
-    ["Offset of field: vpx_rc_key_frame_decision::key_frame_group_size"]
-        [::std::mem::offset_of!(vpx_rc_key_frame_decision, key_frame_group_size) - 4usize];
-};
+
 pub type vpx_rc_key_frame_decision_t = vpx_rc_key_frame_decision;
 pub type vpx_rc_create_model_cb_fn_t = ::std::option::Option<
     unsafe extern "C" fn(
@@ -833,34 +534,7 @@ pub struct vpx_rc_funcs {
     pub rate_ctrl_log_path: *const ::std::os::raw::c_char,
     pub priv_: *mut ::std::os::raw::c_void,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rc_funcs"][::std::mem::size_of::<vpx_rc_funcs>() - 96usize];
-    ["Alignment of vpx_rc_funcs"][::std::mem::align_of::<vpx_rc_funcs>() - 8usize];
-    ["Offset of field: vpx_rc_funcs::rc_type"]
-        [::std::mem::offset_of!(vpx_rc_funcs, rc_type) - 0usize];
-    ["Offset of field: vpx_rc_funcs::create_model"]
-        [::std::mem::offset_of!(vpx_rc_funcs, create_model) - 8usize];
-    ["Offset of field: vpx_rc_funcs::send_firstpass_stats"]
-        [::std::mem::offset_of!(vpx_rc_funcs, send_firstpass_stats) - 16usize];
-    ["Offset of field: vpx_rc_funcs::send_tpl_gop_stats"]
-        [::std::mem::offset_of!(vpx_rc_funcs, send_tpl_gop_stats) - 24usize];
-    ["Offset of field: vpx_rc_funcs::get_encodeframe_decision"]
-        [::std::mem::offset_of!(vpx_rc_funcs, get_encodeframe_decision) - 32usize];
-    ["Offset of field: vpx_rc_funcs::update_encodeframe_result"]
-        [::std::mem::offset_of!(vpx_rc_funcs, update_encodeframe_result) - 40usize];
-    ["Offset of field: vpx_rc_funcs::get_key_frame_decision"]
-        [::std::mem::offset_of!(vpx_rc_funcs, get_key_frame_decision) - 48usize];
-    ["Offset of field: vpx_rc_funcs::get_gop_decision"]
-        [::std::mem::offset_of!(vpx_rc_funcs, get_gop_decision) - 56usize];
-    ["Offset of field: vpx_rc_funcs::get_frame_rdmult"]
-        [::std::mem::offset_of!(vpx_rc_funcs, get_frame_rdmult) - 64usize];
-    ["Offset of field: vpx_rc_funcs::delete_model"]
-        [::std::mem::offset_of!(vpx_rc_funcs, delete_model) - 72usize];
-    ["Offset of field: vpx_rc_funcs::rate_ctrl_log_path"]
-        [::std::mem::offset_of!(vpx_rc_funcs, rate_ctrl_log_path) - 80usize];
-    ["Offset of field: vpx_rc_funcs::priv_"][::std::mem::offset_of!(vpx_rc_funcs, priv_) - 88usize];
-};
+
 pub type vpx_rc_funcs_t = vpx_rc_funcs;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -868,13 +542,7 @@ pub struct vpx_fixed_buf {
     pub buf: *mut ::std::os::raw::c_void,
     pub sz: usize,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_fixed_buf"][::std::mem::size_of::<vpx_fixed_buf>() - 16usize];
-    ["Alignment of vpx_fixed_buf"][::std::mem::align_of::<vpx_fixed_buf>() - 8usize];
-    ["Offset of field: vpx_fixed_buf::buf"][::std::mem::offset_of!(vpx_fixed_buf, buf) - 0usize];
-    ["Offset of field: vpx_fixed_buf::sz"][::std::mem::offset_of!(vpx_fixed_buf, sz) - 8usize];
-};
+
 pub type vpx_fixed_buf_t = vpx_fixed_buf;
 pub type vpx_codec_pts_t = i64;
 pub type vpx_codec_frame_flags_t = u32;
@@ -917,36 +585,7 @@ pub struct vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1 {
     pub height: [::std::os::raw::c_uint; 5usize],
     pub spatial_layer_encoded: [u8; 5usize],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1"]
-        [::std::mem::size_of::<vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1>() - 88usize];
-    ["Alignment of vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1"]
-        [::std::mem::align_of::<vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1>() - 8usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::buf"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1, buf) - 0usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::sz"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1, sz) - 8usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::pts"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1, pts) - 16usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::duration"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1, duration) - 24usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::flags"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1, flags) - 32usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::partition_id"][::std::mem::offset_of!(
-        vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1,
-        partition_id
-    ) - 36usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::width"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1, width) - 40usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::height"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1, height) - 60usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1::spatial_layer_encoded"][::std::mem::offset_of!(
-        vpx_codec_cx_pkt__bindgen_ty_1__bindgen_ty_1,
-        spatial_layer_encoded
-    )
-        - 80usize];
-};
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt {
@@ -955,51 +594,9 @@ pub struct vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt {
     pub psnr: [f64; 4usize],
     pub spatial_layer_id: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt"]
-        [::std::mem::size_of::<vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt>() - 88usize];
-    ["Alignment of vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt"]
-        [::std::mem::align_of::<vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt>() - 8usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt::samples"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt, samples) - 0usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt::sse"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt, sse) - 16usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt::psnr"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt, psnr) - 48usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt::spatial_layer_id"][::std::mem::offset_of!(
-        vpx_codec_cx_pkt__bindgen_ty_1_vpx_psnr_pkt,
-        spatial_layer_id
-    ) - 80usize];
-};
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_codec_cx_pkt__bindgen_ty_1"]
-        [::std::mem::size_of::<vpx_codec_cx_pkt__bindgen_ty_1>() - 128usize];
-    ["Alignment of vpx_codec_cx_pkt__bindgen_ty_1"]
-        [::std::mem::align_of::<vpx_codec_cx_pkt__bindgen_ty_1>() - 8usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1::frame"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1, frame) - 0usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1::twopass_stats"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1, twopass_stats) - 0usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1::firstpass_mb_stats"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1, firstpass_mb_stats) - 0usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1::psnr"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1, psnr) - 0usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1::raw"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1, raw) - 0usize];
-    ["Offset of field: vpx_codec_cx_pkt__bindgen_ty_1::pad"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt__bindgen_ty_1, pad) - 0usize];
-};
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_codec_cx_pkt"][::std::mem::size_of::<vpx_codec_cx_pkt>() - 136usize];
-    ["Alignment of vpx_codec_cx_pkt"][::std::mem::align_of::<vpx_codec_cx_pkt>() - 8usize];
-    ["Offset of field: vpx_codec_cx_pkt::kind"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt, kind) - 0usize];
-    ["Offset of field: vpx_codec_cx_pkt::data"]
-        [::std::mem::offset_of!(vpx_codec_cx_pkt, data) - 8usize];
-};
+
+
+
 pub type vpx_codec_cx_pkt_t = vpx_codec_cx_pkt;
 pub type vpx_codec_enc_output_cx_pkt_cb_fn_t = ::std::option::Option<
     unsafe extern "C" fn(pkt: *mut vpx_codec_cx_pkt_t, user_data: *mut ::std::os::raw::c_void),
@@ -1010,17 +607,7 @@ pub struct vpx_codec_enc_output_cx_cb_pair {
     pub output_cx_pkt: vpx_codec_enc_output_cx_pkt_cb_fn_t,
     pub user_priv: *mut ::std::os::raw::c_void,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_codec_enc_output_cx_cb_pair"]
-        [::std::mem::size_of::<vpx_codec_enc_output_cx_cb_pair>() - 16usize];
-    ["Alignment of vpx_codec_enc_output_cx_cb_pair"]
-        [::std::mem::align_of::<vpx_codec_enc_output_cx_cb_pair>() - 8usize];
-    ["Offset of field: vpx_codec_enc_output_cx_cb_pair::output_cx_pkt"]
-        [::std::mem::offset_of!(vpx_codec_enc_output_cx_cb_pair, output_cx_pkt) - 0usize];
-    ["Offset of field: vpx_codec_enc_output_cx_cb_pair::user_priv"]
-        [::std::mem::offset_of!(vpx_codec_enc_output_cx_cb_pair, user_priv) - 8usize];
-};
+
 pub type vpx_codec_priv_output_cx_pkt_cb_pair_t = vpx_codec_enc_output_cx_cb_pair;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1028,13 +615,7 @@ pub struct vpx_rational {
     pub num: ::std::os::raw::c_int,
     pub den: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_rational"][::std::mem::size_of::<vpx_rational>() - 8usize];
-    ["Alignment of vpx_rational"][::std::mem::align_of::<vpx_rational>() - 4usize];
-    ["Offset of field: vpx_rational::num"][::std::mem::offset_of!(vpx_rational, num) - 0usize];
-    ["Offset of field: vpx_rational::den"][::std::mem::offset_of!(vpx_rational, den) - 4usize];
-};
+
 pub type vpx_rational_t = vpx_rational;
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1126,133 +707,7 @@ pub struct vpx_codec_enc_cfg {
     pub rd_mult_arf_qp_fac: vpx_rational_t,
     pub rd_mult_key_qp_fac: vpx_rational_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_codec_enc_cfg"][::std::mem::size_of::<vpx_codec_enc_cfg>() - 504usize];
-    ["Alignment of vpx_codec_enc_cfg"][::std::mem::align_of::<vpx_codec_enc_cfg>() - 8usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_usage"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_usage) - 0usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_threads"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_threads) - 4usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_profile"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_profile) - 8usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_w"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_w) - 12usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_h"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_h) - 16usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_bit_depth"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_bit_depth) - 20usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_input_bit_depth"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_input_bit_depth) - 24usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_timebase"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_timebase) - 28usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_error_resilient"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_error_resilient) - 36usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_pass"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_pass) - 40usize];
-    ["Offset of field: vpx_codec_enc_cfg::g_lag_in_frames"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, g_lag_in_frames) - 44usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_dropframe_thresh"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_dropframe_thresh) - 48usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_resize_allowed"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_resize_allowed) - 52usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_scaled_width"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_scaled_width) - 56usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_scaled_height"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_scaled_height) - 60usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_resize_up_thresh"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_resize_up_thresh) - 64usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_resize_down_thresh"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_resize_down_thresh) - 68usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_end_usage"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_end_usage) - 72usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_twopass_stats_in"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_twopass_stats_in) - 80usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_firstpass_mb_stats_in"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_firstpass_mb_stats_in) - 96usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_target_bitrate"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_target_bitrate) - 112usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_min_quantizer"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_min_quantizer) - 116usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_max_quantizer"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_max_quantizer) - 120usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_undershoot_pct"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_undershoot_pct) - 124usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_overshoot_pct"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_overshoot_pct) - 128usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_buf_sz"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_buf_sz) - 132usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_buf_initial_sz"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_buf_initial_sz) - 136usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_buf_optimal_sz"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_buf_optimal_sz) - 140usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_2pass_vbr_bias_pct"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_2pass_vbr_bias_pct) - 144usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_2pass_vbr_minsection_pct"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_2pass_vbr_minsection_pct) - 148usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_2pass_vbr_maxsection_pct"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_2pass_vbr_maxsection_pct) - 152usize];
-    ["Offset of field: vpx_codec_enc_cfg::rc_2pass_vbr_corpus_complexity"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rc_2pass_vbr_corpus_complexity) - 156usize];
-    ["Offset of field: vpx_codec_enc_cfg::kf_mode"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, kf_mode) - 160usize];
-    ["Offset of field: vpx_codec_enc_cfg::kf_min_dist"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, kf_min_dist) - 164usize];
-    ["Offset of field: vpx_codec_enc_cfg::kf_max_dist"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, kf_max_dist) - 168usize];
-    ["Offset of field: vpx_codec_enc_cfg::ss_number_layers"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, ss_number_layers) - 172usize];
-    ["Offset of field: vpx_codec_enc_cfg::ss_enable_auto_alt_ref"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, ss_enable_auto_alt_ref) - 176usize];
-    ["Offset of field: vpx_codec_enc_cfg::ss_target_bitrate"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, ss_target_bitrate) - 196usize];
-    ["Offset of field: vpx_codec_enc_cfg::ts_number_layers"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, ts_number_layers) - 216usize];
-    ["Offset of field: vpx_codec_enc_cfg::ts_target_bitrate"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, ts_target_bitrate) - 220usize];
-    ["Offset of field: vpx_codec_enc_cfg::ts_rate_decimator"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, ts_rate_decimator) - 240usize];
-    ["Offset of field: vpx_codec_enc_cfg::ts_periodicity"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, ts_periodicity) - 260usize];
-    ["Offset of field: vpx_codec_enc_cfg::ts_layer_id"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, ts_layer_id) - 264usize];
-    ["Offset of field: vpx_codec_enc_cfg::layer_target_bitrate"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, layer_target_bitrate) - 328usize];
-    ["Offset of field: vpx_codec_enc_cfg::temporal_layering_mode"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, temporal_layering_mode) - 376usize];
-    ["Offset of field: vpx_codec_enc_cfg::use_vizier_rc_params"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, use_vizier_rc_params) - 380usize];
-    ["Offset of field: vpx_codec_enc_cfg::active_wq_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, active_wq_factor) - 384usize];
-    ["Offset of field: vpx_codec_enc_cfg::err_per_mb_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, err_per_mb_factor) - 392usize];
-    ["Offset of field: vpx_codec_enc_cfg::sr_default_decay_limit"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, sr_default_decay_limit) - 400usize];
-    ["Offset of field: vpx_codec_enc_cfg::sr_diff_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, sr_diff_factor) - 408usize];
-    ["Offset of field: vpx_codec_enc_cfg::kf_err_per_mb_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, kf_err_per_mb_factor) - 416usize];
-    ["Offset of field: vpx_codec_enc_cfg::kf_frame_min_boost_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, kf_frame_min_boost_factor) - 424usize];
-    ["Offset of field: vpx_codec_enc_cfg::kf_frame_max_boost_first_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, kf_frame_max_boost_first_factor) - 432usize];
-    ["Offset of field: vpx_codec_enc_cfg::kf_frame_max_boost_subs_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, kf_frame_max_boost_subs_factor) - 440usize];
-    ["Offset of field: vpx_codec_enc_cfg::kf_max_total_boost_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, kf_max_total_boost_factor) - 448usize];
-    ["Offset of field: vpx_codec_enc_cfg::gf_max_total_boost_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, gf_max_total_boost_factor) - 456usize];
-    ["Offset of field: vpx_codec_enc_cfg::gf_frame_max_boost_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, gf_frame_max_boost_factor) - 464usize];
-    ["Offset of field: vpx_codec_enc_cfg::zm_factor"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, zm_factor) - 472usize];
-    ["Offset of field: vpx_codec_enc_cfg::rd_mult_inter_qp_fac"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rd_mult_inter_qp_fac) - 480usize];
-    ["Offset of field: vpx_codec_enc_cfg::rd_mult_arf_qp_fac"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rd_mult_arf_qp_fac) - 488usize];
-    ["Offset of field: vpx_codec_enc_cfg::rd_mult_key_qp_fac"]
-        [::std::mem::offset_of!(vpx_codec_enc_cfg, rd_mult_key_qp_fac) - 496usize];
-};
+
 pub type vpx_codec_enc_cfg_t = vpx_codec_enc_cfg;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1265,25 +720,7 @@ pub struct vpx_svc_parameters {
     pub temporal_layering_mode: ::std::os::raw::c_int,
     pub loopfilter_ctrl: [::std::os::raw::c_int; 12usize],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_svc_parameters"][::std::mem::size_of::<vpx_svc_parameters>() - 292usize];
-    ["Alignment of vpx_svc_parameters"][::std::mem::align_of::<vpx_svc_parameters>() - 4usize];
-    ["Offset of field: vpx_svc_parameters::max_quantizers"]
-        [::std::mem::offset_of!(vpx_svc_parameters, max_quantizers) - 0usize];
-    ["Offset of field: vpx_svc_parameters::min_quantizers"]
-        [::std::mem::offset_of!(vpx_svc_parameters, min_quantizers) - 48usize];
-    ["Offset of field: vpx_svc_parameters::scaling_factor_num"]
-        [::std::mem::offset_of!(vpx_svc_parameters, scaling_factor_num) - 96usize];
-    ["Offset of field: vpx_svc_parameters::scaling_factor_den"]
-        [::std::mem::offset_of!(vpx_svc_parameters, scaling_factor_den) - 144usize];
-    ["Offset of field: vpx_svc_parameters::speed_per_layer"]
-        [::std::mem::offset_of!(vpx_svc_parameters, speed_per_layer) - 192usize];
-    ["Offset of field: vpx_svc_parameters::temporal_layering_mode"]
-        [::std::mem::offset_of!(vpx_svc_parameters, temporal_layering_mode) - 240usize];
-    ["Offset of field: vpx_svc_parameters::loopfilter_ctrl"]
-        [::std::mem::offset_of!(vpx_svc_parameters, loopfilter_ctrl) - 244usize];
-};
+
 pub type vpx_svc_extra_cfg_t = vpx_svc_parameters;
 unsafe extern "C" {
     pub fn vpx_codec_enc_init_ver(
@@ -1375,17 +812,7 @@ pub struct vp8_postproc_cfg {
     pub deblocking_level: ::std::os::raw::c_int,
     pub noise_level: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vp8_postproc_cfg"][::std::mem::size_of::<vp8_postproc_cfg>() - 12usize];
-    ["Alignment of vp8_postproc_cfg"][::std::mem::align_of::<vp8_postproc_cfg>() - 4usize];
-    ["Offset of field: vp8_postproc_cfg::post_proc_flag"]
-        [::std::mem::offset_of!(vp8_postproc_cfg, post_proc_flag) - 0usize];
-    ["Offset of field: vp8_postproc_cfg::deblocking_level"]
-        [::std::mem::offset_of!(vp8_postproc_cfg, deblocking_level) - 4usize];
-    ["Offset of field: vp8_postproc_cfg::noise_level"]
-        [::std::mem::offset_of!(vp8_postproc_cfg, noise_level) - 8usize];
-};
+
 pub type vp8_postproc_cfg_t = vp8_postproc_cfg;
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1401,14 +828,7 @@ pub struct vpx_ref_frame {
     pub frame_type: vpx_ref_frame_type_t,
     pub img: vpx_image_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_ref_frame"][::std::mem::size_of::<vpx_ref_frame>() - 144usize];
-    ["Alignment of vpx_ref_frame"][::std::mem::align_of::<vpx_ref_frame>() - 8usize];
-    ["Offset of field: vpx_ref_frame::frame_type"]
-        [::std::mem::offset_of!(vpx_ref_frame, frame_type) - 0usize];
-    ["Offset of field: vpx_ref_frame::img"][::std::mem::offset_of!(vpx_ref_frame, img) - 8usize];
-};
+
 pub type vpx_ref_frame_t = vpx_ref_frame;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1416,13 +836,7 @@ pub struct vp9_ref_frame {
     pub idx: ::std::os::raw::c_int,
     pub img: vpx_image_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vp9_ref_frame"][::std::mem::size_of::<vp9_ref_frame>() - 144usize];
-    ["Alignment of vp9_ref_frame"][::std::mem::align_of::<vp9_ref_frame>() - 8usize];
-    ["Offset of field: vp9_ref_frame::idx"][::std::mem::offset_of!(vp9_ref_frame, idx) - 0usize];
-    ["Offset of field: vp9_ref_frame::img"][::std::mem::offset_of!(vp9_ref_frame, img) - 8usize];
-};
+
 pub type vp9_ref_frame_t = vp9_ref_frame;
 unsafe extern "C" {
     pub fn vpx_codec_vp8_cx() -> *const vpx_codec_iface;
@@ -1531,26 +945,7 @@ pub struct vpx_roi_map {
     pub ref_frame: [::std::os::raw::c_int; 8usize],
     pub static_threshold: [::std::os::raw::c_uint; 4usize],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_roi_map"][::std::mem::size_of::<vpx_roi_map>() - 168usize];
-    ["Alignment of vpx_roi_map"][::std::mem::align_of::<vpx_roi_map>() - 8usize];
-    ["Offset of field: vpx_roi_map::enabled"]
-        [::std::mem::offset_of!(vpx_roi_map, enabled) - 0usize];
-    ["Offset of field: vpx_roi_map::roi_map"]
-        [::std::mem::offset_of!(vpx_roi_map, roi_map) - 8usize];
-    ["Offset of field: vpx_roi_map::rows"][::std::mem::offset_of!(vpx_roi_map, rows) - 16usize];
-    ["Offset of field: vpx_roi_map::cols"][::std::mem::offset_of!(vpx_roi_map, cols) - 20usize];
-    ["Offset of field: vpx_roi_map::delta_q"]
-        [::std::mem::offset_of!(vpx_roi_map, delta_q) - 24usize];
-    ["Offset of field: vpx_roi_map::delta_lf"]
-        [::std::mem::offset_of!(vpx_roi_map, delta_lf) - 56usize];
-    ["Offset of field: vpx_roi_map::skip"][::std::mem::offset_of!(vpx_roi_map, skip) - 88usize];
-    ["Offset of field: vpx_roi_map::ref_frame"]
-        [::std::mem::offset_of!(vpx_roi_map, ref_frame) - 120usize];
-    ["Offset of field: vpx_roi_map::static_threshold"]
-        [::std::mem::offset_of!(vpx_roi_map, static_threshold) - 152usize];
-};
+
 pub type vpx_roi_map_t = vpx_roi_map;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1559,17 +954,7 @@ pub struct vpx_active_map {
     pub rows: ::std::os::raw::c_uint,
     pub cols: ::std::os::raw::c_uint,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_active_map"][::std::mem::size_of::<vpx_active_map>() - 16usize];
-    ["Alignment of vpx_active_map"][::std::mem::align_of::<vpx_active_map>() - 8usize];
-    ["Offset of field: vpx_active_map::active_map"]
-        [::std::mem::offset_of!(vpx_active_map, active_map) - 0usize];
-    ["Offset of field: vpx_active_map::rows"]
-        [::std::mem::offset_of!(vpx_active_map, rows) - 8usize];
-    ["Offset of field: vpx_active_map::cols"]
-        [::std::mem::offset_of!(vpx_active_map, cols) - 12usize];
-};
+
 pub type vpx_active_map_t = vpx_active_map;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1577,15 +962,7 @@ pub struct vpx_scaling_mode {
     pub h_scaling_mode: VPX_SCALING_MODE,
     pub v_scaling_mode: VPX_SCALING_MODE,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_scaling_mode"][::std::mem::size_of::<vpx_scaling_mode>() - 8usize];
-    ["Alignment of vpx_scaling_mode"][::std::mem::align_of::<vpx_scaling_mode>() - 4usize];
-    ["Offset of field: vpx_scaling_mode::h_scaling_mode"]
-        [::std::mem::offset_of!(vpx_scaling_mode, h_scaling_mode) - 0usize];
-    ["Offset of field: vpx_scaling_mode::v_scaling_mode"]
-        [::std::mem::offset_of!(vpx_scaling_mode, v_scaling_mode) - 4usize];
-};
+
 pub type vpx_scaling_mode_t = vpx_scaling_mode;
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1616,17 +993,7 @@ pub struct vpx_svc_layer_id {
     pub temporal_layer_id: ::std::os::raw::c_int,
     pub temporal_layer_id_per_spatial: [::std::os::raw::c_int; 5usize],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_svc_layer_id"][::std::mem::size_of::<vpx_svc_layer_id>() - 28usize];
-    ["Alignment of vpx_svc_layer_id"][::std::mem::align_of::<vpx_svc_layer_id>() - 4usize];
-    ["Offset of field: vpx_svc_layer_id::spatial_layer_id"]
-        [::std::mem::offset_of!(vpx_svc_layer_id, spatial_layer_id) - 0usize];
-    ["Offset of field: vpx_svc_layer_id::temporal_layer_id"]
-        [::std::mem::offset_of!(vpx_svc_layer_id, temporal_layer_id) - 4usize];
-    ["Offset of field: vpx_svc_layer_id::temporal_layer_id_per_spatial"]
-        [::std::mem::offset_of!(vpx_svc_layer_id, temporal_layer_id_per_spatial) - 8usize];
-};
+
 pub type vpx_svc_layer_id_t = vpx_svc_layer_id;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1643,35 +1010,7 @@ pub struct vpx_svc_ref_frame_config {
     pub reference_alt_ref: [::std::os::raw::c_int; 5usize],
     pub duration: [i64; 5usize],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_svc_ref_frame_config"]
-        [::std::mem::size_of::<vpx_svc_ref_frame_config>() - 240usize];
-    ["Alignment of vpx_svc_ref_frame_config"]
-        [::std::mem::align_of::<vpx_svc_ref_frame_config>() - 8usize];
-    ["Offset of field: vpx_svc_ref_frame_config::lst_fb_idx"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, lst_fb_idx) - 0usize];
-    ["Offset of field: vpx_svc_ref_frame_config::gld_fb_idx"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, gld_fb_idx) - 20usize];
-    ["Offset of field: vpx_svc_ref_frame_config::alt_fb_idx"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, alt_fb_idx) - 40usize];
-    ["Offset of field: vpx_svc_ref_frame_config::update_buffer_slot"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, update_buffer_slot) - 60usize];
-    ["Offset of field: vpx_svc_ref_frame_config::update_last"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, update_last) - 80usize];
-    ["Offset of field: vpx_svc_ref_frame_config::update_golden"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, update_golden) - 100usize];
-    ["Offset of field: vpx_svc_ref_frame_config::update_alt_ref"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, update_alt_ref) - 120usize];
-    ["Offset of field: vpx_svc_ref_frame_config::reference_last"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, reference_last) - 140usize];
-    ["Offset of field: vpx_svc_ref_frame_config::reference_golden"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, reference_golden) - 160usize];
-    ["Offset of field: vpx_svc_ref_frame_config::reference_alt_ref"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, reference_alt_ref) - 180usize];
-    ["Offset of field: vpx_svc_ref_frame_config::duration"]
-        [::std::mem::offset_of!(vpx_svc_ref_frame_config, duration) - 200usize];
-};
+
 pub type vpx_svc_ref_frame_config_t = vpx_svc_ref_frame_config;
 pub const SVC_LAYER_DROP_MODE_CONSTRAINED_LAYER_DROP: SVC_LAYER_DROP_MODE = 0;
 pub const SVC_LAYER_DROP_MODE_LAYER_DROP: SVC_LAYER_DROP_MODE = 1;
@@ -1685,17 +1024,7 @@ pub struct vpx_svc_frame_drop {
     pub framedrop_mode: SVC_LAYER_DROP_MODE,
     pub max_consec_drop: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_svc_frame_drop"][::std::mem::size_of::<vpx_svc_frame_drop>() - 28usize];
-    ["Alignment of vpx_svc_frame_drop"][::std::mem::align_of::<vpx_svc_frame_drop>() - 4usize];
-    ["Offset of field: vpx_svc_frame_drop::framedrop_thresh"]
-        [::std::mem::offset_of!(vpx_svc_frame_drop, framedrop_thresh) - 0usize];
-    ["Offset of field: vpx_svc_frame_drop::framedrop_mode"]
-        [::std::mem::offset_of!(vpx_svc_frame_drop, framedrop_mode) - 20usize];
-    ["Offset of field: vpx_svc_frame_drop::max_consec_drop"]
-        [::std::mem::offset_of!(vpx_svc_frame_drop, max_consec_drop) - 24usize];
-};
+
 pub type vpx_svc_frame_drop_t = vpx_svc_frame_drop;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1703,17 +1032,7 @@ pub struct vpx_svc_spatial_layer_sync {
     pub spatial_layer_sync: [::std::os::raw::c_int; 5usize],
     pub base_layer_intra_only: ::std::os::raw::c_int,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of vpx_svc_spatial_layer_sync"]
-        [::std::mem::size_of::<vpx_svc_spatial_layer_sync>() - 24usize];
-    ["Alignment of vpx_svc_spatial_layer_sync"]
-        [::std::mem::align_of::<vpx_svc_spatial_layer_sync>() - 4usize];
-    ["Offset of field: vpx_svc_spatial_layer_sync::spatial_layer_sync"]
-        [::std::mem::offset_of!(vpx_svc_spatial_layer_sync, spatial_layer_sync) - 0usize];
-    ["Offset of field: vpx_svc_spatial_layer_sync::base_layer_intra_only"]
-        [::std::mem::offset_of!(vpx_svc_spatial_layer_sync, base_layer_intra_only) - 20usize];
-};
+
 pub type vpx_svc_spatial_layer_sync_t = vpx_svc_spatial_layer_sync;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
