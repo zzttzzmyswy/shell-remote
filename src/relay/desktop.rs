@@ -331,10 +331,22 @@ async fn ws_downlink_loop(
     }
     loop {
         tokio::select! {
-            _ = socket.recv() => {
-                // 浏览器侧文本帧：ping/校准请求，发 ping/rst?——使用标准 Pong
-                // 由浏览器协议层处理；任何帧在此都不中断视频流。
+            // 浏览器侧文本帧：ping/校准请求，发 ping/rst?——使用标准 Pong
+        // 由浏览器协议层处理；任何帧在此都不中断视频流。
+        // 关键：浏览器断开时 recv() 返回 Close/None/Err——必须 break，
+        // 否则该分支每次 select 都立即就绪，`rx.recv()` 永无机会执行，
+        // 形成单核自旋死锁（实测 WS viewer 收完帧断开后 relay http 全卡，
+        // 线程全 futex_wait、一个线程 R 自旋）。
+        msg = socket.recv() => {
+            match msg {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Ping(p))) => {
+                    if socket.send(Message::Pong(p)).await.is_err() { break; }
+                }
+                Some(Ok(_)) => { /* Text/Binary 控制帧：忽略 */ }
+                Some(Err(_)) => break,
             }
+        }
             chunk = rx.recv() => {
                 match chunk {
                     Some(c) => {
