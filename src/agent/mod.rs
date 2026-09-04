@@ -828,20 +828,24 @@ async fn run_session(
                         }
                     }
                 }
-                // 链路方式变化时上报（浏览器指标面板显示 ws/http）。
-                // 插到 out 头部：与 desktop:started 同批发送时顺序正确，
-                // 且只有浏览器在线时才可见（started 一定触发本批）。
+                // 链路方式上报（浏览器指标面板显示 ws/http）。两种时机:
+                // ① 方式变化时(WS 建立失败回退)——但首次翻转可能发生在浏览器
+                //   加入前, 广播无人接收; ② 批内含 desktop:started 时总是重发
+                //   ——started 必然有浏览器在等, 保证面板能拿到当前值。
                 {
                     use std::sync::atomic::Ordering as O;
                     let now: u8 = if sent_via_ws { 1 } else { 2 };
-                    if uplink_mode.swap(now, O::Relaxed) != now {
-                        out.insert(
-                            0,
-                            serde_json::json!({
-                                "type": "desktop:uplink",
-                                "payload": { "uplink": if sent_via_ws { "ws" } else { "http" } }
-                            }),
-                        );
+                    let has_started = out.iter().any(|m| m["type"] == "desktop:started");
+                    if uplink_mode.swap(now, O::Relaxed) != now || has_started {
+                        if !out.iter().any(|m| m["type"] == "desktop:uplink") {
+                            out.insert(
+                                0,
+                                serde_json::json!({
+                                    "type": "desktop:uplink",
+                                    "payload": { "uplink": if sent_via_ws { "ws" } else { "http" } }
+                                }),
+                            );
+                        }
                     }
                 }
                 if ws.is_none() && sent_via_ws == false && ws_failures >= 3 {
