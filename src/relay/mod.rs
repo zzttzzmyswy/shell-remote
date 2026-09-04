@@ -808,6 +808,64 @@ mod tests {
         assert_eq!(replay.len(), 1, "byte cap should have evicted the oldest");
         assert_eq!(replay[0].0, 2);
     }
+
+    // ── HTTPS / 自签证书（MYS-886）─────────────────────────────
+
+    /// 自签证书生成：PEM 可被 rustls 加载（这是 HTTPS listener 实际
+    /// 消费它们的路径），SAN 覆盖 localhost + 传入 IP。
+    #[tokio::test]
+    async fn test_self_signed_cert_loads_in_rustls() {
+        let san = vec![
+            "localhost".to_string(),
+            "192.168.1.5".to_string(),
+            "::1".to_string(),
+        ];
+        let ck = generate_self_signed(&san).expect("generate self-signed cert");
+        let cert_pem = ck.cert.pem();
+        let key_pem = ck.key_pair.serialize_pem();
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+        // rustls 能解析 —— 即 RustlsConfig::from_pem 的前置条件。
+        install_rustls_provider();
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            cert_pem.into_bytes(),
+            key_pem.into_bytes(),
+        )
+        .await;
+        assert!(config.is_ok(), "rustls must accept the generated PEM");
+    }
+
+    /// ensure_tls_config：显式证书必须成对提供。
+    #[tokio::test]
+    async fn test_ensure_tls_requires_paired_paths() {
+        let err = ensure_tls_config(Some("/tmp/c.pem"), None).await;
+        assert!(err.is_err());
+        let err = ensure_tls_config(None, Some("/tmp/k.pem")).await;
+        assert!(err.is_err());
+    }
+
+    /// ensure_tls_config：自签路径——生成、写盘，且第二次调用直接复用
+    /// 磁盘上的证书（不再重新生成，证书指纹稳定）。
+    #[tokio::test]
+    async fn test_ensure_tls_self_signed_persists_and_reuses() {
+        // HOME 指到临时目录，隔离测试对真实 ~/.shell-remote 的影响。
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("HOME").ok();
+        // SAFETY: 测试进程内串行修改 HOME；测试结束恢复。
+        std::env::set_var("HOME", tmp.path());
+        let (c1, k1, note1) = ensure_tls_config(None, None).await.unwrap();
+        assert!(note1.contains("generated"));
+        let (c2, k2, note2) = ensure_tls_config(None, None).await.unwrap();
+        assert!(note2.contains("reusing"));
+        assert_eq!(c1, c2, "cert must be reused from disk, not regenerated");
+        assert_eq!(k1, k2);
+        let cert_file = tmp.path().join(".shell-remote/self-signed/relay-cert.pem");
+        assert!(cert_file.exists());
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 }
 
 pub async fn upload_handler(
@@ -1078,6 +1136,9 @@ pub async fn start(
     record_dir: Option<String>,
     agent_upgrade_dir: Option<String>,
     download_dir: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_disabled: bool,
 ) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -1230,6 +1291,42 @@ pub async fn start(
         .layer(cors)
         .with_state(state.clone());
 
+    // ── HTTPS（MYS-886）：自签名证书默认开启 ─────────────────────
+    // WebCodecs (VideoDecoder) 等 Secure Context API 只在 https/localhost
+    // 下暴露——http 访问时浏览器永远回退 MSE 播放路径。relay 默认在
+    // bind+1 端口起 https 监听：证书按 --tls-cert/--tls-key 指定，未指定
+    // 则在数据目录自动生成自签证书（CN=主机名 + IP SAN）并持久化复用。
+    // --tls-port 0 / --no-tls 可关闭。
+    let tls_listen = if tls_disabled {
+        None
+    } else {
+        match ensure_tls_config(tls_cert.as_deref(), tls_key.as_deref()).await {
+            Ok((cert_pem, key_pem, note)) => {
+                // 端口：bind 端口 + 1（如 :3902 http → :3903 https）。
+                let https_bind = {
+                    let (host, port) = match bind.rsplit_once(':') {
+                        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(0)),
+                        None => (bind.clone(), 0),
+                    };
+                    if host.parse::<std::net::IpAddr>().is_err() && host != "localhost" {
+                        // 域名 bind: 同端口无法双协议, 也用 +1。
+                    }
+                    format!("{}:{}", host, port.saturating_add(1))
+                };
+                tracing::info!(
+                    https = %https_bind,
+                    %note,
+                    "HTTPS (self-signed) enabled — 用 https:// 访问可解锁 WebCodecs 等安全上下文 API"
+                );
+                Some((https_bind, cert_pem, key_pem))
+            }
+            Err(e) => {
+                tracing::warn!("TLS setup failed ({e}) — 继续仅 HTTP");
+                None
+            }
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("Relay server listening on {}", bind);
 
@@ -1295,7 +1392,187 @@ pub async fn start(
         });
     }
 
+    // HTTPS listener（同一个 Router 双协议）。失败只降级为仅 HTTP，
+    // 不拖垮主 listener——HTTP 仍是完整可用的入口。
+    if let Some((https_bind, cert_pem, key_pem)) = tls_listen {
+        // rustls 0.23 需要显式选择 CryptoProvider（ring——与 rcgen 一致）。
+        install_rustls_provider();
+        match axum_server::tls_rustls::RustlsConfig::from_pem(
+            cert_pem.into_bytes(),
+            key_pem.into_bytes(),
+        )
+        .await
+        {
+            Ok(config) => {
+                // https_bind 上方按 "host:port" 拼出，解析必成；异常值
+                // （如域名 bind）则记 warn 跳过 HTTPS。
+                match https_bind.parse::<std::net::SocketAddr>() {
+                    Ok(https_addr) => {
+                        let https_app = app.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = axum_server::bind_rustls(https_addr, config)
+                                .serve(https_app.into_make_service())
+                                .await
+                            {
+                                tracing::warn!("HTTPS listener error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("invalid https bind {https_bind} ({e}) — skipped")
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("rustls config failed: {e} — HTTPS listener disabled"),
+        }
+    }
+
     axum::serve(listener, app).await?;
 
     Ok(())
 }
+
+/// 解析 TLS 证书材料：显式路径优先；否则生成/复用自签证书。
+/// 返回 (cert_pem, key_pem, 说明)。
+async fn ensure_tls_config(
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+) -> anyhow::Result<(String, String, String)> {
+    // 用户显式提供证书：两个都要有且可读。
+    if cert_path.is_some() || key_path.is_some() {
+        let (c, k) = match (cert_path, key_path) {
+            (Some(c), Some(k)) => (c, k),
+            _ => anyhow::bail!("--tls-cert 与 --tls-key 需成对提供"),
+        };
+        let cert = tokio::fs::read_to_string(c).await?;
+        let key = tokio::fs::read_to_string(k).await?;
+        return Ok((cert, key, format!("using certs at {c} / {k}")));
+    }
+
+    // 自签证书：持久化在 ~/.shell-remote/self-signed/，存在即复用。
+    let dir = std::path::PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+    )
+    .join(".shell-remote")
+    .join("self-signed");
+    tokio::fs::create_dir_all(&dir).await?;
+    let cert_file = dir.join("relay-cert.pem");
+    let key_file = dir.join("relay-key.pem");
+    if let (Ok(c), Ok(k)) = (
+        tokio::fs::read_to_string(&cert_file).await,
+        tokio::fs::read_to_string(&key_file).await,
+    ) {
+        if !c.is_empty() && !k.is_empty() && c.contains("BEGIN CERTIFICATE") {
+            return Ok((c, k, format!("reusing {}", cert_file.display())));
+        }
+    }
+
+    // 生成新证书：SAN 覆盖 本机主机名 + 全部本机 IP（v4/v6）,
+    // 浏览器对自签证书的告警与 SAN 匹配与否无关（仍需手动信任）,
+    // 但 IP SAN 能让某些客户端（curl --cacert 等）校验通过。
+    let mut san_hosts: Vec<String> = vec!["localhost".to_string()];
+    if let Ok(h) = hostname_or_empty() {
+        if !h.is_empty() {
+            san_hosts.push(h);
+        }
+    }
+    if let Ok(ips) = local_ip_addrs() {
+        for ip in ips {
+            san_hosts.push(ip);
+        }
+    }
+    let signed = generate_self_signed(&san_hosts)?;
+    let cert_pem = signed.cert.pem();
+    let key_pem = signed.key_pair.serialize_pem();
+    tokio::fs::write(&cert_file, &cert_pem).await?;
+    tokio::fs::write(&key_file, &key_pem).await?;
+    Ok((cert_pem, key_pem, format!("generated {}", cert_file.display())))
+}
+
+/// 主机名：优先 /etc/hostname（Linux），失败退回 `hostname` 命令
+/// （macOS/Windows）。拿不到返回 Err——SAN 只少一项，不影响证书生成。
+fn hostname_or_empty() -> Result<String, ()> {
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let t = s.trim().to_string();
+        if !t.is_empty() {
+            return Ok(t);
+        }
+    }
+    let out = std::process::Command::new("hostname")
+        .output()
+        .map_err(|_| ())?;
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if t.is_empty() { Err(()) } else { Ok(t) }
+}
+
+/// 本机非回环 IPv4 地址（best-effort；失败返回空表）。
+/// 本机 IPv4 列表（Linux ip / hostname -I；macOS ifconfig；Windows ipconfig）。
+/// 拿不到返回空——SAN 只少几项 IP，不影响证书生成。
+fn local_ip_addrs() -> Result<Vec<String>, ()> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("ip -4 addr show scope global 2>/dev/null | grep -oE 'inet[[:space:]]+[0-9]+(\\.[0-9]+){3}' | awk '{print $2}' || hostname -I 2>/dev/null")
+        .output()
+        .map_err(|_| ())?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let ips: Vec<String> = s
+        .split_whitespace()
+        .filter(|t| t.parse::<std::net::Ipv4Addr>().is_ok())
+        .map(|t| t.to_string())
+        .collect();
+    if !ips.is_empty() {
+        return Ok(ips);
+    }
+    // 兜底：hostname -I / ipconfig 解析（Windows 无 sh 时上面已失败）。
+    if let Ok(out) = std::process::Command::new("ipconfig").output() {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let re_ips: Vec<String> = s
+            .split_whitespace()
+            .filter(|t| {
+                let t = t.trim_end_matches(',');
+                t.parse::<std::net::Ipv4Addr>().is_ok()
+            })
+            .map(|t| t.trim_end_matches(',').to_string())
+            .collect();
+        if !re_ips.is_empty() {
+            return Ok(re_ips);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// 进程内一次性安装 rustls 的 ring CryptoProvider。重复调用无害。
+/// rustls 0.23 在未启用默认 provider feature 时必须手动选择，否则
+/// RustlsConfig::from_pem 在内部加载证书时 panic。
+fn install_rustls_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn generate_self_signed(san_hosts: &[String]) -> anyhow::Result<rcgen::CertifiedKey> {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, san_hosts.first().cloned().unwrap_or_else(|| "shell-remote".into()));
+    params.distinguished_name = dn;
+    // 长有效期：自签证书仅服务本机浏览器“高级→继续访问”的场景。
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(3650);
+    params.subject_alt_names = san_hosts.iter().map(|h| {
+        if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+            SanType::IpAddress(ip)
+        } else {
+            SanType::DnsName(h.clone().try_into().unwrap_or_else(|_| "localhost".try_into().unwrap()))
+        }
+    }).collect();
+    let key_pair = KeyPair::generate()?;
+    Ok(rcgen::CertifiedKey {
+        cert: params.self_signed(&key_pair)?,
+        key_pair,
+    })
+}
+
+// Windows 下 std::process::Command "sh" 不存在——rcgen 本身跨平台,
+// 只有 local_ip_addrs 的 shell 探测需要分支。

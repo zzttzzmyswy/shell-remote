@@ -61,6 +61,20 @@ enum Command {
         /// binaries can be staged out-of-band (e.g. scp/CI) into this dir.
         #[arg(long)]
         download_dir: Option<String>,
+
+        /// PEM certificate for HTTPS (must be paired with --tls-key).
+        /// Unset = auto-generate a self-signed certificate and persist it
+        /// under ~/.shell-remote/self-signed/ for reuse across restarts.
+        #[arg(long)]
+        tls_cert: Option<String>,
+
+        /// PEM private key matching --tls-cert.
+        #[arg(long)]
+        tls_key: Option<String>,
+
+        /// Disable the automatic HTTPS listener (HTTP only).
+        #[arg(long)]
+        no_tls: bool,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -152,6 +166,9 @@ async fn main() -> anyhow::Result<()> {
             record_dir,
             agent_upgrade_dir,
             download_dir,
+            tls_cert,
+            tls_key,
+            no_tls,
         } => {
             relay::start(
                 bind,
@@ -162,6 +179,9 @@ async fn main() -> anyhow::Result<()> {
                 record_dir,
                 agent_upgrade_dir,
                 download_dir,
+                tls_cert,
+                tls_key,
+                no_tls,
             )
             .await?;
         }

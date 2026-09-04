@@ -1,6 +1,6 @@
 [package]
 name = "shell-remote"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 description = "Self-hosted collaborative remote SSH tool with MCP support"
 
@@ -38,6 +38,11 @@ futures-util = "0.3.34"
 zbus = { version = "3", optional = true }
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+time = { version = "0.3", features = ["formatting"] }
+# axum-server tls-rustls 启用 ring provider；直接依赖 rustls 以便显式 install_default
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [dev-dependencies]
 tempfile = "3"
