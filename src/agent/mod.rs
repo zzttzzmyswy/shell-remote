@@ -790,7 +790,7 @@ async fn run_session(
                 // WS 路径: 逐帧（每条消息一个 text frame）。连接失败按指数
                 // 退避重试; 三次失败后停止尝试一段时间, 本批走 HTTP 兜底。
                 let mut sent_via_ws = false;
-                if ws.is_none() && ws_failures < 3 {
+                let ws_connected_now = if ws.is_none() && ws_failures < 3 {
                     match tokio::time::timeout(
                         Duration::from_secs(3),
                         tokio_tungstenite::connect_async(&ws_url),
@@ -801,6 +801,7 @@ async fn run_session(
                             tracing::info!("desktop WS uplink connected");
                             ws = Some(stream);
                             ws_failures = 0;
+                            true
                         }
                         Ok(Err(e)) => {
                             ws_failures += 1;
@@ -809,11 +810,36 @@ async fn run_session(
                                 200u64.saturating_mul(1 << ws_failures.min(5)),
                             ))
                             .await;
+                            false
                         }
                         Err(_) => {
                             ws_failures += 1;
                             tracing::warn!("desktop WS uplink connect timed out ({ws_failures})");
+                            false
                         }
+                    }
+                } else {
+                    ws.is_some()
+                };
+                // 链路方式上报（浏览器指标面板显示 ws/http）。两种时机:
+                // ① 方式变化时(WS 建立失败回退)——但首次翻转可能发生在浏览器
+                //   加入前, 广播无人接收; ② 批内含 desktop:started 时总是重发
+                //   ——started 必然有浏览器在等, 保证面板能拿到当前值。
+                // 必须在发送**之前**插入（此前放在 send 之后, WS 路径下 out
+                // 已发出, 只有 HTTP 回退路径能带上——真机验证踩过的坑）。
+                {
+                    use std::sync::atomic::Ordering as O;
+                    let expected: u8 = if ws_connected_now { 1 } else { 2 };
+                    let has_started = out.iter().any(|m| m["type"] == "desktop:started");
+                    if uplink_mode.swap(expected, O::Relaxed) != expected || has_started {
+                        out.insert(
+                            0,
+                            serde_json::json!({
+                                "type": "desktop:uplink",
+                                "payload": { "uplink": if ws_connected_now { "ws" } else { "http" } },
+                                "session_id": sid.clone(),
+                            }),
+                        );
                     }
                 }
                 if let Some(stream) = ws.as_mut() {
@@ -825,26 +851,8 @@ async fn run_session(
                             tracing::warn!("desktop WS send failed: {e} — falling back to HTTP");
                             ws = None;
                             ws_failures += 1;
-                        }
-                    }
-                }
-                // 链路方式上报（浏览器指标面板显示 ws/http）。两种时机:
-                // ① 方式变化时(WS 建立失败回退)——但首次翻转可能发生在浏览器
-                //   加入前, 广播无人接收; ② 批内含 desktop:started 时总是重发
-                //   ——started 必然有浏览器在等, 保证面板能拿到当前值。
-                {
-                    use std::sync::atomic::Ordering as O;
-                    let now: u8 = if sent_via_ws { 1 } else { 2 };
-                    let has_started = out.iter().any(|m| m["type"] == "desktop:started");
-                    if uplink_mode.swap(now, O::Relaxed) != now || has_started {
-                        if !out.iter().any(|m| m["type"] == "desktop:uplink") {
-                            out.insert(
-                                0,
-                                serde_json::json!({
-                                    "type": "desktop:uplink",
-                                    "payload": { "uplink": if sent_via_ws { "ws" } else { "http" } }
-                                }),
-                            );
+                            // 本批按实际结果改走 HTTP（uplink 标记已按 WS 发出,
+                            // 下批会纠正）。
                         }
                     }
                 }
