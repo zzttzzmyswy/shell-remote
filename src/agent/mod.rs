@@ -739,6 +739,32 @@ async fn run_session(
                         }
                     }
                 }
+                // 跨批丢帧（MYS-886 延迟修复）: channel 是 unbounded 的, 生产端
+                // （编码循环 60fps）持续快于消费端（WS send / relay 逐条路由）
+                // 时会**无限积压**——实测 Windows GDI 路径稳态积压 ~4s, 表现为
+                // 端到端延迟 4s 且不增长（生产消费恰好平衡在积压点）。批内
+                // MAX_PENDING_FRAMES 检查永远看不到跨批积压。这里在每轮发送前
+                // 主动排水: 队列深度超过 90 帧时丢掉最旧的 media 帧（控制消息
+                // 保留）, 保证上行端到端延迟上限 ≈ 1.5s 而非无界。
+                if post_rx.len() > MAX_PENDING_FRAMES {
+                    let mut dropped = 0usize;
+                    while post_rx.len() > MAX_PENDING_FRAMES {
+                        match post_rx.try_recv() {
+                            Ok(m) => {
+                                if m["type"] == "desktop:video" {
+                                    dropped += 1;
+                                } else {
+                                    // 控制消息插回本批发送（数量少, 不会放大）。
+                                    batch.push(m);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if dropped > 0 {
+                        tracing::debug!("uplink drained {dropped} stale frames (cross-batch backpressure)");
+                    }
+                }
                 // 丢旧保新：media 只留最新 N 条，控制消息全保留。
                 let mut media: Vec<serde_json::Value> = Vec::new();
                 let mut ctrl: Vec<serde_json::Value> = Vec::new();
