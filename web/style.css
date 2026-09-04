@@ -909,7 +909,7 @@ body {
     display: none !important;
 }
 
-/* 桌面性能指标面板（点击视频切换显隐） */
+/* 桌面性能指标面板（“指标”按钮开关） */
 .desktop-metrics {
     position: absolute;
     top: 12px;
@@ -924,6 +924,24 @@ body {
     color: #b8c0cc;
     user-select: none;
     pointer-events: auto;
+}
+/* 显式可见的指标开关按钮（MYS-886：隐藏点击区不可发现） */
+.desktop-metrics-btn {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 31;
+    padding: 4px 14px;
+    background: rgba(20, 24, 32, 0.85);
+    color: #b8c0cc;
+    border: 1px solid #3a4152;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.desktop-metrics-btn:hover {
+    color: #e8ecf2;
+    border-color: #566178;
 }
 .desktop-metrics .metrics-title {
     font-weight: 600;

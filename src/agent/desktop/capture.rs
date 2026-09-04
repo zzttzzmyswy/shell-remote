@@ -31,13 +31,20 @@ pub trait FrameSource: Send {
 /// Open a capture source. `kind` is one of `auto`, `x11`, `wayland`,
 /// `dxgi`, `gdi`/`windows` or `none`; `display` optionally overrides the X11
 /// display (falls back to `DISPLAY` then the X default).
-pub fn open_source(kind: &str, display: Option<&str>) -> Result<Box<dyn FrameSource>, String> {
+///
+/// Returns the source plus the **实际生效**的 backend 名（`dxgi` / `gdi` /
+/// `x11` / `wayland`）——`auto` 解析后回退到的后端与请求值可能不同
+/// （例如虚拟显示器上 dxgi 验证失败回退 gdi），浏览器指标面板展示
+/// 的是这个真值。
+pub fn open_source(
+    kind: &str,
+    display: Option<&str>,
+) -> Result<(Box<dyn FrameSource>, String), String> {
     match kind {
         "none" => Err("desktop capture disabled".to_string()),
-        "x11" => X11Source::open(display).map(|s| Box::new(s) as Box<dyn FrameSource>),
+        "x11" => ok_backend(X11Source::open(display), "x11"),
         #[cfg(all(target_os = "linux", feature = "wayland"))]
-        "wayland" => crate::agent::desktop::wayland::WaylandSource::open()
-            .map(|s| Box::new(s) as Box<dyn FrameSource>),
+        "wayland" => ok_backend(crate::agent::desktop::wayland::WaylandSource::open(), "wayland"),
         #[cfg(not(all(target_os = "linux", feature = "wayland")))]
         "wayland" => Err(
             "Wayland native capture requires a Linux build with the `wayland` feature \
@@ -45,44 +52,54 @@ pub fn open_source(kind: &str, display: Option<&str>) -> Result<Box<dyn FrameSou
                 .to_string(),
         ),
         #[cfg(windows)]
-        "dxgi" => crate::agent::desktop::dxgi::DxgiSource::open()
-            .map(|s| Box::new(s) as Box<dyn FrameSource>),  // 显式指定时尊重用户选择（不验证首帧）
+        // 显式指定时尊重用户选择（不验证首帧）
+        "dxgi" => ok_backend(crate::agent::desktop::dxgi::DxgiSource::open(), "dxgi"),
         #[cfg(not(windows))]
         "dxgi" => Err("DXGI capture is Windows-only".to_string()),
-        "gdi" | "windows" => open_gdi(),
+        "gdi" | "windows" => open_gdi().map(|s| (s, "gdi".to_string())),
         "auto" => open_auto(display),
         other => Err(format!("unknown capture kind: {}", other)),
     }
 }
 
+fn ok_backend(
+    r: Result<impl FrameSource + 'static, String>,
+    name: &str,
+) -> Result<(Box<dyn FrameSource>, String), String> {
+    r.map(|s| (Box::new(s) as Box<dyn FrameSource>, name.to_string()))
+}
+
 /// Platform auto-detect: Windows prefers dxgi (60fps capable) then GDI;
 /// Linux prefers wayland-portal when running under a Wayland session, else X11.
-fn open_auto(display: Option<&str>) -> Result<Box<dyn FrameSource>, String> {
+fn open_auto(display: Option<&str>) -> Result<(Box<dyn FrameSource>, String), String> {
     #[cfg(windows)]
     {
         match crate::agent::desktop::dxgi::DxgiSource::open_verified() {
-            Ok(s) => Ok(Box::new(s) as Box<dyn FrameSource>),
+            Ok(s) => Ok((Box::new(s) as Box<dyn FrameSource>, "dxgi".to_string())),
             Err(e) => {
                 tracing::warn!("dxgi capture unavailable ({e}) — falling back to GDI");
-                open_gdi()
+                open_gdi().map(|s| (s, "gdi".to_string()))
             }
         }
     }
     #[cfg(not(windows))]
     {
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
         let wayland_session = std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
             || std::env::var("WAYLAND_DISPLAY").is_ok();
         #[cfg(all(target_os = "linux", feature = "wayland"))]
         if wayland_session {
             match crate::agent::desktop::wayland::WaylandSource::open() {
-                Ok(s) => return Ok(Box::new(s) as Box<dyn FrameSource>),
+                Ok(s) => {
+                    return Ok((Box::new(s) as Box<dyn FrameSource>, "wayland".to_string()))
+                }
                 Err(e) => {
                     tracing::warn!("wayland portal capture unavailable ({e}) — falling back to X11/XWayland")
                 }
             }
         }
         if display.is_some() || std::env::var("DISPLAY").is_ok() {
-            X11Source::open(display).map(|s| Box::new(s) as Box<dyn FrameSource>)
+            ok_backend(X11Source::open(display), "x11")
         } else {
             Err(
                 "no DISPLAY found; desktop capture requires an X11 session (Xvfb works \

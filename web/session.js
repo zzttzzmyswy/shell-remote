@@ -228,8 +228,20 @@
             showTerminalView();
             return;
         }
+        // 实际生效的捕获后端（auto 解析后可能与请求不同，例如 dxgi 回退 gdi）。
+        window._srDesktopInfo = window._srDesktopInfo || {};
+        window._srDesktopInfo.backend = (msg.payload && msg.payload.backend) || null;
         showDesktopView();
         desktopView.connect();
+    });
+
+    // agent 上行链路方式（ws | http）变化时上报，指标面板展示。
+    window.shellRemote.on('desktop:uplink', function(msg) {
+        window._srDesktopInfo = window._srDesktopInfo || {};
+        window._srDesktopInfo.uplink = (msg.payload && msg.payload.uplink) || null;
+        if (desktopView && desktopView._uplinkMode !== undefined) {
+            desktopView._uplinkMode = window._srDesktopInfo.uplink;
+        }
     });
 
     window.shellRemote.on('desktop:stopped', function(msg) {

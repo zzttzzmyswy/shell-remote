@@ -682,7 +682,13 @@ async fn run_session(
             .to_string();
         let sid = client.session_id.clone();
         let server_auth = client.server_auth().to_string();
-        tokio::spawn(async move {
+        // 当前的上行链路方式（ws | http）——浏览器指标面板展示用。
+        // WS 连接建立/失败回退时更新并广播 desktop:uplink。
+        let uplink_mode = Arc::new(std::sync::atomic::AtomicU8::new(0)); // 0=未知 1=ws 2=http
+        {
+            let uplink_mode = uplink_mode.clone();
+            let post_tx2 = post_tx.clone();
+            tokio::spawn(async move {
             // 上行通道（v0.21）: WebSocket 长连接逐帧发送 —— 无每批 HTTP
             // 握手、无 80ms 攒批窗口、拥塞窗口跨帧保持热态，公网/弱网下
             // 桌面帧的单帧上行时延显著低于批量 POST。WS 不可用（老 relay）
@@ -797,6 +803,17 @@ async fn run_session(
                         }
                     }
                 }
+                // 链路方式变化时上报（浏览器指标面板显示 ws/http）。
+                {
+                    use std::sync::atomic::Ordering as O;
+                    let now: u8 = if sent_via_ws { 1 } else { 2 };
+                    if uplink_mode.swap(now, O::Relaxed) != now {
+                        let _ = post_tx2.send(serde_json::json!({
+                            "type": "desktop:uplink",
+                            "payload": { "uplink": if sent_via_ws { "ws" } else { "http" } }
+                        }));
+                    }
+                }
                 if ws.is_none() && sent_via_ws == false && ws_failures >= 3 {
                     // WS 持续失败: 冷却 30s 后重新允许尝试（长会话中 relay
                     // 升级后 WS 恢复可用）。
@@ -832,7 +849,8 @@ async fn run_session(
                 }
                 tokio::task::yield_now().await;
             }
-        });
+            });
+        }
     }
     let post_fn: crate::agent::desktop::PostFn = Arc::new(move |msg| {
         let t = msg["type"].as_str().unwrap_or("?").to_string();

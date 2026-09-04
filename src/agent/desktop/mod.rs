@@ -222,9 +222,11 @@ const STRIDES: &[u32] = &[1, 2, 3, 5];
 const MAX_CAPTURE_ERRORS: u32 = 150;
 
 /// 静止心跳间隔（毫秒）。桌面静止时 OpenH264 输出空帧不上行，超过
-/// relay 观看者空闲超时（30s）会被误判断流；确保每 1.5s 至少编一个
-/// IDR 心跳帧，让流上始终有字节（静止桌面一个 IDR 仅几 KB）。
-const HEARTBEAT_INTERVAL_MS: u64 = 1500;
+/// relay 观看者空闲超时（30s）会被误判断流；同时它是静止画面的保底
+/// 刷新率——时钟秒数字这类小变化可能被量化抹掉（编码器输出空帧），
+/// 心跳 IDR 保证画面最迟半秒刷新一次（MYS-886：静止桌面不能
+/// "几秒才刷一帧"）。静止 IDR 很小（~10KB），500ms 平均带宽影响有限。
+const HEARTBEAT_INTERVAL_MS: u64 = 500;
 
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
@@ -239,8 +241,8 @@ async fn run_desktop_loop(
     post: PostFn,
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
 ) {
-    let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
-        Ok(s) => s,
+        let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
+        Ok((src, backend)) => (src, backend),
         Err(e) => {
             tracing::error!("desktop capture open failed: {}", e);
             (post)(serde_json::json!({
@@ -250,7 +252,8 @@ async fn run_desktop_loop(
             return;
         }
     };
-    run_desktop_pipeline(cfg, running, post, src, bandwidth).await;
+    let (src, backend) = src;
+    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -261,6 +264,7 @@ async fn run_desktop_pipeline(
     post: PostFn,
     mut src: Box<dyn capture::FrameSource>,
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
+    backend: String,
 ) {
     let (w0, h0) = src.resolution();
     if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
@@ -311,7 +315,7 @@ async fn run_desktop_pipeline(
     let mut cap_no: u64 = 0;
 
     tracing::info!(
-        width = %w0, height = %h0, fps = %cfg.fps,
+        width = %w0, height = %h0, fps = %cfg.fps, backend = %backend,
         "desktop capture started"
     );
     (post)(serde_json::json!({
@@ -319,6 +323,7 @@ async fn run_desktop_pipeline(
         "payload": {
             "codec": cfg.codec, "width": w0, "height": h0, "fps": cfg.fps,
             "min_kbps": cfg.min_bps / 1000, "max_kbps": cfg.max_bps / 1000,
+            "backend": backend,
         }
     }));
 
@@ -393,19 +398,12 @@ async fn run_desktop_pipeline(
         // 防御：RC 仍可能输出空帧（极少数情况）——空帧不 POST，记录为跳帧。
         // （pts 不动：空帧不产生 moof, 推 pts 会造成时间线空洞。）
         if encoded.nalu.is_empty() {
-            skip_win.push_back(true);
-            while skip_win.len() > OBS {
-                skip_win.pop_front();
-            }
-            since_change += 1;
-            if frame_idx % 10 == 0 {
-                let ratio = skipped_ratio(&skip_win);
-                tune_once(
-                    &cfg, &mut enc, &mut stride_idx, &mut scale_idx,
-                    &mut enc_w, &mut enc_h, w0, h0, &mut mp4_cfg, &mut seq,
-                    &mut skip_win, &mut since_change, &mut frame_idx, ratio,
-                );
-            }
+            // 空帧 ≠ 跳帧。静止桌面（含时钟秒变化被量化抹掉）每帧都可能
+            // 输出空帧——这不是码率压力, 把它计入 skip 窗口会让
+            // tune_once/maybe_rescale 误判"高熵降级", 把分辨率一路降到
+            // 0.375（MYS-886 实测根因）。真正的 RC 跳帧是 bEnableFrameSkip
+            // 已关（encoder 配置）, 残余空帧只代表"桌面没变"。这里既不进
+            // 窗口也不触发降级; 心跳 IDR 负责静止期的画面刷新。
             continue;
         }
         skip_win.push_back(false);
@@ -454,6 +452,7 @@ async fn run_desktop_pipeline(
         }));
 
         // Adaptive bitrate + 降级决策: 每 10 个编码帧评估一次。
+        // （静止空帧不进 skip_win, 高 ratio 只反映真实编码压力。）
         if frame_idx % 10 == 0 {
             let now = start.elapsed().as_secs_f64();
             let ratio = skipped_ratio(&skip_win);
@@ -975,6 +974,7 @@ mod tests {
                 post,
                 src,
                 Arc::new(std::sync::atomic::AtomicU64::new(bw)),
+                "test".to_string(),
             ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
@@ -1014,7 +1014,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string()));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1054,7 +1054,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string()));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;

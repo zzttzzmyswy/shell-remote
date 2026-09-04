@@ -392,6 +392,8 @@
       this._stopMetrics();
       const panel = document.getElementById('desktop-metrics');
       if (panel) panel.classList.add('hidden');
+      this._captureBackend = null;
+      this._uplinkMode = null;
       if (this.canvas) {
         const ctx = this.canvas.getContext('2d');
         if (ctx && this.canvas.width) ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
@@ -402,23 +404,23 @@
     // ── 性能指标面板 ─────────────────────────────────────────
     // 端到端延时 = 本地时钟 - 帧的采集 epoch（agent 与浏览器时钟需大致
     // 同步；局域网 NTP 下误差 <10ms，公网下仅作参考趋势）。渲染帧率由
-    // rAF 计数。
+    // rAF 计数。捕获方式/链路方式由 agent 的 desktop:started /
+    // desktop:uplink 广播提供；解码方案是本播放器自己选的（webcodecs）。
     _startMetrics() {
       if (this._metricsTimer) return;
-      const v = this.canvas || this.video;
       const panel = document.getElementById('desktop-metrics');
       if (!panel) return;
       const self = this;
 
-      this._onToggleMetrics = function(e) {
-        const rect = v.getBoundingClientRect();
-        if (e.clientX - rect.left < 64 && e.clientY - rect.top < 32) {
-          panel.classList.toggle('hidden');
-          e.stopPropagation();
-          e.preventDefault();
-        }
+      // 显式按钮开关（session.html #desktop-metrics-btn）；旧的左上角
+      // 隐藏点击区不可发现，已废弃。
+      this._onMetricsBtn = function(e) {
+        panel.classList.toggle('hidden');
+        e.preventDefault();
+        e.stopPropagation();
       };
-      v.addEventListener('pointerdown', this._onToggleMetrics, true);
+      const btn = document.getElementById('desktop-metrics-btn');
+      if (btn) btn.addEventListener('pointerdown', this._onMetricsBtn, true);
 
       this._rafCount = 0;
       this._metricsTimer = setInterval(function() {
@@ -429,6 +431,9 @@
         const fps = document.getElementById('metric-fps');
         const buf = document.getElementById('metric-buffer');
         const drop = document.getElementById('metric-dropped');
+        const backend = document.getElementById('metric-backend');
+        const uplink = document.getElementById('metric-uplink');
+        const decoder = document.getElementById('metric-decoder');
         if (!lag) return;
         try {
           // e2e: 采集→渲染。_lastCaptureMs 在渲染时更新（带 captureMs 的
@@ -446,6 +451,9 @@
           buf.textContent = self._dec ? self._dec.decodeQueueSize : '-';
           drop.textContent = self._droppedFrames;
           br.textContent = self._lastKbps ? self._lastKbps + ' kbps' : '-';
+          if (backend) backend.textContent = self._captureBackend || '-';
+          if (uplink) uplink.textContent = self._uplinkMode || '-';
+          if (decoder) decoder.textContent = 'WebCodecs (原生)';
         } catch (e) { /* 面板只是展示 */ }
       }, 1000);
 
@@ -462,6 +470,8 @@
         clearInterval(this._metricsTimer);
         this._metricsTimer = null;
       }
+      const btn = document.getElementById('desktop-metrics-btn');
+      if (btn && this._onMetricsBtn) btn.removeEventListener('pointerdown', this._onMetricsBtn, true);
     }
 
     // ── 键鼠输入注入（与 MSE 版相同）────────────────────────

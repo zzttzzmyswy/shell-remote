@@ -29,14 +29,18 @@
             <canvas id="desktop-canvas" class="desktop-canvas"></canvas>
             <video id="desktop-video" autoplay muted playsinline></video>
             <div id="desktop-status" class="desktop-status"></div>
+            <button id="desktop-metrics-btn" class="desktop-metrics-btn" title="性能指标">指标</button>
             <div id="desktop-metrics" class="desktop-metrics hidden">
-                <div class="metrics-title">性能指标 <span class="metrics-hint">(点击视频关闭)</span></div>
+                <div class="metrics-title">性能指标 <span class="metrics-hint">(点击“指标”按钮开关)</span></div>
                 <div class="metrics-row"><span>端到端延时</span><b id="metric-lag">-</b></div>
                 <div class="metrics-row"><span>当前码率</span><b id="metric-bitrate">-</b></div>
                 <div class="metrics-row"><span>分辨率</span><b id="metric-res">-</b></div>
                 <div class="metrics-row"><span>渲染帧率</span><b id="metric-fps">-</b></div>
                 <div class="metrics-row"><span>解码队列</span><b id="metric-buffer">-</b></div>
                 <div class="metrics-row"><span>丢帧</span><b id="metric-dropped">-</b></div>
+                <div class="metrics-row"><span>捕获方式</span><b id="metric-backend">-</b></div>
+                <div class="metrics-row"><span>链路方式</span><b id="metric-uplink">-</b></div>
+                <div class="metrics-row"><span>解码方案</span><b id="metric-decoder">-</b></div>
             </div>
         </div>
         <div id="file-resizer" class="file-resizer"></div>

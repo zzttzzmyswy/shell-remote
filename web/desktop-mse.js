@@ -316,7 +316,7 @@
     }
 
     // ── 性能指标面板 ─────────────────────────────────────────────
-    // 点击视频切换显隐; 显示端到端延时(缓冲尾部-播放头)、码率、分辨率、
+    // “指标”按钮切换显隐; 显示端到端延时(缓冲尾部-播放头)、码率、分辨率、
     // 渲染 fps、缓冲长度、丢帧。数据源全部本地可得, 无需 agent 配合。
     _startMetrics() {
       if (this._metricsTimer) return;
@@ -325,18 +325,15 @@
       if (!panel) return;
       const self = this;
 
-      // 双击/长按会与鼠标注入冲突——用"单击视频"切换面板; 但单击也会
-      // 发送一个 left click 注入。约定: 点击画面左上角 64x32 安全区切换
-      // (该区域面板本身挡住, 不会误触远端)。
-      this._onToggleMetrics = function(e) {
-        const rect = v.getBoundingClientRect();
-        if (e.clientX - rect.left < 64 && e.clientY - rect.top < 32) {
-          panel.classList.toggle('hidden');
-          e.stopPropagation();
-          e.preventDefault();
-        }
+      // 显式按钮开关（session.html #desktop-metrics-btn）；旧的左上角
+      // 隐藏点击区不可发现，已废弃。
+      this._onMetricsBtn = function(e) {
+        panel.classList.toggle('hidden');
+        e.preventDefault();
+        e.stopPropagation();
       };
-      v.addEventListener('pointerdown', this._onToggleMetrics, true); // capture 先于注入
+      const btn = document.getElementById('desktop-metrics-btn');
+      if (btn) btn.addEventListener('pointerdown', this._onMetricsBtn, true);
 
       let frames = 0;
       // requestVideoFrameCallback 计渲染帧率(可用时)
@@ -356,6 +353,9 @@
         const fps = document.getElementById('metric-fps');
         const buf = document.getElementById('metric-buffer');
         const drop = document.getElementById('metric-dropped');
+        const backend = document.getElementById('metric-backend');
+        const uplink = document.getElementById('metric-uplink');
+        const decoder = document.getElementById('metric-decoder');
         if (!lag) return;
 
         try {
@@ -375,6 +375,10 @@
           if (v.getVideoPlaybackQuality) {
             drop.textContent = v.getVideoPlaybackQuality().droppedVideoFrames;
           } else { drop.textContent = '-'; }
+          // agent 广播的捕获后端与上行链路（session.js 挂到 window）。
+          if (backend) backend.textContent = window._srDesktopInfo ? (window._srDesktopInfo.backend || '-') : '-';
+          if (uplink) uplink.textContent = window._srDesktopInfo ? (window._srDesktopInfo.uplink || '-') : '-';
+          if (decoder) decoder.textContent = 'MSE';
           // 码率: 复用带宽跟踪的计数窗口(2.5s), 折算当前值
           br.textContent = self._lastKbps ? self._lastKbps + ' kbps' : '-';
         } catch (e) { /* 面板只是展示, 不因异常中断播放 */ }
@@ -386,9 +390,9 @@
         clearInterval(this._metricsTimer);
         this._metricsTimer = null;
       }
+      const btn = document.getElementById('desktop-metrics-btn');
+      if (btn && this._onMetricsBtn) btn.removeEventListener('pointerdown', this._onMetricsBtn, true);
     }
-
-    // ── 键鼠输入注入 ─────────────────────────────────────────────
     // 在 <video> 上采集 pointer/键盘事件, 缩放到桌面坐标后发给 agent
     // (desktop:mouse / desktop:key)。指针坐标换算参考 RustDesk 的
     // canvas→remote 缩放: video 实际渲染尺寸 → 视频原始分辨率。
