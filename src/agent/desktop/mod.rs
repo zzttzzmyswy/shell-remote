@@ -13,6 +13,7 @@
 
 pub mod capture;
 pub mod color;
+pub mod clipboard;
 pub mod input;
 pub mod mp4;
 pub mod openh264;
@@ -52,7 +53,11 @@ impl Default for DesktopConfig {
         Self {
             capture: "auto".to_string(),
             codec: "h264".to_string(),
-            fps: 60.0,
+            // 30fps 起步（MYS-886 时延对标 rustdesk: 22fps/12ms）。60fps 软编
+            // 在低配机器上单核打满（实测 115%），编码耗时直接加进 e2e；
+            // 30fps 减一半编码负载，时延显著优于 60fps，流畅度损失小。
+            // 需要更高帧率用 --desktop-fps 显式指定。
+            fps: 30.0,
             // 静态桌面 ~80k 足够 (openh264 实测 84k 满帧); 动态由 ABR 拉回
             min_bps: 80_000,
             max_bps: 800_000,
@@ -84,6 +89,8 @@ pub struct DesktopManager {
     /// 键鼠注入器。惰性创建：首个输入事件到达时才 spawn 注入线程
     /// （纯观看会话不付这个代价）。
     injector: tokio::sync::Mutex<Option<input::InputInjector>>,
+    /// 剪贴板同步器。同样惰性创建：首个剪贴板命令才 spawn 线程。
+    clipboard: tokio::sync::Mutex<Option<clipboard::ClipboardSync>>,
 }
 
 impl DesktopManager {
@@ -95,6 +102,7 @@ impl DesktopManager {
             task: tokio::sync::Mutex::new(None),
             bandwidth: Arc::new(std::sync::atomic::AtomicU64::new(bps)),
             injector: tokio::sync::Mutex::new(None),
+            clipboard: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -118,6 +126,29 @@ impl DesktopManager {
         let mut g = self.injector.lock().await;
         let inj = g.get_or_insert_with(input::InputInjector::start);
         inj.send(ev);
+    }
+
+    /// Handle `desktop:clipboard:set` — browser pushed its local clipboard
+    /// text to the remote machine.
+    pub async fn handle_clipboard_set(&self, payload: &serde_json::Value) {
+        let Some(text) = payload.get("text").and_then(|v| v.as_str()) else { return };
+        let mut g = self.clipboard.lock().await;
+        let clip = g.get_or_insert_with(clipboard::ClipboardSync::start);
+        clip.set(text.to_string());
+    }
+
+    /// Handle `desktop:clipboard:get` — read the remote clipboard and return
+    /// it as a `desktop:clipboard` message (posted through `post`).
+    pub async fn handle_clipboard_get(&self, post: &PostFn) {
+        let text = {
+            let mut g = self.clipboard.lock().await;
+            let clip = g.get_or_insert_with(clipboard::ClipboardSync::start);
+            clip.get().unwrap_or_default()
+        };
+        post(serde_json::json!({
+            "type": "desktop:clipboard",
+            "payload": { "text": text }
+        }));
     }
 
     pub fn is_running(&self) -> bool {
@@ -381,6 +412,13 @@ async fn run_desktop_pipeline(
         };
         let w = fr.width;
         let h = fr.height;
+        // srtc 取点在**捕获完成、编码开始前**（用户口径：端到端延时须含
+        // 编码全程——编码开始→浏览器解码/渲染完毕）。之前取在 POST 前,
+        // 编码耗时（软编 1080p 单帧可达 20-40ms）被漏掉。
+        let capture_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let i420 = if w == enc_w && h == enc_h {
             color::bgra_to_i420(&fr.bgra, w, h, w * 4)
         } else {
@@ -436,12 +474,8 @@ async fn run_desktop_pipeline(
             continue;
         };
         let sample = mp4::annexb_to_avcc(&encoded.nalu);
-        // 捕获时刻的墙上时间（epoch ms）随分片下发（srtc box），WebCodecs
-        // 播放端用它计算真实端到端延时（播放时钟与编码时钟无关）。
-        let capture_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // capture_ms 已在捕获后、编码前取（见上方赋值处）——srtc 携带的是
+        // 含编码全程的起点。
         let frag = mp4::mp4_fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq, capture_ms);
         seq += 1;
         last_posted_wall = wall_ms;

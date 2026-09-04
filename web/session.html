@@ -30,6 +30,15 @@
             <video id="desktop-video" autoplay muted playsinline></video>
             <div id="desktop-status" class="desktop-status"></div>
             <button id="desktop-metrics-btn" class="desktop-metrics-btn" title="性能指标">指标</button>
+            <button id="desktop-clip-btn" class="desktop-metrics-btn" title="剪贴板：本机⇄远端 同步文本">剪贴板</button>
+            <div id="desktop-clip-panel" class="desktop-metrics hidden">
+                <div class="metrics-title">剪贴板同步 <span class="metrics-hint">(纯文本)</span></div>
+                <textarea id="desktop-clip-text" rows="5" style="width:100%;box-sizing:border-box;background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:4px;font-size:12px;padding:6px;" placeholder="粘贴或编辑文本…"></textarea>
+                <div style="display:flex;gap:6px;margin-top:6px;">
+                    <button id="clip-to-remote-btn" class="btn btn-small" style="flex:1">→ 远端</button>
+                    <button id="clip-from-remote-btn" class="btn btn-small" style="flex:1">远端 → 本机</button>
+                </div>
+            </div>
             <div id="desktop-metrics" class="desktop-metrics hidden">
                 <div class="metrics-title">性能指标 <span class="metrics-hint">(点击“指标”按钮开关)</span></div>
                 <div class="metrics-row"><span>端到端延时</span><b id="metric-lag">-</b></div>

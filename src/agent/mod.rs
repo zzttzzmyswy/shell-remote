@@ -1441,6 +1441,16 @@ async fn run_session(
                                     desktop.handle_key(&msg.payload).await;
                                 }
 
+                                "desktop:clipboard:set" => {
+                                    // 浏览器把本地剪贴板文本推到远端。
+                                    desktop.handle_clipboard_set(&msg.payload).await;
+                                }
+
+                                "desktop:clipboard:get" => {
+                                    // 浏览器拉取远端剪贴板（回包经广播）。
+                                    desktop.handle_clipboard_get(&post_fn).await;
+                                }
+
                                 "desktop:bitrate" => {
                                     // 浏览器周期性上报的实测可用带宽 → 弱网自适应
                                     // (把编码码率天花板 clamp 到网络可承受范围)。

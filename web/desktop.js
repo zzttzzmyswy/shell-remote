@@ -18,7 +18,7 @@
 
   // 解码队列上限：积压超过 N 帧时丢弃旧的非关键帧（对齐 RustDesk
   // frame_controller 的丢帧策略——旧帧无意义，追新才保流畅）。
-  const MAX_DECODE_QUEUE = 8;
+  const MAX_DECODE_QUEUE = 16;
 
   window.DesktopView = class {
     constructor() {
@@ -521,6 +521,9 @@
         send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
         send('desktop:mouse', { type: 'down', button: e.button });
         v.setPointerCapture(e.pointerId);
+        // preventDefault 会阻止 mousedown 的默认聚焦 → canvas 拿不到焦点
+        // → keydown 永远不触发（键盘完全无反应的根因）。显式 focus 补回。
+        if (v.focus) v.focus();
         e.preventDefault();
       };
       this._onPointerUp = function(e) {
@@ -542,20 +545,29 @@
         e.preventDefault();
       };
       this._onContextMenu = function(e) { e.preventDefault(); };
-      this._onKey = function(down) {
+      // 键盘挂 window 而非 canvas：焦点管理在浏览器里很脆弱（点工具栏、
+      // Alt+Tab 回来后焦点在 body），canvas 上的 keydown 依赖焦点正确落位。
+      // 桌面视图激活期间（_inputBound）全局转发，终端此时是隐藏的，无冲突。
+      // 输入框聚焦时（文件抽屉重命名等）不拦截。
+      this._onKeyWin = function(down) {
         return function(e) {
+          if (!self._inputBound) return;
+          const t = e.target;
+          if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
           send('desktop:key', { code: e.code, down: down });
           if (['F5', 'F12'].indexOf(e.code) < 0) e.preventDefault();
         };
       };
+      this._onKeyDown = this._onKeyWin(true);
+      this._onKeyUp = this._onKeyWin(false);
 
       v.addEventListener('pointermove', this._onPointerMove);
       v.addEventListener('pointerdown', this._onPointerDown);
       v.addEventListener('pointerup', this._onPointerUp);
       v.addEventListener('wheel', this._onWheel, { passive: false });
       v.addEventListener('contextmenu', this._onContextMenu);
-      v.addEventListener('keydown', this._onKey(true));
-      v.addEventListener('keyup', this._onKey(false));
+      window.addEventListener('keydown', this._onKeyDown);
+      window.addEventListener('keyup', this._onKeyUp);
       v.tabIndex = 0;
     }
 
@@ -572,8 +584,8 @@
       v.removeEventListener('pointerup', this._onPointerUp);
       v.removeEventListener('wheel', this._onWheel);
       v.removeEventListener('contextmenu', this._onContextMenu);
-      v.removeEventListener('keydown', this._onKey(true));
-      v.removeEventListener('keyup', this._onKey(false));
+      window.removeEventListener('keydown', this._onKeyDown);
+      window.removeEventListener('keyup', this._onKeyUp);
     }
   };
 })();

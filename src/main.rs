@@ -107,8 +107,9 @@ enum Command {
         #[arg(long, default_value = "h264")]
         desktop_codec: String,
 
-        /// Desktop capture frame rate.
-        #[arg(long, default_value_t = 60.0)]
+        /// Desktop capture frame rate (30 balances latency vs smoothness;
+        /// 60 needs a strong CPU to keep encode time from inflating e2e).
+        #[arg(long, default_value_t = 30.0)]
         desktop_fps: f64,
 
         /// Maximum encode bitrate in kbps (user request: 最高 800).

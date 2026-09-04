@@ -260,6 +260,7 @@
                 return pump();
               }
               self.pendingChunks.push(buf);
+              self._noteCaptureTs(buf);
               self._drain();
               self._trackBandwidth(v.byteLength);
             }
@@ -276,6 +277,26 @@
           self.setStatus('无法连接桌面: ' + e.message, true);
         }
       });
+    }
+
+    // 扫描 chunk 里的 srtc box（traf 内自定义 box, 8 字节采集 epoch ms）
+    // 记录最近一帧的采集时刻。MSE 不暴露每帧元数据, e2e 指标用
+    // "最新帧采集时刻→现在" 近似（帧到达即被 append, 与渲染延迟差
+    // LIVE_EDGE_LAG 内）。这修复了此前 e2e 与"解码队列"显示同一个值
+    // （都用 缓冲尾部-播放头）的问题——那是播放时钟口径, 不是链路口径。
+    _noteCaptureTs(buf) {
+      try {
+        const u8 = new Uint8Array(buf);
+        const n = u8.length;
+        for (let i = 8; i + 16 <= n; i++) {
+          if (u8[i + 4] === 0x73 && u8[i + 5] === 0x72 && u8[i + 6] === 0x74 && u8[i + 7] === 0x63) {
+            let v = 0;
+            for (let j = 0; j < 8; j++) v = v * 256 + u8[i + 8 + j];
+            if (v > 1600000000000) this._lastCaptureMs = v;
+            i += 15;
+          }
+        }
+      } catch (e) { /* 指标尽力而为 */ }
     }
 
     _drain() {
@@ -366,17 +387,20 @@
         if (!lag) return;
 
         try {
+          // 端到端延时（链路口径）: 最新帧的采集 epoch(srtc) → 现在。
+          // 含 编码→上行→relay→浏览器 append 全程; 与"解码队列"（播放
+          // 时钟口径: 缓冲尾部-播放头）是两个不同的量。
+          if (self._lastCaptureMs) {
+            lag.textContent = Math.max(0, Date.now() - self._lastCaptureMs) + ' ms';
+          } else {
+            lag.textContent = '-';
+          }
           const b = v.buffered;
           if (b && b.length) {
             const end = b.end(b.length - 1);
-            const ms = Math.round((end - v.currentTime) * 1000);
-            lag.textContent = ms + ' ms';
-            // "解码队列"显示播放头→缓冲尾部的距离（真正的延迟堆积），
-            // 而不是缓冲总长度——修剪策略常驻 ~2s 缓冲，总长恒为 2-3s
-            // 看起来像异常（用户实测困惑点）。堆积超 500ms 说明追帧失效。
             buf.textContent = ((end - v.currentTime) * 1000).toFixed(0) + ' ms';
           } else {
-            lag.textContent = '-'; buf.textContent = '-';
+            buf.textContent = '-';
           }
           res.textContent = v.videoWidth + 'x' + v.videoHeight;
           fps.textContent = frames; // 1s 间隔, 数值即 fps
@@ -450,6 +474,9 @@
         send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
         send('desktop:mouse', { type: 'down', button: e.button });
         v.setPointerCapture(e.pointerId);
+        // preventDefault 阻止 mousedown 默认聚焦 → 键盘收不到事件。
+        // 显式 focus 补回（键盘无反应的根因修复）。
+        if (v.focus) v.focus();
         e.preventDefault();
       };
       this._onPointerUp = function(e) {
@@ -476,22 +503,28 @@
         e.preventDefault();
       };
       this._onContextMenu = function(e) { e.preventDefault(); };
-      this._onKey = function(down) {
+      // 键盘挂 window（焦点管理脆弱：Alt+Tab/点工具栏后焦点在 body,
+      // video 上的 keydown 依赖焦点落位）。桌面视图激活期间全局转发;
+      // 输入框聚焦时不拦截。
+      this._onKeyWin = function(down) {
         return function(e) {
-          // 过滤浏览器自身快捷键（F5 刷新/Ctrl+W 关标签等由浏览器处理）
+          if (!self._inputBound) return;
+          const t = e.target;
+          if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
           send('desktop:key', { code: e.code, down: down });
           if (['F5', 'F12'].indexOf(e.code) < 0) e.preventDefault();
         };
       };
+      this._onKeyDown = this._onKeyWin(true);
+      this._onKeyUp = this._onKeyWin(false);
 
       v.addEventListener('pointermove', this._onPointerMove);
       v.addEventListener('pointerdown', this._onPointerDown);
       v.addEventListener('pointerup', this._onPointerUp);
       v.addEventListener('wheel', this._onWheel, { passive: false });
       v.addEventListener('contextmenu', this._onContextMenu);
-      v.addEventListener('keydown', this._onKey(true));
-      v.addEventListener('keyup', this._onKey(false));
-      // 键盘焦点: video 不是天然可聚焦元素, 点击后手动聚焦才能收 key 事件
+      window.addEventListener('keydown', this._onKeyDown);
+      window.addEventListener('keyup', this._onKeyUp);
       v.tabIndex = 0;
     }
 
@@ -504,8 +537,8 @@
       v.removeEventListener('pointerup', this._onPointerUp);
       v.removeEventListener('wheel', this._onWheel);
       v.removeEventListener('contextmenu', this._onContextMenu);
-      v.removeEventListener('keydown', this._onKey(true));
-      v.removeEventListener('keyup', this._onKey(false));
+      window.removeEventListener('keydown', this._onKeyDown);
+      window.removeEventListener('keyup', this._onKeyUp);
     }
   };
 })();

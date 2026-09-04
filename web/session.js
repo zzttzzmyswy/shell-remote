@@ -244,6 +244,45 @@
         }
     });
 
+    // ── 剪贴板同步（纯文本）──────────────────────────────────
+    // → 远端：读文本框（为空则读本机剪贴板）发给 agent 设置远端剪贴板。
+    // 远端 → 本机：请求 agent 读远端剪贴板，回包写入文本框并尝试写本机
+    // 剪贴板（写剪贴板需要用户手势——按钮点击就是手势）。
+    const clipBtn = document.getElementById('desktop-clip-btn');
+    const clipPanel = document.getElementById('desktop-clip-panel');
+    const clipText = document.getElementById('desktop-clip-text');
+    if (clipBtn && clipPanel) {
+        clipBtn.addEventListener('click', function() {
+            clipPanel.classList.toggle('hidden');
+        });
+        document.getElementById('clip-to-remote-btn').addEventListener('click', async function() {
+            let text = clipText.value;
+            if (!text) {
+                try { text = await navigator.clipboard.readText(); clipText.value = text; } catch (e) {}
+            }
+            if (!text) { showToast('没有可同步的文本', 'error'); return; }
+            window.shellRemote.send('desktop:clipboard:set', { text: text });
+            showToast('已写入远端剪贴板', 'success');
+        });
+        document.getElementById('clip-from-remote-btn').addEventListener('click', function() {
+            window.shellRemote.send('desktop:clipboard:get', {});
+            showToast('正在读取远端剪贴板…', 'success');
+        });
+    }
+    window.shellRemote.on('desktop:clipboard', function(msg) {
+        const text = (msg.payload && msg.payload.text) || '';
+        if (clipText) clipText.value = text;
+        if (text && navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function() {
+                showToast('远端剪贴板已同步到本机', 'success');
+            }).catch(function() {
+                showToast('远端文本已载入面板（本机剪贴板写入被浏览器拒绝）', 'success');
+            });
+        } else {
+            showToast(text ? '远端文本已载入面板' : '远端剪贴板为空', 'success');
+        }
+    });
+
     window.shellRemote.on('desktop:stopped', function(msg) {
         if (desktopActive) {
             desktopView.disconnect();

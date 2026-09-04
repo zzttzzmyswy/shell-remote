@@ -102,7 +102,10 @@ impl DesktopStream {
     /// The receiver yields no fragments until the first key frame arrives.
     pub async fn add_viewer(&self) -> (String, mpsc::Receiver<Vec<u8>>, Option<Vec<u8>>) {
         let id = format!("dv_{}", uuid::Uuid::new_v4().simple());
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        // 256 帧缓冲（30fps ≈ 8.5s; 单帧 ~2-10KB, 内存上限 ~2.5MB）。
+// 之前 64 帧在浏览器解码短暂卡顿(标签页切后台)时 try_send 失败即把
+// viewer 踢掉——表现成局域网"丢帧"/断流（MYS-886 问题6）。
+let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
         self.inner
             .viewers
             .write()
