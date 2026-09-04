@@ -91,6 +91,11 @@ pub struct DesktopManager {
     injector: tokio::sync::Mutex<Option<input::InputInjector>>,
     /// 剪贴板同步器。同样惰性创建：首个剪贴板命令才 spawn 线程。
     clipboard: tokio::sync::Mutex<Option<clipboard::ClipboardSync>>,
+    /// 与 relay 的时钟偏移（relay_epoch - 本地_epoch，ms）。srtc 打点加上
+    /// 此偏移后落在 relay 时基，端到端延时不再依赖 agent/浏览器两机时钟同步
+    /// （MYS-886 指标失真根因）。由 DesktopManager::set_clock_offset 注入，
+    /// 默认 0 ＝ 未校准（行为与旧版一致）。
+    clock_offset: std::sync::atomic::AtomicI64,
 }
 
 impl DesktopManager {
@@ -103,7 +108,16 @@ impl DesktopManager {
             bandwidth: Arc::new(std::sync::atomic::AtomicU64::new(bps)),
             injector: tokio::sync::Mutex::new(None),
             clipboard: tokio::sync::Mutex::new(None),
+            clock_offset: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// 注入 relay 时钟偏移（relay_epoch - 本地_epoch，ms）。agent 在会话
+    /// 建立后对 relay /api/clock 采样得到；srtc 打点会加上这个偏移，
+    /// 把采集时刻换算到 relay 时基（不依赖 agent 系统时间）。
+    pub fn set_clock_offset(&self, offset_ms: i64) {
+        use std::sync::atomic::Ordering as O;
+        self.clock_offset.store(offset_ms, O::Relaxed);
     }
 
     /// Browser-reported available bandwidth (bps) feedback (weak networks).
@@ -176,8 +190,9 @@ impl DesktopManager {
         let running = self.running.clone();
         let cfg = self.config.clone();
         let bandwidth = self.bandwidth.clone();
+        let clock_offset = self.clock_offset.load(std::sync::atomic::Ordering::Relaxed);
         let task = tokio::task::spawn(async move {
-            run_desktop_loop(cfg, running, post, bandwidth).await;
+            run_desktop_loop(cfg, running, post, bandwidth, clock_offset).await;
         });
         *self.task.lock().await = Some(task);
     }
@@ -271,6 +286,7 @@ async fn run_desktop_loop(
     running: Arc<AtomicBool>,
     post: PostFn,
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
+    clock_offset_ms: i64,
 ) {
         let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok((src, backend)) => (src, backend),
@@ -284,7 +300,7 @@ async fn run_desktop_loop(
         }
     };
     let (src, backend) = src;
-    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend).await;
+    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -296,6 +312,7 @@ async fn run_desktop_pipeline(
     mut src: Box<dyn capture::FrameSource>,
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
     backend: String,
+    clock_offset_ms: i64,
 ) {
     let (w0, h0) = src.resolution();
     if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
@@ -415,10 +432,14 @@ async fn run_desktop_pipeline(
         // srtc 取点在**捕获完成、编码开始前**（用户口径：端到端延时须含
         // 编码全程——编码开始→浏览器解码/渲染完毕）。之前取在 POST 前,
         // 编码耗时（软编 1080p 单帧可达 20-40ms）被漏掉。
-        let capture_ms = std::time::SystemTime::now()
+        // 校准到 relay 时基：本地墙钟 + 偏移（relay_epoch - 本地_epoch）。
+        // 偏移默认 0（未校准, 行为与旧版一致）；校准后 srtc 落在 relay
+        // 时间轴上, 浏览器 e2e 不再受 agent/浏览器两机时钟差影响。
+        let cap_local = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        let capture_ms = (cap_local + clock_offset_ms).max(0) as u64;
         let i420 = if w == enc_w && h == enc_h {
             color::bgra_to_i420(&fr.bgra, w, h, w * 4)
         } else {
@@ -1009,6 +1030,7 @@ mod tests {
                 src,
                 Arc::new(std::sync::atomic::AtomicU64::new(bw)),
                 "test".to_string(),
+                0,
             ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
@@ -1048,7 +1070,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string()));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1088,7 +1110,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string()));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;

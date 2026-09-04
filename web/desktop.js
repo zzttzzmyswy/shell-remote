@@ -39,6 +39,42 @@
       this._e2eMs = null;
       this._renderPending = false;
       this._droppedFrames = 0;
+      // 浏览器与 relay 的时钟偏移（relay_epoch - 本地_epoch）。srtc 在 relay
+      // 转发时被改写为 relay 墙钟，e2e 用 本地now+偏移 与 srtc 对齐，彻底摆脱
+      // 双机系统时间差（MYS-886 指标失真根因）。
+      this._clockOffset = 0;
+    }
+
+    // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
+    // 采样 3 次取中值，消除单向网络延迟造成的偏差。
+    _calibrateClock() {
+      const self = this;
+      const samples = [];
+      let pending = 3;
+      return new Promise(function(resolve) {
+        const done = function() {
+          if (samples.length === 0) { resolve(); return; }
+          samples.sort(function(a, b) { return a.offset - b.offset; });
+          self._clockOffset = samples[Math.floor(samples.length / 2)].offset;
+          resolve();
+        };
+        for (let i = 0; i < 3; i++) {
+          const t0 = Date.now();
+          fetch('/api/clock', { cache: 'no-store' }).then(function(r) { return r.json(); })
+            .then(function(j) {
+              const t1 = Date.now();
+              const rtt = t1 - t0;
+              // 单程 ≈ rtt/2：relay 时钟等于 t0 时刻的 (j.epoch_ms - rtt/2)
+              const relayAtT0 = j.epoch_ms - rtt / 2;
+              samples.push({ offset: relayAtT0 - t0 });
+            })
+            .catch(function() {})
+            .then(function() {
+              pending -= 1;
+              if (pending === 0) done();
+            });
+        }
+      });
     }
 
     // relay 预建桌面流的时机略晚于 desktop:started 广播; 404 时指数退避重试
@@ -79,7 +115,10 @@
         this._mode = 'webcodecs';
         if (this.canvas) this.canvas.classList.remove('hidden');
         if (this.video) this.video.classList.add('hidden');
-        this._startFetch();
+        // 先校准时钟到 relay 时基，再拉流（不阻塞重连：校准失败也继续）。
+        // 下行优先 WS，失败自动回退 HTTP fetch。
+        const self = this;
+        this._calibrateClock().then(function() { self._startWs(); });
         return;
       }
       // 回退：MSE 播放器（旧浏览器）。
@@ -92,6 +131,66 @@
       } else {
         this.setStatus('当前浏览器不支持 WebCodecs/MSE', true);
       }
+    }
+
+    // ── 拉流：WS 优先（relay WS 下行），失败回退 HTTP fetch ──────
+    _startWs() {
+      const token = sessionStorage.getItem('shell-remote-token');
+      if (!token || typeof WebSocket === 'undefined') {
+        this._startFetch();
+        return;
+      }
+      const self = this;
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = proto + '//' + location.host + '/agent/desktop/ws?token=' + encodeURIComponent(token);
+      let ws;
+      try { ws = new WebSocket(url); } catch (e) {
+        this._startFetch();
+        return;
+      }
+      const sessionTimeout = setTimeout(function() {
+        try { ws.close(); } catch (e) {}
+        self._onWsFailed();
+      }, 4000);
+      this._ws = ws;
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = function() {
+        clearTimeout(sessionTimeout);
+        self._streamRetries = 0;
+        self.connected = true;
+        self._bindInput();
+        self._startMetrics();
+        self.setStatus('桌面已连接 (WS)', false);
+        self._buf = new Uint8Array(0);
+      };
+      ws.onmessage = function(ev) {
+        if (typeof ev.data === 'string') return; // 控制帧（如 ping 文本）
+        const v = new Uint8Array(ev.data);
+        if (v.byteLength) {
+          self._trackBandwidth(v.byteLength);
+          self._feed(v);
+        }
+      };
+      ws.onerror = function() { self._onWsFailed(); };
+      ws.onclose = function() {
+        if (self._ws === ws) self._ws = null;
+        if (self.connected && self._streamRetries < 10) {
+          self._streamRetries += 1;
+          self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
+          self.disconnect(false);
+          const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000);
+          setTimeout(function() { self.connect(); }, delay);
+        } else if (self.connected) {
+          self.setStatus('桌面流已结束', true);
+          self.connected = false;
+        }
+      };
+    }
+
+    _onWsFailed() {
+      if (this._ws) { try { this._ws.onclose = null; this._ws.close(); } catch (e) {} this._ws = null; }
+      // WS 不可用 → HTTP fetch 兜底
+      this._startFetch();
     }
 
     // ── 拉流（两种模式共用入口）──────────────────────────────
@@ -450,10 +549,11 @@
         const decoder = document.getElementById('metric-decoder');
         if (!lag) return;
         try {
-          // e2e: 采集→渲染。_lastCaptureMs 在渲染时更新（带 captureMs 的
-          // 帧到达时记录），误差为时钟差。
+          // e2e: 采集→渲染。srtc 已由 agent 校准到 relay 时基；本地 now 也加
+          // _clockOffset 换算到 relay 时基 —— 两个值都在同一时间轴上，彻底
+          // 摆脱 agent/浏览器两机系统时钟差（MYS-886 指标失真根因）。
           if (self._lastCaptureMs) {
-            const e2e = Math.max(0, Date.now() - self._lastCaptureMs);
+            const e2e = Math.max(0, (Date.now() + self._clockOffset) - self._lastCaptureMs);
             self._e2eMs = e2e;
             lag.textContent = e2e + ' ms';
           } else {

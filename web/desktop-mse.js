@@ -27,6 +27,9 @@
       this._bpsBytes = 0;
       this._bpsTs = 0;
       this._inputBound = false;
+      // 浏览器与 relay 的时钟偏移（relay_epoch - 本地_epoch）。agent 的 srtc
+      // 已校准到 relay 时基，e2e 用 本地now+偏移 与 srtc 对齐。
+      this._clockOffset = 0;
     }
 
     // relay 预建桌面流的时机略晚于 desktop:started 广播; 遇到 404 时重试
@@ -41,6 +44,37 @@
       const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000);
       setTimeout(function() { self.connect(); }, delay);
       return true;
+    }
+
+    // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
+    // 采样 3 次取中值。srtc 已在 relay 时基，e2e 用此偏移对齐。
+    _calibrateClock() {
+      const self = this;
+      const samples = [];
+      let pending = 3;
+      return new Promise(function(resolve) {
+        const done = function() {
+          if (samples.length === 0) { resolve(); return; }
+          samples.sort(function(a, b) { return a.offset - b.offset; });
+          self._clockOffset = samples[Math.floor(samples.length / 2)].offset;
+          resolve();
+        };
+        for (let i = 0; i < 3; i++) {
+          const t0 = Date.now();
+          fetch('/api/clock', { cache: 'no-store' }).then(function(r) { return r.json(); })
+            .then(function(j) {
+              const t1 = Date.now();
+              const rtt = t1 - t0;
+              const relayAtT0 = j.epoch_ms - rtt / 2;
+              samples.push({ offset: relayAtT0 - t0 });
+            })
+            .catch(function() {})
+            .then(function() {
+              pending -= 1;
+              if (pending === 0) done();
+            });
+        }
+      });
     }
 
     setStatus(text, isError) {
@@ -87,6 +121,9 @@
       const self = this;
       ms.addEventListener('sourceopen', function onOpen() {
         ms.removeEventListener('sourceopen', onOpen);
+        // 先校准时钟再拉流（校准失败也继续）
+        self._calibrateClock().then(function() { self._startFetch(); });
+        return;
         // 不在这里用预设 codec 建 SourceBuffer：必须先拿到 init 段、解析
         // SPS 的真实 profile/level 再建。用 avc1.42E01E(level 3.0) 建而实际
         // 1080p 码流是 level 4.0 时, 严格浏览器会拒绝解码(黑屏)。
@@ -391,7 +428,8 @@
           // 含 编码→上行→relay→浏览器 append 全程; 与"解码队列"（播放
           // 时钟口径: 缓冲尾部-播放头）是两个不同的量。
           if (self._lastCaptureMs) {
-            lag.textContent = Math.max(0, Date.now() - self._lastCaptureMs) + ' ms';
+            // srtc 已是 relay 时基；本地时刻加偏移后与其对齐，不受两机时钟差影响。
+            lag.textContent = Math.max(0, (Date.now() + self._clockOffset) - self._lastCaptureMs) + ' ms';
           } else {
             lag.textContent = '-';
           }

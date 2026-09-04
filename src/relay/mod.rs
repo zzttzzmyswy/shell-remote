@@ -1034,6 +1034,17 @@ pub async fn upload_handler(
     Ok(StatusCode::OK)
 }
 
+/// `GET /api/clock` — relay 墙钟（epoch ms）。agent 与浏览器各自向此端点
+/// 做 NTP 式往返采样，把自己校准到 relay 时基；srtc 采集时间戳与端到端
+/// 延时因此完全不受各机器系统时间差的影响（MYS-886 延时指标失真根因）。
+pub async fn clock_handler() -> impl IntoResponse {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    axum::Json(serde_json::json!({ "epoch_ms": now }))
+}
+
 pub async fn install_script_handler(
     State(_state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
@@ -1242,6 +1253,14 @@ pub async fn start(
         .route(
             "/agent/desktop/stream",
             get(crate::relay::desktop::stream_handler),
+        )
+        .route(
+            "/agent/desktop/ws",
+            get(crate::relay::desktop::ws_downlink_handler),
+        )
+        .route(
+            "/api/clock",
+            get(clock_handler),
         )
         .route(
             "/agent/upgrade/blob/:filename",

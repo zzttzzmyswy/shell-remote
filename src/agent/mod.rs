@@ -676,7 +676,47 @@ async fn run_session(
     // Desktop video sharing: control + frame messages are posted through a
     // single-task FIFO so the byte stream reaches the relay in order
     // (concurrent sends could reorder fragments and break playback).
-    let desktop = crate::agent::desktop::DesktopManager::new(desktop_cfg.clone());
+    let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(desktop_cfg.clone()));
+    // 时钟校准：采样 relay /api/clock 求 (relay_epoch - 本地_epoch) 偏移，
+    // 注入 DesktopManager，srtc 打点落在 relay 时基 —— e2e 延时从此不再
+    // 依赖 agent/浏览器两机系统时钟同步（MYS-886 指标失真根因）。
+    if desktop_cfg.enabled() {
+        let cc = client.http_client().clone();
+        let clock_base = client.send_url().trim_end_matches("/agent/send").to_string();
+        let dm2 = desktop.clone();
+        tokio::spawn(async move {
+            let mut samples: Vec<i64> = Vec::with_capacity(3);
+            for _ in 0..3 {
+                let t0 = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                match cc.get(format!("{}/api/clock", clock_base)).send().await {
+                    Ok(r) => {
+                        if let Ok(j) = r.json::<serde_json::Value>().await {
+                            if let Some(ep) = j["epoch_ms"].as_u64() {
+                                let t1 = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+                                let rtt = t1 - t0;
+                                let relay_at_t0 = ep as i64 - rtt / 2;
+                                samples.push(relay_at_t0 - t0);
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("clock calibrate failed: {e}"),
+                }
+            }
+            if !samples.is_empty() {
+                samples.sort_unstable();
+                let offset = samples[samples.len() / 2];
+                tracing::info!(clock_offset_ms = offset, "relay clock calibrated");
+                dm2.set_clock_offset(offset);
+            }
+        });
+    }
     let (post_tx, mut post_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     {
         let pc = client.http_client().clone();

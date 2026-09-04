@@ -254,6 +254,102 @@ impl Drop for ViewerGuard {
     }
 }
 
+/// WS 下行推流端点：`GET /agent/desktop/ws?token=<session token>`。
+///
+/// 鉴权与 `/agent/desktop/stream` 相同（Authorization: Bearer 或 ?token=）。
+/// 与 HTTP stream 共用同一 `DesktopStream` fan-out。srtc 由 agent 在
+/// 捕获后打点并校准到 relay 时基（agent 连上后对 /api/clock 采样偏移），
+/// 因此无论 HTTP 还是 WS 下行，浏览器拿到的 srtc 都在 relay 时间轴上。
+///
+/// 帧格式：binary frame = 原始 fMP4 字节（init/frag），与 HTTP 流逐块前进
+/// 完全等价；浏览器用同一 demux 解析。`clk` 文本帧（浏览器发起）回复中
+/// 不消费视频字节。
+pub async fn ws_downlink_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    let token =
+        match crate::relay::auth::extract_token_from_headers_or_query(&headers, params.get("token")) {
+            Some(t) => t,
+            None => {
+                return (StatusCode::UNAUTHORIZED, "Missing token").into_response();
+            }
+        };
+    let (session_id, _perm) = match state.sessions.authenticate(&token).await {
+        Some(r) => r,
+        None => return (StatusCode::UNAUTHORIZED, "Invalid token").into_response(),
+    };
+    let ds = {
+        let streams = state.desktop_streams.read().await;
+        streams.get(&session_id).cloned()
+    };
+    let ds = match ds {
+        Some(ds) => ds,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                "desktop stream is not active; start it first (desktop:start)",
+            )
+                .into_response();
+        }
+    };
+    ws.on_upgrade(move |socket| ws_downlink_loop(ds, session_id, socket))
+}
+
+async fn ws_downlink_loop(
+    ds: DesktopStream,
+    _session_id: String,
+    mut socket: axum::extract::ws::WebSocket,
+) {
+    use axum::extract::ws::Message;
+    // add_viewer() 只等第一个 init；先拿到 init 缓存（已存在则立即返回,
+    // 否则等至多 10s），再开始推送 —— 首帧必须是 init。
+    let (vid, mut rx, init) = ds.add_viewer().await;
+    let guard = ViewerGuard { stream: ds.clone(), id: vid };
+    // 若 init 尚未到：先尝试等待，超时未到则关闭连接（浏览器会重连）。
+    if init.is_none() {
+        let got = ds.wait_first_init(std::time::Duration::from_secs(10)).await;
+        if got.is_none() {
+            drop(guard);
+            let _ = socket
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: "init timeout".into(),
+                })))
+                .await;
+            return;
+        }
+    }
+    let init = if init.is_some() { init } else { ds.inner.init.read().await.clone() };
+    let Some(init) = init else { drop(guard); return; };
+
+    if socket.send(Message::Binary(init.into())).await.is_err() {
+        drop(guard);
+        return;
+    }
+    loop {
+        tokio::select! {
+            _ = socket.recv() => {
+                // 浏览器侧文本帧：ping/校准请求，发 ping/rst?——使用标准 Pong
+                // 由浏览器协议层处理；任何帧在此都不中断视频流。
+            }
+            chunk = rx.recv() => {
+                match chunk {
+                    Some(c) => {
+                        if socket.send(Message::Binary(c.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    drop(guard);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
