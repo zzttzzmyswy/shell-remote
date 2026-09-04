@@ -68,7 +68,12 @@ if [ -d "$WIN_DIR" ]; then
   # 相同时不会触发 rerun-if-env-changed, 复用无 vpx 的旧输出 → 链接缺 -lvpx。
   touch "$ROOT/build.rs"
 fi
-RUSTFLAGS="-C link-args=$ROOT/build/agent_manifest.o -C target-feature=+crt-static" \
+# 静态 C++ 运行时: 不加 -static-libstdc++ 与 -L$dir 时, -lstdc++ 落到 mingw
+# 的动态导入库 libstdc++-6.dll.a → exe 运行时报"找不到 libstdc++-6.dll"
+# （用户实拍 MYS-886）。-static-libstdc++ + 打包的静态 libstdc++.a 双保险。
+WIN_STD="$CACHE/shell-remote-x86_64"
+RUSTFLAGS="-C link-args=$ROOT/build/agent_manifest.o -C target-feature=+crt-static \
+-C link-arg=-L$WIN_STD -C link-arg=-static-libstdc++" \
   env "${WIN_LIBVPX[@]}" \
   cargo build --release --target x86_64-pc-windows-gnu --manifest-path "$ROOT/Cargo.toml"
 
