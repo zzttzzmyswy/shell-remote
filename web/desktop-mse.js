@@ -207,11 +207,10 @@
       } catch (e) { /* remove 中断无害 */ }
     }
 
-    // 从 init 段 (ftyp/moov 内含 avcC / vpcC) 解析浏览器实际需要的 codec 串。
-    // OpenH264 输出的 SPS profile/level 可能与预设不同；解析到真实值后
-    // 用 true codec 建 SourceBuffer，避免严格 MSE 因 codec 串与实际流不
-    // 匹配而拒播（1080p 实际是 level 4.0，avc1.42E01E 是 level 3.0）。
-    // VP9 解析 vpcC → vp09.PP.LL.DD。
+    // 从 init 段 (ftyp/moov 内含 avcC / vpcC / av1C) 解析浏览器实际需要
+    // 的 codec 串。OpenH264 输出的 SPS profile/level 可能与预设不同；解析
+    // 到真实值后用它建 SourceBuffer，避免严格 MSE 因 codec 串与实际流不
+    // 匹配而拒播。VP9 → vp09.PP.LL.DD；AV1 → av01.P.LLT.DD。
     _codecFromInit(buf) {
       const u8 = new Uint8Array(buf);
       const hex = (b) => b.toString(16).padStart(2, '0').toUpperCase();
@@ -229,14 +228,26 @@
             String(level).padStart(2, '0') + '.08';
         }
       }
+      for (let i = 0; i + 8 <= u8.length; i++) {
+        if (u8[i] === 0x61 && u8[i + 1] === 0x76 && u8[i + 2] === 0x31 && u8[i + 3] === 0x43) {
+          // av1C 是普通 box（非 FullBox）：[i+4]=0x81 [i+5]=profile(3)|level(5)
+          // [i+6]=tier(1)... codec 串 LL 用 seq_level_idx 的十进制两位
+          // （3.0→2→"02"，4.0→4→"04"）。
+          const profile = (u8[i + 5] >> 5) & 0x7;
+          const level = u8[i + 5] & 0x1f;
+          const tier = ((u8[i + 6] >> 7) & 0x1) ? 'H' : 'M';
+          return 'av01.' + profile + '.' + String(level).padStart(2, '0') + tier + '.08';
+        }
+      }
       return null;
     }
 
     _resolveCodec(initBuf) {
       const actual = this._codecFromInit(initBuf);
       if (actual && this._codecSupported(actual)) return actual;
-      // fallback：默认串（优先 h264，再尝试 vp9 高配置）
+      // fallback：默认串（优先 h264，再尝试 vp9/av1 高配置）
       if (this._codecSupported(this.codec)) return this.codec;
+      if (this._codecSupported('av01.0.30M.08')) return 'av01.0.30M.08';
       if (this._codecSupported('vp09.02.10.08')) return 'vp09.02.10.08';
       if (this._codecSupported('vp09.01.10.08')) return 'vp09.01.10.08';
       if (this._codecSupported('vp09.00.10.08')) return 'vp09.00.10.08';
@@ -501,13 +512,15 @@
         }
       };
 
-      // 视频渲染坐标 → 桌面像素坐标（object-fit: cover —— 铺满容器, 超出裁切;
-      // 与 contain 的信箱区不同, 这里 scale 取 max, 元素 box 即完整画面映射）
+      // 视频渲染坐标 → 桌面像素坐标（object-fit: contain —— 完整画面可见,
+      // 等比缩放铺满一条边, 另一条边最多两条黑边; 与 cover 的裁切不同,
+      // 这里 scale 取 min, 黑边区不产生输入映射。getBoundingClientRect 实时
+      // 取容器尺寸 → 窗口/浏览器缩放时映射动态调整)。
       this._toDesktopXY = function(e) {
         const vw = v.videoWidth, vh = v.videoHeight;
         if (!vw || !vh) return null;
         const rect = v.getBoundingClientRect();
-        const scale = Math.max(rect.width / vw, rect.height / vh);
+        const scale = Math.min(rect.width / vw, rect.height / vh);
         const drawW = vw * scale, drawH = vh * scale;
         const offX = (rect.width - drawW) / 2, offY = (rect.height - drawH) / 2;
         const x = (e.clientX - rect.left - offX) / scale;

@@ -21,6 +21,8 @@ pub mod openh264;
 pub mod rate;
 #[cfg(feature = "vp9")]
 pub mod vpx;
+#[cfg(feature = "av1")]
+pub mod aom;
 
 #[cfg(windows)]
 pub mod dxgi;
@@ -40,7 +42,8 @@ pub type PostFn = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 pub struct DesktopConfig {
     /// Capture backend: `auto`, `x11`, `wayland`, `gdi`/`windows` or `none`.
     pub capture: String,
-    /// Encoder codec (only `h264` today).
+    /// Encoder codec (`h264` / `vp9` / `av1`). Default AV1: 压缩率最高,
+    /// 码率在固定分辨率下真实受控 —— 支撑"禁止自动降低分辨率"。
     pub codec: String,
     /// Nominal encode frame rate.
     pub fps: f64,
@@ -55,7 +58,7 @@ impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
             capture: "auto".to_string(),
-            codec: "h264".to_string(),
+            codec: "av1".to_string(),
             // 30fps 起步（MYS-886 时延对标 rustdesk: 22fps/12ms）。60fps 软编
             // 在低配机器上单核打满（实测 115%），编码耗时直接加进 e2e；
             // 30fps 减一半编码负载，时延显著优于 60fps，流畅度损失小。
@@ -79,6 +82,7 @@ impl DesktopConfig {
     pub fn supports_codec(&self, codec: &str) -> bool {
         codec.eq_ignore_ascii_case("h264")
             || (cfg!(feature = "vp9") && codec.eq_ignore_ascii_case("vp9"))
+            || (cfg!(feature = "av1") && codec.eq_ignore_ascii_case("av1"))
     }
 }
 
@@ -237,6 +241,9 @@ impl DesktopManager {
                 if cfg!(feature = "vp9") {
                     v.push("vp9");
                 }
+                if cfg!(feature = "av1") {
+                    v.push("av1");
+                }
                 v
             } else {
                 Vec::new()
@@ -263,8 +270,11 @@ impl Drop for DesktopManager {
 }
 
 /// Encode-resolution scale steps (fraction of the capture size). Length 1
-/// would disable the adaptive resolution entirely.
-const SCALES: &[f64] = &[1.0, 0.75, 0.5, 0.375];
+/// disables the adaptive resolution entirely — MYS-886: 用户明确"禁止自动
+/// 降低分辨率"(对比 rustdesk 太糊)。码率完全交给 AV1/VP9 CBR 在固定分辨率
+/// 下控制(两者实测 60/60 帧码率受控在预算 ~10-60% 内)。
+/// 若将来要恢复自适应分辨率, 改回 &[1.0, 0.75, 0.5, 0.375] 即可。
+const SCALES: &[f64] = &[1.0];
 
 /// Frame-stride steps for our own frame skipping (1 = encode every capture
 /// frame). Effective encode fps = `cfg.fps / STRIDES[i]` → 15/7/5/3 fps.
@@ -707,6 +717,8 @@ mod tests {
 
     #[test]
     fn test_maybe_rescale_degrades_on_overbudget() {
+        // MYS-886: 分辨率阶梯已禁用 (SCALES = [1.0])。超预算时 maybe_rescale
+        // **不再降分辨率** —— 码率交给 AV1/VP9 CBR 在固定分辨率下控制。
         let cfg = DesktopConfig::default();
         let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
@@ -726,14 +738,10 @@ mod tests {
             &cfg, &mut enc, &mut scale_idx, &mut enc_w, &mut enc_h, w0, h0,
             &mut mp4_cfg, &mut seq, &mut byte_win, &mut since_change, &mut frame_idx, 1.5, 0,
         );
-        assert_eq!(scale_idx, 1, "must degrade one step");
-        assert_eq!(enc_w, 1440, "0.75 of 1920");
-        assert_eq!(enc_h, 810, "0.75 of 1080");
-        assert!(mp4_cfg.is_none(), "mux config must reset for re-init");
-        assert_eq!(seq, 1, "fragment sequence must reset");
-        assert!(byte_win.is_empty(), "byte window must reset");
-        assert_eq!(since_change, 0, "cooldown must reset");
-        assert_eq!(frame_idx, 0, "ABR/IDR anchor must reset");
+        assert_eq!(scale_idx, 0, "resolution ladder disabled — no degrade");
+        assert_eq!(enc_w, 1920, "stays at native resolution");
+        assert_eq!(enc_h, 1080, "stays at native resolution");
+        assert!(mp4_cfg.is_some(), "mux config untouched");
     }
 
     #[test]
@@ -776,9 +784,11 @@ mod tests {
             w0, h0, &mut mp4_cfg, &mut seq, &mut byte_win, &mut since_change,
             &mut frame_idx, 1.5,
         );
-        assert_eq!(scale_idx, 1, "over-budget must first lower resolution");
-        assert_eq!(stride_idx, 0, "stride untouched while resolution has room");
-        assert_eq!(since_change, 0, "cooldown must reset");
+        assert_eq!(scale_idx, 0, "resolution ladder disabled — resolution unchanged");
+        assert_eq!(stride_idx, 0, "no frame-rate degradation either");
+        assert_eq!(enc_w, w0, "must stay at native resolution under over-budget");
+        assert_eq!(enc_h, h0, "must stay at native resolution under over-budget");
+        assert_eq!(since_change, 30, "cooldown untouched (no change happened)");
 
         // 分辨率已到顶仍超预算 → 降帧率
         let mut byte_win2: VecDeque<u32> = (0..48).map(|_| (budget(cfg.fps) * 1.5) as u32).collect();

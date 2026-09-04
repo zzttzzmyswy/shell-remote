@@ -12,7 +12,7 @@
 //! A viewer that joins mid-stream needs the current init segment again — the
 //! relay caches and replays it (see `relay::desktop`).
 
-/// 视频采样描述：codec 参数集（H.264 走 avcC；VP9 走 vpcC）。
+/// 视频采样描述：codec 参数集（H.264 走 avcC；VP9 走 vpcC；AV1 走 av1C）。
 #[derive(Clone, Debug)]
 pub enum VisualSample {
     /// H.264: bare SPS/PPS NAL (no start code, no length prefix), carried in
@@ -20,6 +20,8 @@ pub enum VisualSample {
     H264 { sps: Vec<u8>, pps: Vec<u8> },
     /// VP9: profile_idc / level_idc, carried in the `vpcC` box.
     Vp9 { profile: u8, level: u8 },
+    /// AV1: profile / level (level is AV1 level_idx, carried in `av1C`).
+    Av1 { profile: u8, level: u8 },
 }
 
 /// Parameters that describe the encoded stream (resolved from SPS/PPS or VP9
@@ -50,6 +52,12 @@ impl Mp4Config {
             }
             VisualSample::Vp9 { profile, level } => {
                 format!("vp09.{:02}.{:02}.08", profile, level)
+            }
+            VisualSample::Av1 { profile, level } => {
+                // AV1 codec string: av01.P.LLT.DD；P=profile, LL=seq_level_idx
+                // 的十进制两位（3.0→idx2→"02", 4.0→idx4→"04"），Chrome 按
+                // 5 位 idx(0-31) 校验, 写两位 level 号(30/40)会被拒。
+                format!("av01.{}.{:02}M.08", profile, av1_level_to_idx(*level))
             }
         }
     }
@@ -161,7 +169,7 @@ fn dref() -> Vec<u8> {
 fn avcc(cfg: &Mp4Config) -> Vec<u8> {
     let (sps, pps) = match &cfg.sample {
         VisualSample::H264 { sps, pps } => (sps, pps),
-        VisualSample::Vp9 { .. } => unreachable!("avcC is h264-only"),
+        VisualSample::Vp9 { .. } | VisualSample::Av1 { .. } => unreachable!("avcC is h264-only"),
     };
     assert!(!sps.is_empty() && !pps.is_empty(), "SPS/PPS required");
     let mut p = Vec::new();
@@ -224,7 +232,66 @@ fn sample_entry(cfg: &Mp4Config) -> Vec<u8> {
     match &cfg.sample {
         VisualSample::H264 { .. } => avc1(cfg),
         VisualSample::Vp9 { profile, level } => vp09(cfg, *profile, *level),
+        VisualSample::Av1 { profile, level } => av01(cfg, *profile, *level),
     }
+}
+
+/// AV1 两位 level（30=3.0、40=4.0…）→ av1C `seq_level_idx_0`（5 位字段）。
+/// AV1 规范的 idx 表**含保留槽位**（2.2/2.3/3.2/3.3/4.2/4.3 保留但占用索引）:
+///   2.0→0, 2.1→1; 3.0→4, 3.1→5; 4.0→8, 4.1→9;
+///   5.0→12, 5.1→13, 5.2→14, 5.3→15; 6.0→16…6.3→19。
+/// 三重实证：ffmpeg 720p15 实测 idx=5(=3.1)、libaom 源码 SEQ_LEVEL_3_0=4 /
+/// SEQ_LEVEL_5_0=12。直接 `level & 0x1f` 在 ≥4.0 (40&0x1f=8) 会错，旧版
+/// `3→2+m` 也低估 2（写 6.0 会实际落在 4.0）。
+fn av1_level_to_idx(level: u8) -> u8 {
+    let major = level / 10;
+    let minor = level % 10;
+    match major {
+        2 => minor,
+        3 => 4 + minor,
+        4 => 8 + minor,
+        5 => 12 + minor,
+        6 => 16 + minor,
+        _ => 0,
+    }
+}
+
+/// AV1 codec configuration record (`av1C`), per ISO/IEC 14496-15 §8.x
+/// (AV1CodecConfigurationRecord — 普通 box, 无 version/flags)。布局:
+///   marker(1)+version(7)=0x81
+///   seq_profile(3) seq_level_idx_0(5)
+///   seq_tier_0(1) high_bitdepth(1) twelve_bit(1) monochrome(1)
+///     chroma_subsampling_x(1) chroma_subsampling_y(1) chroma_sample_position(2)
+///   reserved(3) initial_presentation_delay_present(1) reserved(4)
+fn av1c(profile: u8, level: u8) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.push(0x81); // marker=1, version=1
+    p.push((profile << 5) | av1_level_to_idx(level)); // profile + level_idx
+    // 8-bit 4:2:0: tier=0 high=0 twelve=0 mono=0 x=1 y=1 pos=0
+    p.push(0b0000_1100);
+    p.push(0); // no initial_presentation_delay
+    box_of(b"av1C", &p)
+}
+
+fn av01(cfg: &Mp4Config, profile: u8, level: u8) -> Vec<u8> {
+    let av1c_box = av1c(profile, level);
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0u8; 6]); // reserved
+    p.extend_from_slice(&u16b(1)); // data_reference_index
+    p.extend_from_slice(&u16b(0)); // pre_defined
+    p.extend_from_slice(&[0u8; 2]); // reserved
+    p.extend_from_slice(&[0u8; 12]); // pre_defined
+    p.extend_from_slice(&u16b(cfg.width as u16));
+    p.extend_from_slice(&u16b(cfg.height as u16));
+    p.extend_from_slice(&u32b(0x00480000)); // horizresolution
+    p.extend_from_slice(&u32b(0x00480000)); // vertresolution
+    p.extend_from_slice(&u32b(0)); // reserved
+    p.extend_from_slice(&u16b(1)); // frame_count
+    p.extend_from_slice(&[0u8; 32]); // compressorname
+    p.extend_from_slice(&u16b(24)); // depth
+    p.extend_from_slice(&u16b(0xffff)); // pre_defined
+    p.extend_from_slice(&av1c_box);
+    box_of(b"av01", &p)
 }
 
 fn vp09(cfg: &Mp4Config, profile: u8, level: u8) -> Vec<u8> {
@@ -546,6 +613,15 @@ mod tests {
         }
     }
 
+    fn av1_cfg() -> Mp4Config {
+        Mp4Config {
+            width: 320,
+            height: 240,
+            fps: 15.0,
+            sample: VisualSample::Av1 { profile: 0, level: 30 },
+        }
+    }
+
     fn box_total(data: &[u8], mut pos: usize) -> u32 {
         let mut total = 0u32;
         while pos + 8 <= data.len() {
@@ -582,10 +658,26 @@ mod tests {
     }
 
     #[test]
+    fn test_av1_init_segment_contains_av1c() {
+        let init = mp4_init_segment(&av1_cfg());
+        assert_eq!(&init[4..8], b"ftyp");
+        assert!(init.windows(8).any(|w| &w[4..8] == b"moov"));
+        assert!(init.windows(4).any(|w| w == b"av1C"), "av1 init must carry av1C");
+        assert!(init.windows(4).any(|w| w == b"av01"), "av1 sample entry must be av01");
+        assert_eq!(init.len() as u32, box_total(&init, 0));
+        // av1C payload: marker-version 0x81, profile<<5|level_idx, fmt byte
+        let pos = init.windows(4).position(|w| w == b"av1C").unwrap();
+        assert_eq!(init[pos + 4], 0x81);
+        assert_eq!(init[pos + 5], (0u8 << 5) | 4u8, "profile0 level30 -> seq_level_idx 4");
+        assert_eq!(init[pos + 6], 0b0000_1100, "4:2:0 8-bit");
+    }
+
+    #[test]
     fn test_codec_string() {
         let c = cfg();
         assert_eq!(c.codec_string(), "avc1.42001F");
         assert_eq!(vp9_cfg().codec_string(), "vp09.00.10.08");
+        assert_eq!(av1_cfg().codec_string(), "av01.0.04M.08");
     }
 
     #[test]

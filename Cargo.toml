@@ -70,5 +70,8 @@ windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics
 wayland = ["dep:zbus", "dep:gstreamer", "dep:gstreamer-app"]
 # VP9 软编（libvpx）。默认开启；若目标机没有 libvpx 静态/动态库可关闭，
 # 此时 --desktop-codec vp9 会被拒绝、codecs 列表只剩 h264。
-default = ["vp9"]
+# AV1 软编（libaom）。两者并存，默认 AV1（压缩率最高的同时码率真实受控，
+# 让用户要求"禁止自动降低分辨率"成立）；agent 可用 --desktop-codec 切 vp9。
+default = ["vp9", "av1"]
 vp9 = []
+av1 = []

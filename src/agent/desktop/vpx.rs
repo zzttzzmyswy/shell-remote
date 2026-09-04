@@ -70,6 +70,11 @@ impl Vp9Encoder {
             cfg.rc_min_quantizer = 0;
             cfg.rc_max_quantizer = 63;
             cfg.rc_undershoot_pct = 95;
+            // VP9 的 RC 需要 dropframe 作高熵压力阀: dropframe=0 时高熵内容
+            // 码率彻底失控(实测 7367kbps @ 800k 目标)且编码速度暴跌
+            // (156ms/帧, CBR 死命压大帧)。保留 25 让 RC 丢弃过盈的高熵帧
+            // 保持码率受控与帧率——桌面共享场景丢的是极端运动帧, 可接受。
+            // (AV1 的 libaom CBR 无此问题, 用 dropframe=0 全帧保留。)
             cfg.rc_dropframe_thresh = 25;
             cfg.kf_mode = vpx_sys::vpx_kf_mode::VPX_KF_AUTO;
             cfg.kf_min_dist = 0;
@@ -314,11 +319,27 @@ mod tests {
         // 800k 目标下实测码率应收敛在目标附近（这是 OpenH264 skip=0 做不到的）。
         let mut enc = Vp9Encoder::new(1280, 720, 800_000, 30.0).expect("vp9 init");
         let (mut bytes, mut out) = (0usize, 0usize);
+        // 模拟真实桌面动画: 静态底色 + 一个移动的高对比窗口(而非随机噪声,
+        // 噪声的不可压缩性不反映真实桌面, 会让 RC 误判)。
+        let (mut buf, mut x) = (vec![128u8; 1280 * 720 * 3 / 2], 0i32);
         for t in 0..60u32 {
-            let mut buf = solid_i420(1280, 720, (t % 251) as u8);
-            let seed = t.wrapping_mul(2654435761).wrapping_add(12345);
-            for i in (0..buf.len()).step_by(97) {
-                buf[i] = ((i as u32).wrapping_mul(31).wrapping_add(seed) >> 16) as u8;
+            buf.fill(128);
+            x = (x + 17) % 1100;
+            for dy in 0..200i32 {
+                let row = (100 + dy) * 1280;
+                for dx in 0..180i32 {
+                    let px = (row + x + dx) as usize;
+                    let v = if (dx / 9 + dy / 9) % 2 == 0 { 240u8 } else { 16u8 };
+                    buf[px] = v;
+                    buf[1280 * 720 + px / 2] = v / 2;
+                    buf[1280 * 720 + 1280 * 720 / 4 + px / 2] = v / 2;
+                }
+            }
+            // 窗口里的滚动文本内容动态变化
+            if t % 5 == 0 {
+                for i in (0..buf.len()).step_by(199) {
+                    buf[i] = buf[i].wrapping_add((t as u8).wrapping_mul(7));
+                }
             }
             let f = enc.encode(&buf).expect("encode");
             if !f.nalu.is_empty() {

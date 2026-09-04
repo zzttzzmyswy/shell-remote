@@ -18,7 +18,11 @@
 
   // 解码队列上限：积压超过 N 帧时丢弃旧的非关键帧（对齐 RustDesk
   // frame_controller 的丢帧策略——旧帧无意义，追新才保流畅）。
-  const MAX_DECODE_QUEUE = 16;
+  // 注意阈值不能太小: AV1 软解 1080p 的瞬时入队深度实测到 ~24,
+  // 16 就丢帧会在参考链上撕口子 → WebCodecs "Decoding error" 整段卡死
+  // (MYS-886 实测)。96 只在真正严重积压时兜底, 平时靠 _onDecoded 的
+  // 渲染队列丢弃保新鲜 (decode 输入比 render 输出快时队列本来就浅)。
+  const MAX_DECODE_QUEUE = 96;
 
   window.DesktopView = class {
     constructor() {
@@ -34,7 +38,7 @@
       this._inputBound = false;
       this._dec = null;
       this._desc = null;          // avcC description (Uint8Array)
-      this._codecKind = null;     // 'h264' | 'vp9'（由 init 段确定）
+      this._codecKind = null;     // 'h264' | 'vp9' | 'av1'（由 init 段确定）
       this._vpcProfile = 0;
       this._vpcLevel = 10;
       this._frames = [];          // decoded VideoFrames pending render
@@ -306,9 +310,11 @@
     }
 
     _handleMoov(body) {
-      // 找 codec 配置 box：先扫 avcC（H.264），再扫 vpcC（VP9）。
+      // 找 codec 配置 box：先扫 avcC（H.264），再扫 vpcC（VP9），再扫 av1C（AV1）。
       //   avcC payload: [i+4]=1(version) [i+5..i+7]=profile/compat/level
       //   vpcC payload: [i+4]=1(version) [i+5]=profile [i+6]=level [i+7]=bitDepth4|chroma3|range1
+      //   av1C payload: [i+4]=0x81(marker+version) [i+5]=profile(3)|level(5)
+      //     [i+6]=tier/high/twelve/mono/chroma_x/chroma_y/position [i+7]=delay
       // 之前误把 i（标签起点）当 payload 起算，codec 串取到 'v','c','C'
       // 变成 avc1.766343 非法——WebCodecs configure 报 Unknown codec name。
       for (let i = 0; i + 8 <= body.length; i++) {
@@ -332,6 +338,18 @@
           this._initDecoder();
           return;
         }
+        if (body[i] === 0x61 && body[i+1] === 0x76 && body[i+2] === 0x31 && body[i+3] === 0x43) {
+          // av1C 是普通 box（非 FullBox），payload 从标签后 4 字节起。
+          // [i+5]=seq_profile(3)|seq_level_idx_0(5)；codec 串 LL 直接用
+          // 该 5 位索引的十进制两位（3.0→idx=2→"02"，4.0→idx=4→"04"）。
+          this._desc = null; // AV1 无 description
+          this._av1Profile = (body[i+5] >> 5) & 0x7; // seq_profile(3)
+          this._av1Level = body[i+5] & 0x1f;         // seq_level_idx_0(5)
+          this._av1Tier = (body[i+6] >> 7) & 0x1;    // seq_tier_0(1)
+          this._codecKind = 'av1';
+          this._initDecoder();
+          return;
+        }
       }
     }
 
@@ -342,6 +360,28 @@
         this._dec = null;
       }
       const hex = (b) => b.toString(16).padStart(2, '0').toUpperCase();
+      if (this._codecKind === 'av1') {
+        // AV1 codec 串: av01.P.LLT.DD；P=profile, LL=seq_level_idx 的十进制
+        // 两位(3.0→02、4.0→04)，不是 level 号本身——Chrome 按 5 位 idx
+        // (0-31) 校验, 写 "40" 会被拒。T=tier(M/H), DD=bit depth(08)。
+        // 无 description。实测 ffmpeg：1080p30 的 av1C idx=8 → av01.*.08M.08。
+        const tier = this._av1Tier ? 'H' : 'M';
+        const codec = 'av01.' + this._av1Profile + '.' +
+          String(this._av1Level).padStart(2, '0') + tier + '.08';
+        this._dec = new VideoDecoder({
+          output: function(frame) { self._onDecoded(frame); },
+          error: function(e) {
+            self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
+            self.setStatus('解码错误: ' + e.message, true);
+          }
+        });
+        this._dec.configure({
+          codec: codec,
+          optimizeForLatency: true
+        });
+        this._codecStr = codec;
+        return;
+      }
       if (this._codecKind === 'vp9') {
         // VP9: codec 串 vp09.profile.level.bitdepth，无 description。
         const codec = 'vp09.' + String(this._vpcProfile).padStart(2, '0') +
@@ -349,6 +389,7 @@
         this._dec = new VideoDecoder({
           output: function(frame) { self._onDecoded(frame); },
           error: function(e) {
+            self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
             self.setStatus('解码错误: ' + e.message, true);
           }
         });
@@ -403,8 +444,11 @@
               // flags: data-offset(0x1)|first-sample-flags(0x4)|dur(0x100)|size(0x200)
               // 布局: ver/flags(4) count(4) dataOffset(4) firstFlags(4) dur(4) size(4)
               sawTrun = true;
-              const firstFlags = (d2[12] << 16) | (d2[13] << 8) | d2[14];
-              isKey = (firstFlags & 0x00ff0000) !== 0; // sample_is_non_sync_sample 位为 0 → key
+              // first_sample_flags 高字节低 2 位 = sample_depends_on; 2=key, 1=delta。
+              // 不能只看整字节非零(0x01=delta 的整字节也是非零 → 误判全 key,
+              // 每帧重建解码器+perf 崩)。见 verify_vp9_browser.js 的同样修正。
+              const sampleFlagsByte = d2[12];
+              isKey = ((sampleFlagsByte & 0x03) === 0x02);
               const szPos = d2.length - 4;
               sampleSize = (d2[szPos] << 24) | (d2[szPos+1] << 16) | (d2[szPos+2] << 8) | d2[szPos+3];
             } else if (t2 === 'srtc' && d2.length >= 8) {
@@ -432,6 +476,12 @@
         timestamp: p.ptsUs,
         data: sample
       });
+      // 解码器报错（参考链断裂/丢帧等）：在下一个关键帧重建解码器自愈。
+      // 不重建的话 WebCodecs 报错后 decode() 全部失效，画面永久卡死。
+      if (p.isKey && this._decErr) {
+        this._decErr = false;
+        this._initDecoder();
+      }
       // 积压保护：解码队列过深时丢旧的非关键帧。
       if (this._dec.decodeQueueSize > MAX_DECODE_QUEUE && !p.isKey) {
         this._droppedFrames += 1;
@@ -637,9 +687,12 @@
         const vw = self._videoW(), vh = self._videoH();
         if (!vw || !vh) return null;
         const rect = v.getBoundingClientRect();
-        // CSS object-fit: cover —— 画面铺满容器, 比例不一致时裁切超出部分。
-        // 像素→桌面坐标取 max(scale): 显示区恰好覆盖整个元素 box。
-        const scale = Math.max(rect.width / vw, rect.height / vh);
+        // CSS object-fit: contain —— 完整画面可见, 等比缩放铺满一条边,
+        // 另一条边留最多两条黑边。像素→桌面坐标取 min(scale): 渲染区
+        // 恰好是元素 box 内的 contain 矩形(黑边区不产生输入映射)。
+        // getBoundingClientRect 每次取实时容器尺寸, 窗口缩放/浏览器缩放
+        // 时坐标映射随之动态调整(MYS-886)。
+        const scale = Math.min(rect.width / vw, rect.height / vh);
         const drawW = vw * scale, drawH = vh * scale;
         const offX = (rect.width - drawW) / 2, offY = (rect.height - drawH) / 2;
         const x = (e.clientX - rect.left - offX) / scale;
