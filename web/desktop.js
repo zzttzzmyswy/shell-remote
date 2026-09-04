@@ -204,14 +204,18 @@
     }
 
     _handleMoov(body) {
-      // 找 avcC（在 avc1 box 内）。avcC 结构：
-      // [0]=1 [1..3]=profile/compat/level [4]=0xff [5]=1 [6..7] spsLen sps ppsCount ppsLen pps
+      // 找 avcC box。扫描到的 i 指向 4 字节标签 "avcC"，payload 从 i+4 起：
+      //   [i+4]=1(version) [i+5..i+7]=profile/compat/level [i+8]=0xff
+      //   [i+9]=numSPS [i+10..i+11]=spsLen sps... [..]=numPPS [..]=ppsLen pps...
+      // 之前误把 i（标签起点）当 payload 起算，codec 串取到 'v','c','C'
+      // 变成 avc1.766343 非法——WebCodecs configure 报 Unknown codec name。
       for (let i = 0; i + 8 <= body.length; i++) {
         if (body[i] === 0x61 && body[i+1] === 0x76 && body[i+2] === 0x63 && body[i+3] === 0x43) {
-          const spsLen = (body[i+6] << 8) | body[i+7];
-          const ppsOff = i + 8 + spsLen;
-          const ppsLen = (body[ppsOff+1] << 8) | body[ppsOff+2];
-          this._desc = body.slice(i, ppsOff + 3 + ppsLen);
+          const spsLen = (body[i+10] << 8) | body[i+11];
+          const numPpsOff = i + 12 + spsLen;
+          const ppsLen = (body[numPpsOff+1] << 8) | body[numPpsOff+2];
+          // description 取 AVCDecoderConfigurationRecord（不含 box 标签）。
+          this._desc = body.slice(i + 4, numPpsOff + 3 + ppsLen);
           this._initDecoder();
           return;
         }
