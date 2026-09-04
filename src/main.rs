@@ -7,6 +7,7 @@ mod integration_test;
 mod proto;
 mod relay;
 mod web;
+mod tlsutil;
 
 #[derive(Parser)]
 #[command(name = "shell-remote", about = "Collaborative remote shell tool", version)]
@@ -79,9 +80,14 @@ enum Command {
 
     /// Run in agent mode (connects to a relay)
     Agent {
-        /// WebSocket URL of the relay server
+        /// WebSocket URL of the relay server (ws:// | wss://)
         #[arg(long, default_value = "ws://localhost:3000")]
         relay_url: String,
+
+        /// 信任自签证书（连 https/wss relay 的自签 TLS 时必填；
+        /// relay 默认自签证书, 不信任则 register 握手即失败）
+        #[arg(long)]
+        relay_insecure: bool,
 
         /// Fixed authentication key (optional, random token used if omitted)
         #[arg(long)]
@@ -187,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Agent {
             relay_url,
+            relay_insecure,
             key,
             root,
             token_type,
@@ -219,7 +226,14 @@ async fn main() -> anyhow::Result<()> {
                 display: desktop_display,
             };
             agent::start(
-                relay_url, key, root, token_type.as_str().to_string(), shell, desired, desktop_cfg,
+                relay_url,
+                key,
+                root,
+                token_type.as_str().to_string(),
+                shell,
+                desired,
+                desktop_cfg,
+                relay_insecure,
             )
             .await?;
         }

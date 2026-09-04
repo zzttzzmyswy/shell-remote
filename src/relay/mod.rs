@@ -826,7 +826,7 @@ mod tests {
         assert!(cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(key_pem.contains("BEGIN PRIVATE KEY"));
         // rustls 能解析 —— 即 RustlsConfig::from_pem 的前置条件。
-        install_rustls_provider();
+        crate::tlsutil::install_rustls_provider();
         let config = axum_server::tls_rustls::RustlsConfig::from_pem(
             cert_pem.into_bytes(),
             key_pem.into_bytes(),
@@ -1396,7 +1396,7 @@ pub async fn start(
     // 不拖垮主 listener——HTTP 仍是完整可用的入口。
     if let Some((https_bind, cert_pem, key_pem)) = tls_listen {
         // rustls 0.23 需要显式选择 CryptoProvider（ring——与 rcgen 一致）。
-        install_rustls_provider();
+        crate::tlsutil::install_rustls_provider();
         match axum_server::tls_rustls::RustlsConfig::from_pem(
             cert_pem.into_bytes(),
             key_pem.into_bytes(),
@@ -1539,17 +1539,6 @@ fn local_ip_addrs() -> Result<Vec<String>, ()> {
         }
     }
     Ok(Vec::new())
-}
-
-/// 进程内一次性安装 rustls 的 ring CryptoProvider。重复调用无害。
-/// rustls 0.23 在未启用默认 provider feature 时必须手动选择，否则
-/// RustlsConfig::from_pem 在内部加载证书时 panic。
-fn install_rustls_provider() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
 }
 
 fn generate_self_signed(san_hosts: &[String]) -> anyhow::Result<rcgen::CertifiedKey> {

@@ -573,6 +573,7 @@ pub async fn start(
     shell_path: String,
     session_id: Option<String>,
     desktop_cfg: crate::agent::desktop::DesktopConfig,
+    insecure_tls: bool,
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_secs(1);
     let max_delay = Duration::from_secs(300);
@@ -590,6 +591,7 @@ pub async fn start(
             session_id.as_deref(),
             &mut cached_tokens,
             &desktop_cfg,
+            insecure_tls,
         )
         .await
         {
@@ -614,6 +616,7 @@ async fn run_session(
     session_id: Option<&str>,
     cached_tokens: &mut Option<Vec<(String, String)>>,
     desktop_cfg: &crate::agent::desktop::DesktopConfig,
+    insecure_tls: bool,
 ) -> anyhow::Result<()> {
     // Validate the root directory BEFORE registering with the relay. A bad
     // root must fail fast without minting a session — otherwise the relay
@@ -634,6 +637,7 @@ async fn run_session(
         session_id,
         cached_tokens.as_deref(),
         10,
+        insecure_tls,
     )
     .await?;
 
@@ -682,6 +686,12 @@ async fn run_session(
             .to_string();
         let sid = client.session_id.clone();
         let server_auth = client.server_auth().to_string();
+        // 自签 https relay 模式：桌面 WS 上行同样跳过证书校验（与 register
+        // 通道保持一致——relay 是自签证书, 不信任则 wss 握手必失败）。
+        let insecure_tls = client.insecure_tls();
+        if insecure_tls {
+            crate::tlsutil::install_rustls_provider();
+        }
         // 当前的上行链路方式（ws | http）——浏览器指标面板展示用。
         // WS 连接建立/失败回退时更新并广播 desktop:uplink。
         let uplink_mode = Arc::new(std::sync::atomic::AtomicU8::new(0)); // 0=未知 1=ws 2=http
@@ -696,7 +706,12 @@ async fn run_session(
             // 控制消息（started/stopped/error）绝不丢弃。
             const MAX_PENDING_FRAMES: usize = 90; // 60fps × 1.5s
             let ws_url = {
-                let mut u = base.replace("http://", "ws://").replace("https://", "wss://");
+                // base 来自 --relay-url；ws/wss 直接沿用，http/https 映射。
+                let mut u = if base.starts_with("ws://") || base.starts_with("wss://") {
+                    base.clone()
+                } else {
+                    base.replace("http://", "ws://").replace("https://", "wss://")
+                };
                 u.push_str("/agent/ws/send?session=");
                 u.push_str(&sid);
                 if !server_auth.is_empty() {
@@ -793,7 +808,18 @@ async fn run_session(
                 let ws_connected_now = if ws.is_none() && ws_failures < 3 {
                     match tokio::time::timeout(
                         Duration::from_secs(3),
-                        tokio_tungstenite::connect_async(&ws_url),
+                        tokio_tungstenite::connect_async_tls_with_config(
+                            &ws_url,
+                            None,
+                            true,
+                            if insecure_tls {
+                                Some(tokio_tungstenite::Connector::Rustls(
+                                    crate::tlsutil::no_verify_client_config(),
+                                ))
+                            } else {
+                                None
+                            },
+                        ),
                     )
                     .await
                     {

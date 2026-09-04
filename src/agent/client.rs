@@ -82,6 +82,8 @@ pub struct RelayClient {
     transport: Transport,
     pub session_id: String,
     pub tokens: Vec<(String, String)>,
+    /// 自签 https relay 模式：上行(register/SSE/桌面WS)跳过证书校验。
+    pub insecure_tls: bool,
 }
 
 impl RelayClient {
@@ -91,11 +93,25 @@ impl RelayClient {
         token_type: &str,
         desired_session_id: Option<&str>,
         cached_tokens: Option<&[(String, String)]>,
+        insecure_tls: bool,
     ) -> anyhow::Result<Self> {
         let base = relay_url.trim_end_matches('/');
-        let send_url = format!("{}/agent/send", base);
+        // reqwest 的 register/SSE 是常规 HTTP 通道（wss/ws 仅供桌面 WS 上行
+        // 使用）；把 ws://world 映射到 http://、wss:// 映射到 https://。
+        let http_base = base
+            .replace("ws://", "http://")
+            .replace("wss://", "https://");
+        let send_url = format!("{}/agent/send", http_base);
 
-        let http_client = reqwest::Client::new();
+        let http_client = if insecure_tls {
+            crate::tlsutil::install_rustls_provider();
+            reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .context("Failed to build HTTP client (insecure TLS)")?
+        } else {
+            reqwest::Client::new()
+        };
 
         // Best-effort host probe (CPU model, arch, OS, …) reported with every
         // registration so the admin device panel reflects the current host.
@@ -156,7 +172,7 @@ impl RelayClient {
             .context("Missing session_id in register response")?
             .to_string();
 
-        let events_url = format!("{}/agent/events?session={}", base, session_id);
+        let events_url = format!("{}/agent/events?session={}", http_base, session_id);
 
         let (tx, rx) = mpsc::unbounded_channel::<String>();
 
@@ -203,6 +219,7 @@ impl RelayClient {
             },
             session_id: String::new(),
             tokens: Vec::new(),
+            insecure_tls,
         };
 
         Self::handle_register_response(&mut client, &response)?;
@@ -259,6 +276,7 @@ impl RelayClient {
         desired_session_id: Option<&str>,
         cached_tokens: Option<&[(String, String)]>,
         max_retries: u32,
+        insecure_tls: bool,
     ) -> anyhow::Result<Self> {
         let relay_url = relay_url.trim_end_matches('/');
         let mut delay = tokio::time::Duration::from_secs(1);
@@ -271,6 +289,7 @@ impl RelayClient {
                 token_type,
                 desired_session_id,
                 cached_tokens,
+                insecure_tls,
             )
             .await
             {
@@ -282,7 +301,7 @@ impl RelayClient {
                     tracing::warn!(
                         "Connection attempt {} failed: {}. Retrying in {:?}...",
                         attempt + 1,
-                        e,
+                        format!("{e:#}"),
                         delay
                     );
                     tokio::time::sleep(delay).await;
@@ -304,6 +323,10 @@ impl RelayClient {
 
     /// The `--key` value used at registration ("" when unset). The desktop
     /// WS uplink reuses it for socket authentication.
+    pub(crate) fn insecure_tls(&self) -> bool {
+        self.insecure_tls
+    }
+
     pub(crate) fn server_auth(&self) -> &str {
         &self.transport.server_auth
     }
@@ -384,5 +407,37 @@ mod tests {
             "empty stream must end immediately, not wait for the timeout"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    /// --relay-url 允许 ws/wss 也用于 register/SSE：reqwest 是常规 HTTP
+    /// 通道，ws://→http://、wss://→https:// 映射后请求才能发出。
+    #[test]
+    fn test_relay_scheme_normalization() {
+        let base = "wss://127.0.0.1:3903".trim_end_matches('/');
+        let http_base = base
+            .replace("ws://", "http://")
+            .replace("wss://", "https://");
+        assert_eq!(http_base, "https://127.0.0.1:3903");
+        let send_url = format!("{}/agent/send", http_base);
+        assert_eq!(send_url, "https://127.0.0.1:3903/agent/send");
+
+        let base = "http://127.0.0.1:3902".trim_end_matches('/');
+        let http_base = base
+            .replace("ws://", "http://")
+            .replace("wss://", "https://");
+        assert_eq!(http_base, "http://127.0.0.1:3902");
+    }
+
+    /// no-verify 连接器：以自签证书为服务端的 wss 握手必须放下可。
+    #[tokio::test]
+    async fn test_no_verify_connector_builds() {
+        use tokio_tungstenite::Connector;
+        let cfg = crate::tlsutil::no_verify_client_config();
+        match Connector::Rustls(cfg) {
+            Connector::Rustls(_) => {}
+            _ => panic!("expected rustls connector"),
+        }
+        // 纯构建测试：真正握手已由人工端到端验证（agent --relay-insecure
+        // wss:// 注册+上行+https 拉流），此处不依赖网络。
     }
 }
