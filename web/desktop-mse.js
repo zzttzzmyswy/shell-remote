@@ -108,6 +108,13 @@
           try { ua = ' UA=' + navigator.userAgent; } catch (e) {}
           self.setStatus('MSE 解码错误: 浏览器无法解码该视频流 (codec=' + codec + ')' + ua, true);
         });
+        // 追帧心跳（MYS-886 延迟修复）：_syncPlayhead 只挂在 updateend 上，
+        // 静止桌面 500ms 才一帧时事件稀疏，播放头可能与尾部拉开距离。
+        // 250ms 心跳兜底钳制，保证 MSE 路径延迟有界。
+        if (this._catchupTimer) clearInterval(this._catchupTimer);
+        this._catchupTimer = setInterval(function() {
+          if (self.connected) self._syncPlayhead();
+        }, 250);
       } catch (e) {
         this.setStatus('播放器初始化失败: ' + e.message, true);
         this.disconnect();
@@ -364,8 +371,10 @@
             const end = b.end(b.length - 1);
             const ms = Math.round((end - v.currentTime) * 1000);
             lag.textContent = ms + ' ms';
-            const total = (b.end(b.length - 1) - b.start(0));
-            buf.textContent = total.toFixed(1) + ' s';
+            // "解码队列"显示播放头→缓冲尾部的距离（真正的延迟堆积），
+            // 而不是缓冲总长度——修剪策略常驻 ~2s 缓冲，总长恒为 2-3s
+            // 看起来像异常（用户实测困惑点）。堆积超 500ms 说明追帧失效。
+            buf.textContent = ((end - v.currentTime) * 1000).toFixed(0) + ' ms';
           } else {
             lag.textContent = '-'; buf.textContent = '-';
           }
@@ -378,7 +387,11 @@
           // agent 广播的捕获后端与上行链路（session.js 挂到 window）。
           if (backend) backend.textContent = window._srDesktopInfo ? (window._srDesktopInfo.backend || '-') : '-';
           if (uplink) uplink.textContent = window._srDesktopInfo ? (window._srDesktopInfo.uplink || '-') : '-';
-          if (decoder) decoder.textContent = 'MSE';
+          if (decoder) {
+            const secure = typeof window.isSecureContext !== 'undefined' ? window.isSecureContext : false;
+            decoder.textContent = secure ? 'MSE (浏览器无 VideoDecoder)'
+              : 'MSE (http 访问未启用 WebCodecs，用 https 可解锁原生解码)';
+          }
           // 码率: 复用带宽跟踪的计数窗口(2.5s), 折算当前值
           br.textContent = self._lastKbps ? self._lastKbps + ' kbps' : '-';
         } catch (e) { /* 面板只是展示, 不因异常中断播放 */ }
@@ -389,6 +402,10 @@
       if (this._metricsTimer) {
         clearInterval(this._metricsTimer);
         this._metricsTimer = null;
+      }
+      if (this._catchupTimer) {
+        clearInterval(this._catchupTimer);
+        this._catchupTimer = null;
       }
       const btn = document.getElementById('desktop-metrics-btn');
       if (btn && this._onMetricsBtn) btn.removeEventListener('pointerdown', this._onMetricsBtn, true);

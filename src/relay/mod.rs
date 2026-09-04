@@ -261,7 +261,7 @@ use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use tokio_stream::StreamExt;
 
-async fn static_handler(uri: Uri) -> Response<Body> {
+async fn static_handler(uri: Uri, headers: axum::http::HeaderMap) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
@@ -274,20 +274,44 @@ async fn static_handler(uri: Uri) -> Response<Body> {
         (if c.is_some() { html } else { path.to_string() }, c)
     };
 
-    match data {
-        Some(content) => {
-            let mime = mime_guess::from_path(&resolved).first_or_octet_stream();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime.as_ref())
-                .body(Body::from(content.data.into_owned()))
-                .unwrap()
-        }
-        None => Response::builder()
+    let Some(content) = data else {
+        return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not Found"))
-            .unwrap(),
+            .unwrap();
+    };
+    let body = content.data.into_owned();
+    let mime = mime_guess::from_path(&resolved).first_or_octet_stream();
+    // 前端资源随版本演进（WebCodecs 播放器、指标面板等），但 URL 不变。
+    // 无缓存头时浏览器按启发式缓存 JS，用户拿到旧版 desktop.js → 永远走
+    // MSE 回退路径、旧追帧逻辑（MYS-886 实测踩坑："Chrome 最新版仍显示
+    // MSE"）。ETag=内容哈希 + no-cache：每次带验证器协商，未变走 304，
+    // 变了立刻拿新版本。
+    let mut etag_hash: u64 = 1469598103934665603; // FNV-1a offset basis
+    for b in &body {
+        etag_hash ^= *b as u64;
+        etag_hash = etag_hash.wrapping_mul(1099511628211);
     }
+    let etag = format!("\"{:016x}\"", etag_hash);
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains(&etag))
+        .unwrap_or(false)
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .body(Body::empty())
+            .unwrap();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime.as_ref())
+        .header(header::ETAG, etag.clone())
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -299,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn test_static_handler_root_serves_index() {
         let uri = "/".parse::<Uri>().unwrap();
-        let resp = static_handler(uri).await;
+        let resp = static_handler(uri, HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
@@ -311,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn test_static_handler_session_without_extension() {
         let uri = "/session".parse::<Uri>().unwrap();
-        let resp = static_handler(uri).await;
+        let resp = static_handler(uri, HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let content_type = resp
             .headers()
@@ -329,22 +353,50 @@ mod tests {
     #[tokio::test]
     async fn test_static_handler_session_js() {
         let uri = "/session.js".parse::<Uri>().unwrap();
-        let resp = static_handler(uri).await;
+        let resp = static_handler(uri, HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_static_handler_css() {
         let uri = "/style.css".parse::<Uri>().unwrap();
-        let resp = static_handler(uri).await;
+        let resp = static_handler(uri, HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_static_handler_not_found() {
         let uri = "/nonexistent".parse::<Uri>().unwrap();
-        let resp = static_handler(uri).await;
+        let resp = static_handler(uri, HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// 前端资源必须带 ETag + no-cache（MYS-886）：无缓存控制头时浏览器
+    /// 启发式缓存旧 JS，用户拿到旧播放器（永远走 MSE 回退、旧追帧逻辑）。
+    /// 未变资源带 If-None-Match 走 304。
+    #[tokio::test]
+    async fn test_static_handler_cache_headers_and_304() {
+        let uri = "/desktop.js".parse::<Uri>().unwrap();
+        let resp = static_handler(uri.clone(), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        let etag = resp.headers().get(header::ETAG).unwrap().clone();
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, etag);
+        let resp304 = static_handler(uri, cond).await;
+        assert_eq!(resp304.status(), StatusCode::NOT_MODIFIED);
+        // 内容变了（不同文件）→ 同一 ETag 不命中, 重新 200。
+        let uri2 = "/desktop-mse.js".parse::<Uri>().unwrap();
+        let mut cond2 = HeaderMap::new();
+        cond2.insert(
+            header::IF_NONE_MATCH,
+            "\"0000000000000000\"".parse().unwrap(),
+        );
+        let resp2 = static_handler(uri2, cond2).await;
+        assert_eq!(resp2.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -369,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn test_static_handler_session_html_direct() {
         let uri = "/session.html".parse::<Uri>().unwrap();
-        let resp = static_handler(uri).await;
+        let resp = static_handler(uri, HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

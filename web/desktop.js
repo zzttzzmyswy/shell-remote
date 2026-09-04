@@ -60,7 +60,17 @@
     }
 
     _webcodecsAvailable() {
+      // WebCodecs (VideoDecoder) 只在安全上下文暴露：https 或 localhost。
+      // http://IP:port 访问 relay 时 Chrome 最新版也没有 VideoDecoder,
+      // 回退 MSE 是预期行为（不是浏览器旧）。
       return typeof window.VideoDecoder !== 'undefined' && this.canvas !== null;
+    }
+
+    // 回退原因说明（指标面板"解码方案"行展示）。
+    _decoderLabel() {
+      if (this._mode === 'webcodecs') return 'WebCodecs (原生)';
+      const secure = typeof window.isSecureContext !== 'undefined' ? window.isSecureContext : false;
+      return secure ? 'MSE (浏览器无 VideoDecoder)' : 'MSE (http 访问未启用 WebCodecs，用 https 可解锁原生解码)';
     }
 
     connect() {
@@ -453,7 +463,7 @@
           br.textContent = self._lastKbps ? self._lastKbps + ' kbps' : '-';
           if (backend) backend.textContent = self._captureBackend || '-';
           if (uplink) uplink.textContent = self._uplinkMode || '-';
-          if (decoder) decoder.textContent = 'WebCodecs (原生)';
+          if (decoder) decoder.textContent = self._decoderLabel();
         } catch (e) { /* 面板只是展示 */ }
       }, 1000);
 
