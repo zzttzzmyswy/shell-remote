@@ -39,7 +39,7 @@ zbus = { version = "3", optional = true }
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 time = { version = "0.3", features = ["formatting"] }
 # axum-server tls-rustls 启用 ring provider；直接依赖 rustls 以便显式 install_default
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
