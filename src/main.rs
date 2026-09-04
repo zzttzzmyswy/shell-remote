@@ -125,7 +125,7 @@ enum Command {
         #[arg(long, default_value = "auto")]
         desktop_capture: String,
 
-        /// Desktop encoder codec (only h264 is currently supported).
+        /// Desktop encoder codec: h264 (OpenH264) or vp9 (libvpx, feature vp9).
         #[arg(long, default_value = "h264")]
         desktop_codec: String,
 

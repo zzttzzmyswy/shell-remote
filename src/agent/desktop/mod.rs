@@ -14,10 +14,13 @@
 pub mod capture;
 pub mod color;
 pub mod clipboard;
+pub mod encoder;
 pub mod input;
 pub mod mp4;
 pub mod openh264;
 pub mod rate;
+#[cfg(feature = "vp9")]
+pub mod vpx;
 
 #[cfg(windows)]
 pub mod dxgi;
@@ -75,6 +78,7 @@ impl DesktopConfig {
 
     pub fn supports_codec(&self, codec: &str) -> bool {
         codec.eq_ignore_ascii_case("h264")
+            || (cfg!(feature = "vp9") && codec.eq_ignore_ascii_case("vp9"))
     }
 }
 
@@ -228,7 +232,15 @@ impl DesktopManager {
         serde_json::json!({
             "available": cfg.enabled(),
             "running": self.is_running(),
-            "codecs": if cfg.enabled() { vec!["h264"] } else { Vec::new() },
+            "codecs": if cfg.enabled() {
+                let mut v = vec!["h264"];
+                if cfg!(feature = "vp9") {
+                    v.push("vp9");
+                }
+                v
+            } else {
+                Vec::new()
+            },
             "capture": cfg.capture,
         })
     }
@@ -323,16 +335,17 @@ async fn run_desktop_pipeline(
         return;
     }
 
-    let mut enc = match openh264::H264Encoder::new(w0 as u32, h0 as u32, cfg.max_bps, cfg.fps) {
-        Ok(e) => e,
-        Err(e) => {
-            (post)(serde_json::json!({
-                "type": "desktop:started",
-                "payload": { "codec": cfg.codec, "error": format!("encoder init failed: {e}") }
-            }));
-            return;
-        }
-    };
+    let mut enc: Box<dyn encoder::VideoEncoder> =
+        match encoder::new_encoder(&cfg.codec, w0 as u32, h0 as u32, cfg.max_bps, cfg.fps) {
+            Ok(e) => e,
+            Err(e) => {
+                (post)(serde_json::json!({
+                    "type": "desktop:started",
+                    "payload": { "codec": cfg.codec, "error": format!("encoder init failed: {e}") }
+                }));
+                return;
+            }
+        };
     let mut abr = rate::Abr::new(cfg.min_bps, cfg.max_bps);
 
     // fMP4 config is final once the first IDR carries SPS/PPS at the *current*
@@ -474,14 +487,14 @@ async fn run_desktop_pipeline(
         since_change += 1;
 
         if encoded.is_idr && mp4_cfg.is_none() {
-            // 首个 IDR（或分辨率重配后）携带 SPS/PPS，构建 mux config 并下发 init。
-            if let (Some(sps), Some(pps)) = (&encoded.sps, &encoded.pps) {
+            // 首个关键帧（或分辨率重配后）携带 codec 参数集（H.264: SPS/PPS；
+            // VP9: profile/level），构建 mux config 并下发 init。
+            if let Some(sample) = enc.mux_sample(&encoded) {
                 let c = mp4::Mp4Config {
                     width: enc_w as u32,
                     height: enc_h as u32,
                     fps: cfg.fps,
-                    sps: sps.clone(),
-                    pps: pps.clone(),
+                    sample,
                 };
                 let init = mp4::mp4_init_segment(&c);
                 post(serde_json::json!({
@@ -496,7 +509,12 @@ async fn run_desktop_pipeline(
             // No parameter sets yet — drop this frame.
             continue;
         };
-        let sample = mp4::annexb_to_avcc(&encoded.nalu);
+        // H.264 sample = AVCC（长度前缀）；VP9 sample = 原始压缩帧。
+        let sample = if cfg.codec.eq_ignore_ascii_case("h264") {
+            mp4::annexb_to_avcc(&encoded.nalu)
+        } else {
+            encoded.nalu.clone()
+        };
         // capture_ms 已在捕获后、编码前取（见上方赋值处）——srtc 携带的是
         // 含编码全程的起点。
         let frag = mp4::mp4_fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq, capture_ms);
@@ -558,7 +576,7 @@ fn avg_frame_bytes(byte_win: &VecDeque<u32>) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn tune_once(
     cfg: &DesktopConfig,
-    enc: &mut openh264::H264Encoder,
+    enc: &mut Box<dyn encoder::VideoEncoder>,
     stride_idx: &mut usize,
     scale_idx: &mut usize,
     enc_w: &mut usize,
@@ -614,7 +632,7 @@ fn tune_once(
 #[allow(clippy::too_many_arguments)]
 fn maybe_rescale(
     cfg: &DesktopConfig,
-    enc: &mut openh264::H264Encoder,
+    enc: &mut Box<dyn encoder::VideoEncoder>,
     scale_idx: &mut usize,
     enc_w: &mut usize,
     enc_h: &mut usize,
@@ -642,7 +660,7 @@ fn maybe_rescale(
     if nw < 2 || nh < 2 {
         return;
     }
-    match openh264::H264Encoder::new(nw as u32, nh as u32, cfg.max_bps, cfg.fps) {
+    match encoder::new_encoder(&cfg.codec, nw as u32, nh as u32, cfg.max_bps, cfg.fps) {
         Ok(mut new_enc) => {
             tracing::warn!(
                 "desktop: {} encode resolution {enc_w}x{enc_h} -> {nw}x{nh} (bytes={:.0}% budget)",
@@ -690,7 +708,7 @@ mod tests {
     #[test]
     fn test_maybe_rescale_degrades_on_overbudget() {
         let cfg = DesktopConfig::default();
-        let mut enc = openh264::H264Encoder::new(1920, 1080, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 0usize;
         let (mut enc_w, mut enc_h) = (w0, h0);
@@ -698,8 +716,7 @@ mod tests {
             width: 1920,
             height: 1080,
             fps: cfg.fps,
-            sps: vec![1],
-            pps: vec![1],
+            sample: mp4::VisualSample::H264 { sps: vec![1], pps: vec![1] },
         });
         let mut seq = 5u32;
         let mut byte_win: VecDeque<u32> = (0..48).map(|_| (budget(cfg.fps) * 1.5) as u32).collect();
@@ -722,7 +739,7 @@ mod tests {
     #[test]
     fn test_maybe_rescale_restores_on_lightly_budgeted_content() {
         let cfg = DesktopConfig::default();
-        let mut enc = openh264::H264Encoder::new(1440, 810, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 1usize;
         let (mut enc_w, mut enc_h) = (1440usize, 810usize);
@@ -744,7 +761,7 @@ mod tests {
     fn test_tune_once_prefers_resolution_before_stride() {
         // 新策略: 超预算先降分辨率(模糊不掉帧), 分辨率到底才降帧率。
         let cfg = DesktopConfig::default();
-        let mut enc = openh264::H264Encoder::new(1920, 1080, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut stride_idx = 0usize;
         let mut scale_idx = 0usize;
@@ -766,7 +783,7 @@ mod tests {
         // 分辨率已到顶仍超预算 → 降帧率
         let mut byte_win2: VecDeque<u32> = (0..48).map(|_| (budget(cfg.fps) * 1.5) as u32).collect();
         let mut since_change2 = 30u32;
-        let mut enc2 = openh264::H264Encoder::new(480, 270, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps).unwrap();
         let mut stride2 = 0usize;
         let mut scale2 = SCALES.len() - 1;
         let (mut ew2, mut eh2) = (480usize, 270usize);
@@ -782,7 +799,7 @@ mod tests {
     #[test]
     fn test_tune_once_restores_slowly() {
         let cfg = DesktopConfig::default();
-        let mut enc = openh264::H264Encoder::new(1440, 810, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut stride_idx = 2usize;
         let mut scale_idx = 1usize; // 分辨率与帧率都降过
@@ -814,7 +831,7 @@ mod tests {
     #[test]
     fn test_maybe_rescale_respects_cooldown_and_bounds() {
         let cfg = DesktopConfig::default();
-        let mut enc = openh264::H264Encoder::new(1920, 1080, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 0usize;
         let (mut enc_w, mut enc_h) = (w0, h0);
@@ -829,7 +846,7 @@ mod tests {
         );
         assert_eq!(scale_idx, 0, "cooldown must block change");
         // 已经是最小档: 极端超预算也不能再降
-        let mut enc2 = openh264::H264Encoder::new(480, 270, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps).unwrap();
         let mut scale_idx = SCALES.len() - 1;
         let (mut ew, mut eh) = (480usize, 270usize);
         let mut byte_win2: VecDeque<u32> = (0..48).map(|_| (budget(cfg.fps) * 1.5) as u32).collect();
@@ -861,10 +878,10 @@ mod tests {
     }
 
     #[test]
-    fn test_supports_codec_h264_only() {
+    fn test_supports_codec_known() {
         let cfg = DesktopConfig::default();
         assert!(cfg.supports_codec("h264"));
-        assert!(!cfg.supports_codec("vp9"));
+        assert_eq!(cfg.supports_codec("vp9"), cfg!(feature = "vp9"));
         assert!(!cfg.supports_codec("hevc"));
     }
 

@@ -207,16 +207,26 @@
       } catch (e) { /* remove 中断无害 */ }
     }
 
-    // 从 init 段 (ftyp/moov 内含 avcC) 解析浏览器实际需要的 codec 串。
+    // 从 init 段 (ftyp/moov 内含 avcC / vpcC) 解析浏览器实际需要的 codec 串。
     // OpenH264 输出的 SPS profile/level 可能与预设不同；解析到真实值后
     // 用 true codec 建 SourceBuffer，避免严格 MSE 因 codec 串与实际流不
     // 匹配而拒播（1080p 实际是 level 4.0，avc1.42E01E 是 level 3.0）。
+    // VP9 解析 vpcC → vp09.PP.LL.DD。
     _codecFromInit(buf) {
       const u8 = new Uint8Array(buf);
+      const hex = (b) => b.toString(16).padStart(2, '0').toUpperCase();
       for (let i = 0; i + 8 <= u8.length; i++) {
         if (u8[i] === 0x61 && u8[i + 1] === 0x76 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) {
-          const hex = (b) => b.toString(16).padStart(2, '0').toUpperCase();
           return 'avc1.' + hex(u8[i + 5]) + hex(u8[i + 6]) + hex(u8[i + 7]);
+        }
+      }
+      for (let i = 0; i + 8 <= u8.length; i++) {
+        if (u8[i] === 0x76 && u8[i + 1] === 0x70 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) {
+          // vpcC 是 FullBox：version/flags(4B) 后才是 profile/level。
+          const profile = u8[i + 8];
+          const level = u8[i + 9];
+          return 'vp09.' + String(profile).padStart(2, '0') + '.' +
+            String(level).padStart(2, '0') + '.08';
         }
       }
       return null;
@@ -225,11 +235,14 @@
     _resolveCodec(initBuf) {
       const actual = this._codecFromInit(initBuf);
       if (actual && this._codecSupported(actual)) return actual;
-      // fallback：默认串 / 高 profile 串
+      // fallback：默认串（优先 h264，再尝试 vp9 高配置）
       if (this._codecSupported(this.codec)) return this.codec;
+      if (this._codecSupported('vp09.02.10.08')) return 'vp09.02.10.08';
+      if (this._codecSupported('vp09.01.10.08')) return 'vp09.01.10.08';
+      if (this._codecSupported('vp09.00.10.08')) return 'vp09.00.10.08';
       if (this._codecSupported('avc1.64001E')) return 'avc1.64001E';
       if (this._codecSupported('avc1.42C028')) return 'avc1.42C028'; // 1080p level 4.0
-      return 'avc1.640028';
+      return this._codecSupported('avc1.640028') ? 'avc1.640028' : this.codec;
     }
 
     _startFetch() {

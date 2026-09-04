@@ -34,6 +34,9 @@
       this._inputBound = false;
       this._dec = null;
       this._desc = null;          // avcC description (Uint8Array)
+      this._codecKind = null;     // 'h264' | 'vp9'（由 init 段确定）
+      this._vpcProfile = 0;
+      this._vpcLevel = 10;
       this._frames = [];          // decoded VideoFrames pending render
       this._lastCaptureMs = 0;    // 最新已渲染帧的采集时间（e2e 延时）
       this._e2eMs = null;
@@ -271,7 +274,7 @@
       while (guard++ < 512) {
         const box = this._parseNextBox();
         if (!box) break;
-        if (box.type === 'moov' || (box.type === 'ftyp' && !this._desc)) {
+        if (box.type === 'moov' || (box.type === 'ftyp' && !this._codecKind)) {
           // init：ftyp 直接跳过，moov 内找 avcC
           if (box.type === 'moov') this._handleMoov(box.body);
         } else if (box.type === 'moof') {
@@ -303,9 +306,9 @@
     }
 
     _handleMoov(body) {
-      // 找 avcC box。扫描到的 i 指向 4 字节标签 "avcC"，payload 从 i+4 起：
-      //   [i+4]=1(version) [i+5..i+7]=profile/compat/level [i+8]=0xff
-      //   [i+9]=numSPS [i+10..i+11]=spsLen sps... [..]=numPPS [..]=ppsLen pps...
+      // 找 codec 配置 box：先扫 avcC（H.264），再扫 vpcC（VP9）。
+      //   avcC payload: [i+4]=1(version) [i+5..i+7]=profile/compat/level
+      //   vpcC payload: [i+4]=1(version) [i+5]=profile [i+6]=level [i+7]=bitDepth4|chroma3|range1
       // 之前误把 i（标签起点）当 payload 起算，codec 串取到 'v','c','C'
       // 变成 avc1.766343 非法——WebCodecs configure 报 Unknown codec name。
       for (let i = 0; i + 8 <= body.length; i++) {
@@ -315,6 +318,17 @@
           const ppsLen = (body[numPpsOff+1] << 8) | body[numPpsOff+2];
           // description 取 AVCDecoderConfigurationRecord（不含 box 标签）。
           this._desc = body.slice(i + 4, numPpsOff + 3 + ppsLen);
+          this._codecKind = 'h264';
+          this._initDecoder();
+          return;
+        }
+        if (body[i] === 0x76 && body[i+1] === 0x70 && body[i+2] === 0x63 && body[i+3] === 0x43) {
+          // vpcC 是 FullBox：version/flags(4B) 后才是 profile/level。
+          // 位置: [i+4]=version [i+5..i+7]=flags [i+8]=profile [i+9]=level
+          this._desc = null; // VP9 无 description
+          this._vpcProfile = body[i+8];
+          this._vpcLevel = body[i+9];
+          this._codecKind = 'vp9';
           this._initDecoder();
           return;
         }
@@ -327,8 +341,25 @@
         try { this._dec.close(); } catch (e) {}
         this._dec = null;
       }
-      // codec 串取 avcC 的 profile/compat/level（与码流一致才被接受）。
       const hex = (b) => b.toString(16).padStart(2, '0').toUpperCase();
+      if (this._codecKind === 'vp9') {
+        // VP9: codec 串 vp09.profile.level.bitdepth，无 description。
+        const codec = 'vp09.' + String(this._vpcProfile).padStart(2, '0') +
+          '.' + String(this._vpcLevel).padStart(2, '0') + '.08';
+        this._dec = new VideoDecoder({
+          output: function(frame) { self._onDecoded(frame); },
+          error: function(e) {
+            self.setStatus('解码错误: ' + e.message, true);
+          }
+        });
+        this._dec.configure({
+          codec: codec,
+          optimizeForLatency: true
+        });
+        this._codecStr = codec;
+        return;
+      }
+      // H.264: codec 串取 avcC 的 profile/compat/level（与码流一致才被接受）。
       const codec = 'avc1.' + hex(this._desc[1]) + hex(this._desc[2]) + hex(this._desc[3]);
       this._dec = new VideoDecoder({
         output: function(frame) { self._onDecoded(frame); },
@@ -418,7 +449,7 @@
         this._dec.decode(chunk);
       } catch (e) {
         // config 变化（分辨率重配）等：丢弃该帧, 等下一个 IDR 重建解码器。
-        if (p.isKey && this._desc) this._initDecoder();
+        if (p.isKey && this._codecKind) this._initDecoder();
       }
     }
 

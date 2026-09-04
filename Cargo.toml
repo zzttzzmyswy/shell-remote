@@ -44,6 +44,9 @@ time = { version = "0.3", features = ["formatting"] }
 # axum-server tls-rustls 启用 ring provider；直接依赖 rustls 以便显式 install_default
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dev-dependencies]
 tempfile = "3"
 http-body-util = "0.1"
@@ -65,3 +68,7 @@ windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics
 # Wayland 原生捕获: portal + PipeWire（构建需 zbus/gstreamer 与系统的
 # xdg-desktop-portal；未启用时 --desktop-capture wayland 给出可操作错误）。
 wayland = ["dep:zbus", "dep:gstreamer", "dep:gstreamer-app"]
+# VP9 软编（libvpx）。默认开启；若目标机没有 libvpx 静态/动态库可关闭，
+# 此时 --desktop-codec vp9 会被拒绝、codecs 列表只剩 h264。
+default = ["vp9"]
+vp9 = []

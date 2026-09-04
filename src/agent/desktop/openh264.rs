@@ -13,18 +13,8 @@ use std::os::raw::{c_int, c_void};
 use openh264_sys2::*;
 
 /// One encoded picture: Annex-B byte stream plus key-frame / parameter-set
-/// metadata extracted from the bitstream.
-#[derive(Debug)]
-pub struct EncodedFrame {
-    /// Annex-B (4-byte startcode) NAL sequence for the whole frame.
-    pub nalu: Vec<u8>,
-    /// True when this frame is an IDR (random-access point).
-    pub is_idr: bool,
-    /// SPS NAL (without startcode), present on the initial/key frames.
-    pub sps: Option<Vec<u8>>,
-    /// PPS NAL (without startcode), present on the initial/key frames.
-    pub pps: Option<Vec<u8>>,
-}
+/// metadata sketched by the shared codec-agnostic [`encoder::EncodedFrame`].
+pub use crate::agent::desktop::encoder::EncodedFrame;
 
 
 
@@ -343,6 +333,50 @@ impl Drop for H264Encoder {
                 self.api.WelsDestroySVCEncoder(self.enc);
             }
         }
+    }
+}
+
+impl crate::agent::desktop::encoder::VideoEncoder for H264Encoder {
+    fn encode(&mut self, i420: &[u8]) -> Result<EncodedFrame, String> {
+        H264Encoder::encode(self, i420)
+    }
+
+    fn force_idr(&mut self) {
+        H264Encoder::force_idr(self);
+    }
+
+    fn set_bitrate(&mut self, bps: u64) {
+        H264Encoder::set_bitrate(self, bps);
+    }
+
+    fn bitrate_bps(&self) -> u64 {
+        H264Encoder::bitrate_bps(self)
+    }
+
+    fn set_frame_rate(&mut self, fps: f32) {
+        H264Encoder::set_frame_rate(self, fps);
+    }
+
+    fn fps(&self) -> f64 {
+        H264Encoder::fps(self)
+    }
+
+    fn width(&self) -> u32 {
+        H264Encoder::width(self)
+    }
+
+    fn height(&self) -> u32 {
+        H264Encoder::height(self)
+    }
+
+    fn codec(&self) -> &'static str {
+        "h264"
+    }
+
+    fn mux_sample(&self, frame: &EncodedFrame) -> Option<crate::agent::desktop::encoder::VisualSample> {
+        frame.sps.clone().zip(frame.pps.clone()).map(
+            |(sps, pps)| crate::agent::desktop::mp4::VisualSample::H264 { sps, pps },
+        )
     }
 }
 

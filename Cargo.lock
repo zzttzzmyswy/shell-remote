@@ -2676,6 +2676,7 @@ dependencies = [
  "http-body-util",
  "mime_guess",
  "openh264-sys2",
+ "pkg-config",
  "portable-pty",
  "rand 0.8.6",
  "rcgen",

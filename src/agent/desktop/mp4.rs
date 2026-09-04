@@ -1,8 +1,8 @@
-//! Fragmented MP4 (fMP4) muxer for streaming H.264 to browser MSE.
+//! Fragmented MP4 (fMP4) muxer for streaming H.264 / VP9 to browser MSE.
 //!
 //! Produces two kinds of byte sequences:
-//! - `mp4_init_segment`: `ftyp` + `moov` (incl. `avcC` sample entry) — sent
-//!   once per stream so the browser can initialize its `SourceBuffer`.
+//! - `mp4_init_segment`: `ftyp` + `moov` (incl. `avcC`/`vpcC` sample entry) —
+//!   sent once per stream so the browser can initialize its `SourceBuffer`.
 //! - `mp4_fragment`: one `moof` + `mdat` per encoded frame — appended to the
 //!   source buffer for as long as the viewer stays connected; each fragment
 //!   carries its own decode time (`tfdt`) plus sample flags so key frames are
@@ -12,29 +12,46 @@
 //! A viewer that joins mid-stream needs the current init segment again — the
 //! relay caches and replays it (see `relay::desktop`).
 
-/// Parameters that describe the encoded stream (resolved from SPS/PPS).
+/// 视频采样描述：codec 参数集（H.264 走 avcC；VP9 走 vpcC）。
+#[derive(Clone, Debug)]
+pub enum VisualSample {
+    /// H.264: bare SPS/PPS NAL (no start code, no length prefix), carried in
+    /// the `avcC` box.
+    H264 { sps: Vec<u8>, pps: Vec<u8> },
+    /// VP9: profile_idc / level_idc, carried in the `vpcC` box.
+    Vp9 { profile: u8, level: u8 },
+}
+
+/// Parameters that describe the encoded stream (resolved from SPS/PPS or VP9
+/// config).
 #[derive(Clone, Debug)]
 pub struct Mp4Config {
     pub width: u32,
     pub height: u32,
     /// Nominal frame rate (frame duration in timescale units = 1000 / fps).
     pub fps: f64,
-    /// Bare SPS NAL (no start code, no length prefix).
-    pub sps: Vec<u8>,
-    /// Bare PPS NAL (no start code, no length prefix).
-    pub pps: Vec<u8>,
+    /// Sample description (codec parameter set).
+    pub sample: VisualSample,
 }
 
 impl Mp4Config {
-    /// The `avc1.xxxxxx` codec string the browser uses to create its source
-    /// buffer. `profile_idc` / `constraint` / `level_idc` come from the SPS.
+    /// The codec string the browser uses to create its source buffer /
+    /// WebCodecs decoder. H.264 → `avc1.xxxxxx`（取自 SPS）; VP9 →
+    /// `vp09.PP.LL.DD`（profile/level/bitdepth）。
     pub fn codec_string(&self) -> String {
-        let (profile, compat, level) = if self.sps.len() >= 4 {
-            (self.sps[1], self.sps[2], self.sps[3])
-        } else {
-            (0x64, 0x00, 0x1f) // baseline-ish fallback
-        };
-        format!("avc1.{:02X}{:02X}{:02X}", profile, compat, level)
+        match &self.sample {
+            VisualSample::H264 { sps, .. } => {
+                let (profile, compat, level) = if sps.len() >= 4 {
+                    (sps[1], sps[2], sps[3])
+                } else {
+                    (0x64, 0x00, 0x1f) // baseline-ish fallback
+                };
+                format!("avc1.{:02X}{:02X}{:02X}", profile, compat, level)
+            }
+            VisualSample::Vp9 { profile, level } => {
+                format!("vp09.{:02}.{:02}.08", profile, level)
+            }
+        }
     }
 }
 
@@ -142,23 +159,28 @@ fn dref() -> Vec<u8> {
 }
 
 fn avcc(cfg: &Mp4Config) -> Vec<u8> {
-    assert!(!cfg.sps.is_empty() && !cfg.pps.is_empty(), "SPS/PPS required");
+    let (sps, pps) = match &cfg.sample {
+        VisualSample::H264 { sps, pps } => (sps, pps),
+        VisualSample::Vp9 { .. } => unreachable!("avcC is h264-only"),
+    };
+    assert!(!sps.is_empty() && !pps.is_empty(), "SPS/PPS required");
     let mut p = Vec::new();
     p.push(1); // configurationVersion
-    p.push(cfg.sps[1]); // avcProfileIndication
-    p.push(cfg.sps[2]); // profile_compatibility
-    p.push(cfg.sps[3]); // avcLevelIndication
+    p.push(sps[1]); // avcProfileIndication
+    p.push(sps[2]); // profile_compatibility
+    p.push(sps[3]); // avcLevelIndication
     p.push(0xff); // lengthSizeMinusOne = 3
     p.push(1); // numOfSequenceParameterSets
-    p.extend_from_slice(&u16b(cfg.sps.len() as u16));
-    p.extend_from_slice(&cfg.sps);
+    p.extend_from_slice(&u16b(sps.len() as u16));
+    p.extend_from_slice(sps);
     p.push(1); // numOfPictureParameterSets
-    p.extend_from_slice(&u16b(cfg.pps.len() as u16));
-    p.extend_from_slice(&cfg.pps);
+    p.extend_from_slice(&u16b(pps.len() as u16));
+    p.extend_from_slice(pps);
     // avcC 是普通 box（不含 version/flags），勿用 full_box。
     box_of(b"avcC", &p)
 }
 
+/// VP9 codec configuration record (`vpcC`). 8-bit 4:2:0, BT.709.
 fn avc1(cfg: &Mp4Config) -> Vec<u8> {
     let avcc_box = avcc(cfg);
     let mut p = Vec::new();
@@ -180,10 +202,56 @@ fn avc1(cfg: &Mp4Config) -> Vec<u8> {
     box_of(b"avc1", &p)
 }
 
+fn vpcc(profile: u8, level: u8) -> Vec<u8> {
+    // version/flags (full box, version 1) then:
+    //   profile(1) level(1) bitDepth(4) chromaSubsampling(3) videoFullRange(1)
+    //   colourPrimaries(1) transferCharacteristics(1) matrixCoefficients(1)
+    //   codecInitializationDataSize(2)
+    let mut p = Vec::new();
+    p.push(1); // full box version
+    p.extend_from_slice(&[0, 0, 0]); // flags
+    p.push(profile);
+    p.push(level);
+    p.push((8u8 << 4) | (1u8 << 1)); // bitDepth=8, chromaSubsampling=1 (4:2:0)
+    p.push(1); // colourPrimaries = BT.709
+    p.push(1); // transferCharacteristics = BT.709
+    p.push(1); // matrixCoefficients = BT.709
+    p.extend_from_slice(&u16b(0)); // codecInitializationDataSize
+    box_of(b"vpcC", &p)
+}
+
+fn sample_entry(cfg: &Mp4Config) -> Vec<u8> {
+    match &cfg.sample {
+        VisualSample::H264 { .. } => avc1(cfg),
+        VisualSample::Vp9 { profile, level } => vp09(cfg, *profile, *level),
+    }
+}
+
+fn vp09(cfg: &Mp4Config, profile: u8, level: u8) -> Vec<u8> {
+    let vpcc_box = vpcc(profile, level);
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0u8; 6]); // reserved
+    p.extend_from_slice(&u16b(1)); // data_reference_index
+    p.extend_from_slice(&u16b(0)); // pre_defined
+    p.extend_from_slice(&[0u8; 2]); // reserved
+    p.extend_from_slice(&[0u8; 12]); // pre_defined
+    p.extend_from_slice(&u16b(cfg.width as u16));
+    p.extend_from_slice(&u16b(cfg.height as u16));
+    p.extend_from_slice(&u32b(0x00480000)); // horizresolution
+    p.extend_from_slice(&u32b(0x00480000)); // vertresolution
+    p.extend_from_slice(&u32b(0)); // reserved
+    p.extend_from_slice(&u16b(1)); // frame_count
+    p.extend_from_slice(&[0u8; 32]); // compressorname
+    p.extend_from_slice(&u16b(24)); // depth
+    p.extend_from_slice(&u16b(0xffff)); // pre_defined
+    p.extend_from_slice(&vpcc_box);
+    box_of(b"vp09", &p)
+}
+
 fn stsd(cfg: &Mp4Config) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&u32b(1)); // entry_count
-    p.extend_from_slice(&avc1(cfg));
+    p.extend_from_slice(&sample_entry(cfg));
     full_box(b"stsd", 0, [0, 0, 0], &p)
 }
 
@@ -462,8 +530,19 @@ mod tests {
             width: 320,
             height: 240,
             fps: 15.0,
-            sps: vec![0x67, 0x42, 0x00, 0x1f, 0xe5, 0x01, 0x40],
-            pps: vec![0x68, 0xce, 0x3c, 0x80],
+            sample: VisualSample::H264 {
+                sps: vec![0x67, 0x42, 0x00, 0x1f, 0xe5, 0x01, 0x40],
+                pps: vec![0x68, 0xce, 0x3c, 0x80],
+            },
+        }
+    }
+
+    fn vp9_cfg() -> Mp4Config {
+        Mp4Config {
+            width: 320,
+            height: 240,
+            fps: 15.0,
+            sample: VisualSample::Vp9 { profile: 0, level: 10 },
         }
     }
 
@@ -493,9 +572,20 @@ mod tests {
     }
 
     #[test]
+    fn test_vp9_init_segment_contains_vpcc() {
+        let init = mp4_init_segment(&vp9_cfg());
+        assert_eq!(&init[4..8], b"ftyp");
+        assert!(init.windows(8).any(|w| &w[4..8] == b"moov"));
+        assert!(init.windows(4).any(|w| w == b"vpcC"), "vp9 init must carry vpcC");
+        assert!(init.windows(4).any(|w| w == b"vp09"), "vp9 sample entry must be vp09");
+        assert_eq!(init.len() as u32, box_total(&init, 0));
+    }
+
+    #[test]
     fn test_codec_string() {
         let c = cfg();
         assert_eq!(c.codec_string(), "avc1.42001F");
+        assert_eq!(vp9_cfg().codec_string(), "vp09.00.10.08");
     }
 
     #[test]
