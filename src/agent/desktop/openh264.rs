@@ -75,6 +75,23 @@ unsafe impl Send for H264Encoder {}
 impl H264Encoder {
     /// Create a new encoder pinned to `w x h` at `fps` frames/s.
     pub fn new(w: u32, h: u32, bitrate_bps: u64, fps: f64) -> Result<Self, String> {
+        Self::new_ext(w, h, bitrate_bps, fps, false, 42, RC_BITRATE_MODE)
+    }
+
+    /// Parameterized variant used by the bitrate/skip experiments and the
+    /// tests below. `rc_skip` restores OpenH264's rate-control frame dropping
+    /// (production disables it), `max_qp` bounds how blurry a frame may get
+    /// before the RC starts dropping, `rc_mode` selects the RC strategy
+    /// (RC_BITRATE_MODE / RC_QUALITY_MODE / RC_OFF_MODE).
+    pub fn new_ext(
+        w: u32,
+        h: u32,
+        bitrate_bps: u64,
+        fps: f64,
+        rc_skip: bool,
+        max_qp: i32,
+        rc_mode: c_int,
+    ) -> Result<Self, String> {
         assert!(w % 2 == 0 && h % 2 == 0, "dimensions must be even for 4:2:0");
         assert!(bitrate_bps > 0 && fps > 0.0);
 
@@ -110,7 +127,7 @@ impl H264Encoder {
         param.iPicWidth = w as c_int;
         param.iPicHeight = h as c_int;
         param.iTargetBitrate = bitrate_bps as c_int;
-        param.iRCMode = RC_BITRATE_MODE;
+        param.iRCMode = rc_mode;
         param.fMaxFrameRate = fps as f32;
         param.iTemporalLayerNum = 1;
         param.iSpatialLayerNum = 1;
@@ -130,12 +147,14 @@ impl H264Encoder {
         param.iMultipleThreadIdc = 4;
         param.iComplexityMode = openh264_sys2::LOW_COMPLEXITY;
         param.iNumRefFrame = 1;
-        // 关闭 RC 跳帧: openh264 在码率预算不足时会跳过 (几乎) 所有 P 帧,
-        // 导致高熵桌面上 web 端黑屏。宁可每帧硬编码、由调用方通过降低
-        // 有效帧率/分辨率把平均码率压回上限以内。
-        param.bEnableFrameSkip = false;
+        // RC 跳帧: openh264 在码率预算不足时靠 drop-P 帧兑现码率。生产
+        // (rc_skip=false) 关闭跳帧，防止高熵下 (几乎) 所有 P 帧被丢而
+        // 黑屏; 但代价是 RC 无法控制码率(见 ParamValidation 警告——该
+        // 模式下单帧冲出预算, 高熵桌面实测码率放飞 4000kbps)。实验对比
+        // 见 tests 中的 probe_bitrate_rc 手工用例。
+        param.bEnableFrameSkip = rc_skip;
         // 允许更高的 QP (更模糊) 而不是爆码率 — 单帧比特被量化上限约束。
-        param.iMaxQp = 42;
+        param.iMaxQp = max_qp;
         param.bPrefixNalAddingCtrl = false;
         param.bEnableDenoise = false;
         param.bEnableBackgroundDetection = false;
@@ -414,6 +433,151 @@ mod e2e_debug {
         eprintln!("DONE");
     }
 }
+#[cfg(test)]
+mod bitrate_rc_probe {
+    use super::*;
+    use std::time::Instant;
+
+    // 模拟"拖动窗口"高熵场景: 每帧全新随机纹理 + 一个移动色块。
+    fn drag_frame(w: usize, h: usize, t: u32) -> Vec<u8> {
+        let mut buf = vec![128u8; w * h + w * h / 2];
+        let seed = t.wrapping_mul(2654435761).wrapping_add(12345);
+        for i in 0..w * h {
+            buf[i] = ((i as u32).wrapping_mul(31).wrapping_add(seed) >> 16) as u8;
+        }
+        let bx = ((t * 7) % (w as u32).saturating_sub(100)) as usize;
+        let by = ((t * 13) % (h as u32).saturating_sub(100)) as usize;
+        for y in by..(by + 80).min(h) {
+            for x in bx..(bx + 90).min(w) {
+                let i = y * w + x;
+                buf[i] = 200;
+                buf[w * h + (y / 2) * (w / 2) + x / 2] = 90;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_bitrate_rc() {
+        let (w, h): (usize, usize) = (1280, 720);
+        let combos = [
+            ("skip0_qp42", false, 42), // 当前生产配置
+            ("skip0_qp51", false, 51),
+            ("skip1_qp51", true, 51),
+            ("skip1_qp42", true, 42),
+        ];
+        for (name, skip, qp) in combos {
+            let mut enc = H264Encoder::new_ext(w as u32, h as u32, 800_000, 30.0, skip, qp, RC_BITRATE_MODE).unwrap();
+            let (mut bytes, mut out, mut empty) = (0usize, 0usize, 0usize);
+            let mut max_frame = 0usize;
+            let t0 = Instant::now();
+            for t in 0..120 {
+                let f = enc.encode(&drag_frame(w, h, t)).unwrap();
+                if f.nalu.is_empty() {
+                    empty += 1;
+                    continue;
+                }
+                out += 1;
+                bytes += f.nalu.len();
+                max_frame = max_frame.max(f.nalu.len());
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            let kbps = bytes as f64 * 8.0 / (120.0 / 30.0) / 1000.0;
+            eprintln!(
+                "[{name}] skip={skip} qp={qp}: out={out}/120 empty={empty} actual={kbps:.0}kbps max_frame={:.0}KB avg={:.1}ms/f"
+                ,
+                max_frame as f64 / 1024.0,
+                dt * 1000.0 / 120.0
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_rc_real_capture() {
+        // 用真实屏幕内容回放扫参数组合。前提: DISPLAY 上有一段持续动画
+        // (Xvfb + 移动窗口脚本)。SR_XTEST_DISPLAY 覆盖测试用 display。
+        let display = std::env::var("SR_XTEST_DISPLAY").unwrap_or_else(|_| ":98".into());
+        use crate::agent::desktop::capture::FrameSource as _;
+        let mut src = crate::agent::desktop::capture::X11Source::open(Some(&display))
+            .unwrap_or_else(|e| panic!("x11 open failed: {e}"));
+        let (w, h) = src.resolution();
+        let mut frames: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        for _ in 0..120 {
+            let fr = src.next_frame().expect("frame");
+            frames.push((fr.bgra, fr.width as usize, fr.height as usize));
+        }
+        eprintln!("captured {} frames {}x{}", frames.len(), w, h);
+        // (name, rc_skip, max_qp, rc_mode, enc_w, enc_h)
+        let combos = [
+            ("bitr_skip0_qp42_720p", false, 42, RC_BITRATE_MODE, 1280, 720), // 当前生产
+            ("bitr_skip1_qp51_720p", true, 51, RC_BITRATE_MODE, 1280, 720),
+            ("qual_skip0_qp51_720p", false, 51, RC_QUALITY_MODE, 1280, 720),
+            ("qual_skip0_qp42_720p", false, 42, RC_QUALITY_MODE, 1280, 720),
+            ("bitr_skip0_qp42_640x360", false, 42, RC_BITRATE_MODE, 640, 360),
+            ("bitr_skip0_qp42_512x288", false, 42, RC_BITRATE_MODE, 512, 288),
+        ];
+        for (name, skip, qp, rc_mode, ew, eh) in combos {
+            let mut enc = H264Encoder::new_ext(ew, eh, 800_000, 30.0, skip, qp, rc_mode).unwrap();
+            let (mut bytes, mut out, mut empty) = (0usize, 0usize, 0usize);
+            let mut max_frame = 0usize;
+            let t0 = std::time::Instant::now();
+            for (bgra, fw, fh) in &frames {
+                let i420 = if ew as usize == *fw && eh as usize == *fh {
+                    crate::agent::desktop::color::bgra_to_i420(bgra, *fw, *fh, *fw * 4)
+                } else {
+                    crate::agent::desktop::color::bgra_to_i420_scaled(
+                        bgra, *fw, *fh, *fw * 4, ew as usize, eh as usize,
+                    )
+                };
+                let ef = enc.encode(&i420).unwrap();
+                if ef.nalu.is_empty() {
+                    empty += 1;
+                    continue;
+                }
+                out += 1;
+                bytes += ef.nalu.len();
+                max_frame = max_frame.max(ef.nalu.len());
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            let kbps = bytes as f64 * 8.0 / (frames.len() as f64 / 30.0) / 1000.0;
+            eprintln!(
+                "[{name}] skip={skip} qp={qp}: out={out}/{} empty={empty} kbps={kbps:.0} max_frame={:.0}KB avg={:.1}ms/f",
+                frames.len(),
+                max_frame as f64 / 1024.0,
+                dt * 1000.0 / frames.len() as f64
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_bitrate_low_ceiling() {
+        // 200k 极限预算下 skip=true+高QP 是否仍然不出帧
+        let (w, h): (usize, usize) = (1280, 720);
+        for &target in &[200_000u64, 500_000] {
+            let mut enc = H264Encoder::new_ext(w as u32, h as u32, target, 30.0, true, 51, RC_BITRATE_MODE).unwrap();
+            let (mut out, mut empty) = (0usize, 0usize);
+            let mut bytes = 0usize;
+            for t in 0..120 {
+                let f = enc.encode(&drag_frame(w, h, t)).unwrap();
+                if f.nalu.is_empty() {
+                    empty += 1;
+                    continue;
+                }
+                out += 1;
+                bytes += f.nalu.len();
+            }
+            let kbps = bytes as f64 * 8.0 / (120.0 / 30.0) / 1000.0;
+            eprintln!(
+                "[{}k skip=1 qp=51]: out={out}/120 empty={empty} actual={kbps:.0}kbps",
+                target / 1000
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod static_bitrate_probe {
     use super::*;
