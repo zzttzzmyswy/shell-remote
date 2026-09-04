@@ -1291,34 +1291,19 @@ pub async fn start(
         .layer(cors)
         .with_state(state.clone());
 
-    // ── HTTPS（MYS-886）：自签名证书默认开启 ─────────────────────
+    // ── HTTPS（MYS-886）：自签名证书默认开启，单端口 ──────────────
     // WebCodecs (VideoDecoder) 等 Secure Context API 只在 https/localhost
-    // 下暴露——http 访问时浏览器永远回退 MSE 播放路径。relay 默认在
-    // bind+1 端口起 https 监听：证书按 --tls-cert/--tls-key 指定，未指定
-    // 则在数据目录自动生成自签证书（CN=主机名 + IP SAN）并持久化复用。
-    // --tls-port 0 / --no-tls 可关闭。
-    let tls_listen = if tls_disabled {
+    // 下暴露——http 访问时浏览器永远回退 MSE 播放路径。relay 在 bind 端口
+    // 直接起 TLS（https/wss 同端口），不再额外开 http 端口。证书按
+    // --tls-cert/--tls-key 指定，未指定则在数据目录自动生成自签证书
+    // （CN=主机名 + IP SAN）并持久化复用。--no-tls 关闭 TLS 走纯 http。
+    let tls_certs = if tls_disabled {
         None
     } else {
         match ensure_tls_config(tls_cert.as_deref(), tls_key.as_deref()).await {
             Ok((cert_pem, key_pem, note)) => {
-                // 端口：bind 端口 + 1（如 :3902 http → :3903 https）。
-                let https_bind = {
-                    let (host, port) = match bind.rsplit_once(':') {
-                        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(0)),
-                        None => (bind.clone(), 0),
-                    };
-                    if host.parse::<std::net::IpAddr>().is_err() && host != "localhost" {
-                        // 域名 bind: 同端口无法双协议, 也用 +1。
-                    }
-                    format!("{}:{}", host, port.saturating_add(1))
-                };
-                tracing::info!(
-                    https = %https_bind,
-                    %note,
-                    "HTTPS (self-signed) enabled — 用 https:// 访问可解锁 WebCodecs 等安全上下文 API"
-                );
-                Some((https_bind, cert_pem, key_pem))
+                tracing::info!(%note, "HTTPS (self-signed) enabled on {}", bind);
+                Some((cert_pem, key_pem))
             }
             Err(e) => {
                 tracing::warn!("TLS setup failed ({e}) — 继续仅 HTTP");
@@ -1392,42 +1377,21 @@ pub async fn start(
         });
     }
 
-    // HTTPS listener（同一个 Router 双协议）。失败只降级为仅 HTTP，
-    // 不拖垮主 listener——HTTP 仍是完整可用的入口。
-    if let Some((https_bind, cert_pem, key_pem)) = tls_listen {
-        // rustls 0.23 需要显式选择 CryptoProvider（ring——与 rcgen 一致）。
+    // 单端口 serve：有 TLS 证书则 https，否则 http。
+    if let Some((cert_pem, key_pem)) = tls_certs {
         crate::tlsutil::install_rustls_provider();
-        match axum_server::tls_rustls::RustlsConfig::from_pem(
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem(
             cert_pem.into_bytes(),
             key_pem.into_bytes(),
         )
-        .await
-        {
-            Ok(config) => {
-                // https_bind 上方按 "host:port" 拼出，解析必成；异常值
-                // （如域名 bind）则记 warn 跳过 HTTPS。
-                match https_bind.parse::<std::net::SocketAddr>() {
-                    Ok(https_addr) => {
-                        let https_app = app.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = axum_server::bind_rustls(https_addr, config)
-                                .serve(https_app.into_make_service())
-                                .await
-                            {
-                                tracing::warn!("HTTPS listener error: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("invalid https bind {https_bind} ({e}) — skipped")
-                    }
-                }
-            }
-            Err(e) => tracing::warn!("rustls config failed: {e} — HTTPS listener disabled"),
-        }
+        .await?;
+        let listener = listener.into_std()?;
+        axum_server::from_tcp_rustls(listener, config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        axum::serve(listener, app).await?;
     }
-
-    axum::serve(listener, app).await?;
 
     Ok(())
 }

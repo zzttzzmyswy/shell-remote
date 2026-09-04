@@ -73,15 +73,17 @@ enum Command {
         #[arg(long)]
         tls_key: Option<String>,
 
-        /// Disable the automatic HTTPS listener (HTTP only).
+        /// Disable TLS on the bind port and serve plain HTTP (same port).
+        /// Default is HTTPS (self-signed) on the single listen port.
         #[arg(long)]
         no_tls: bool,
     },
 
     /// Run in agent mode (connects to a relay)
     Agent {
-        /// WebSocket URL of the relay server (ws:// | wss://)
-        #[arg(long, default_value = "ws://localhost:3000")]
+        /// Relay 服务器地址（仅 http:// 或 https://；内部自动按
+        /// http→ws / https→wss 用作视频上行，WS 不稳定时回退 http/https）
+        #[arg(long, default_value = "http://localhost:3000")]
         relay_url: String,
 
         /// 信任自签证书（连 https/wss relay 的自签 TLS 时必填；

@@ -706,12 +706,8 @@ async fn run_session(
             // 控制消息（started/stopped/error）绝不丢弃。
             const MAX_PENDING_FRAMES: usize = 90; // 60fps × 1.5s
             let ws_url = {
-                // base 来自 --relay-url；ws/wss 直接沿用，http/https 映射。
-                let mut u = if base.starts_with("ws://") || base.starts_with("wss://") {
-                    base.clone()
-                } else {
-                    base.replace("http://", "ws://").replace("https://", "wss://")
-                };
+                // 配置是 http/https，视频上行内部映射 http→ws / https→wss。
+                let mut u = base.replace("http://", "ws://").replace("https://", "wss://");
                 u.push_str("/agent/ws/send?session=");
                 u.push_str(&sid);
                 if !server_auth.is_empty() {

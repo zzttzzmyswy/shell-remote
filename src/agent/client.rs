@@ -96,11 +96,16 @@ impl RelayClient {
         insecure_tls: bool,
     ) -> anyhow::Result<Self> {
         let base = relay_url.trim_end_matches('/');
-        // reqwest 的 register/SSE 是常规 HTTP 通道（wss/ws 仅供桌面 WS 上行
-        // 使用）；把 ws://world 映射到 http://、wss:// 映射到 https://。
-        let http_base = base
-            .replace("ws://", "http://")
-            .replace("wss://", "https://");
+        // 配置只接受 http/https 路径；ws/wss 由程序内部推导（http→ws、
+        // https→wss 用作视频上行）。误传 ws/wss 直接报错，避免隐式转换
+        // 掩盖配置错误。
+        if base.starts_with("ws://") || base.starts_with("wss://") {
+            anyhow::bail!(
+                "非法 relay URL 协议：请使用 http:// 或 https://（内部自动按 \
+                 http→ws / https→wss 用作视频上行），勿直接填 ws://wss://"
+            );
+        }
+        let http_base = base;
         let send_url = format!("{}/agent/send", http_base);
 
         let http_client = if insecure_tls {
@@ -409,23 +414,24 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// --relay-url 允许 ws/wss 也用于 register/SSE：reqwest 是常规 HTTP
-    /// 通道，ws://→http://、wss://→https:// 映射后请求才能发出。
+    /// --relay-url 只接受 http:// 与 https://（MYS-886：配置统一 http/https
+    /// 路径，内部再推导 ws/wss 供视频上行）。误填 ws/wss 会被拒绝。
     #[test]
-    fn test_relay_scheme_normalization() {
-        let base = "wss://127.0.0.1:3903".trim_end_matches('/');
-        let http_base = base
-            .replace("ws://", "http://")
-            .replace("wss://", "https://");
-        assert_eq!(http_base, "https://127.0.0.1:3903");
-        let send_url = format!("{}/agent/send", http_base);
-        assert_eq!(send_url, "https://127.0.0.1:3903/agent/send");
-
-        let base = "http://127.0.0.1:3902".trim_end_matches('/');
-        let http_base = base
-            .replace("ws://", "http://")
-            .replace("wss://", "https://");
-        assert_eq!(http_base, "http://127.0.0.1:3902");
+    fn test_relay_url_rejects_ws_scheme() {
+        // 通过 connect_http 的校验逻辑验证：ws://wss:// 必须报错。
+        let bad = vec!["wss://127.0.0.1:3903", "ws://127.0.0.1:3902"];
+        for url in bad {
+            let ctx = format!("--relay-url={url}");
+            let base = url.trim_end_matches('/');
+            let rejected = base.starts_with("ws://") || base.starts_with("wss://");
+            assert!(rejected, "{ctx} 不应被接受");
+        }
+        // http/https 正常通过同款校验。
+        for url in ["http://127.0.0.1:3000", "https://127.0.0.1:3903"] {
+            let base = url.trim_end_matches('/');
+            let rejected = base.starts_with("ws://") || base.starts_with("wss://");
+            assert!(!rejected, "{url}");
+        }
     }
 
     /// no-verify 连接器：以自签证书为服务端的 wss 握手必须放下可。
