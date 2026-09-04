@@ -49,8 +49,17 @@ for entry in "${PLATFORMS[@]}"; do
     echo "WARNING: no static libvpx for $target ($CACHE/libvpx-$target) — building without VP9"
     LIBVPX_FLAGS=()
   fi
+  # AV1 (libaom): same pattern (tools/build-libaom.sh → $CACHE/libaom-<target>/).
+  LIBXAOM_FLAGS=()
+  if [ -d "$CACHE/libaom-$target" ]; then
+    LIBXAOM_FLAGS=("LIBXAOM_DIR=$CACHE/libaom-$target")
+    echo "static libaom: $CACHE/libaom-$target"
+  else
+    echo "WARNING: no static libaom for $target ($CACHE/libaom-$target) — building without AV1"
+    LIBXAOM_FLAGS=()
+  fi
 
-  env CC="$cc" CXX="$cxx" AR="$ar" "${LIBVPX_FLAGS[@]}" \
+  env CC="$cc" CXX="$cxx" AR="$ar" "${LIBVPX_FLAGS[@]}" "${LIBXAOM_FLAGS[@]}" \
       RUSTFLAGS="-C link-arg=-L$dir" \
       cargo build --release --target "$target" --manifest-path "$ROOT/Cargo.toml"
 done
@@ -61,11 +70,19 @@ echo "== embedding windows manifest =="
 x86_64-w64-mingw32-windres "$ROOT/build/embed-manifest.rc" -O coff -o "$ROOT/build/agent_manifest.o"
 WIN_DIR="$CACHE/libvpx-x86_64-pc-windows-gnu"
 WIN_LIBVPX=()
+WIN_AOM_DIR="$CACHE/libaom-x86_64-pc-windows-gnu"
+WIN_LIBXAOM=()
 if [ -d "$WIN_DIR" ]; then
   WIN_LIBVPX=("LIBVPX_DIR=$WIN_DIR")
+fi
+if [ -d "$WIN_AOM_DIR" ]; then
+  WIN_LIBXAOM=("LIBXAOM_DIR=$WIN_AOM_DIR")
+fi
+if [ -n "${WIN_LIBVPX[*]}" ] || [ -n "${WIN_LIBXAOM[*]}" ]; then
   # 触碰 build.rs 强制重跑 build script: cargo 按 (package, RUSTFLAGS) 缓存
-  # build-script 输出, manifest 段 RUSTFLAGS 与主循环不同, LIBVPX_DIR 的值
-  # 相同时不会触发 rerun-if-env-changed, 复用无 vpx 的旧输出 → 链接缺 -lvpx。
+  # build-script 输出, manifest 段 RUSTFLAGS 与主循环不同, LIBVPX/LIBXAOM_DIR
+  # 的值相同时不会触发 rerun-if-env-changed, 复用无 vpx/aom 的旧输出 →
+  # 链接缺 -lvpx/-laom。
   touch "$ROOT/build.rs"
 fi
 # 静态 C++ 运行时: 不加 -static-libstdc++ 与 -L$dir 时, -lstdc++ 落到 mingw
@@ -74,15 +91,23 @@ fi
 WIN_STD="$CACHE/shell-remote-x86_64"
 RUSTFLAGS="-C link-args=$ROOT/build/agent_manifest.o -C target-feature=+crt-static \
 -C link-arg=-L$WIN_STD -C link-arg=-static-libstdc++" \
-  env "${WIN_LIBVPX[@]}" \
+  env "${WIN_LIBVPX[@]}" "${WIN_LIBXAOM[@]}" \
   cargo build --release --target x86_64-pc-windows-gnu --manifest-path "$ROOT/Cargo.toml"
 
 echo "== staging releases =="
 mkdir -p "$ROOT/dist"
-cp "$ROOT"/target/x86_64-unknown-linux-musl/release/shell-remote            "$ROOT/dist/shell-remote-x86_64"
-cp "$ROOT"/target/aarch64-unknown-linux-musl/release/shell-remote           "$ROOT/dist/shell-remote-aarch64"
-cp "$ROOT"/target/armv7-unknown-linux-musleabihf/release/shell-remote       "$ROOT/dist/shell-remote-armv7"
-cp "$ROOT"/target/x86_64-pc-windows-gnu/release/shell-remote.exe            "$ROOT/dist/shell-remote-x86_64.exe"
+# 逐个拷贝；某目标正被使用(如本地 relay 跑着 dist 二进制)时 cp 会 ETXTBSY,
+# 不应中止其余目标(该目标可稍后停进程再补拷)。
+stage() { cp "$1" "$2" && echo "staged $2" || { echo "WARN: 未能覆盖 $2 (可能仍被运行中的进程占用)"; failed=1; }; }
+failed=0
+stage "$ROOT"/target/x86_64-unknown-linux-musl/release/shell-remote \
+      "$ROOT/dist/shell-remote-x86_64"
+stage "$ROOT"/target/aarch64-unknown-linux-musl/release/shell-remote \
+      "$ROOT/dist/shell-remote-aarch64"
+stage "$ROOT"/target/armv7-unknown-linux-musleabihf/release/shell-remote \
+      "$ROOT/dist/shell-remote-armv7"
+stage "$ROOT"/target/x86_64-pc-windows-gnu/release/shell-remote.exe \
+      "$ROOT/dist/shell-remote-x86_64.exe"
 
 echo "Built:"
 ls -lh "$ROOT/dist/"

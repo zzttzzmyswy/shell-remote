@@ -38,7 +38,7 @@ pub trait VideoEncoder: Send {
     fn mux_sample(&self, frame: &EncodedFrame) -> Option<VisualSample>;
 }
 
-/// Construct an encoder for a codec name (`h264` / `vp9`).
+/// Construct an encoder for a codec name (`av1` / `vp9` / `h264`).
 pub fn new_encoder(
     codec: &str,
     w: u32,
@@ -50,6 +50,8 @@ pub fn new_encoder(
         "h264" => crate::agent::desktop::openh264::H264Encoder::new(w, h, max_bps, fps).map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         #[cfg(feature = "vp9")]
         "vp9" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, max_bps, fps).map(|e| Box::new(e) as Box<dyn VideoEncoder>),
+        #[cfg(feature = "av1")]
+        "av1" => crate::agent::desktop::aom::AomEncoder::new(w, h, max_bps, fps).map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         other => Err(format!("unsupported desktop codec: {other}")),
     }
 }

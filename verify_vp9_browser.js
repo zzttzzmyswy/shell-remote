@@ -10,14 +10,23 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>
 const log = (s) => { document.getElementById('log').textContent += s + '\\n'; };
 (async () => {
   const bytes = new Uint8Array(await (await fetch('/stream.bin')).arrayBuffer());
-  let profile = 0, level = 10;
+  // 解析 codec 配置 box：vpcC → VP9；av1C → AV1。
+  let isVp9 = false, profile = 0, level = 10, tier = 'M';
   for (let i = 0; i + 8 <= bytes.length; i++) {
     if (bytes[i]===0x76&&bytes[i+1]===0x70&&bytes[i+2]===0x63&&bytes[i+3]===0x43) {
-      profile = bytes[i+8]; level = bytes[i+9]; break;
+      isVp9 = true; profile = bytes[i+8]; level = bytes[i+9]; break;
+    }
+    if (bytes[i]===0x61&&bytes[i+1]===0x76&&bytes[i+2]===0x31&&bytes[i+3]===0x43) {
+      isVp9 = false;
+      profile = (bytes[i+5] >> 5) & 0x7;
+      level = bytes[i+5] & 0x1f;   // seq_level_idx 的十进制两位 (3.0→2→"02")
+      tier = ((bytes[i+6] >> 7) & 0x1) ? 'H' : 'M'; break;
     }
   }
-  const codec = 'vp09.'+String(profile).padStart(2,'0')+'.'+String(level).padStart(2,'0')+'.08';
-  log('codec='+codec);
+  const codecStr = isVp9
+    ? 'vp09.'+String(profile).padStart(2,'0')+'.'+String(level).padStart(2,'0')+'.08'
+    : 'av01.'+profile+'.'+String(level).padStart(2,'0')+tier+'.08';
+  log('codec='+codecStr);
   const boxes=[]; let p=0;
   while (p+8<=bytes.length) {
     const size=(bytes[p]<<24)|(bytes[p+1]<<16)|(bytes[p+2]<<8)|bytes[p+3];
@@ -34,7 +43,7 @@ const log = (s) => { document.getElementById('log').textContent += s + '\\n'; };
       ctx.drawImage(frame,0,0); frame.close(); },
     error(e){ decErr=e.message; log('decoder error: '+e.message); },
   });
-  dec.configure({codec, optimizeForLatency:true});
+  dec.configure({codec: codecStr, optimizeForLatency:true});
   let pending=null;
   for (const bx of boxes) {
     if (bx.type==='moof') {
@@ -69,14 +78,14 @@ const log = (s) => { document.getElementById('log').textContent += s + '\\n'; };
       if (pending.isKey) keyframes++;
       nchunk++;
       chunks.push((pending.isKey?'K':'D')+':'+pending.size+'@'+pending.pts);
-      try { dec.decode(new EncodedVideoChunk({type:'key',
+      try { dec.decode(new EncodedVideoChunk({type: pending.isKey?'key':'delta',
         timestamp:pending.pts, data:sample})); } catch(e) { log('decode throw: '+e.message); }
       pending=null;
     }
   }
   try { await dec.flush(); } catch(e) { log('flush throw: '+e.message); }
   await new Promise(r=>setTimeout(r,400));
-  return {decoded, keyframes, codec, decErr, nchunk, head:chunks.slice(0,8).join(' '),
+  return {decoded, keyframes, codecStr, decErr, nchunk, head:chunks.slice(0,8).join(' '),
     tail:chunks.slice(-3).join(' ')};
 })().then(r=>window.__res=r);
 </script></body></html>`;
