@@ -237,18 +237,21 @@ fn sample_entry(cfg: &Mp4Config) -> Vec<u8> {
 }
 
 /// AV1 两位 level（30=3.0、40=4.0…）→ av1C `seq_level_idx_0`（5 位字段）。
-/// AV1 规范映射: 2.0→0, 2.1→1, 3.0→2, 3.1→3, 4.0→4, 4.1→5, 5.0→6,
-/// 5.1→7, 6.0→8, 6.1→9, 6.2→10, 6.3→11。直接 `level & 0x1f` 在 ≥4.0
-/// (40&0x1f=8) 时会把错误的索引写进 box。
+/// AV1 规范的 idx 表**含保留槽位**（2.2/2.3/3.2/3.3/4.2/4.3 保留但占用索引）:
+///   2.0→0, 2.1→1; 3.0→4, 3.1→5; 4.0→8, 4.1→9;
+///   5.0→12, 5.1→13, 5.2→14, 5.3→15; 6.0→16…6.3→19。
+/// 三重实证：ffmpeg 720p15 实测 idx=5(=3.1)、libaom 源码 SEQ_LEVEL_3_0=4 /
+/// SEQ_LEVEL_5_0=12。直接 `level & 0x1f` 在 ≥4.0 (40&0x1f=8) 会错，旧版
+/// `3→2+m` 也低估 2（写 6.0 会实际落在 4.0）。
 fn av1_level_to_idx(level: u8) -> u8 {
     let major = level / 10;
     let minor = level % 10;
     match major {
         2 => minor,
-        3 => 2 + minor,
-        4 => 4 + minor,
-        5 => 6 + minor,
-        6 => 8 + minor,
+        3 => 4 + minor,
+        4 => 8 + minor,
+        5 => 12 + minor,
+        6 => 16 + minor,
         _ => 0,
     }
 }
@@ -665,7 +668,7 @@ mod tests {
         // av1C payload: marker-version 0x81, profile<<5|level_idx, fmt byte
         let pos = init.windows(4).position(|w| w == b"av1C").unwrap();
         assert_eq!(init[pos + 4], 0x81);
-        assert_eq!(init[pos + 5], (0u8 << 5) | 2u8, "profile0 level30 -> seq_level_idx 2");
+        assert_eq!(init[pos + 5], (0u8 << 5) | 4u8, "profile0 level30 -> seq_level_idx 4");
         assert_eq!(init[pos + 6], 0b0000_1100, "4:2:0 8-bit");
     }
 
@@ -674,7 +677,7 @@ mod tests {
         let c = cfg();
         assert_eq!(c.codec_string(), "avc1.42001F");
         assert_eq!(vp9_cfg().codec_string(), "vp09.00.10.08");
-        assert_eq!(av1_cfg().codec_string(), "av01.0.02M.08");
+        assert_eq!(av1_cfg().codec_string(), "av01.0.04M.08");
     }
 
     #[test]
