@@ -120,6 +120,10 @@ pub struct DesktopManager {
     quality: std::sync::RwLock<f32>,
     /// 运行时用户码率硬顶（web 自定义码率）。0 = auto（base×quality）。
     max_bps: std::sync::RwLock<u64>,
+    /// QoS 码率缩放（千分比，1000 = 100%）。弱网（高端到端延时）时下调
+    /// 目标码率预算，让 ABR/编码器在紧张链路下自动收敛（rustdesk QoS 的
+    /// quality 维度，MYS-886 需求7-3）；网络恢复自动回升到 1000。
+    qos_scale: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DesktopManager {
@@ -141,6 +145,7 @@ impl DesktopManager {
             fps: Arc::new(std::sync::atomic::AtomicU32::new(fps0)),
             quality: std::sync::RwLock::new(quality0),
             max_bps: std::sync::RwLock::new(max_bps0),
+            qos_scale: Arc::new(std::sync::atomic::AtomicU32::new(1000)),
         }
     }
 
@@ -176,6 +181,16 @@ impl DesktopManager {
         use std::sync::atomic::Ordering as O;
         self.fps.store(fps, O::Relaxed);
         tracing::info!(fps, "desktop QoS: target fps adjusted");
+    }
+
+    /// QoS 码率缩放（千分比）：弱网时下调目标码率预算，恢复后置回 1000。
+    /// 只影响 ABR ceiling，不重建流（rustdesk QoS 的 quality 维度，MYS-886
+    /// 需求7-3）。范围 100-1000。
+    pub fn set_qos_scale(&self, permille: u32) {
+        let permille = permille.clamp(100, 1000);
+        use std::sync::atomic::Ordering as O;
+        self.qos_scale.store(permille, O::Relaxed);
+        tracing::info!(qos_scale = permille, "desktop QoS: bitrate scale adjusted");
     }
 
     /// 运行时热切换编码方案（av1/vp9/h264）。仅当桌面正在运行时重建
@@ -294,8 +309,9 @@ impl DesktopManager {
         let bandwidth = self.bandwidth.clone();
         let clock_offset = self.clock_offset.load(std::sync::atomic::Ordering::Relaxed);
         let fps_ctl = self.fps.clone();
+        let qos_scale = self.qos_scale.clone();
         let task = tokio::task::spawn(async move {
-            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl).await;
+            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl, qos_scale).await;
         });
         *self.task.lock().await = Some(task);
     }
@@ -384,12 +400,23 @@ const STRIDES: &[u32] = &[1, 2, 3, 5];
 /// 窗口（约 10s @ 15fps）才能跨过瞬时失效而非误杀整个桌面流。
 const MAX_CAPTURE_ERRORS: u32 = 150;
 
-/// 静止心跳间隔（毫秒）。桌面静止时 OpenH264 输出空帧不上行，超过
-/// relay 观看者空闲超时（30s）会被误判断流；同时它是静止画面的保底
-/// 刷新率——时钟秒数字这类小变化可能被量化抹掉（编码器输出空帧），
-/// 心跳 IDR 保证画面最迟半秒刷新一次（MYS-886：静止桌面不能
-/// "几秒才刷一帧"）。静止 IDR 很小（~10KB），500ms 平均带宽影响有限。
-const HEARTBEAT_INTERVAL_MS: u64 = 500;
+/// 编码器内部 AUTO 关键帧兜底间隔（秒）。关键帧实际节奏由外部动态控制
+/// （MYS-886 需求7-1：静止 4.5s / 活跃 1.5s 心跳 IDR）；kf_max_dist 只是
+/// 编码器最晚自动插关键帧的兜底，保证外部 force_idr 失效时仍可 seek。
+pub const KF_AUTO_MAX_SECS: f64 = 5.0;
+
+/// 静止/活跃关键帧间隔（毫秒）。MYS-886 需求7-1：静止画面 P 帧近 0 字节，
+/// 关键帧是唯一带宽开销 → 心跳 IDR 从 500ms 拉长到 4.5s（带宽降至 1/9×）；
+/// 活跃（帧均字节超阈值）时 1.5s 一个 IDR 保持 seek 与参考链健康。
+/// 判定用 [`avg_frame_bytes`]：> [`KF_ACTIVE_BYTES_FRAME`] 视为活跃。
+pub const KF_QUIET_MS: u64 = 4500;
+pub const KF_ACTIVE_MS: u64 = 1500;
+/// 帧均字节阈值：超过则视为活跃内容（需要高频关键帧）。
+pub const KF_ACTIVE_BYTES_FRAME: f64 = 2048.0;
+
+/// 动态关键帧间隔由 [`KF_QUIET_MS`]/[`KF_ACTIVE_MS`] 取代旧的 500ms 固定
+/// 静止心跳（MYS-886 需求7-1：静止 4.5s 一个 IDR，带宽降至 ~1/9，且远低于
+/// relay 观看者 30s 空闲超时，不会误判断流）。
 
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
@@ -405,6 +432,7 @@ async fn run_desktop_loop(
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
     clock_offset_ms: i64,
     fps_ctl: Arc<std::sync::atomic::AtomicU32>,
+    qos_scale: Arc<std::sync::atomic::AtomicU32>,
 ) {
         let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok((src, backend)) => (src, backend),
@@ -418,7 +446,7 @@ async fn run_desktop_loop(
         }
     };
     let (src, backend) = src;
-    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl).await;
+    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl, qos_scale).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -432,6 +460,7 @@ async fn run_desktop_pipeline(
     backend: String,
     clock_offset_ms: i64,
     fps_ctl: Arc<std::sync::atomic::AtomicU32>,
+    qos_scale: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // cfg 需可变：编码器 fallback 后回写实际 codec。
     let mut cfg = cfg;
@@ -466,10 +495,13 @@ async fn run_desktop_pipeline(
     }
     cfg.codec = actual_codec;
     // ABR 上限：用户 max_bps>0 用其值，否则用 rustdesk 模型（base×quality）。
+    // 小分辨率（如 320x180 测试/低端屏）`base×quality` 可能低于 min_bps，
+    // 必须顶到 min_bps——否则 Abr::new 断言 min<=max 直接 panic 冲掉整个
+    // 桌面流（rate.rs:27 实测崩溃路径）。
     let abr_ceiling = if cfg.max_bps > 0 {
-        cfg.max_bps
+        cfg.max_bps.max(cfg.min_bps)
     } else {
-        encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality)
+        encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality).max(cfg.min_bps)
     };
     let mut abr = rate::Abr::new(cfg.min_bps, abr_ceiling);
 
@@ -498,7 +530,6 @@ async fn run_desktop_pipeline(
     // 用弱网上限（带宽 clamp）。高熵时帧平均超预算 → 分辨率阶梯降级
     // （模糊但不丢帧）; 预算富余 → 逐档恢复。
     let mut stride_idx: usize = 0;
-    let mut cap_no: u64 = 0;
 
     tracing::info!(
         width = %w0, height = %h0, fps = %cfg.fps, backend = %backend,
@@ -518,9 +549,9 @@ async fn run_desktop_pipeline(
     let start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
     let mut err_count: u32 = 0;
-    // 上次实际 POST 视频帧的墙上时间。静止桌面空帧不上行, 用它判断是否
-    // 该发心跳 IDR（保证 relay 观看者流上始终有字节, 不被空闲超时误杀）。
-    let mut last_posted_wall: u64 = 0;
+    // 上次强制 IDR 的虚拟墙钟（wall_ms 时基）。动态关键帧节拍用它判断
+    // 是否到间隔（静止 KF_QUIET_MS / 活跃 KF_ACTIVE_MS，MYS-886 需求7-1）。
+    let mut last_kf_wall: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let cur_fps = fps_ctl.load(Ordering::SeqCst).clamp(1, 60);
@@ -529,20 +560,20 @@ async fn run_desktop_pipeline(
         if !running.load(Ordering::SeqCst) {
             break;
         }
-        // 每 2 秒一个 IDR, 以真实采集帧计算（与 stride 无关）。
-        cap_no += 1;
-        if cap_no % (cur_fps as u64 * 2) == 0 {
-            enc.force_idr();
-        }
+        // 动态关键帧节拍（MYS-886 需求7-1）：由内容活跃度决定 IDR 间隔。
+        // 静止（帧均字节 ≤ 阈值）时 P 帧近 0 字节，关键帧是唯一带宽开销
+        // → 从 500ms 拉长到 4.5s，静止带宽降至 ~1/9；活跃时 1.5s 一 IDR
+        // 保持 seek 与参考链健康。首帧强制 IDR（同时就是 init 段的参数集）。
         // 低延时管线（MYS-886）: **编码不跳帧**——每个 tick 都捕获+编码。
         // 帧率阶梯（STRIDES）与降分辨率不再作用于编码路径, 编码器始终
         // 以满帧率输出; 码率控制交给 ABR 的 set_bitrate。跳帧只发生在
         // 上行（批量 POST 的丢旧保新, 见 agent::mod 的 batch 逻辑）和
         // relay→浏览器（非关键帧丢弃）——两者都不破坏解码器状态。
-        // 心跳保活: 静止桌面 OpenH264 输出空帧不上行, 到间隔强制 IDR。
         wall_ms += frame_ms;
-        if last_posted_wall + HEARTBEAT_INTERVAL_MS <= wall_ms {
+        let kf_ms = kf_interval_ms_for(avg_frame_bytes(&byte_win));
+        if frame_idx == 0 || last_kf_wall + kf_ms <= wall_ms {
             enc.force_idr();
+            last_kf_wall = wall_ms;
         }
         let fr = match src.next_frame() {
             Ok(f) => {
@@ -646,7 +677,6 @@ async fn run_desktop_pipeline(
         // 含编码全程的起点。
         let frag = mp4::mp4_fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq, capture_ms);
         seq += 1;
-        last_posted_wall = wall_ms;
         pts_ms += frame_ms; // 只有真实 POST 的帧推进 fMP4 时间线
         post(serde_json::json!({
             "type": "desktop:video",
@@ -667,7 +697,11 @@ async fn run_desktop_pipeline(
             } else {
                 encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality)
             };
-            let eff_max = bandwidth.load(O::Relaxed).min(ceiling).max(cfg.min_bps);
+            // QoS 码率缩放（rustdesk QoS 的 quality 维度，MYS-886 需求7-3）：
+            // 弱网时把码率天花板压回网络可承受范围（1000‰ = 不缩放）。
+            let scale = qos_scale.load(O::Relaxed).clamp(100, 1000) as u64;
+            let eff_base = bandwidth.load(O::Relaxed).min(ceiling).max(cfg.min_bps);
+            let eff_max = eff_base.saturating_mul(scale) / 1000;
             abr.set_ceiling(eff_max);
             let budget = (eff_max as f64 / 8.0 / cfg.fps).max(1.0);
             let byte_ratio = avg_frame_bytes(&byte_win) / budget;
@@ -697,6 +731,29 @@ fn avg_frame_bytes(byte_win: &VecDeque<u32>) -> f64 {
         return 0.0;
     }
     byte_win.iter().map(|&b| b as f64).sum::<f64>() / byte_win.len() as f64
+}
+
+/// 动态关键帧间隔（MYS-886 需求7-1）：帧均字节（反映内容活跃度）高于
+/// [`KF_ACTIVE_BYTES_FRAME`] 视为活跃 → 高频 IDR；否则静止 → 低频 IDR。
+/// 静止画面 P 帧近 0 字节、关键帧是唯一带宽开销，拉长间隔直接省带宽。
+fn kf_interval_ms_for(avg_bytes: f64) -> u64 {
+    if avg_bytes > KF_ACTIVE_BYTES_FRAME {
+        KF_ACTIVE_MS
+    } else {
+        KF_QUIET_MS
+    }
+}
+
+/// QoS 码率缩放（千分比，MYS-886 需求7-3）：端到端延时 <150ms 满额、
+/// 150-300ms 压到 75%、≥300ms 压到 50%。弱网应急，恢复后自动升回 1000。
+pub fn qos_bitrate_scale_for_delay(delay_ms: u64) -> u32 {
+    if delay_ms < 150 {
+        1000
+    } else if delay_ms < 300 {
+        750
+    } else {
+        500
+    }
 }
 
 /// One step of the high-entropy degradation ladder (called every ~10 encoded
@@ -825,6 +882,28 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kf_interval_adapts_to_activity() {
+        // 高熵（帧均 > 2KB）→ 活跃 1.5s
+        assert_eq!(kf_interval_ms_for(10_000.0), KF_ACTIVE_MS);
+        // 刚过阈值仍是活跃
+        assert_eq!(kf_interval_ms_for(KF_ACTIVE_BYTES_FRAME + 0.1), KF_ACTIVE_MS);
+        // 静止（帧均 ≤ 2KB）→ 4.5s
+        assert_eq!(kf_interval_ms_for(KF_ACTIVE_BYTES_FRAME), KF_QUIET_MS);
+        assert_eq!(kf_interval_ms_for(0.0), KF_QUIET_MS);
+    }
+
+    #[test]
+    fn test_qos_bitrate_scale_mapping() {
+        // <150ms 满额；150-300ms 压到 75%；≥300ms 压到 50%（弱网应急）
+        assert_eq!(qos_bitrate_scale_for_delay(0), 1000);
+        assert_eq!(qos_bitrate_scale_for_delay(149), 1000);
+        assert_eq!(qos_bitrate_scale_for_delay(150), 750);
+        assert_eq!(qos_bitrate_scale_for_delay(299), 750);
+        assert_eq!(qos_bitrate_scale_for_delay(300), 500);
+        assert_eq!(qos_bitrate_scale_for_delay(900), 500);
+    }
 
     #[test]
     fn test_avg_frame_bytes() {
@@ -1140,6 +1219,35 @@ mod tests {
         }
     }
 
+    /// 完全静止源：所有帧完全一致（模拟"桌面无人操作"），用于验证静止
+    /// 桌面关键帧节奏被拉长（MYS-886 需求7-1：4.5s 一 IDR，而非旧 500ms）。
+    struct StaticSource {
+        w: usize,
+        h: usize,
+    }
+
+    impl capture::FrameSource for StaticSource {
+        fn next_frame(&mut self) -> Result<capture::Frame, String> {
+            let w = self.w;
+            let h = self.h;
+            let mut bgra = vec![0u8; w * h * 4];
+            for row in 0..h {
+                for col in 0..w {
+                    let i = (row * w + col) * 4;
+                    let v = (130u8).wrapping_add(((row / 4 + col / 4) % 16) as u8);
+                    bgra[i] = v;
+                    bgra[i + 1] = v;
+                    bgra[i + 2] = v;
+                    bgra[i + 3] = 255;
+                }
+            }
+            Ok(capture::Frame { bgra, width: w, height: h })
+        }
+        fn resolution(&self) -> (usize, usize) {
+            (self.w, self.h)
+        }
+    }
+
     /// 始终失败的捕获源：模拟 XWayland 下 root GetImage 抛 BadMatch。
     struct FailingSource;
 
@@ -1175,6 +1283,7 @@ mod tests {
                 "test".to_string(),
                 0,
                 Arc::new(std::sync::atomic::AtomicU32::new(30)),
+                Arc::new(std::sync::atomic::AtomicU32::new(1000)),
             ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
@@ -1214,7 +1323,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000))));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1232,6 +1341,41 @@ mod tests {
             frags.len()
         );
         assert!(!keys.is_empty(), "must produce key frames for viewers to join");
+    }
+
+    /// 需求7-1 回归：静止桌面关键帧节奏必须被拉长（4.5s 一个 IDR，而非旧
+    /// 500ms 心跳）。静止 8s 应只有首帧 + ~2 个心跳 IDR（≤4），旧实现会
+    /// 产出 ~16 个。静止 P 帧近 0 字节，关键帧是唯一带宽开销——拉长间隔
+    /// 是"不降画质省带宽"的核心。
+    #[test]
+    fn pipeline_static_desktop_spaces_out_keyframes() {
+        let mut cfg = DesktopConfig::default();
+        cfg.fps = 15.0; // 8s = 120 tick
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let r2 = running.clone();
+        let src: Box<dyn capture::FrameSource> = Box::new(StaticSource { w: 320, h: 180 });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let bw = cfg.max_bps;
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(15)), Arc::new(std::sync::atomic::AtomicU32::new(1000))));
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            running.store(false, Ordering::SeqCst);
+            let _ = handle.await;
+        });
+        let list = posted.lock().unwrap();
+        let keys: Vec<_> = list
+            .iter()
+            .filter(|v| v["type"] == "desktop:video" && v["payload"]["kind"] == "frag" && v["payload"]["key"] == true)
+            .collect();
+        eprintln!("pipeline static: keys={} (expect ≤4 spaced by 4.5s)", keys.len());
+        assert!(
+            keys.len() >= 1 && keys.len() <= 4,
+            "static desktop must space out keyframes, got {} (old 500ms heartbeat would be ~16)",
+            keys.len()
+        );
     }
 
     /// 最坏情况回归：纯噪声内容即便无法流畅编码，也必须持续产出关键帧
@@ -1254,7 +1398,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000))));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1273,3 +1417,4 @@ mod tests {
         );
     }
 }
+

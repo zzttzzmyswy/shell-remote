@@ -89,7 +89,10 @@ impl Vp9Encoder {
             cfg.rc_dropframe_thresh = 25;
             cfg.kf_mode = vpx_sys::vpx_kf_mode::VPX_KF_AUTO;
             cfg.kf_min_dist = 0;
-            cfg.kf_max_dist = fps.max(1.0) as c_uint;
+            // 关键帧节奏改由外部动态控制（MYS-886 需求7-1：静止 4.5s / 活跃
+            // 1.5s 心跳 IDR）。kf_max_dist 拉长到 5s 只是编码器兜底——防止
+            // 内部 AUTO 关键帧以 1s 固定节奏抢跑外部节奏（静止期省带宽）。
+            cfg.kf_max_dist = (fps.max(1.0) * crate::agent::desktop::KF_AUTO_MAX_SECS) as c_uint;
 
             let mut ctx: vpx_sys::vpx_codec_ctx_t = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
             let rc = vpx_sys::vpx_codec_enc_init_ver(
@@ -231,11 +234,12 @@ impl Vp9Encoder {
     /// Dynamically update the encoder's frame-rate model.
     pub fn set_frame_rate(&mut self, fps: f32) {
         self.fps = fps.clamp(1.0, 60.0) as f64;
-        // kf_max_dist drives key-frame spacing; keep it in sync with the model.
+        // kf_max_dist keeps a fixed *wall-clock* key-frame ceiling (5s); it does
+        // not follow fps — external force_idr controls actual cadence (MYS-886).
         unsafe {
             let src_ptr = self.ctx.config.enc as *const vpx_sys::vpx_codec_enc_cfg_t;
             let mut cfg: vpx_sys::vpx_codec_enc_cfg_t = std::ptr::read(src_ptr);
-            cfg.kf_max_dist = self.fps.max(1.0) as c_uint;
+            cfg.kf_max_dist = (self.fps * crate::agent::desktop::KF_AUTO_MAX_SECS) as c_uint;
             vpx_sys::vpx_codec_enc_config_set(&mut self.ctx, &cfg);
         }
     }
@@ -389,5 +393,32 @@ mod tests {
         eprintln!("vp9 800k target: actual {kbps:.0} kbps, {out}/60 frames");
         assert!(kbps < 4000.0, "bitrate runaway: {kbps:.0} kbps");
         assert!(out >= 50, "must produce most frames, got {out}/60");
+    }
+}
+
+#[cfg(test)]
+mod static_kf_tests {
+    use super::*;
+    use crate::agent::desktop::encoder::VideoEncoder;
+
+    #[test]
+    fn static_frames_force_idr_produces_bytes() {
+        let mut enc = Vp9Encoder::new(640, 360, 400_000, 15.0, 24, 50).expect("vp9 init");
+        let buf = vec![90u8; 640 * 360 + 640 * 360 / 2];
+        let mut non_empty_kf = 0;
+        let mut frames = 0;
+        for i in 0..120u32 {
+            enc.force_idr();
+            let f = enc.encode(&buf).expect("encode");
+            frames += 1;
+            if f.is_idr && !f.nalu.is_empty() {
+                non_empty_kf += 1;
+                eprintln!("idx={i}: kf nalu_len={}", f.nalu.len());
+            } else if f.is_idr {
+                eprintln!("idx={i}: IDR but EMPTY nalu");
+            }
+        }
+        eprintln!("static 120 forced frames: non_empty_kf={non_empty_kf} frames={frames}");
+        assert!(non_empty_kf > 0, "forced IDR on static content must produce bytes");
     }
 }

@@ -1514,8 +1514,10 @@ async fn run_session(
                                 }
 
                                 "desktop:qos" => {
-                                    // 浏览器端到端延时反馈 → 动态目标帧率
-                                    // （rustdesk 同款：<150ms 提升、差网降低）。
+                                    // 端到端延时反馈 → 动态目标帧率+码率预算
+                                    // （rustdesk QoS 双维度：好网 fps 60 +
+                                    // 满码率 <150ms；差网降 fps+压码率，恢复
+                                    // 自动回升，MYS-886 需求7-3）。
                                     let delay_ms = msg
                                         .payload
                                         .get("delay_ms")
@@ -1529,6 +1531,11 @@ async fn run_session(
                                         15
                                     };
                                     desktop.set_fps(fps);
+                                    // 码率缩放：<150ms 满额；150-300ms 压到
+                                    // 75%；≥300ms 压到 50%（弱网应急，恢复升回）。
+                                    let scale =
+                                        crate::agent::desktop::qos_bitrate_scale_for_delay(delay_ms);
+                                    desktop.set_qos_scale(scale);
                                 }
 
                                 "desktop:quality" => {

@@ -89,7 +89,10 @@ impl AomEncoder {
             cfg.rc_dropframe_thresh = 25;
             cfg.kf_mode = aom_sys::aom_kf_mode_AOM_KF_AUTO;
             cfg.kf_min_dist = 0;
-            cfg.kf_max_dist = fps.max(1.0) as c_uint;
+            // 关键帧节奏改由外部动态控制（MYS-886 需求7-1：静止 4.5s / 活跃
+            // 1.5s 心跳 IDR）。kf_max_dist 拉长到 5s 只是编码器兜底——防止
+            // 内部 AUTO 关键帧以 1s 固定节奏抢跑外部节奏（静止期省带宽）。
+            cfg.kf_max_dist = (fps.max(1.0) * crate::agent::desktop::KF_AUTO_MAX_SECS) as c_uint;
 
             let mut ctx: aom_sys::aom_codec_ctx_t = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
             let rc = aom_sys::aom_codec_enc_init_ver(
@@ -230,7 +233,7 @@ impl AomEncoder {
         unsafe {
             let src_ptr = self.ctx.config.enc as *const aom_sys::aom_codec_enc_cfg_t;
             let mut cfg: aom_sys::aom_codec_enc_cfg_t = std::ptr::read(src_ptr);
-            cfg.kf_max_dist = self.fps.max(1.0) as c_uint;
+            cfg.kf_max_dist = (self.fps * crate::agent::desktop::KF_AUTO_MAX_SECS) as c_uint;
             aom_sys::aom_codec_enc_config_set(&mut self.ctx, &cfg);
         }
     }
