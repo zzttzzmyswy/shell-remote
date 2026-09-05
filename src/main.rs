@@ -133,7 +133,7 @@ enum Command {
 
         /// Desktop encoder codec: av1 (libaom, default), vp9 (libvpx) or
         /// h264 (OpenH264). av1/vp9 只在对应 feature 开启时可用。
-        #[arg(long, default_value = "av1")]
+        #[arg(long, default_value = "vp9")]
         desktop_codec: String,
 
         /// Desktop capture frame rate (30 balances latency vs smoothness;

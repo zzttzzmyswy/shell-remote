@@ -73,6 +73,9 @@
         desktopContainer.classList.remove('hidden');
         tabBarEl.classList.add('hidden');
         toggleDesktopBtn.textContent = '终端';
+        // 编码/码率控件仅桌面模式显示（MYS-886）。
+        const bar = document.getElementById('desktop-ctrl-bar');
+        if (bar) bar.classList.remove('hidden');
     }
 
     function showTerminalView() {
@@ -81,23 +84,24 @@
         desktopContainer.classList.add('hidden');
         tabBarEl.classList.remove('hidden');
         toggleDesktopBtn.textContent = '桌面';
+        const bar = document.getElementById('desktop-ctrl-bar');
+        if (bar) bar.classList.add('hidden');
         setTimeout(() => { term.resize(); }, 50);
     }
 
     function setDesktopEnabled(available) {
         desktopEnabled = !!available;
+        // 无桌面捕获能力（无头/未启用）时：桌面按钮与相关控件直接不显示。
+        if (!desktopEnabled) {
+            toggleDesktopBtn.classList.add('hidden');
+        } else {
+            toggleDesktopBtn.classList.remove('hidden');
+        }
         toggleDesktopBtn.disabled = !desktopEnabled;
         if (!desktopEnabled) {
             toggleDesktopBtn.title = '设备不支持桌面共享（未启用桌面捕获）';
         } else {
             toggleDesktopBtn.title = '打开桌面画面（默认关闭）';
-        }
-        // 编码器切换选择框：与桌面能力联动启用（仅在 agent 声明可用编码时）。
-        const sel = document.getElementById('desktop-codec-select');
-        if (sel) {
-            sel.disabled = !desktopEnabled;
-            if (!desktopEnabled) sel.title = '设备不支持桌面共享';
-            else sel.title = '编码方案（切换后自动重建画面）';
         }
     }
 
@@ -112,6 +116,27 @@
             window.__codecSwitchPending = true;
             window.shellRemote.send('desktop:codec', { codec: codec });
             showToast('切换编码为 ' + codec.toUpperCase() + '…', '');
+        });
+    }
+
+    // 码率档切换（rustdesk 三档 + 自定义）：发送 desktop:quality，agent
+    // 重建桌面流应用新档/自定义码率硬顶。
+    const qualitySelect = document.getElementById('desktop-quality-select');
+    if (qualitySelect) {
+        qualitySelect.addEventListener('change', function() {
+            let quality = this.value;
+            let custom = 0;
+            if (quality === 'custom') {
+                const input = window.prompt('自定义码率 (kbps)，例如 1000', '1000');
+                if (input === null) { this.value = 'balanced'; return; }
+                custom = parseInt(input, 10);
+                if (!(custom > 0)) { this.value = 'balanced'; return; }
+                quality = 'balanced'; // 自定义 = balanced 档 + 码率硬顶
+            }
+            if (!desktopEnabled || !window.shellRemote) return;
+            window.__codecSwitchPending = true;
+            window.shellRemote.send('desktop:quality', { quality: quality, bitrate_kbps: custom });
+            showToast('切换码率档…', '');
         });
     }
 
@@ -270,6 +295,13 @@
         // 实际生效的捕获后端（auto 解析后可能与请求不同，例如 dxgi 回退 gdi）。
         window._srDesktopInfo = window._srDesktopInfo || {};
         window._srDesktopInfo.backend = (msg.payload && msg.payload.backend) || null;
+        // 实际生效的编码方案（可能因 fallback 与 select 默认值不同）同步 UI。
+        if (msg.payload && msg.payload.codec) {
+            const cs = document.getElementById('desktop-codec-select');
+            if (cs && Array.from(cs.options).some(function(o) { return o.value === msg.payload.codec; })) {
+                cs.value = msg.payload.codec;
+            }
+        }
         showDesktopView();
         desktopView.connect();
     });

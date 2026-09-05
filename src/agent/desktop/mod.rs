@@ -61,7 +61,7 @@ impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
             capture: "auto".to_string(),
-            codec: "av1".to_string(),
+            codec: "vp9".to_string(),
             // 30fps 起步（MYS-886 时延对标 rustdesk: 22fps/12ms）。60fps 软编
             // 在低配机器上单核打满（实测 115%），编码耗时直接加进 e2e；
             // 30fps 减一半编码负载，时延显著优于 60fps，流畅度损失小。
@@ -115,6 +115,11 @@ pub struct DesktopManager {
     codec: std::sync::RwLock<String>,
     /// 运行时目标编码帧率（QoS 动态调，rustdesk 同款：延时好提升、差降低）。
     fps: Arc<std::sync::atomic::AtomicU32>,
+    /// 运行时质量档倍率（web 码率下拉可改：speed/balanced/best）。初始 =
+    /// config.quality；改动后重建桌面流应用（set_codec 同机制）。
+    quality: std::sync::RwLock<f32>,
+    /// 运行时用户码率硬顶（web 自定义码率）。0 = auto（base×quality）。
+    max_bps: std::sync::RwLock<u64>,
 }
 
 impl DesktopManager {
@@ -122,6 +127,8 @@ impl DesktopManager {
         let bps = config.max_bps;
         let codec = config.codec.clone();
         let fps0 = config.fps.clamp(1.0, 60.0) as u32;
+        let quality0 = config.quality;
+        let max_bps0 = config.max_bps;
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
@@ -132,7 +139,33 @@ impl DesktopManager {
             clock_offset: std::sync::atomic::AtomicI64::new(0),
             codec: std::sync::RwLock::new(codec),
             fps: Arc::new(std::sync::atomic::AtomicU32::new(fps0)),
+            quality: std::sync::RwLock::new(quality0),
+            max_bps: std::sync::RwLock::new(max_bps0),
         }
+    }
+
+    /// 运行时切换码率档位（rustdesk 同款三档 + 自定义 kbps）。
+    /// `quality` ∈ speed/balanced/best；`custom_kbps` >0 时为自定义硬顶。
+    /// 重建桌面流使新档生效（低频操作，可接受瞬间重建）。
+    pub async fn set_quality(&self, quality: &str, custom_kbps: u64, post: PostFn) -> Result<(), String> {
+        let q = match quality {
+            "speed" => crate::agent::desktop::encoder::QUALITY_SPEED,
+            "best" => crate::agent::desktop::encoder::QUALITY_BEST,
+            _ => crate::agent::desktop::encoder::QUALITY_BALANCED,
+        };
+        {
+            let mut cur = self.quality.write().map_err(|_| "quality lock poisoned".to_string())?;
+            *cur = q;
+        }
+        {
+            let mut cur = self.max_bps.write().map_err(|_| "bitrate lock poisoned".to_string())?;
+            *cur = if custom_kbps > 0 { custom_kbps * 1000 } else { 0 };
+        }
+        if self.is_running() {
+            self.stop(post.clone()).await;
+            self.start(post).await;
+        }
+        Ok(())
     }
 
     /// QoS 动态调整目标帧率（rustdesk 同款）：浏览器端到端延时 <150ms 提升
@@ -252,6 +285,12 @@ impl DesktopManager {
         let running = self.running.clone();
         let mut cfg = self.config.clone();
         cfg.codec = codec;
+        // 运行时档位（web 码率/质量下拉可改）覆盖启动默认值。
+        cfg.quality = self.quality.read().map(|q| *q).unwrap_or(cfg.quality);
+        let mb = self.max_bps.read().map(|b| *b).unwrap_or(0);
+        if mb > 0 {
+            cfg.max_bps = mb;
+        }
         let bandwidth = self.bandwidth.clone();
         let clock_offset = self.clock_offset.load(std::sync::atomic::Ordering::Relaxed);
         let fps_ctl = self.fps.clone();

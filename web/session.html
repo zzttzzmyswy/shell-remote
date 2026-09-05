@@ -15,10 +15,6 @@
         </div>
         <div class="toolbar-right">
             <button id="copy-token-btn" class="btn btn-small" title="复制密钥">复制密钥</button>
-            <select id="desktop-codec-select" class="btn btn-small" title="编码方案（切换后自动重建画面）" disabled>
-                <option value="av1">AV1</option>
-                <option value="vp9">VP9</option>
-            </select>
             <button id="toggle-desktop-btn" class="btn btn-small" title="打开桌面画面（默认关闭）" disabled>桌面</button>
             <button id="toggle-files-btn" class="btn btn-small">文件</button>
         </div>
@@ -30,6 +26,22 @@
     <div class="main-content">
         <div id="terminal-container"></div>
         <div id="desktop-container" class="desktop-container hidden">
+            <div id="desktop-ctrl-bar" class="desktop-ctrl-bar hidden">
+                <label class="desktop-ctrl-item">编码
+                    <select id="desktop-codec-select" title="编码方案（切换后自动重建画面）">
+                        <option value="av1">AV1</option>
+                        <option value="vp9">VP9</option>
+                    </select>
+                </label>
+                <label class="desktop-ctrl-item">码率
+                    <select id="desktop-quality-select" title="码率档（rustdesk 三档 + 自定义）">
+                        <option value="speed">极速 (低码率)</option>
+                        <option value="balanced" selected>均衡 (默认)</option>
+                        <option value="best">画质 (高码率)</option>
+                        <option value="custom">自定义…</option>
+                    </select>
+                </label>
+            </div>
             <canvas id="desktop-canvas" class="desktop-canvas"></canvas>
             <video id="desktop-video" autoplay muted playsinline></video>
             <div id="desktop-status" class="desktop-status"></div>

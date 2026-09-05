@@ -1531,6 +1531,37 @@ async fn run_session(
                                     desktop.set_fps(fps);
                                 }
 
+                                "desktop:quality" => {
+                                    // 码率档切换（web 码率下拉）：speed/balanced/best
+                                    // + 自定义 kbps。改档后重建桌面流。
+                                    let quality = msg
+                                        .payload
+                                        .get("quality")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("balanced")
+                                        .to_string();
+                                    let custom_kbps = msg
+                                        .payload
+                                        .get("bitrate_kbps")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    tracing::info!(quality = %quality, custom_kbps, "desktop:quality requested");
+                                    if let Err(e) = desktop
+                                        .set_quality(&quality, custom_kbps, post_fn.clone())
+                                        .await
+                                    {
+                                        let err = Message {
+                                            msg_type: "error".to_string(),
+                                            session_id: client.session_id.clone(),
+                                            payload: serde_json::json!({
+                                                "code": "DESKTOP_BAD_QUALITY",
+                                                "message": e
+                                            }),
+                                        };
+                                        out.control(err).await;
+                                    }
+                                }
+
                                 "desktop:mouse" => {
                                     // 浏览器键鼠注入：desktop:mouse
                                     // {type,x,y,button,dx,dy}（RW 权限校验

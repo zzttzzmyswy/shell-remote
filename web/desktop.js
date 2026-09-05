@@ -123,7 +123,25 @@
       return { h264: 'H.264', vp9: 'VP9', av1: 'AV1' }[this._codecKind] || this._codecKind;
     }
 
+    // 解码错误自动恢复（MYS-886）：WebCodecs 解码器持续报错时，延迟重建
+    // 整个桌面流（disconnect → 清 init → connect 重新拉流）。带防抖避免
+    // 连续报错触发重连风暴；正常关键帧自愈（_decErr）优先，这里兜底。
+    _scheduleDecodeRecover() {
+      const self = this;
+      if (this._decRecoverTimer) return;
+      this._decRecoverTimer = setTimeout(function() {
+        self._decRecoverTimer = null;
+        if (!self.connected) return;
+        self.setStatus('解码异常，重建桌面流…', false);
+        self.disconnect(false);
+        self._codecKind = null; // 强制重新解析新流的 init 段
+        self._decErr = false;
+        setTimeout(function() { self.connect(); }, 800);
+      }, 1500);
+    }
+
     connect() {
+      if (this._decRecoverTimer) { clearTimeout(this._decRecoverTimer); this._decRecoverTimer = null; }
       this.disconnect(false);
       if (this._webcodecsAvailable()) {
         this._mode = 'webcodecs';
@@ -380,6 +398,7 @@
           error: function(e) {
             self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
             self.setStatus('解码错误: ' + e.message, true);
+            self._scheduleDecodeRecover();
           }
         });
         this._dec.configure({
@@ -398,6 +417,7 @@
           error: function(e) {
             self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
             self.setStatus('解码错误: ' + e.message, true);
+            self._scheduleDecodeRecover();
           }
         });
         this._dec.configure({
@@ -413,6 +433,7 @@
         output: function(frame) { self._onDecoded(frame); },
         error: function(e) {
           self.setStatus('解码错误: ' + e.message, true);
+          self._scheduleDecodeRecover();
         }
       });
       this._dec.configure({

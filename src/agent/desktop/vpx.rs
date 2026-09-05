@@ -79,7 +79,7 @@ impl Vp9Encoder {
             cfg.rc_target_bitrate = (bitrate_bps / 1000).min(u32::MAX as u64) as c_uint;
             cfg.rc_min_quantizer = q_min;
             cfg.rc_max_quantizer = q_max;
-            cfg.rc_undershoot_pct = 25;
+            cfg.rc_undershoot_pct = 95;
             cfg.rc_overshoot_pct = 25;
             // VP9 的 RC 需要 dropframe 作高熵压力阀: dropframe=0 时高熵内容
             // 码率彻底失控(实测 7367kbps @ 800k 目标)且编码速度暴跌
