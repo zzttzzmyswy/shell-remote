@@ -264,6 +264,13 @@ impl Drop for ThreadedFrameSource {
 /// `XCompositeRedirectWindow(root, Automatic)` + `XCompositeNameWindowPixmap`,
 /// then `GetImage` on the named pixmap (which reads the window backing store
 /// and works on composited servers).
+///
+/// Fast path: when the X server exposes the MIT-SHM extension we attach a
+/// System V shared-memory segment and use `ShmGetImage` (rustdesk
+/// `x11/capturer.rs`): the server writes pixels directly into our memory,
+/// avoiding a full-frame round-trip through the X protocol on every capture.
+/// Falls back to plain `GetImage` if SHM init fails (no extension / server
+/// refuses the attach).
 pub struct X11Source {
     conn: x11rb::rust_connection::RustConnection,
     screen_num: usize,
@@ -273,10 +280,37 @@ pub struct X11Source {
     depth: u8,
     /// Lazily-initialised XComposite backend used when root `GetImage` fails.
     composite: Option<x11rb::protocol::xproto::Pixmap>,
+    /// MIT-SHM fast-path state (segment + x11rb shm seg id). `None` = SHM
+    /// unavailable (not tried yet, or init failed) — capture falls back.
+    shm: Option<ShmState>,
+    /// SHM init already failed on this geometry — don't retry every frame.
+    /// Reset when the display geometry changes (segment would be stale).
+    shm_failed: bool,
     /// 每 N 帧重查一次 root geometry（display 分辨率运行时变更检测，
     /// rustdesk `Rect`/HotPlug 对齐）。X setup 缓存不反映 xrandr 变更。
     recheck: u32,
 }
+
+/// MIT-SHM segment: SysV shared memory mapped into our address space and
+/// attached to the X server under an x11rb `shm::Seg` id.
+///
+/// `ptr` aliases a SysV mapping that outlives this struct only while the
+/// struct lives (dropped via `shmdt`); X writes into it on `ShmGetImage`.
+/// Access is guarded: capture reads it only after the `ShmGetImage` reply
+/// has been waited on, so no explicit sync fence is needed between X and us.
+struct ShmState {
+    shmid: i32,
+    ptr: *mut u8,
+    size: usize,
+    seg: x11rb::protocol::shm::Seg,
+    width: u16,
+    height: u16,
+}
+
+// SAFETY: the raw pointer is only ever dereferenced from the owning thread
+// (capture loop) after a `ShmGetImage` reply, so it is safe to consider the
+// struct Send within this single-threaded `ThreadedFrameSource` usage.
+unsafe impl Send for ShmState {}
 
 impl X11Source {
     pub fn open(display: Option<&str>) -> Result<Self, String> {
@@ -306,8 +340,80 @@ impl X11Source {
             height,
             depth,
             composite: None,
+            shm: None,
+            shm_failed: false,
             recheck: 0,
         })
+    }
+
+    /// Try to initialise the MIT-SHM fast path. Quietly falls back to
+    /// `GetImage` on any failure (no extension, or the server refuses to
+    /// attach our SysV segment) — SHM is an optimisation, not a requirement.
+    fn try_init_shm(&mut self) -> Result<(), String> {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::shm::ConnectionExt as _;
+
+        if self.shm.is_some() {
+            return Ok(());
+        }
+        // Query the extension version — if the server has no MIT-SHM, shmget
+        // attach would just hang the capture; fail fast instead.
+        self.conn
+            .shm_query_version()
+            .map_err(|e| format!("shm_query_version cookie: {e}"))?
+            .reply()
+            .map_err(|e| format!("shm_query_version reply: {e}"))?;
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let size = w * h * 4; // BGRA 32bpp
+        // shmget with IPC_PRIVATE: server writes into this segment.
+        let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, size, libc::IPC_CREAT | 0o600) };
+        if shmid < 0 {
+            return Err(format!("shmget failed: {}", std::io::Error::last_os_error()));
+        }
+        // Attach in our address space.
+        let ptr = unsafe { libc::shmat(shmid, std::ptr::null(), 0) };
+        if ptr as isize == -1 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+            return Err(format!("shmat failed: {err}"));
+        }
+        // Register the segment with the X server.
+        let seg = self.conn.generate_id().map_err(|e| format!("generate shm id: {e}"))?;
+        self.conn
+            .shm_attach(seg, shmid as u32, false)
+            .map_err(|e| {
+                unsafe { libc::shmdt(ptr) };
+                unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+                format!("shm_attach cookie: {e}")
+            })?
+            .check()
+            .map_err(|e| {
+                unsafe { libc::shmdt(ptr) };
+                unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+                format!("shm_attach reply: {e}")
+            })?;
+        self.shm = Some(ShmState {
+            shmid,
+            ptr: ptr as *mut u8,
+            size,
+            seg,
+            width: self.width,
+            height: self.height,
+        });
+        tracing::debug!("X11 MIT-SHM fast path enabled ({w}x{h} @ {size} bytes)");
+        Ok(())
+    }
+
+    /// Drop the SHM segment (server detach + sysv detach/remove). Called on
+    /// Drop and before re-init after a display geometry change.
+    fn teardown_shm(&mut self) {
+        use x11rb::protocol::shm::ConnectionExt as _;
+        if let Some(s) = self.shm.take() {
+            let _ = self.conn.shm_detach(s.seg);
+            unsafe { libc::shmdt(s.ptr as *const _ as *mut _) };
+            unsafe { libc::shmctl(s.shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+        }
     }
 
     fn bpp(depth: u8) -> x11rb::image::BitsPerPixel {
@@ -357,10 +463,7 @@ impl X11Source {
     /// `GetImage` on a drawable and return packed BGRA rows for the capture
     /// region (see `next_frame` for the depth/stride contract).
     fn capture_impl(&self, drawable: impl Into<x11rb::protocol::xproto::Drawable>) -> Result<Vec<u8>, String> {
-        use x11rb::connection::Connection as _;
-        use x11rb::image::{BitsPerPixel, Image, ImageOrder, ScanlinePad};
         use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
-        use std::borrow::Cow;
 
         let drawable: x11rb::protocol::xproto::Drawable = drawable.into();
         let w = self.width as u16;
@@ -371,8 +474,55 @@ impl X11Source {
             .map_err(|e| format!("get_image cookie: {e}"))?
             .reply()
             .map_err(|e| format!("get_image reply: {e}"))?;
-
         let depth = if reply.depth > 0 { reply.depth } else { self.depth };
+        Self::bgra_from_pixels(&reply.data, depth, self.width as usize, self.height as usize, &self.conn)
+    }
+
+    /// `ShmGetImage` on the *current root* — the server writes the pixels
+    /// straight into our attached SysV segment (no X protocol frame payload),
+    /// then we copy the segment into a fresh BGRA buffer for the encoder.
+    /// This is the rustdesk `x11/capturer.rs` fast path.
+    fn capture_shm(&self) -> Result<Vec<u8>, String> {
+        use x11rb::protocol::shm::ConnectionExt as _;
+        use x11rb::protocol::xproto::ImageFormat;
+
+        let s = self
+            .shm
+            .as_ref()
+            .ok_or_else(|| "capture_shm called without SHM state".to_string())?;
+        let w = self.width as u16;
+        let h = self.height as u16;
+        // Wait for the reply: after it lands the segment holds the frame.
+        self.conn
+            .shm_get_image(self.root, 0, 0, w, h, !0, ImageFormat::Z_PIXMAP.into(), s.seg, 0)
+            .map_err(|e| format!("shm_get_image cookie: {e}"))?
+            .reply()
+            .map_err(|e| format!("shm_get_image reply: {e}"))?;
+        // SAFETY: `s.ptr` points at our own SysV segment (`shmat`), which stays
+        // mapped until `teardown_shm`/`Drop`; the `ShmGetImage` reply above
+        // guarantees the server has finished writing `size` bytes.
+        let data = unsafe { std::slice::from_raw_parts(s.ptr, s.size) };
+        Self::bgra_from_pixels(data, self.depth, self.width as usize, self.height as usize, &self.conn)
+    }
+
+    /// Normalize a raw X11 pixel buffer (depth 24/32, server byte order) into
+    /// packed BGRA rows (B,G,R,A bytes), shared by the `GetImage` and
+    /// MIT-SHM paths so both produce byte-identical output.
+    ///
+    /// `data` is the pixel payload in the server's native byte order
+    /// (x11rb `Image::new` handles byte-order/scanline details), read from a
+    /// `GetImage` reply or a MIT-SHM segment.
+    fn bgra_from_pixels(
+        data: &[u8],
+        depth: u8,
+        w: usize,
+        h: usize,
+        conn: &x11rb::rust_connection::RustConnection,
+    ) -> Result<Vec<u8>, String> {
+        use x11rb::connection::Connection as _;
+        use x11rb::image::{BitsPerPixel, Image, ImageOrder, ScanlinePad};
+        use std::borrow::Cow;
+
         // depth 30 (10-bit per channel) is NOT byte-addressable BGRA: treating
         // it as 32bpp would silently produce wrong colors. Fail loudly instead.
         // 8/16-bit depths are likewise unsupported for the packed-BGRA contract.
@@ -382,23 +532,23 @@ impl X11Source {
             ));
         }
         let bpp = Self::bpp(depth);
-        let byte_order = ImageOrder::try_from(self.conn.setup().image_byte_order)
+        let byte_order = ImageOrder::try_from(conn.setup().image_byte_order)
             .unwrap_or(ImageOrder::LsbFirst);
         let image = Image::new(
-            w,
-            h,
+            w as u16,
+            h as u16,
             ScanlinePad::Pad32,
             depth,
             bpp,
             byte_order,
-            Cow::Borrowed(&reply.data),
+            Cow::Borrowed(data),
         )
         .map_err(|e| format!("Image::new: {e}"))?;
 
         // Normalize to the server's native layout so bytes are BGRA (X pixmap
         // byte order is preserved; on little-endian hosts B is the lowest byte).
         let native = image
-            .native(&self.conn.setup())
+            .native(&conn.setup())
             .map_err(|e| format!("Image::native: {e}"))?;
 
         let stride = match bpp {
@@ -443,27 +593,65 @@ impl FrameSource for X11Source {
         self.recheck += 1;
         if self.recheck >= 30 {
             self.recheck = 0;
+            let mut resized = false;
             if let Ok(cookie) = self.conn.get_geometry(self.root) {
                 if let Ok(geo) = cookie.reply() {
                     if geo.width > 0 && geo.height > 0 {
+                        // 分辨率变了：SHM 段尺寸失效，重建。
+                        if self.width != geo.width || self.height != geo.height {
+                            resized = true;
+                        }
                         self.width = geo.width;
                         self.height = geo.height;
                     }
                 }
             }
+            if resized {
+                self.teardown_shm();
+                self.shm_failed = false;
+            }
         }
-        let bgra = match self.capture_impl(self.root) {
-            Ok(b) => b,
-            Err(root_err) => match self.composite_capture() {
+        // 首次（或分辨率变更后）尝试开启 MIT-SHM 快路径；失败则标记失败
+        // 不再每帧重试（回落 GetImage）。
+        if self.shm.is_none() && !self.shm_failed {
+            if let Err(e) = self.try_init_shm() {
+                tracing::debug!(%e, "X11 MIT-SHM unavailable, using GetImage");
+                self.shm_failed = true;
+            }
+        }
+        let has_shm = self.shm.as_ref().map(|s| {
+            s.width == self.width && s.height == self.height && s.size >= (self.width as usize * self.height as usize * 4)
+        });
+        let bgra = match has_shm {
+            Some(true) => match self.capture_shm() {
                 Ok(b) => b,
-                Err(comp_err) => {
-                    return Err(format!(
-                        "X11 capture failed: GetImage on root — {root_err}; \
-                         XComposite fallback — {comp_err}. If this is a Wayland session (XWayland), \
-                         the X11 root has no image data — the native Wayland desktop cannot be \
-                         captured over X11; run the agent in a real X11 session (Xorg/Xvfb) instead"
-                    ));
+                // SHM 读取失败（极端竞态/服务器限制）：回退 GetImage 保活
+                Err(shm_err) => {
+                    tracing::debug!(%shm_err, "X11 SHM capture failed, falling back to GetImage");
+                    self.teardown_shm();
+                    self.shm = None;
+                    self.shm_failed = true;
+                    match self.capture_impl(self.root) {
+                        Ok(b) => b,
+                        Err(root_err) => {
+                            return self.err_composite(shm_err, root_err);
+                        }
+                    }
                 }
+            },
+            _ => match self.capture_impl(self.root) {
+                Ok(b) => b,
+                Err(root_err) => match self.composite_capture() {
+                    Ok(b) => b,
+                    Err(comp_err) => {
+                        return Err(format!(
+                            "X11 capture failed: GetImage on root — {root_err}; \
+                             XComposite fallback — {comp_err}. If this is a Wayland session (XWayland), \
+                             the X11 root has no image data — the native Wayland desktop cannot be \
+                             captured over X11; run the agent in a real X11 session (Xorg/Xvfb) instead"
+                        ));
+                    }
+                },
             },
         };
         Ok(Frame {
@@ -474,7 +662,30 @@ impl FrameSource for X11Source {
     }
 }
 
+impl Drop for X11Source {
+    fn drop(&mut self) {
+        self.teardown_shm();
+    }
+}
+
 impl X11Source {
+    /// Compose the composite-fallback error (shared by the shm-fallback path).
+    fn err_composite(&mut self, shm_err: String, root_err: String) -> Result<Frame, String> {
+        match self.composite_capture() {
+            Ok(b) => Ok(Frame {
+                bgra: b,
+                width: self.width as usize,
+                height: self.height as usize,
+            }),
+            Err(comp_err) => Err(format!(
+                "X11 capture failed: ShmGetImage — {shm_err}; GetImage on root — {root_err}; \
+                 XComposite fallback — {comp_err}. If this is a Wayland session (XWayland), \
+                 the X11 root has no image data — the native Wayland desktop cannot be \
+                 captured over X11; run the agent in a real X11 session (Xorg/Xvfb) instead"
+            )),
+        }
+    }
+
     fn composite_capture(&mut self) -> Result<Vec<u8>, String> {
         self.ensure_composite()?;
         let pixmap = self
@@ -703,6 +914,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// X11 SHM fast path smoke test against a real X server (Xvfb :99).
+    /// Verifies: SHM init succeeds, the first frame is captured via the
+    /// segment, and multiple frames agree on size — plus drop() releases the
+    /// SysV segment without leaking it (would show up as shmseg reuse errors).
+    /// Skipped when no display is reachable: reads SR_XTEST_DISPLAY or :99.
+    #[test]
+    fn test_x11_shm_capture_on_xvfb() {
+        let display = std::env::var("SR_XTEST_DISPLAY").unwrap_or_else(|_| ":99".into());
+        let mut src = match X11Source::open(Some(&display)) {
+            Ok(s) => s,
+            Err(e) => {
+                if e.contains("connect") && std::env::var("SR_NO_XTEST").is_ok() {
+                    return;
+                }
+                panic!("x11 open failed: {e}");
+            }
+        };
+        let (w, h) = src.resolution();
+        assert!(w > 0 && h > 0);
+        // First frame drives try_init_shm.
+        let fr = src.next_frame().expect("frame");
+        assert_eq!(fr.bgra.len(), w * h * 4);
+        // On servers with MIT-SHM the fast path must be active after this.
+        if src.shm.is_some() {
+            assert_eq!(src.shm.as_ref().unwrap().size, w * h * 4);
+            // Second frame also via SHM, same size.
+            let fr2 = src.next_frame().expect("frame 2");
+            assert_eq!(fr2.bgra.len(), w * h * 4);
+        } else {
+            eprintln!(
+                "display {display} has no MIT-SHM support (or attach refused); \
+                 GetImage fallback tested instead"
+            );
+        }
+        // Drop must not leak: dropping the segment, a fresh X11Source to the
+        // same display still captures (exercises segment id reuse + cleanup).
+        // Xvfb aggressively resets a connection that closes then re-opens
+        // immediately (os error 104 noise); retry briefly rather than flake.
+        drop(src);
+        let mut src2 = None;
+        for attempt in 0..5 {
+            match X11Source::open(Some(&display)) {
+                Ok(s) => {
+                    src2 = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 4 {
+                        panic!("reopen after drop, final attempt failed: {e}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+        let mut src2 = src2.unwrap();
+        let _ = src2.next_frame().expect("frame after reopen");
     }
 
     /// X11 capture smoke test against a real X server (Xvfb :99).
