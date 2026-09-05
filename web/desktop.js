@@ -51,6 +51,8 @@
       this._decodeCount = 0;      // 本 1s 窗口已解码帧数（解码背压上传）
       this._reqKeyAt = 0;         // 上次 desktop:reqkey 发送时刻（限频）
       this._reqKeyCount = 0;      // 最近 10s 内 reqkey 次数
+      this._lastSeq = 0;        // 最近收到的帧号（seqn box）
+      this._seqDrop = 0;        // 真实上行丢帧数（seq gap 累计）
       this._renderPending = false;
       this._droppedFrames = 0;
       // 浏览器与 relay 的时钟偏移（relay_epoch - 本地_epoch）。srtc 在 relay
@@ -505,12 +507,12 @@
       this._codecStr = codec;
     }
 
-    // moof: 提取 tfdt(pts)、trun(size+flags)、srtc(captureMs)
+    // moof: 提取 tfdt(pts)、trun(size+flags)、srtc(captureMs)、seqn(帧号)
     _handleMoof(body) {
       if (!this._dec) return; // 尚无 init
       // 遍历 traf 子 box
       let pos = 0;
-      let ptsUs = 0, sampleSize = 0, isKey = false, captureMs = 0;
+      let ptsUs = 0, sampleSize = 0, isKey = false, captureMs = 0, frameSeq = 0;
       let sawTrun = false;
       while (pos + 8 <= body.length) {
         const size = (body[pos] << 24) | (body[pos+1] << 16) | (body[pos+2] << 8) | body[pos+3];
@@ -545,6 +547,13 @@
                 (BigInt(d2[2]) << 40n) | (BigInt(d2[3]) << 32n) |
                 (BigInt(d2[4]) << 24n) | (BigInt(d2[5]) << 16n) |
                 (BigInt(d2[6]) << 8n) | BigInt(d2[7]));
+            } else if (t2 === 'seqn' && d2.length >= 8) {
+              // 帧号：TCP 有序，只可能从上游丢帧 → seq gap = 真实上行丢帧数
+              //（对齐 rustdesk 控制端丢帧口径，替代"解码丢弃"估算）。
+              frameSeq = Number((BigInt(d2[0]) << 56n) | (BigInt(d2[1]) << 48n) |
+                (BigInt(d2[2]) << 40n) | (BigInt(d2[3]) << 32n) |
+                (BigInt(d2[4]) << 24n) | (BigInt(d2[5]) << 16n) |
+                (BigInt(d2[6]) << 8n) | BigInt(d2[7]));
             }
             p += s2;
           }
@@ -552,6 +561,14 @@
         pos += size;
       }
       if (!sawTrun || sampleSize === 0) return;
+      // 真实上行丢帧统计：TCP 有序，seq gap 只能来自上游丢弃（上传队列丢旧/
+      // relay 丢旧）。对齐 rustdesk 控制端丢帧口径。
+      if (frameSeq > 0) {
+        if (this._lastSeq > 0 && frameSeq > this._lastSeq + 1) {
+          this._seqDrop += frameSeq - this._lastSeq - 1;
+        }
+        this._lastSeq = Math.max(this._lastSeq, frameSeq);
+      }
       this._pending = { ptsUs: ptsUs, isKey: isKey, captureMs: captureMs, size: sampleSize };
     }
 
@@ -703,6 +720,8 @@
       this._reqKeyAt = 0;
       this._reqKeyCount = 0;
       this._reqKeyWindowStart = 0;
+      this._lastSeq = 0;
+      this._seqDrop = 0;
       this._unbindInput();
       this._stopMetrics();
       const panel = document.getElementById('desktop-metrics');
@@ -772,7 +791,7 @@
           fps.textContent = self._rafCount;
           self._rafCount = 0;
           buf.textContent = self._dec ? self._dec.decodeQueueSize : '-';
-          drop.textContent = self._droppedFrames;
+          drop.textContent = self._droppedFrames + ' 解码 / ' + self._seqDrop + ' 上行(seq)';
           br.textContent = self._avgKbps ? self._avgKbps + ' kbps' : '-';
           if (backend) backend.textContent = self._captureBackend || '-';
           if (uplink) uplink.textContent = self._uplinkMode || '-';
@@ -787,7 +806,8 @@
             window.shellRemote.send('desktop:qos', {
               delay_ms: Math.round(self._e2eMs),
               dfps: dfps,
-              dq: self._dec ? self._dec.decodeQueueSize : 0
+              dq: self._dec ? self._dec.decodeQueueSize : 0,
+              lseq: self._lastSeq || 0
             });
           }
           // 停滞检测：曾收到帧但现在 500ms 无新帧 → 关键帧断裂可能，请求刷新。

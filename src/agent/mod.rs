@@ -1534,8 +1534,13 @@ async fn run_session(
                                         .get("dq")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0) as u32;
+                                    let ack_seq = msg
+                                        .payload
+                                        .get("lseq")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
                                     let (fps, qos_scale, bitrate_kbps) =
-                                        desktop.on_qos_delay(delay_ms, decode_fps, decode_queue).await;
+                                        desktop.on_qos_delay(delay_ms, decode_fps, decode_queue, ack_seq).await;
                                     // 回传当前生效的 QoS 状态（对齐 rustdesk TestDelay
                                     // 携带 target_bitrate，MYS-886 #153）：浏览器可展示
                                     // 实际码率/帧率。

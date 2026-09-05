@@ -234,6 +234,7 @@ impl DesktopManager {
         delay_ms: u32,
         decode_fps: u32,
         decode_queue: u32,
+        ack_seq: u64,
     ) -> (u32, u32, u64) {
         use std::sync::atomic::Ordering as O;
         let cap = (self.config.fps as u32).clamp(1, 60);
@@ -274,7 +275,7 @@ impl DesktopManager {
             encoder::target_bitrate(1920, 1080, 0, self.config.quality).max(self.config.min_bps)
         };
         let bitrate_kbps = base_bps * (permille as u64) / 1000 / 1000;
-        tracing::info!(delay_ms, fps, qos_scale = permille, cap, "desktop QoS: adaptive adjusted");
+        tracing::info!(delay_ms, fps, qos_scale = permille, cap, ack_seq, "desktop QoS: adaptive adjusted");
         (fps, permille, bitrate_kbps)
     }
 

@@ -489,6 +489,9 @@ pub fn mp4_fragment(
     // Browsers parse and skip unknown boxes per ISO-BMFF, so this is invisible
     // to MSE/ffmpeg but extractable by our WebCodecs player for e2e latency.
     let srtc = box_of(b"srtc", &capture_epoch_ms.to_be_bytes());
+    // seqn (frame sequence, custom box): 8-byte 单调帧号。浏览器据此统计真实
+    // 丢帧率（seq gap）并做 ack 限产（在途帧上限），对齐 rustdesk 丢帧口径。
+    let seqn = box_of(b"seqn", &(seq as u64).to_be_bytes());
 
     let traf = {
         let mut inner = Vec::new();
@@ -496,6 +499,7 @@ pub fn mp4_fragment(
         inner.extend_from_slice(&tfdt);
         inner.extend_from_slice(&trun);
         inner.extend_from_slice(&srtc);
+        inner.extend_from_slice(&seqn);
         box_of(b"traf", &inner)
     };
 
