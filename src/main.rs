@@ -164,6 +164,20 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 崩溃诊断：任何 Rust panic 都留痕到 shell-remote-crash.log（含 panic
+    // 消息与代码位置），避免 release 构建静默闪退无从排查（MYS-886
+    // Windows agent 桌面闪退定位）。panic=unwind 下 hook 在 unwind 前调用，
+    // panic=abort 下在 abort 前调用——两种配置都能留下日志。
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!(
+            "==== shell-remote panic ====\nthread: {}\nlocation: {:?}\ninfo: {}\n",
+            std::thread::current().name().unwrap_or("?").to_string(),
+            info.location(),
+            info.payload().downcast_ref::<&str>().copied().unwrap_or("(non-str payload)")
+        );
+        let _ = std::fs::write("shell-remote-crash.log", &msg);
+        eprintln!("{msg}");
+    }));
     // 关闭 ANSI 颜色控制符: 在不支持色彩的终端(重定向/日志文件/Windows 旧终端)
     // 里会产生大量转义序列垃圾。用户要求无法检测时直接关闭。
     tracing_subscriber::fmt()

@@ -281,16 +281,14 @@ impl Vp9Encoder {
     }
 
     /// Dynamically update the encoder's frame-rate model.
+    ///
+    /// **不再调用 `vpx_codec_enc_config_set`**（MYS-886 Windows 闪退根因，
+    /// 与 AV1 同款）：运行期频繁 config_set 会使 libvpx 内部量化/编解码
+    /// 状态与 config 不同步，后续 `encode` 崩溃。KF_DISABLED 下关键帧全由
+    /// 外部 force_idr 控制（kf_max_dist 保持 0），RC 帧率由真实 pts 差
+    /// 表达，帧率模型无需运行期重设。fps 仅保存在 Rust 侧供逻辑使用。
     pub fn set_frame_rate(&mut self, fps: f32) {
         self.fps = fps.clamp(1.0, 60.0) as f64;
-        // KF_DISABLED（rustdesk 非录制同款）：关键帧全由外部 force_idr
-        // 控制，这里只需同步帧率模型，kf_max_dist 保持 0。
-        unsafe {
-            let src_ptr = self.ctx.config.enc as *const vpx_sys::vpx_codec_enc_cfg_t;
-            let mut cfg: vpx_sys::vpx_codec_enc_cfg_t = std::ptr::read(src_ptr);
-            cfg.kf_max_dist = 0;
-            vpx_sys::vpx_codec_enc_config_set(&mut self.ctx, &cfg);
-        }
     }
 
     /// Force the next encoded frame to be a key frame.

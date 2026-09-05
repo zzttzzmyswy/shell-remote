@@ -553,7 +553,16 @@ async fn run_desktop_pipeline(
     // 截图线程化（rustdesk capture 线程对齐）：capture 挪到独立线程持续
     // 抓帧，编码循环 try_latest 非阻塞取最新帧——抓帧（X11/DXGI）不再拖慢
     // 编码，慢抓帧时跳帧追最新。src 被 move 进抓帧线程。
-    let threaded = capture::ThreadedFrameSource::spawn(src);
+    let threaded = match capture::ThreadedFrameSource::spawn(src) {
+        Ok(t) => t,
+        Err(e) => {
+            (post)(serde_json::json!({
+                "type": "desktop:started",
+                "payload": { "codec": cfg.codec, "error": format!("capture thread failed: {e}") }
+            }));
+            return;
+        }
+    };
     let (mut w0, mut h0) = threaded.resolution();
     if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
         (post)(serde_json::json!({

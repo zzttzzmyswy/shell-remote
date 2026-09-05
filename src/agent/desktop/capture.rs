@@ -145,7 +145,7 @@ pub struct ThreadedFrameSource {
 
 impl ThreadedFrameSource {
     /// 启动抓帧线程。`inner` 被 move 进线程（不再可从外部访问）。
-    pub fn spawn(mut inner: Box<dyn FrameSource>) -> Self {
+    pub fn spawn(mut inner: Box<dyn FrameSource>) -> Result<Self, String> {
         use std::sync::atomic::Ordering as O;
         let (width, height) = inner.resolution();
         let latest = Arc::new(std::sync::Mutex::new(None));
@@ -153,25 +153,44 @@ impl ThreadedFrameSource {
         let last_err = Arc::new(std::sync::Mutex::new(None));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (s1, l1, e1, le1) = (stop.clone(), latest.clone(), err_count.clone(), last_err.clone());
-        let thread = std::thread::spawn(move || loop {
-            if s1.load(O::Relaxed) {
-                break;
-            }
-            match inner.next_frame() {
-                Ok(f) => {
-                    *l1.lock().unwrap() = Some(f);
-                    e1.store(0, O::Relaxed);
+        let builder = std::thread::Builder::new().name("desktop-capture".to_string());
+        let thread = builder
+            .spawn(move || {
+                use std::sync::atomic::Ordering as O;
+                // unwind 捕获：capture 内部若有 Rust panic（如 unwrap/越界），
+                // 转成错误上报而非让整个 agent 进程闪退（panic=unwind 构建）。
+                // abort 构建下无法拦截，但有 crash 日志 hook 记录现场。
+                let run = || loop {
+                    if s1.load(O::Relaxed) {
+                        break;
+                    }
+                    match inner.next_frame() {
+                        Ok(f) => {
+                            *l1.lock().unwrap() = Some(f);
+                            e1.store(0, O::Relaxed);
+                        }
+                        Err(e) => {
+                            e1.fetch_add(1, O::Relaxed);
+                            *le1.lock().unwrap() = Some(e);
+                        }
+                    }
+                    // 防空转：快源（测试 mock / Xvfb）全速产帧时让出 CPU；真实后端
+                    // 自带节流（X11 每帧一次 X 往返、DXGI 静止 200ms timeout）。
+                    std::thread::yield_now();
+                };
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                    // 置 u32::MAX 触发 pipeline 的 MAX_CAPTURE_ERRORS 终止并回传。
+                    e1.store(u32::MAX, O::Relaxed);
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "capture thread panicked (unknown payload)".to_string());
+                    *le1.lock().unwrap() = Some(format!("capture thread panic: {msg}"));
                 }
-                Err(e) => {
-                    e1.fetch_add(1, O::Relaxed);
-                    *le1.lock().unwrap() = Some(e);
-                }
-            }
-            // 防空转：快源（测试 mock / Xvfb）全速产帧时让出 CPU；真实后端
-            // 自带节流（X11 每帧一次 X 往返、DXGI 静止 200ms timeout）。
-            std::thread::yield_now();
-        });
-        Self {
+            })
+            .map_err(|e| format!("spawn capture thread: {e}"))?;
+        Ok(Self {
             latest,
             err_count,
             last_err,
@@ -179,7 +198,7 @@ impl ThreadedFrameSource {
             thread: Some(thread),
             width,
             height,
-        }
+        })
     }
 
     /// 取走当前最新帧；尚无新帧时返回 `None`（主循环跳帧，不阻塞）。
@@ -751,7 +770,7 @@ mod tests {
     #[test]
     fn test_threaded_source_yields_latest_frame() {
         let src: Box<dyn FrameSource> = Box::new(CounterSource { w: 16, h: 16, t: 0 });
-        let ts = ThreadedFrameSource::spawn(src);
+        let ts = ThreadedFrameSource::spawn(src).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut frame = None;
         while std::time::Instant::now() < deadline {
@@ -779,7 +798,7 @@ mod tests {
     #[test]
     fn test_threaded_source_drop_stops_thread() {
         let src: Box<dyn FrameSource> = Box::new(CounterSource { w: 8, h: 8, t: 0 });
-        let ts = ThreadedFrameSource::spawn(src);
+        let ts = ThreadedFrameSource::spawn(src).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(ts.try_latest().is_some(), "capture thread must run before drop");
         // drop 触发 stop + join，不应 hang。
@@ -797,7 +816,7 @@ mod tests {
                 (4, 4)
             }
         }
-        let ts = ThreadedFrameSource::spawn(Box::new(Fail));
+        let ts = ThreadedFrameSource::spawn(Box::new(Fail)).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline && ts.err_count() == 0 {
             std::thread::sleep(std::time::Duration::from_millis(2));

@@ -308,14 +308,16 @@ impl AomEncoder {
     }
 
     /// Dynamically update the encoder's frame-rate model.
+    ///
+    /// **不再调用 `aom_codec_enc_config_set`**（MYS-886 Windows 闪退根因）：
+    /// libaom 的 `aom_codec_enc_config_set` 每次会重设内部 config，跨多次
+    /// 连续调用后量化 qmatrix 表悬垂 → 下一次 `encode` 在
+    /// `aom_quantize_b_helper_c` 崩溃（qm_ptr=0x1，ACCESS_VIOLATION）。
+    /// 而 libaom 的 RC 用真实 pts 差算实际帧率（duration=1 + 递增 pts，
+    /// 已对齐 rustdesk），**帧率模型不需要运行期重设**。fps 仅保存在
+    /// Rust 侧供逻辑使用，不触碰编码器内部状态。
     pub fn set_frame_rate(&mut self, fps: f32) {
         self.fps = fps.clamp(1.0, 60.0) as f64;
-        unsafe {
-            let src_ptr = self.ctx.config.enc as *const aom_sys::aom_codec_enc_cfg_t;
-            let mut cfg: aom_sys::aom_codec_enc_cfg_t = std::ptr::read(src_ptr);
-            cfg.kf_max_dist = (self.fps * crate::agent::desktop::KF_AUTO_MAX_SECS) as c_uint;
-            aom_sys::aom_codec_enc_config_set(&mut self.ctx, &cfg);
-        }
     }
 
     /// Force the next encoded frame to be a key frame.
@@ -514,6 +516,75 @@ mod bench_encode_time {
         buf
     }
 
+    /// MYS-886 Windows 桌面闪退复现尝试：1280x800（用户机型分辨率）长时间多
+    /// 帧多样化内容 + QoS 低帧率时钟，捕捉 libaom 量化查表越界（崩溃点
+    /// `mov edx,[r11+rdx*4]` / quantize 路径）。本地跑（x86 服务器核数对齐
+    /// codec_thread_num），崩溃即复现 → gdb debug。
+    #[test]
+    #[ignore]
+    fn av1_1280x800_long_desktop_like_stress() {
+        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45).expect("av1 init");
+        let mut ticks = 0u64;
+        let start = std::time::Instant::now();
+        // 持续 180s 冲刺（fps=1 → ~180 编码帧，但每帧都是完整桌面帧）
+        while start.elapsed().as_secs() < 180 {
+            let t = ticks;
+            let mut buf = vec![128u8; 1280 * 800 + 1280 * 800 / 2];
+            let (w, h) = (1280usize, 800usize);
+            // 模拟桌面：静态底色 + 移动高对比窗口 + 文本行噪声
+            let wx = ((t as usize * 37) % (w * 2)) as isize - w as isize / 2;
+            let wy = ((t as usize * 23) % (h * 2)) as isize - h as isize / 2;
+            for dy in 0..180isize {
+                for dx in 0..160isize {
+                    let px = wx + dx;
+                    let py = wy.saturating_mul(0) + dy;
+                    let _ = py;
+                    let xx = wx + dx;
+                    let yy = wy + dy;
+                    if (0..w as isize).contains(&xx) && (0..h as isize).contains(&yy) {
+                        let i = (yy as usize * w + xx as usize) * 2 / 2;
+                        let y = i;
+                        if y < w * h {
+                            let v = 200u8.wrapping_add((t % 64) as u8);
+                            buf[y] = v;
+                            // U/V 写正确位置（UV 平面）
+                            let ui = w * h + (yy as usize / 2) * (w / 2) + xx as usize / 2;
+                            if ui < buf.len() {
+                                buf[ui] = 128;
+                            }
+                            let vi = ui + w * h / 4;
+                            if vi < buf.len() {
+                                buf[vi] = 128;
+                            }
+                        }
+                    }
+                }
+            }
+            // 文本行噪声
+            if t % 7 == 0 {
+                for i in (0..w * h).step_by(131) {
+                    buf[i] = (t as u8).wrapping_mul(31).wrapping_add((i % 251) as u8);
+                }
+            }
+            // 周期关键帧（模拟外部 force_idr 节奏）
+            if t % 9 == 0 {
+                enc.force_idr();
+            }
+            let res = enc.encode(&buf);
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("encode error at tick {t}: {e}");
+                    panic!("encode error: {e}");
+                }
+            }
+            ticks += 1;
+            // 帧率时钟：QoS 把 fps 压到 1 → 每帧间隔 1s（模拟真实节奏）
+            std::thread::sleep(std::time::Duration::from_millis(0));
+        }
+        eprintln!("av1 1280x800 stress: {ticks} frames in {:.0}s OK", start.elapsed().as_secs_f64());
+    }
+
     #[test]
     fn bench_av1_1080p_complex_encode_ms_per_frame() {
         let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0, 10, 30).expect("av1 init");
@@ -529,5 +600,104 @@ mod bench_encode_time {
         // 上限 250ms 是宽松护栏（并行跑全量测试时 CPU 竞争可把单帧拖到
         // 120-150ms）；真正的延迟验证在 E2E 链路完成。
         assert!(ms < 250.0, "av1 frame took {ms:.1}ms — latency bug remains");
+    }
+
+    /// MYS-886 Windows 闪退复现：运行期反复 `aom_codec_enc_config_set`
+    /// （set_bitrate 改码率 / set_quality 改 QP 区间，QoS+ABR 真实节奏）。
+    /// 崩溃点在 `aom_quantize_b_helper_c` 的 qm_ptr 悬垂（Windows 实测
+    /// fault module=exe、qm_ptr=0x1）。本地可复现即坐实根因。
+    #[test]
+    #[ignore]
+    fn av1_set_bitrate_only_stress() {
+        // 验证：仅高频 set_bitrate（aom_codec_enc_config_set 改 rc_target）+
+        // encode 是否独立触发 quantize 崩溃（MYS-886 根因排查：已确认
+        // 每帧 set_frame_rate 是崩溃源，此处隔离 set_bitrate）。
+        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45).expect("av1 init");
+        fn frame(t: u64, w: usize, h: usize) -> Vec<u8> {
+            let mut buf = vec![128u8; w * h + w * h / 2];
+            let wx = ((t as usize * 37) % (w * 2)) as isize - w as isize / 2;
+            let wy = ((t as usize * 23) % (h * 2)) as isize - h as isize / 2;
+            for dy in 0..180isize {
+                for dx in 0..160isize {
+                    let xx = wx + dx;
+                    let yy = wy + dy;
+                    if (0..w as isize).contains(&xx) && (0..h as isize).contains(&yy) {
+                        buf[(yy as usize) * w + xx as usize] = 200u8.wrapping_add((t as u8) & 0x3f);
+                    }
+                }
+            }
+            if t % 7 == 0 {
+                for i in (0..w * h).step_by(131) {
+                    buf[i] = buf[i].wrapping_add((t as u8).wrapping_mul(31));
+                }
+            }
+            buf
+        }
+        let (w, h) = (1280usize, 800usize);
+        for t in 0..3000u64 {
+            if t % 3 == 0 {
+                let kbps = [400, 800, 1200, 600, 1400, 500][(t / 3) as usize % 6];
+                enc.set_bitrate(kbps * 1000);
+            }
+            if t % 15 == 0 {
+                enc.force_idr();
+            }
+            let buf = frame(t, w, h);
+            let _ = enc.encode(&buf).expect("encode");
+        }
+        eprintln!("av1 set_bitrate-only 3000 frames OK");
+    }
+
+    #[test]
+    #[ignore]
+    fn av1_dynamic_rc_reconfig_repro() {
+        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45).expect("av1 init");
+        let mut qos = 1000u32; // 千分比
+        let mut phase = 0usize;
+        // 模拟桌面内容：静态底 + 移动窗口块
+        fn frame(t: u64, w: usize, h: usize) -> Vec<u8> {
+            let mut buf = vec![128u8; w * h + w * h / 2];
+            let wx = ((t as usize * 37) % (w * 2)) as isize - w as isize / 2;
+            let wy = ((t as usize * 23) % (h * 2)) as isize - h as isize / 2;
+            for dy in 0..180isize {
+                for dx in 0..160isize {
+                    let xx = wx + dx;
+                    let yy = wy + dy;
+                    if (0..w as isize).contains(&xx) && (0..h as isize).contains(&yy) {
+                        buf[(yy as usize) * w + xx as usize] = 200u8.wrapping_add((t as u8) & 0x3f);
+                    }
+                }
+            }
+            if t % 7 == 0 {
+                for i in (0..w * h).step_by(131) {
+                    buf[i] = buf[i].wrapping_add((t as u8).wrapping_mul(31));
+                }
+            }
+            buf
+        }
+        let (w, h) = (1280usize, 800usize);
+        for t in 0..6000u64 {
+            // QoS 节律：每 ~3s（fps=1 时 3 帧）调码率千分比
+            if t % 3 == 0 {
+                qos = [1000, 800, 600, 900, 1200, 700][phase % 6];
+                phase += 1;
+                let kbps = (900u64 * qos as u64 / 1000).max(80);
+                enc.set_bitrate(kbps * 1000);
+            }
+            // quality 档切换（改 QP 区间）：每 12 帧（4 个 QoS 周期）
+            if t % 12 == 0 {
+                let ratio = [0.5f32, 1.5, 0.67][phase as usize % 3];
+                enc.set_quality(ratio);
+            }
+            if t % 15 == 0 {
+                enc.force_idr();
+            }
+            // pipeline 每 tick 都调 set_frame_rate（QoS 动态 fps）→ rc_config_set
+            let cur_fps = if t % 7 == 0 { 1.0f32 } else { 30.0 };
+            enc.set_frame_rate(cur_fps);
+            let buf = frame(t, w, h);
+            let _ = enc.encode(&buf).expect("encode");
+        }
+        eprintln!("av1 dynamic rc 6000 frames OK");
     }
 }
