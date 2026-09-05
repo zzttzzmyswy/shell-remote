@@ -13,6 +13,8 @@
 //! `open_source` resolves `auto` per-platform: Windows tries dxgi→gdi, Linux
 //! tries wayland (when a portal is reachable) then X11.
 
+use std::sync::Arc;
+
 /// One captured frame: packed BGRA (little-endian byte order B,G,R,A).
 pub struct Frame {
     pub bgra: Vec<u8>,
@@ -119,6 +121,100 @@ fn open_gdi() -> Result<Box<dyn FrameSource>, String> {
 #[cfg(not(windows))]
 fn open_gdi() -> Result<Box<dyn FrameSource>, String> {
     Err("GDI capture is Windows-only".to_string())
+}
+
+// ── 截图线程化（rustdesk capture 线程对齐） ────────────────
+
+/// 独立抓帧线程包装：把 `FrameSource` 挪到专用线程持续抓帧，主循环用
+/// [`ThreadedFrameSource::try_latest`] 非阻塞取最新帧——编码线程不再被慢
+/// 抓帧（X11 GetImage / DXGI 等）阻塞，抓帧与编码并行。
+///
+/// - `latest` 只保留**最新**一帧（旧帧丢弃，等同"追最新帧"跳帧语义）；
+/// - capture 线程持续出错时累计 `err_count` 并保存 `last_err`，供主循环
+///   按 `MAX_CAPTURE_ERRORS` 终止决策；
+/// - drop 时置 stop 并 join，保证线程干净退出（不再有后台孤儿线程）。
+pub struct ThreadedFrameSource {
+    latest: Arc<std::sync::Mutex<Option<Frame>>>,
+    err_count: Arc<std::sync::atomic::AtomicU32>,
+    last_err: Arc<std::sync::Mutex<Option<String>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    width: usize,
+    height: usize,
+}
+
+impl ThreadedFrameSource {
+    /// 启动抓帧线程。`inner` 被 move 进线程（不再可从外部访问）。
+    pub fn spawn(mut inner: Box<dyn FrameSource>) -> Self {
+        use std::sync::atomic::Ordering as O;
+        let (width, height) = inner.resolution();
+        let latest = Arc::new(std::sync::Mutex::new(None));
+        let err_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let last_err = Arc::new(std::sync::Mutex::new(None));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s1, l1, e1, le1) = (stop.clone(), latest.clone(), err_count.clone(), last_err.clone());
+        let thread = std::thread::spawn(move || loop {
+            if s1.load(O::Relaxed) {
+                break;
+            }
+            match inner.next_frame() {
+                Ok(f) => {
+                    *l1.lock().unwrap() = Some(f);
+                    e1.store(0, O::Relaxed);
+                }
+                Err(e) => {
+                    e1.fetch_add(1, O::Relaxed);
+                    *le1.lock().unwrap() = Some(e);
+                }
+            }
+            // 防空转：快源（测试 mock / Xvfb）全速产帧时让出 CPU；真实后端
+            // 自带节流（X11 每帧一次 X 往返、DXGI 静止 200ms timeout）。
+            std::thread::yield_now();
+        });
+        Self {
+            latest,
+            err_count,
+            last_err,
+            stop,
+            thread: Some(thread),
+            width,
+            height,
+        }
+    }
+
+    /// 取走当前最新帧；尚无新帧时返回 `None`（主循环跳帧，不阻塞）。
+    pub fn try_latest(&self) -> Option<Frame> {
+        self.latest.lock().unwrap().take()
+    }
+
+    /// capture 线程累计的连续失败次数（成功后清零）。
+    pub fn err_count(&self) -> u32 {
+        use std::sync::atomic::Ordering as O;
+        self.err_count.load(O::Relaxed)
+    }
+
+    /// 最近一次抓帧错误（用于报错回传浏览器）。
+    pub fn last_err(&self) -> Option<String> {
+        self.last_err.lock().unwrap().clone()
+    }
+
+    /// 捕获源初始分辨率（抓帧线程内 self-inner 自身会随 display 变更更新
+    /// 帧尺寸，主循环用帧尺寸检测变更）。
+    pub fn resolution(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+}
+
+impl Drop for ThreadedFrameSource {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering as O;
+        self.stop.store(true, O::Relaxed);
+        if let Some(t) = self.thread.take() {
+            // join 等线程退出；真实后端最多阻塞一个抓帧周期（DXGI 静止
+            // 200ms timeout / X11 一次往返），毫秒级可接受。
+            let _ = t.join();
+        }
+    }
 }
 
 // ── X11 ────────────────────────────────────────────────────────
@@ -628,6 +724,87 @@ mod tests {
     #[test]
     fn test_gdi_source_compiles_on_windows_target() {
         // Compile-only presence check (never runs in tests).
+    }
+
+    /// 快速产帧源：每帧内容含递增序号（验证"取到最新帧"）。
+    struct CounterSource {
+        w: usize,
+        h: usize,
+        t: usize,
+    }
+
+    impl FrameSource for CounterSource {
+        fn next_frame(&mut self) -> Result<Frame, String> {
+            self.t += 1;
+            let v = self.t as u8;
+            Ok(Frame {
+                bgra: vec![v; self.w * self.h * 4],
+                width: self.w,
+                height: self.h,
+            })
+        }
+        fn resolution(&self) -> (usize, usize) {
+            (self.w, self.h)
+        }
+    }
+
+    #[test]
+    fn test_threaded_source_yields_latest_frame() {
+        let src: Box<dyn FrameSource> = Box::new(CounterSource { w: 16, h: 16, t: 0 });
+        let ts = ThreadedFrameSource::spawn(src);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut frame = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(f) = ts.try_latest() {
+                frame = Some(f);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let f = frame.expect("threaded source must produce a frame within 2s");
+        assert_eq!((f.width, f.height), (16, 16));
+        assert_eq!(f.bgra.len(), 16 * 16 * 4);
+        // 持续产帧：再取几帧都应成功
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got = 0;
+        while std::time::Instant::now() < deadline && got < 3 {
+            if ts.try_latest().is_some() {
+                got += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(got >= 3, "must keep yielding frames, got {got}");
+    }
+
+    #[test]
+    fn test_threaded_source_drop_stops_thread() {
+        let src: Box<dyn FrameSource> = Box::new(CounterSource { w: 8, h: 8, t: 0 });
+        let ts = ThreadedFrameSource::spawn(src);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(ts.try_latest().is_some(), "capture thread must run before drop");
+        // drop 触发 stop + join，不应 hang。
+        drop(ts);
+    }
+
+    #[test]
+    fn test_threaded_source_reports_errors() {
+        struct Fail;
+        impl FrameSource for Fail {
+            fn next_frame(&mut self) -> Result<Frame, String> {
+                Err("boom".into())
+            }
+            fn resolution(&self) -> (usize, usize) {
+                (4, 4)
+            }
+        }
+        let ts = ThreadedFrameSource::spawn(Box::new(Fail));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && ts.err_count() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(ts.err_count() > 0, "errors must accumulate in the thread");
+        assert!(ts.try_latest().is_none(), "no frame when the source always fails");
+        assert_eq!(ts.last_err().as_deref(), Some("boom"));
     }
 }
 

@@ -518,7 +518,7 @@ async fn run_desktop_pipeline(
     cfg: DesktopConfig,
     running: Arc<AtomicBool>,
     post: PostFn,
-    mut src: Box<dyn capture::FrameSource>,
+    src: Box<dyn capture::FrameSource>,
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
     backend: String,
     clock_offset_ms: i64,
@@ -528,7 +528,11 @@ async fn run_desktop_pipeline(
 ) {
     // cfg 需可变：编码器 fallback 后回写实际 codec。
     let mut cfg = cfg;
-    let (mut w0, mut h0) = src.resolution();
+    // 截图线程化（rustdesk capture 线程对齐）：capture 挪到独立线程持续
+    // 抓帧，编码循环 try_latest 非阻塞取最新帧——抓帧（X11/DXGI）不再拖慢
+    // 编码，慢抓帧时跳帧追最新。src 被 move 进抓帧线程。
+    let threaded = capture::ThreadedFrameSource::spawn(src);
+    let (mut w0, mut h0) = threaded.resolution();
     if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
         (post)(serde_json::json!({
             "type": "desktop:started",
@@ -612,7 +616,6 @@ async fn run_desktop_pipeline(
     // 前读目标 fps，sleep 对应间隔并同步编码器帧率模型（kf_max_dist）。
     let start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
-    let mut err_count: u32 = 0;
     // 上次强制 IDR 的虚拟墙钟（wall_ms 时基）。动态关键帧节拍用它判断
     // 是否到间隔（静止 KF_QUIET_MS / 活跃 KF_ACTIVE_MS，MYS-886 需求7-1）。
     let mut last_kf_wall: u64 = 0;
@@ -639,26 +642,31 @@ async fn run_desktop_pipeline(
             enc.force_idr();
             last_kf_wall = wall_ms;
         }
-        let fr = match src.next_frame() {
-            Ok(f) => {
-                err_count = 0;
-                f
-            }
-            Err(e) => {
-                // 持续性捕获失败（例如 XWayland 下 root GetImage 抛 BadMatch、
-                // Windows 屏幕 DC 失效且重建失败）。无限重试只会刷屏且永远
-                // 黑屏。连续失败 MAX_CAPTURE_ERRORS 帧后终止, 并把原因回传
-                // 给浏览器展示。
-                err_count += 1;
-                if err_count >= MAX_CAPTURE_ERRORS {
-                    tracing::error!("desktop capture failed {err_count} frames in a row — giving up: {e}");
-                    (post)(serde_json::json!({
-                        "type": "desktop:error",
-                        "payload": { "error": format!("capture failed: {e}") }
-                    }));
-                    break;
+        let fr = match threaded.try_latest() {
+            Some(f) => f,
+            None => {
+                // 无新帧（capture 线程慢于编码，追最新帧跳帧）或线程在报错。
+                let ec = threaded.err_count();
+                if ec > 0 {
+                    // 持续性捕获失败（例如 XWayland 下 root GetImage 抛 BadMatch、
+                    // Windows 屏幕 DC 失效）。无限重试只会刷屏且永远黑屏。
+                    // 连续失败 MAX_CAPTURE_ERRORS 次后终止, 并把原因回传
+                    // 给浏览器展示。
+                    if ec >= MAX_CAPTURE_ERRORS {
+                        tracing::error!("desktop capture failed {ec} frames in a row — giving up");
+                        let e = threaded.last_err().unwrap_or_else(|| "capture failed".to_string());
+                        (post)(serde_json::json!({
+                            "type": "desktop:error",
+                            "payload": { "error": format!("capture failed: {e}") }
+                        }));
+                        break;
+                    }
+                    tracing::warn!(
+                        "capture frame error (thread): {} — retrying ({ec}/{MAX_CAPTURE_ERRORS})",
+                        threaded.last_err().unwrap_or_default()
+                    );
                 }
-                tracing::warn!("capture frame error: {} — retrying ({}/{MAX_CAPTURE_ERRORS})", e, err_count);
+                // 无新帧：跳过本 tick（编码不被抓帧阻塞）。
                 continue;
             }
         };
