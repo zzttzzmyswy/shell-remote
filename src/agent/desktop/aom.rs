@@ -28,6 +28,8 @@ pub struct AomEncoder {
     max_bps: u64,
     quality: f32,
     force_kf: bool,
+    /// 递增帧时间戳（timebase 1ms，对齐 rustdesk：每帧 +1000/fps）。
+    pts_ms: u64,
 }
 
 // libaom spawns internal worker threads; the encoder is only ever driven from
@@ -74,18 +76,22 @@ impl AomEncoder {
             cfg.g_threads = 4;
             cfg.g_timebase.num = 1;
             cfg.g_timebase.den = 1000;
-            cfg.g_error_resilient = 1;
+            cfg.g_error_resilient = 0;
             cfg.g_pass = aom_sys::aom_enc_pass_AOM_RC_ONE_PASS;
             cfg.g_lag_in_frames = 0;
             cfg.rc_end_usage = aom_sys::aom_rc_mode_AOM_CBR;
             cfg.rc_target_bitrate = (bitrate_bps / 1000).min(u32::MAX as u64) as c_uint;
             cfg.rc_min_quantizer = q_min;
             cfg.rc_max_quantizer = q_max;
-            cfg.rc_undershoot_pct = 95;
-            cfg.rc_overshoot_pct = 25;
-            // 不丢帧: 用户明确"接受模糊、不接受掉帧"(MYS-886)。CBR 靠 QP
-            // 把瞬时峰值压回预算, 而不是跳过 P 帧造成卡顿。libaom 的
-            // dropframe 独立于码率控制, 关掉它码率仍受控(见码率测试)。
+            // rustdesk AV1 (webrtc 配置)：undershoot/overshoot 各 50%，缓冲
+            // 600/600/1000（初始/最优/总量）—— 比默认更紧的码率边界 + 更快
+            // 填满 rc buffer，降低首帧等待与码率收敛延迟（MYS-886 卡顿修复）。
+            cfg.rc_undershoot_pct = 50;
+            cfg.rc_overshoot_pct = 50;
+            cfg.rc_buf_initial_sz = 600;
+            cfg.rc_buf_optimal_sz = 600;
+            cfg.rc_buf_sz = 1000;
+            // AV1 CBR 高熵压力阀同 vpx（dropframe 25，rustdesk 同款）。
             cfg.rc_dropframe_thresh = 25;
             cfg.kf_mode = aom_sys::aom_kf_mode_AOM_KF_AUTO;
             cfg.kf_min_dist = 0;
@@ -105,12 +111,58 @@ impl AomEncoder {
             if rc != aom_sys::aom_codec_err_t_AOM_CODEC_OK {
                 return Err(format!("aom_codec_enc_init rc={rc:?}"));
             }
-            // 实时档: cpu-used 8 (realtime tier), row-mt 并行估计算法。
-// 注意: **不用 tile-columns** —— Chrome WebCodecs 的 av01 chunk 判定
-// (libgav1/dav1d) 对多 tile 关键帧不兼容: 帧内多个 tile 会让其判断
-// "wasn't a key frame" 并拒绝 (实测: ffmpeg tile-columns 4 的帧被拒,
-// tile-columns 0 全 OK)。多线程交给 row_mt + g_threads, tile 留给单 tile。
-            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AOME_SET_CPUUSED as c_int, 8);
+            // 低延迟实时档全套（对齐 rustdesk libs/scrap/src/common/aom.rs
+            // webrtc 配置，MYS-886 卡顿修复）：
+            //   - cpu_used 按分辨率分级（≤320x180=8、≤640x360=9、其余=10），
+            //     1080p 用 10 而非固定 8 —— 大幅降低单帧编码耗时
+            //   - AOM_CONTENT_SCREEN：屏幕内容专用 tune（关闭电影类工具）
+            //   - 显式关闭高耗时工具（warped/global/obmc/ref_frame_mvs/
+            //     tpl/deltaq/order_hint/dual_filter/rect/restoration 等）
+            //   - AQ_MODE=3（区域化量化，屏幕低比特率信息保留更好）
+            //   - MAX_INTRA_BITRATE_PCT=300：关键帧码率上限放宽，避免
+            //     静止桌面关键帧被 CBR 压垮
+            // 注意: **不用 tile-columns** —— Chrome WebCodecs 的 av01 chunk 判定
+            // (libgav1/dav1d) 对多 tile 关键帧不兼容: 帧内多个 tile 会让其判断
+            // "wasn't a key frame" 并拒绝 (实测: ffmpeg tile-columns 4 的帧被拒,
+            // tile-columns 0 全 OK)。多线程交给 row_mt + g_threads, tile 留给单 tile。
+            let cpu_used = if w <= 320 && h <= 180 {
+                8
+            } else if w <= 640 && h <= 360 {
+                9
+            } else {
+                10
+            };
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AOME_SET_CPUUSED as c_int, cpu_used);
+            // 屏幕内容 tune 优先（AOM_CONTENT_SCREEN 等价 webrtc 的 kScreensharing）
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_TUNE_CONTENT as c_int, aom_sys::aom_tune_content_AOM_CONTENT_SCREEN as c_int);
+            // 禁高耗时帧间/帧内工具（均不显著改善屏幕编码质量，但显著降耗时）
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_TPL_MODEL as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_DELTAQ_MODE as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_ORDER_HINT as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_WARPED_MOTION as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_GLOBAL_MOTION as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_OBMC as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_REF_FRAME_MVS as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_DUAL_FILTER as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_RESTORATION as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_CFL_INTRA as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_SMOOTH_INTRA as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_FILTER_INTRA as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_ANGLE_DELTA as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_PAETH_INTRA as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_INTRABC as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_RECT_PARTITIONS as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_TX64 as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_DIST_WTD_COMP as c_int, 0);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_MASKED_COMP as c_int, 0);
+            // 结构化更新：MV/coeff/mode 成本每 3 帧同步（screenshare 内容变化
+            // 快，全量同步浪费 CPU；rustdesk 同款）
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_MV_COST_UPD_FREQ as c_int, 3);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_COEFF_COST_UPD_FREQ as c_int, 3);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_MODE_COST_UPD_FREQ as c_int, 3);
+            // 区域化量化 + 关键帧码率放宽
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_AQ_MODE as c_int, 3);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AOME_SET_MAX_INTRA_BITRATE_PCT as c_int, 300);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ROW_MT as c_int, 1);
 
             Ok(Self {
@@ -122,6 +174,7 @@ impl AomEncoder {
                 max_bps,
                 quality,
                 force_kf: false,
+                pts_ms: 0,
             })
         }
     }
@@ -153,10 +206,11 @@ impl AomEncoder {
             let rc = aom_sys::aom_codec_encode(
                 &mut self.ctx,
                 &img,
-                0,
-                33,
+                self.pts_ms as aom_sys::aom_codec_pts_t,
+                (1000.0 / self.fps).max(1.0) as std::os::raw::c_ulong,
                 flags,
             );
+            self.pts_ms += (1000.0 / self.fps).round().max(1.0) as u64;
             aom_sys::aom_img_free(&mut img);
             if rc != aom_sys::aom_codec_err_t_AOM_CODEC_OK {
                 return Err(format!("aom_codec_encode rc={rc:?}"));
@@ -204,7 +258,7 @@ impl AomEncoder {
     /// 按质量档动态调整（rustdesk QoS 同款）：重算目标码率 + QP 区间。
     pub fn set_quality(&mut self, ratio: f32) {
         self.quality = ratio;
-        let (q_min, q_max) = crate::agent::desktop::encoder::calc_q_values(ratio);
+        let (q_min, q_max) = crate::agent::desktop::encoder::calc_q_values_aom(ratio);
         let target = crate::agent::desktop::encoder::target_bitrate(
             self.width,
             self.height,
@@ -411,5 +465,34 @@ mod tests {
         }
         let el = start.elapsed().as_secs_f64();
         eprintln!("av1 1080p complex: {n} frames in {el:.2}s = {:.1} fps", n as f64 / el);
+    }
+}
+#[cfg(test)]
+mod bench_encode_time {
+    use super::*;
+    use crate::agent::desktop::encoder::VideoEncoder;
+
+    fn noise_i420(w: usize, h: usize, t: u32) -> Vec<u8> {
+        let mut buf = vec![90u8; w * h + w * h / 2];
+        let seed = t.wrapping_mul(2654435761).wrapping_add(7);
+        for i in (0..w * h).step_by(97) {
+            buf[i] = (i as u32).wrapping_mul(31).wrapping_add(seed) as u8;
+        }
+        buf
+    }
+
+    #[test]
+    fn bench_av1_1080p_complex_encode_ms_per_frame() {
+        let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0, 10, 30).expect("av1 init");
+        let start = std::time::Instant::now();
+        let n = 15u32;
+        for t in 0..n {
+            let buf = noise_i420(1920, 1080, t);
+            let _ = enc.encode(&buf).expect("encode");
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("BENCH av1 1080p complex: {ms:.1} ms/frame");
+        // cpu_used=10 + screen tune + 禁高耗时工具后应在 ~10-50ms/帧。
+        assert!(ms < 120.0, "av1 frame took {ms:.1}ms — latency bug remains");
     }
 }

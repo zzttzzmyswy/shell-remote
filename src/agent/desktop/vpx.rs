@@ -29,6 +29,10 @@ pub struct Vp9Encoder {
     quality: f32,
     /// 下一次 encode 强制关键帧（通过 encode flags 传 VPX_EFLAG_FORCE_KF）。
     force_kf: bool,
+    /// 递增帧时间戳（timebase 1ms，对齐 rustdesk：每帧 +1000/fps）。
+    /// libvpx 的 RC 用 pts 差算实际帧率——固定 0 可能让其误判为
+    /// 全速/满帧率，影响码率分配（MYS-886 卡顿修复）。
+    pts_ms: u64,
 }
 
 // libvpx spawns internal worker threads; the encoder is only ever driven from
@@ -119,6 +123,7 @@ impl Vp9Encoder {
                 max_bps: 0,
                 quality: crate::agent::desktop::encoder::QUALITY_BALANCED,
                 force_kf: false,
+                pts_ms: 0,
             })
         }
     }
@@ -150,11 +155,12 @@ impl Vp9Encoder {
             let rc = vpx_sys::vpx_codec_encode(
                 &mut self.ctx,
                 &img,
-                0,
-                33,
+                self.pts_ms as vpx_sys::vpx_codec_pts_t,
+                (1000.0 / self.fps).max(1.0) as std::os::raw::c_ulong,
                 flags,
-                1_000_000, // deadline: infinite, best for realtime
+                vpx_sys::VPX_DL_REALTIME as std::os::raw::c_ulong,
             );
+            self.pts_ms += (1000.0 / self.fps).round().max(1.0) as u64;
             vpx_sys::vpx_img_free(&mut img);
             if rc != vpx_sys::vpx_codec_err_t::VPX_CODEC_OK {
                 return Err(format!("vpx_codec_encode rc={rc:?}"));
@@ -420,5 +426,36 @@ mod static_kf_tests {
         }
         eprintln!("static 120 forced frames: non_empty_kf={non_empty_kf} frames={frames}");
         assert!(non_empty_kf > 0, "forced IDR on static content must produce bytes");
+    }
+}
+
+#[cfg(test)]
+mod bench_encode_time {
+    use super::*;
+    use crate::agent::desktop::encoder::VideoEncoder;
+
+    fn noise_i420(w: usize, h: usize, t: u32) -> Vec<u8> {
+        let mut buf = vec![90u8; w * h + w * h / 2];
+        let seed = t.wrapping_mul(2654435761).wrapping_add(7);
+        for i in (0..w * h).step_by(97) {
+            buf[i] = (i as u32).wrapping_mul(31).wrapping_add(seed) as u8;
+        }
+        buf
+    }
+
+    #[test]
+    fn bench_vp9_1080p_complex_encode_ms_per_frame() {
+        let mut enc = Vp9Encoder::new(1920, 1080, 800_000, 30.0, 24, 50).expect("vp9 init");
+        let start = std::time::Instant::now();
+        let n = 15u32;
+        for t in 0..n {
+            let buf = noise_i420(1920, 1080, t);
+            let _ = enc.encode(&buf).expect("encode");
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("BENCH vp9 1080p complex: {ms:.1} ms/frame");
+        // REALTIME deadline 下 1080p 软编应在 ~10-40ms/帧；修复前 deadline=1s
+        // 会飙升到几十~上百ms（这就是 200-600ms e2e 延时的源头）。
+        assert!(ms < 100.0, "vp9 frame took {ms:.1}ms — latency bug remains");
     }
 }

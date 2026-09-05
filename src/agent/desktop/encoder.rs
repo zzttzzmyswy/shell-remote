@@ -92,6 +92,21 @@ pub fn calc_q_values(ratio: f32) -> (u32, u32) {
     (q_min, q_max)
 }
 
+/// rustdesk AV1 专用 QP 区间（`libs/scrap/src/common/aom.rs calc_q_values`）：
+/// q_min∈[24,5]、q_max∈[45,25]。与 VP9（q_min∈[36,0]/q_max∈[56,37]）不同档。
+/// AV1 的 QP 标度更紧（libaom 量化 5-45 覆盖全质量谱），直接套 VP9 的
+/// 区间会在低 quality 时过度量化（卡顿/糊）或高 quality 超预算。
+pub fn calc_q_values_aom(ratio: f32) -> (u32, u32) {
+    let b = (ratio * 100.0) as u32;
+    let b = b.min(200);
+    let (q_min1, q_min2) = (24u32, 5u32);
+    let (q_max1, q_max2) = (45u32, 25u32);
+    let t = b as f32 / 200.0;
+    let q_min = (((1.0 - t) * q_min1 as f32 + t * q_min2 as f32).round() as u32).clamp(q_min2, q_min1);
+    let q_max = (((1.0 - t) * q_max1 as f32 + t * q_max2 as f32).round() as u32).clamp(q_max2, q_max1);
+    (q_min, q_max)
+}
+
 /// 目标码率（bps）：rustdesk 模型 `base_bitrate(w,h) × quality`（base 单位
 /// kbps，乘 1000 转 bps），用户 `--desktop-max-bitrate` 显式设值时作为
 /// 硬顶（max_bps>0）；0 = 自动跟随 rustdesk 模型。
@@ -124,8 +139,11 @@ pub fn new_encoder(
         "vp9" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, target, fps, q_min, q_max)
             .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         #[cfg(feature = "av1")]
-        "av1" => crate::agent::desktop::aom::AomEncoder::new(w, h, target, fps, q_min, q_max)
-            .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
+        "av1" => {
+            let (q_min_a, q_max_a) = calc_q_values_aom(quality);
+            crate::agent::desktop::aom::AomEncoder::new(w, h, target, fps, q_min_a, q_max_a)
+                .map(|e| Box::new(e) as Box<dyn VideoEncoder>)
+        }
         other => Err(format!("unsupported desktop codec: {other}")),
     }
 }

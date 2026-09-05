@@ -174,13 +174,19 @@ impl DesktopManager {
     }
 
     /// QoS 动态调整目标帧率（rustdesk 同款）：浏览器端到端延时 <150ms 提升
-    /// 到 60fps、<300ms 维持 30fps、更差降到 15fps 保流畅。编码循环按此值
+    /// 到配置上限、<300ms 维持、更差降到 15fps 保流畅。编码循环按此值
     /// 动态改 tick 周期。
+    ///
+    /// 上限不是 60：软编（VP9/AV1 1080p）单帧编码 30-60ms，16.7ms 的 60fps
+    /// 预算编不出来只会让编码队列越积越深、端到端延时飙升（实测 200-600ms，
+    /// MYS-886 卡顿回归根因之一）。上限取 `--desktop-fps`（默认 30），用户
+    /// 显式要求更高帧率才提升。
     pub fn set_fps(&self, fps: u32) {
-        let fps = fps.clamp(1, 60);
         use std::sync::atomic::Ordering as O;
+        let cap = (self.config.fps as u32).clamp(1, 60);
+        let fps = fps.clamp(1, cap);
         self.fps.store(fps, O::Relaxed);
-        tracing::info!(fps, "desktop QoS: target fps adjusted");
+        tracing::info!(fps, cap, "desktop QoS: target fps adjusted");
     }
 
     /// QoS 码率缩放（千分比）：弱网时下调目标码率预算，恢复后置回 1000。
