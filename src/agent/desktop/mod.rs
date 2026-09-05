@@ -61,7 +61,7 @@ impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
             capture: "auto".to_string(),
-            codec: "vp9".to_string(),
+            codec: "av1".to_string(),
             // 30fps 起步（MYS-886 时延对标 rustdesk: 22fps/12ms）。60fps 软编
             // 在低配机器上单核打满（实测 115%），编码耗时直接加进 e2e；
             // 30fps 减一半编码负载，时延显著优于 60fps，流畅度损失小。

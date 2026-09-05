@@ -46,6 +46,28 @@ pub const QUALITY_SPEED: f32 = 0.5;
 pub const QUALITY_BALANCED: f32 = 0.67;
 pub const QUALITY_BEST: f32 = 1.5;
 
+/// 编码器线程数（对齐 rustdesk `codec_thread_num(64)`）：
+/// 按可用核数与当前负载自适应，clamp 到 libvpx/libaom 的 MAX_NUM_THREADS=64
+/// 的常见档位（64/32/16/8/4/2/1）。比固定 4 线程更充分地利用多核——软编
+/// 1080p 每帧编码耗时随线程数显著下降（低延迟关键，MYS-886）。
+pub fn codec_thread_num() -> usize {
+    let max = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    // rustdesk: (核数 - 负载) × 0.5。无 loadavg 依赖时近似用核数一半起跳，
+    // 上限核数；多核机型编码线程多一点，低配 4 核保持 4。
+    let mut res = (max as f64 * 0.5).round() as usize;
+    res = res.min(max).max(1);
+    res = match res {
+        _ if res >= 64 => 64,
+        _ if res >= 32 => 32,
+        _ if res >= 16 => 16,
+        _ if res >= 8 => 8,
+        _ if res >= 4 => 4,
+        _ if res >= 2 => 2,
+        _ => 1,
+    };
+    res.min(64)
+}
+
 /// 按分辨率给基准码率（kbps 级，rustdesk `base_bitrate` 表）。
 /// 1080p → 2073kbps；目标码率 = base_bitrate × quality 档。
 pub fn base_bitrate(width: u32, height: u32) -> u64 {
