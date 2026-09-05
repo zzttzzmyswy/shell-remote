@@ -105,6 +105,17 @@ impl DxgiSource {
             }
         }
         let device: ID3D11Device = device.ok_or("no d3d11 device")?;
+        // 截图线程化（v0.33）后 D3D11 device/context 在**独立 capture 线程**
+        // 使用（创建在 tokio 线程、用在新线程）。D3D11 immediate context
+        // 默认绑定创建线程，跨线程调用会导致驱动崩溃（Windows agent 打开
+        // 桌面 ~3s 闪退的根因）——必须启用 multithread-protected
+        // （rustdesk/scrap 同款：ID3D10Multithread::SetMultithreadProtected）。
+        {
+            use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
+            if let Ok(mt) = device.cast::<ID3D10Multithread>() {
+                let _ = unsafe { mt.SetMultithreadProtected(true) };
+            }
+        }
         let context: ID3D11DeviceContext =
             device.GetImmediateContext().map_err(|e| format!("GetImmediateContext: {e}"))?;
 
