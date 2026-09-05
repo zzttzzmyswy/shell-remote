@@ -1490,6 +1490,29 @@ async fn run_session(
                                     desktop.stop(post_fn.clone()).await;
                                 }
 
+                                "desktop:codec" => {
+                                    // 热切换编码方案（web 页编码器下拉）：
+                                    // av1/vp9/h264，切换后自动重建桌面流。
+                                    let codec = msg
+                                        .payload
+                                        .get("codec")
+                                        .and_then(|c| c.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    tracing::info!(codec = %codec, "desktop:codec requested");
+                                    if let Err(e) = desktop.set_codec(&codec, post_fn.clone()).await {
+                                        let err = Message {
+                                            msg_type: "error".to_string(),
+                                            session_id: client.session_id.clone(),
+                                            payload: serde_json::json!({
+                                                "code": "DESKTOP_BAD_CODEC",
+                                                "message": e
+                                            }),
+                                        };
+                                        out.control(err).await;
+                                    }
+                                }
+
                                 "desktop:mouse" => {
                                     // 浏览器键鼠注入：desktop:mouse
                                     // {type,x,y,button,dx,dy}（RW 权限校验

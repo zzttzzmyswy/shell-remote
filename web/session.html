@@ -15,6 +15,10 @@
         </div>
         <div class="toolbar-right">
             <button id="copy-token-btn" class="btn btn-small" title="复制密钥">复制密钥</button>
+            <select id="desktop-codec-select" class="btn btn-small" title="编码方案（切换后自动重建画面）" disabled>
+                <option value="av1">AV1</option>
+                <option value="vp9">VP9</option>
+            </select>
             <button id="toggle-desktop-btn" class="btn btn-small" title="打开桌面画面（默认关闭）" disabled>桌面</button>
             <button id="toggle-files-btn" class="btn btn-small">文件</button>
         </div>
@@ -49,6 +53,7 @@
                 <div class="metrics-row"><span>丢帧</span><b id="metric-dropped">-</b></div>
                 <div class="metrics-row"><span>捕获方式</span><b id="metric-backend">-</b></div>
                 <div class="metrics-row"><span>链路方式</span><b id="metric-uplink">-</b></div>
+                <div class="metrics-row"><span>编码方案</span><b id="metric-encoder">-</b></div>
                 <div class="metrics-row"><span>解码方案</span><b id="metric-decoder">-</b></div>
             </div>
         </div>

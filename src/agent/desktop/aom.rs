@@ -67,7 +67,8 @@ impl AomEncoder {
             cfg.rc_target_bitrate = (bitrate_bps / 1000).min(u32::MAX as u64) as c_uint;
             cfg.rc_min_quantizer = 0;
             cfg.rc_max_quantizer = 63;
-            cfg.rc_undershoot_pct = 95;
+            cfg.rc_undershoot_pct = 25;
+            cfg.rc_overshoot_pct = 25;
             // 不丢帧: 用户明确"接受模糊、不接受掉帧"(MYS-886)。CBR 靠 QP
             // 把瞬时峰值压回预算, 而不是跳过 P 帧造成卡顿。libaom 的
             // dropframe 独立于码率控制, 关掉它码率仍受控(见码率测试)。
@@ -330,5 +331,39 @@ mod tests {
         eprintln!("av1 800k target: actual {kbps:.0} kbps, {out}/60 frames");
         assert!(kbps < 4000.0, "bitrate runaway: {kbps:.0} kbps");
         assert!(out >= 50, "must produce most frames, got {out}/60");
+    }
+
+    #[test]
+    fn test_av1_1080p_complex_throughput_bench() {
+        // 1080p 高熵内容下 realtime 档的实际编码吞吐 —— 复杂内容"4-8s 延时"
+        // 的直接瓶颈衡量（MYS-886 需求2）。不设断言, 输出 fps 供人工评估。
+        let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0).expect("av1 init");
+        let start = std::time::Instant::now();
+        let n = 30u32;
+        for t in 0..n {
+            let mut buf = solid_i420(1920, 1080, 90);
+            // 高熵：随机噪声块 + 移动窗口
+            let seed = t.wrapping_mul(2654435761).wrapping_add(7);
+            let y_len = 1920 * 1080;
+            let u_off = y_len;
+            let v_off = y_len + y_len / 4;
+            let uv_half = 960usize; // 1920/2
+            for y in (0..1080).step_by(8) {
+                for x in (0..1920).step_by(8) {
+                    if (x as u32 ^ y).wrapping_mul(seed) % 3 == 0 {
+                        let i = (y as usize) * 1920 + x as usize;
+                        buf[i] = ((seed >> 8) as u8).wrapping_add(x as u8);
+                        let ui = (y as usize / 2) * uv_half + x as usize / 2;
+                        if ui < y_len / 4 {
+                            buf[u_off + ui] = (seed & 0xff) as u8;
+                            buf[v_off + ui] = (seed >> 16) as u8;
+                        }
+                    }
+                }
+            }
+            let _ = enc.encode(&buf).expect("encode");
+        }
+        let el = start.elapsed().as_secs_f64();
+        eprintln!("av1 1080p complex: {n} frames in {el:.2}s = {:.1} fps", n as f64 / el);
     }
 }

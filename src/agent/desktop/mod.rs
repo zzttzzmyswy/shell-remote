@@ -104,11 +104,15 @@ pub struct DesktopManager {
     /// （MYS-886 指标失真根因）。由 DesktopManager::set_clock_offset 注入，
     /// 默认 0 ＝ 未校准（行为与旧版一致）。
     clock_offset: std::sync::atomic::AtomicI64,
+    /// 运行时编码方案（av1/vp9/h264）。初始 = config.codec，前端可通过
+    /// desktop:codec 热切换（重建桌面流），见 [`Self::set_codec`]。
+    codec: std::sync::RwLock<String>,
 }
 
 impl DesktopManager {
     pub fn new(config: DesktopConfig) -> Self {
         let bps = config.max_bps;
+        let codec = config.codec.clone();
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
@@ -117,7 +121,35 @@ impl DesktopManager {
             injector: tokio::sync::Mutex::new(None),
             clipboard: tokio::sync::Mutex::new(None),
             clock_offset: std::sync::atomic::AtomicI64::new(0),
+            codec: std::sync::RwLock::new(codec),
         }
+    }
+
+    /// 运行时热切换编码方案（av1/vp9/h264）。仅当桌面正在运行时重建
+    /// 桌面流（stop 旧流 → start 新流，前端按新 init 段的 codec box
+    /// 自动切换解码）。codec 不变时是 no-op。
+    pub async fn set_codec(&self, codec: &str, post: PostFn) -> Result<(), String> {
+        let codec = codec.to_string();
+        if !self.config.supports_codec(&codec) {
+            return Err(format!("unsupported codec {codec}"));
+        }
+        {
+            let mut cur = self.codec.write().map_err(|_| "codec lock poisoned".to_string())?;
+            if *cur == codec {
+                return Ok(());
+            }
+            *cur = codec;
+        }
+        if self.is_running() {
+            self.stop(post.clone()).await;
+            self.start(post).await;
+        }
+        Ok(())
+    }
+
+    /// 当前编码方案（供日志/指标）。
+    pub fn codec(&self) -> String {
+        self.codec.read().map(|c| c.clone()).unwrap_or_default()
     }
 
     /// 注入 relay 时钟偏移（relay_epoch - 本地_epoch，ms）。agent 在会话
@@ -190,13 +222,16 @@ impl DesktopManager {
             self.post_started_error(&post, "desktop capture is disabled (--desktop-capture none)");
             return;
         }
-        if !self.config.supports_codec(&self.config.codec) {
-            self.post_started_error(&post, &format!("unsupported codec {}", self.config.codec));
+        // 用运行时 codec（热切换后的值），不是启动时的 config.codec。
+        let codec = self.codec.read().map(|c| c.clone()).unwrap_or_default();
+        if !self.config.supports_codec(&codec) {
+            self.post_started_error(&post, &format!("unsupported codec {codec}"));
             return;
         }
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
-        let cfg = self.config.clone();
+        let mut cfg = self.config.clone();
+        cfg.codec = codec;
         let bandwidth = self.bandwidth.clone();
         let clock_offset = self.clock_offset.load(std::sync::atomic::Ordering::Relaxed);
         let task = tokio::task::spawn(async move {

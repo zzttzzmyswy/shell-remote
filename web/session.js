@@ -92,6 +92,27 @@
         } else {
             toggleDesktopBtn.title = '打开桌面画面（默认关闭）';
         }
+        // 编码器切换选择框：与桌面能力联动启用（仅在 agent 声明可用编码时）。
+        const sel = document.getElementById('desktop-codec-select');
+        if (sel) {
+            sel.disabled = !desktopEnabled;
+            if (!desktopEnabled) sel.title = '设备不支持桌面共享';
+            else sel.title = '编码方案（切换后自动重建画面）';
+        }
+    }
+
+    // 编码方案切换：发送 desktop:codec，agent 重建桌面流。
+    const codecSelect = document.getElementById('desktop-codec-select');
+    if (codecSelect) {
+        codecSelect.addEventListener('change', function() {
+            const codec = this.value;
+            if (!desktopEnabled || !window.shellRemote) return;
+            // 切换中标志：agent stop→start 重建流期间, desktop:stopped 不
+            // 触发退出桌面视图, 等 desktop:started 到来后自动重连新流。
+            window.__codecSwitchPending = true;
+            window.shellRemote.send('desktop:codec', { codec: codec });
+            showToast('切换编码为 ' + codec.toUpperCase() + '…', '');
+        });
     }
 
     toggleDesktopBtn.addEventListener('click', function() {
@@ -213,6 +234,22 @@
     window.shellRemote.on('desktop:capabilities', function(msg) {
         clearJoinWatchdog();
         setDesktopEnabled(msg.payload && msg.payload.available);
+        // 按 agent 声明的可用编码过滤切换选项（codecs: ["av1","vp9","h264"]）。
+        const codecs = (msg.payload && msg.payload.codecs) || [];
+        const sel = document.getElementById('desktop-codec-select');
+        if (sel && codecs.length) {
+            const cur = sel.value;
+            sel.innerHTML = '';
+            for (const c of ['av1', 'vp9', 'h264']) {
+                if (codecs.indexOf(c) >= 0) {
+                    const o = document.createElement('option');
+                    o.value = c;
+                    o.textContent = c.toUpperCase();
+                    sel.appendChild(o);
+                }
+            }
+            sel.value = (codecs.indexOf(cur) >= 0) ? cur : (codecs[0] || 'av1');
+        }
         if (msg.payload && msg.payload.running && !desktopActive && !desktopStarting) {
             // 其它浏览器已开启桌面：本地直接进入观看
             showDesktopView();
@@ -223,6 +260,8 @@
     window.shellRemote.on('desktop:started', function(msg) {
         desktopStarting = false;
         toggleDesktopBtn.disabled = !desktopEnabled;
+        // 编码热切换完成：清除 pending 标志。
+        window.__codecSwitchPending = false;
         if (msg.payload && msg.payload.error) {
             showToast('桌面启动失败: ' + msg.payload.error, 'error');
             showTerminalView();
@@ -284,6 +323,8 @@
     });
 
     window.shellRemote.on('desktop:stopped', function(msg) {
+        // 编码热切换中的 stop：保持桌面视图, 等 desktop:started 重连新流。
+        if (window.__codecSwitchPending) return;
         if (desktopActive) {
             desktopView.disconnect();
             showTerminalView();

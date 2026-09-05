@@ -116,6 +116,13 @@
       return secure ? 'MSE (浏览器无 VideoDecoder)' : 'MSE (http 访问未启用 WebCodecs，用 https 可解锁原生解码)';
     }
 
+    // 当前编码方案：与解码同源，由 init 段的 codec box（av1C/vpcC/avcC）
+    // 判定。指标面板展示用（MYS-886：新增指标）。
+    _encoderLabel() {
+      if (!this._codecKind) return '-';
+      return { h264: 'H.264', vp9: 'VP9', av1: 'AV1' }[this._codecKind] || this._codecKind;
+    }
+
     connect() {
       this.disconnect(false);
       if (this._webcodecsAvailable()) {
@@ -541,6 +548,9 @@
       }
       const ctx = c.getContext('2d');
       ctx.drawImage(frame, 0, 0);
+      // 渲染帧率 = 实际画到 canvas 的新内容帧数（对齐远程桌面帧率），
+      // 而非本地显示器刷新率（MYS-886：之前指标是 rAF 计数恒 60）。
+      this._rafCount += 1;
       frame.close();
       this._frames = [];
     }
@@ -550,16 +560,22 @@
       if (!this._bpsTs) {
         this._bpsTs = now;
         this._bpsBytes = 0;
+        this._peakKbps = 0;
       }
       this._bpsBytes += bytes;
       const dt = (now - this._bpsTs) / 1000;
-      if (dt >= 2.5) {
+      if (dt >= 1.0) {
         const kbps = Math.round(this._bpsBytes * 8 / dt / 1000);
-        this._lastKbps = kbps;
+        // 峰值跟踪：静止桌面空帧窗口 kbps≈0 会把 2.5s 平均拉低, 让 agent
+        // 低估可用带宽 → 复杂内容时 eff_max 被压 → 码率上不去、画面模糊
+        // （MYS-886）。用 1s 窗口的峰值估计上行能力, 让 agent 敢于把
+        // 码率顶到用户设置的上限。
+        if (kbps > this._peakKbps) this._peakKbps = kbps;
+        this._lastKbps = this._peakKbps;
         this._bpsTs = now;
         this._bpsBytes = 0;
-        if (kbps > 0 && window.shellRemote && window.shellRemote.send) {
-          window.shellRemote.send('desktop:bitrate', { kbps: kbps });
+        if (this._peakKbps > 0 && window.shellRemote && window.shellRemote.send) {
+          window.shellRemote.send('desktop:bitrate', { kbps: this._peakKbps });
         }
       }
     }
@@ -628,6 +644,7 @@
         const backend = document.getElementById('metric-backend');
         const uplink = document.getElementById('metric-uplink');
         const decoder = document.getElementById('metric-decoder');
+        const encoder = document.getElementById('metric-encoder');
         if (!lag) return;
         try {
           // e2e: 采集→渲染。srtc 已由 agent 校准到 relay 时基；本地 now 也加
@@ -649,15 +666,9 @@
           if (backend) backend.textContent = self._captureBackend || '-';
           if (uplink) uplink.textContent = self._uplinkMode || '-';
           if (decoder) decoder.textContent = self._decoderLabel();
+          if (encoder) encoder.textContent = self._encoderLabel();
         } catch (e) { /* 面板只是展示 */ }
       }, 1000);
-
-      const raf = function() {
-        if (!self._metricsTimer) return;
-        self._rafCount += 1;
-        requestAnimationFrame(raf);
-      };
-      requestAnimationFrame(raf);
     }
 
     _stopMetrics() {
