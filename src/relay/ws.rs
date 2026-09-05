@@ -758,6 +758,11 @@ impl Drop for AgentEventsCleanup {
                             session = %session_id,
                             "agent SSE disconnected — agent channels cleared"
                         );
+                        // Agent genuinely gone：清理其桌面流与升级任务，防止
+                        // desktop_streams / agent_upgrades 长期残留（审计缺口，
+                        // MYS-886）。
+                        state.desktop_streams.write().await.remove(&session_id);
+                        state.agent_upgrades.write().await.remove(&session_id);
                         // No newer connection replaced this one → the agent is
                         // genuinely gone. Tell every connected browser so it can
                         // show a status and auto-rejoin instead of staring at a

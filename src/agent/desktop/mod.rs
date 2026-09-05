@@ -699,6 +699,10 @@ async fn run_desktop_pipeline(
     // 上次编码/上次墙钟采样点（真实时间，见下方循环内说明）。
     let mut last_encode = std::time::Instant::now();
     let mut last_wall = std::time::Instant::now();
+    // 最近一帧原始像素（静态 IDR / reqkey 重编用）。采样低频（≥500ms 才
+    // 更新一次）限制拷贝开销；静态 IDR 只需要"最近画面"。
+    let mut last_static: Option<(usize, usize, Vec<u8>)> = None;
+    let mut last_static_at = std::time::Instant::now();
 
     while running.load(Ordering::SeqCst) {
         let cur_fps = fps_ctl.load(Ordering::SeqCst).clamp(1, 60);
@@ -713,20 +717,24 @@ async fn run_desktop_pipeline(
         // 动态关键帧节拍（MYS-886 需求7-1）：由内容活跃度决定 IDR 间隔。
         // 静止（帧均字节 ≤ 阈值）时 P 帧近 0 字节，关键帧是唯一带宽开销
         // → 静止 KF_QUIET_MS / 活跃 KF_ACTIVE_MS 一 IDR。首帧强制 IDR
-        // （同时就是 init 段的参数集）。低延时管线：编码不跳帧（跳过的是
-        // try_latest 追最新帧），码率控制交给 ABR 的 set_bitrate。
+        // （同时就是 init 段的参数集）。IDR 决策只在"确有帧可编"时做：
+        // 动态走新帧路径；静态用最近一帧按周期/reqkey 重编（viewer 可加入、
+        // 参考链可刷新），静止其余时刻不空转编码（rustdesk would-block 语义）。
         let kf_ms = kf_interval_ms_for(avg_frame_bytes(&byte_win));
-        // 浏览器 reqkey（接入/参考链断裂/解码错误）→ 立即出关键帧，不等周期。
-        if idr_request.swap(false, Ordering::SeqCst) {
-            enc.force_idr();
-            last_kf_wall = wall_ms;
-        }
-        if frame_idx == 0 || last_kf_wall + kf_ms <= wall_ms {
-            enc.force_idr();
-            last_kf_wall = wall_ms;
-        }
+
+        // 取帧；无新帧时若 reqkey 或静态 IDR 到期 → 用最近一帧重编 IDR。
+        // synthetic=true 标记静态心跳帧：它必须照常 POST（viewer 可加入/
+        // 参考链可刷新），但**不计入 QoS 内容活动**（否则每 4s 一次的心跳
+        // IDR 会被当成"内容在变"，fps 保持 30，静态永不闲置）。
+        let mut synthetic = false;
         let fr = match threaded.try_latest() {
-            Some(f) => f,
+            Some(f) => {
+                if last_static.is_none() || last_static_at.elapsed() >= Duration::from_millis(500) {
+                    last_static = Some((f.width, f.height, f.bgra.clone()));
+                    last_static_at = std::time::Instant::now();
+                }
+                Some(f)
+            }
             None => {
                 // 无新帧（capture 线程慢于编码，追最新帧跳帧）或线程在报错。
                 let ec = threaded.err_count();
@@ -749,13 +757,32 @@ async fn run_desktop_pipeline(
                         threaded.last_err().unwrap_or_default()
                     );
                 }
-                // 无新帧：短轮询等帧，不按 fps 节拍空转——否则静止转动态的
-                // 首帧会白等一整拍（fps=1 时高达 1s），正是"静止→点一下等半
-                // 天才有反应"的体感根因之一。
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                continue;
+                // 静态 IDR / reqkey：最近一帧重编一个关键帧（viewer 可加入、
+                // 参考链可刷新），否则短轮询等帧，不整拍空转。
+                let due = last_static.as_ref().is_some()
+                    && (frame_idx == 0
+                        || last_kf_wall + kf_ms <= wall_ms
+                        || idr_request.load(Ordering::SeqCst));
+                if due {
+                    // 决策只读 flag；消费与 force_idr 由下方"有帧即决策"块统一处理。
+                    synthetic = true;
+                    let (w, h, bgra) = last_static.as_ref().unwrap();
+                    Some(capture::Frame { bgra: bgra.clone(), width: *w, height: *h })
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
             }
         };
+        let fr = match fr {
+            Some(f) => f,
+            None => continue,
+        };
+        // IDR 决策（仅在确有帧可编时）：首帧 / 周期到期 / reqkey 请求。
+        if frame_idx == 0 || last_kf_wall + kf_ms <= wall_ms || idr_request.swap(false, Ordering::SeqCst) {
+            enc.force_idr();
+            last_kf_wall = wall_ms;
+        }
         // 有新帧：fps 是两次编码的最小间隔（上限节奏）。间隔已满足 → 立即
         // 编码；未满足 → 等余量再编（期间 try_latest 追最新帧，跳过中间帧）。
         // 静止转动态：间隔通常早已满足，首帧立即编码（不整拍等）。
@@ -862,9 +889,13 @@ async fn run_desktop_pipeline(
             // 证据，把 fps/码率打压（MYS-886 卡顿死锁的另一半根因）。
             continue;
         }
-        // QoS DYNAMIC_SCREEN 统计：只计**实际产出字节**的帧（动态判定）。
+        // QoS DYNAMIC_SCREEN 统计：只计**实际内容变化**的帧（动态判定）。
+        // synthetic（静态心跳 IDR/reqkey 重编）不算——它只是周期重同步，
+        // 不表示内容在变（否则静态永不闲置）。
         use std::sync::atomic::Ordering as O;
-        qos_frames.fetch_add(1, O::Relaxed);
+        if !synthetic {
+            qos_frames.fetch_add(1, O::Relaxed);
+        }
         // 按实际编码字节入窗: 决策依据 = avg(bytes/frame) vs 预算。
         byte_win.push_back(encoded.nalu.len() as u32);
         while byte_win.len() > OBS {

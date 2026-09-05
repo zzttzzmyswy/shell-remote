@@ -160,14 +160,30 @@ impl ThreadedFrameSource {
                 // unwind 捕获：capture 内部若有 Rust panic（如 unwrap/越界），
                 // 转成错误上报而非让整个 agent 进程闪退（panic=unwind 构建）。
                 // abort 构建下无法拦截，但有 crash 日志 hook 记录现场。
-                let run = || loop {
+                let run = || {
+                    // rustdesk would-block 语义：缓存上一帧原始像素，逐字节判重，
+                    // 画面未变则不发布"新帧"。静止=零发布=编码循环真正闲置
+                    // （不再复用 last_frame 喂时钟空转），动态变化首帧立即唤醒。
+                    let mut last_raw: Option<(usize, usize, Vec<u8>)> = None;
+                    loop {
                     if s1.load(O::Relaxed) {
                         break;
                     }
                     match inner.next_frame() {
                         Ok(f) => {
-                            *l1.lock().unwrap() = Some(f);
                             e1.store(0, O::Relaxed);
+                            let same = match &last_raw {
+                                Some((lw, lh, buf)) => {
+                                    (*lw == f.width && *lh == f.height && buf.as_slice() == f.bgra.as_slice())
+                                }
+                                None => false,
+                            };
+                            if same {
+                                // 画面未变：不发布（等变化帧），静止零产。
+                            } else {
+                                last_raw = Some((f.width, f.height, f.bgra.clone()));
+                                *l1.lock().unwrap() = Some(f);
+                            }
                         }
                         Err(e) => {
                             e1.fetch_add(1, O::Relaxed);
@@ -177,6 +193,7 @@ impl ThreadedFrameSource {
                     // 防空转：快源（测试 mock / Xvfb）全速产帧时让出 CPU；真实后端
                     // 自带节流（X11 每帧一次 X 往返、DXGI 静止 200ms timeout）。
                     std::thread::yield_now();
+                    }
                 };
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
                     // 置 u32::MAX 触发 pipeline 的 MAX_CAPTURE_ERRORS 终止并回传。

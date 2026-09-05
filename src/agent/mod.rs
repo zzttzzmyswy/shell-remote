@@ -668,7 +668,7 @@ async fn run_session(
         client.session_id.clone(),
         control_rx,
         output_rx,
-        Duration::from_secs(30),
+        Duration::from_secs(15),
     ));
     // Keep a control sender for spawned long-running tasks (e.g. mcp:exec).
     let task_control_tx = control_tx;

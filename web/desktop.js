@@ -60,11 +60,12 @@
     }
 
     // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
-    // 采样 3 次取中值，消除单向网络延迟造成的偏差。
+    // 采样 7 次、剔除单边 RTT>500ms 的脏样本后取中值，消除单向延迟与
+    // 抖动造成的偏差（对齐 rustdesk 校准精度，MYS-886）。
     _calibrateClock() {
       const self = this;
       const samples = [];
-      let pending = 3;
+      let pending = 7;
       return new Promise(function(resolve) {
         const done = function() {
           if (samples.length === 0) { resolve(); return; }
@@ -72,15 +73,19 @@
           self._clockOffset = samples[Math.floor(samples.length / 2)].offset;
           resolve();
         };
-        for (let i = 0; i < 3; i++) {
+        for (let i = 0; i < 7; i++) {
           const t0 = Date.now();
           fetch('/api/clock', { cache: 'no-store' }).then(function(r) { return r.json(); })
             .then(function(j) {
               const t1 = Date.now();
               const rtt = t1 - t0;
-              // 单程 ≈ rtt/2：relay 时钟等于 t0 时刻的 (j.epoch_ms - rtt/2)
-              const relayAtT0 = j.epoch_ms - rtt / 2;
-              samples.push({ offset: relayAtT0 - t0 });
+              // 脏样本（单边往返 >500ms，抖动过大）不计入：避免校准被一次
+              // 高 RTT 污染，直接抬高 e2e 读数误导 QoS（13s 类事件时钟侧来源）。
+              if (rtt <= 1000) {
+                // 单程 ≈ rtt/2：relay 时钟等于 t0 时刻的 (j.epoch_ms - rtt/2)
+                const relayAtT0 = j.epoch_ms - rtt / 2;
+                samples.push({ offset: relayAtT0 - t0 });
+              }
             })
             .catch(function() {})
             .then(function() {
