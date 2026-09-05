@@ -491,7 +491,10 @@ pub const KF_AUTO_MAX_SECS: f64 = 5.0;
 /// 关键帧是唯一带宽开销 → 心跳 IDR 从 500ms 拉长到 4.5s（带宽降至 1/9×）；
 /// 活跃（帧均字节超阈值）时 1.5s 一个 IDR 保持 seek 与参考链健康。
 /// 判定用 [`avg_frame_bytes`]：> [`KF_ACTIVE_BYTES_FRAME`] 视为活跃。
-pub const KF_QUIET_MS: u64 = 4500;
+/// 静止间隔从 4.5s 收紧到 2s —— 过长会让浏览器在无变化期长时间收不到
+/// 帧（P 帧≈0 字节不 POST、关键帧太远），渲染长期停住、e2e 累加到秒级、
+/// 体感如"死机"（MYS-886）。2s 一关键帧仍能大幅省带宽且交互不"冻结"。
+pub const KF_QUIET_MS: u64 = 2000;
 pub const KF_ACTIVE_MS: u64 = 1500;
 /// 帧均字节阈值：超过则视为活跃内容（需要高频关键帧）。
 pub const KF_ACTIVE_BYTES_FRAME: f64 = 2048.0;
@@ -1042,7 +1045,12 @@ impl QosAdaptive {
         if avg > 50 {
             self.quick_increase_fps_count = 0;
         }
-        fps = fps.clamp(QOS_MIN_FPS, QOS_MAX_FPS);
+        // fps 下限用 quality 档的 min_fps（balanced=10/best=8/speed=12），
+        // **不是全局 1** —— MYS-886 卡顿死锁根因：e2e 上限一高，fps 被
+        // 压到 1 → 交互变成 1fps → 体感"非常卡"，且帧率低→srtc 陈旧→
+        // e2e 再虚高→永远不恢复。至少保 8-12fps 交互底线（rustdesk
+        // 同款：min_fps 即下限）。
+        fps = fps.clamp(min_fps, QOS_MAX_FPS);
         // 新连接 1s 内 cap 到 INIT_FPS（rustdesk adjust_fps 的 new_user_instant）
         // ——我们无"用户加入"事件，用首次样本近似：fps 超过 INIT_FPS 且刚启动
         // 由外部在 start 时初始化，这里保持渐进即可。
@@ -1282,6 +1290,19 @@ mod tests {
             "bad net ratio < 1000‰, got {}‰",
             q.current_ratio_permille()
         );
+    }
+
+    #[test]
+    fn test_qos_adaptive_terrible_net_keeps_interactive_fps_floor() {
+        // MYS-886 卡顿死锁回归：e2e 即使 2s/4s 级差网，fps 也必须停在
+        // quality 档下限（balanced=10），**绝不允许掉到 1fps**——否则
+        // 交互变 1fps 体感卡死且永远不恢复。修复: fps.clamp(min_fps, ..)。
+        let mut q = QosAdaptive::new();
+        let (fps, _) = q.on_delay(2000, 0, 1.0);
+        assert!(fps >= 10, "2s net must keep fps >= 10, got {fps}");
+        let (fps4, _) = q.on_delay(4000, 0, 1.0);
+        assert!(fps4 >= 10, "4s net must keep fps >= 10, got {fps4}");
+        assert!(fps4 <= fps, "worse net may lower or hold fps, not raise");
     }
 
     #[test]
