@@ -53,6 +53,8 @@
       this._reqKeyCount = 0;      // 最近 10s 内 reqkey 次数
       this._lastSeq = 0;        // 最近收到的帧号（seqn box）
       this._seqDrop = 0;        // 真实上行丢帧数（seq gap 累计）
+      this._arrivals = [];      // 帧到达间隔窗口（jitter 计算）
+      this._lastArrival = 0;
       this._renderPending = false;
       this._droppedFrames = 0;
       // 浏览器与 relay 的时钟偏移（relay_epoch - 本地_epoch）。srtc 在 relay
@@ -576,6 +578,13 @@
       const p = this._pending;
       this._pending = null;
       if (!p || !this._dec || this._dec.state === 'closed') return;
+      // 帧到达 jitter：相邻帧到达时刻差（R2 乙58/R4 丁157 面板项）
+      const now = Date.now();
+      if (this._lastArrival) {
+        this._arrivals.push(now - this._lastArrival);
+        if (this._arrivals.length > 32) this._arrivals.shift();
+      }
+      this._lastArrival = now;
       const sample = body.subarray(body.length - p.size); // mdat 尾部即本帧
       const chunk = new EncodedVideoChunk({
         type: p.isKey ? 'key' : 'delta',
@@ -722,6 +731,8 @@
       this._reqKeyWindowStart = 0;
       this._lastSeq = 0;
       this._seqDrop = 0;
+      this._arrivals = [];
+      this._lastArrival = 0;
       this._unbindInput();
       this._stopMetrics();
       const panel = document.getElementById('desktop-metrics');
@@ -765,6 +776,7 @@
         const fps = document.getElementById('metric-fps');
         const buf = document.getElementById('metric-buffer');
         const drop = document.getElementById('metric-dropped');
+        const jitterEl = document.getElementById('metric-jitter');
         const backend = document.getElementById('metric-backend');
         const uplink = document.getElementById('metric-uplink');
         const decoder = document.getElementById('metric-decoder');
@@ -792,6 +804,19 @@
           self._rafCount = 0;
           buf.textContent = self._dec ? self._dec.decodeQueueSize : '-';
           drop.textContent = self._droppedFrames + ' 解码 / ' + self._seqDrop + ' 上行(seq)';
+          // 帧到达 jitter（stddev）：稳定流应 ≪ 帧间隔（top 场景目标 <8ms）
+          if (jitterEl) {
+            const a = self._arrivals;
+            self._arrivals = [];
+            self._lastArrival = 0;
+            if (a.length >= 2) {
+              const m = a.reduce(function(x, y) { return x + y; }, 0) / a.length;
+              const v = a.reduce(function(x, y) { var d = y - m; return x + d * d; }, 0) / a.length;
+              jitterEl.textContent = Math.sqrt(v).toFixed(1) + ' ms';
+            } else {
+              jitterEl.textContent = '-';
+            }
+          }
           br.textContent = self._avgKbps ? self._avgKbps + ' kbps' : '-';
           if (backend) backend.textContent = self._captureBackend || '-';
           if (uplink) uplink.textContent = self._uplinkMode || '-';
