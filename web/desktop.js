@@ -61,6 +61,17 @@
       // 转发时被改写为 relay 墙钟，e2e 用 本地now+偏移 与 srtc 对齐，彻底摆脱
       // 双机系统时间差（MYS-886 指标失真根因）。
       this._clockOffset = 0;
+      // agent 经 desktop:qos-ack 回传的当前 QoS 状态（目标帧率/码率档）。
+      // 面板"目标帧率/活动"行展示：与渲染帧率对照，可分辨"是我在降帧
+      // 还是解码跟不上"（对齐 rustdesk TestDelay/target fps，MYS-886）。
+      this._ackFps = null;
+      this._ackScale = null;
+      // 首帧时间 TTFV 打点（R2 乙60：接入 → 首帧渲染毫秒），面板"链路状态"
+      // 前放置；弱网模式判定也在此（e2e 连续命中阈值 → 弱网标记）。
+      this._ttfvStart = 0;
+      this._ttfvMs = null;
+      this._weakNetStrikes = 0;   // 连续 e2e>500ms 的观测次数（>2 tick 判弱网）
+      this._weakNet = false;
     }
 
     // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
@@ -167,12 +178,15 @@
       if (this._reqKeyCount >= 3) return;
       this._reqKeyAt = now;
       this._reqKeyCount += 1;
+      this._reqKeyHistory = (this._reqKeyHistory || 0) + 1;
       window.shellRemote.send('desktop:reqkey', {});
     }
 
     connect() {
       if (this._decRecoverTimer) { clearTimeout(this._decRecoverTimer); this._decRecoverTimer = null; }
       this.disconnect(false);
+      this._ttfvStart = Date.now(); // TTFV 打点起点（对齐 R2 乙60）
+      this._ttfvMs = null;
       if (this._webcodecsAvailable()) {
         this._mode = 'webcodecs';
         if (this.canvas) this.canvas.classList.remove('hidden');
@@ -630,6 +644,10 @@
       this._lastNewFrameAt = Date.now();
       this._gotFirstFrame = true;
       this._decodeCount += 1;
+      // TTFV：从 connect() 到首帧解码完成的毫秒（对齐 R2 乙60，面板打点）。
+      if (this._ttfvMs === null && this._ttfvStart) {
+        this._ttfvMs = Date.now() - this._ttfvStart;
+      }
       if (capMs) {
         this._lastCaptureMs = capMs;
         // e2e 在解码**到达时刻**测定（即时管线延时 = 本地now(relay时基) − 采集
@@ -733,6 +751,12 @@
       this._seqDrop = 0;
       this._arrivals = [];
       this._lastArrival = 0;
+      this._ackFps = null;
+      this._ackScale = null;
+      this._ttfvStart = 0;
+      this._ttfvMs = null;
+      this._weakNetStrikes = 0;
+      this._weakNet = false;
       this._unbindInput();
       this._stopMetrics();
       const panel = document.getElementById('desktop-metrics');
@@ -751,6 +775,20 @@
     // 同步；局域网 NTP 下误差 <10ms，公网下仅作参考趋势）。渲染帧率由
     // rAF 计数。捕获方式/链路方式由 agent 的 desktop:started /
     // desktop:uplink 广播提供；解码方案是本播放器自己选的（webcodecs）。
+
+    // agent 经 relay 回传的 QoS 状态（desktop:qos-ack → desktop:qos 的
+    // 应答）：当前目标帧率与码率档。面板"目标帧率/活动"行据此展示 agent
+    // 眼中的目标 vs 本地实际渲染帧率（对齐 rustdesk TestDelay 携带目标
+    // bitrate 的口径；diff >0 时面板可区分"agent 在降帧"还是"解码跟不上"）。
+    receiveQosAck(ack) {
+      if (!ack) return;
+      if (typeof ack.fps === 'number' || typeof ack.fps === 'string') {
+        this._ackFps = Number(ack.fps);
+      }
+      if (typeof ack.qos_scale === 'number' || typeof ack.qos_scale === 'string') {
+        this._ackScale = Number(ack.qos_scale);
+      }
+    }
     _startMetrics() {
       if (this._metricsTimer) return;
       const panel = document.getElementById('desktop-metrics');
@@ -774,9 +812,12 @@
         const br = document.getElementById('metric-bitrate');
         const res = document.getElementById('metric-res');
         const fps = document.getElementById('metric-fps');
+        const gofps = document.getElementById('metric-gofps');
         const buf = document.getElementById('metric-buffer');
         const drop = document.getElementById('metric-dropped');
         const jitterEl = document.getElementById('metric-jitter');
+        const weaknet = document.getElementById('metric-weaknet');
+        const reqkeyEl = document.getElementById('metric-reqkey');
         const backend = document.getElementById('metric-backend');
         const uplink = document.getElementById('metric-uplink');
         const decoder = document.getElementById('metric-decoder');
@@ -800,7 +841,8 @@
             lag.textContent = '-';
           }
           res.textContent = self.canvas ? self.canvas.width + 'x' + self.canvas.height : '-';
-          fps.textContent = self._rafCount;
+          const actualFps = self._rafCount;
+          fps.textContent = actualFps;
           self._rafCount = 0;
           buf.textContent = self._dec ? self._dec.decodeQueueSize : '-';
           drop.textContent = self._droppedFrames + ' 解码 / ' + self._seqDrop + ' 上行(seq)';
@@ -822,6 +864,41 @@
           if (uplink) uplink.textContent = self._uplinkMode || '-';
           if (decoder) decoder.textContent = self._decoderLabel();
           if (encoder) encoder.textContent = self._encoderLabel();
+          // 目标帧率 vs 内容活动：agent 回传的目标 fps（desktop:qos-ack），
+          // 与本地实际渲染对比。fps=1 → 静态；≥15 → 动态满帧；中间为解码
+          // 背压阶梯。diff 代表 agent 目标与本地实际的安全余量（对齐
+          // rustdesk 控制端目标/实测帧率对照，MYS-886）。
+          if (gofps) {
+            const ack = self._ackFps;
+            if (ack !== null && ack !== undefined) {
+              gofps.textContent = '目标 ' + ack + ' / 实际 ' + actualFps + (ack >= 15 ? ' (动态)' : ' (静态)');
+            } else {
+              gofps.textContent = '实际 ' + actualFps;
+            }
+          }
+          // reqkey 计数：面板可见的刷新风暴观测（对齐 R2 己110/R4 丁75）。
+          if (reqkeyEl) {
+            if (self._reqKeyCount > 0) {
+              reqkeyEl.textContent = self._reqKeyCount + ' 次/10s';
+            } else {
+              reqkeyEl.textContent = self._reqKeyHistory ? self._reqKeyHistory + ' 次' : '-';
+            }
+          }
+          // 弱网模式标记：e2e 连续 ≥2 个观测窗口命中阈值（>500ms）判弱网；
+          // 恢复（e2e<阈值）后清零标记（对齐 R3 丁110 弱网模式 UI）。
+          if (weaknet) {
+            if (self._e2eMs !== undefined && self._e2eMs > 500) {
+              self._weakNetStrikes += 1;
+              if (self._weakNetStrikes >= 2) self._weakNet = true;
+            } else {
+              self._weakNetStrikes = 0;
+              self._weakNet = false;
+            }
+            let wl = self._weakNet ? '弱网 ON' : '正常';
+            if (self._ttfvMs !== null) wl += ' · 首帧 ' + self._ttfvMs + 'ms';
+            weaknet.textContent = wl;
+            weaknet.style.color = self._weakNet ? '#f0a020' : '';
+          }
           // QoS 反馈：端到端延时 + 解码背压（解码帧率/队列深度）上报 agent。
           //（agent 侧：fps 由内容活动驱动——静态 1fps/动态满帧，网络只调
           //  码率；解码背压是唯一允许降帧的信号。）

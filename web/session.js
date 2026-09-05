@@ -304,8 +304,15 @@
             return;
         }
         // 实际生效的捕获后端（auto 解析后可能与请求不同，例如 dxgi 回退 gdi）。
+        // 先 connect 再设置：connect() 内部 disconnect(false) 会清空面板状态，
+        // 若在此前赋值会被一并清掉（backend 行恒为 '-'）。
+        showDesktopView();
+        desktopView.connect();
         window._srDesktopInfo = window._srDesktopInfo || {};
         window._srDesktopInfo.backend = (msg.payload && msg.payload.backend) || null;
+        if (desktopView && desktopView._captureBackend !== undefined) {
+            desktopView._captureBackend = window._srDesktopInfo.backend;
+        }
         // 实际生效的编码方案（可能因 fallback 与 select 默认值不同）同步 UI。
         if (msg.payload && msg.payload.codec) {
             const cs = document.getElementById('desktop-codec-select');
@@ -313,8 +320,6 @@
                 cs.value = msg.payload.codec;
             }
         }
-        showDesktopView();
-        desktopView.connect();
     });
 
     // agent 上行链路方式（ws | http）变化时上报，指标面板展示。
@@ -323,6 +328,14 @@
         window._srDesktopInfo.uplink = (msg.payload && msg.payload.uplink) || null;
         if (desktopView && desktopView._uplinkMode !== undefined) {
             desktopView._uplinkMode = window._srDesktopInfo.uplink;
+        }
+    });
+
+    // agent 回传的 QoS 状态（desktop:qos 应答）：目标帧率/码率档 → 面板
+    // "目标帧率/活动"行（对齐 rustdesk TestDelay 回带 target_bitrate）。
+    window.shellRemote.on('desktop:qos-ack', function(msg) {
+        if (desktopView && typeof desktopView.receiveQosAck === 'function') {
+            desktopView.receiveQosAck(msg.payload || {});
         }
     });
 
