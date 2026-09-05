@@ -1234,6 +1234,16 @@ pub async fn browser_send_handler(
     State(state): State<Arc<SharedState>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // 防毒包（MYS-886 对齐项 R3丙94）：单条控制消息上限 8MB，超过直接拒绝，
+    // 防止异常/恶意客户端把整个内存拖进 JSON 路由。
+    let raw_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
+    if raw_len > 8 * 1024 * 1024 {
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            axum::Json(json!({"error": "Message too large"})),
+        )
+            .into_response();
+    }
     let token = match body["token"].as_str() {
         Some(t) => t,
         None => {
@@ -1970,6 +1980,18 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_browser_send_oversized_rejected() {
+        // MYS-886 对齐项（R3丙94）：单条控制消息 >8MB 直接拒掉（防毒包）。
+        let state = make_state("");
+        let big = "x".repeat(9 * 1024 * 1024);
+        let body = json!({"type": "terminal:input", "payload": {"data": big}});
+        let resp = browser_send_handler(State(state), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 413);
     }
 
     #[tokio::test]
