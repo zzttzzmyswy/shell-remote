@@ -17,6 +17,35 @@ use std::os::raw::{c_int, c_uint};
 /// One encoded picture, shaped like [`crate::agent::desktop::encoder::EncodedFrame`].
 pub use crate::agent::desktop::encoder::EncodedFrame;
 
+/// AV1 realtime `cpu_used` 按**面积**分档（对齐 rustdesk webrtc
+/// `get_cpu_speed`：≤320×180→8、≤640×360→9、其余→10）。
+///
+/// 注意 rustdesk 与 Chromium 都用 `w*h` 面积而非"宽高各超阈值"——超宽/
+/// 竖屏（640×180、1080×400）面积落在低档时用低 speed 反而更快；逐边判断
+/// 会把这类屏错判到 10，单帧编码耗时多 ~30%。
+pub fn av1_cpu_used(w: u32, h: u32) -> u32 {
+    let area = w * h;
+    if area <= 320 * 180 {
+        8
+    } else if area <= 640 * 360 {
+        9
+    } else {
+        10
+    }
+}
+
+/// AV1 superblock 档位（对齐 rustdesk `get_super_block_size`：≥4 线程且
+/// `960×540 ≤ w*h < 1920×1080` → 64X64，否则 DYNAMIC）。纯面积比较，
+/// 超宽屏（1920×300）也在 64x64 档内——逐边判断会漏这类屏。
+pub fn av1_superblock_size(w: u32, h: u32, threads: u32) -> c_int {
+    let area = w * h;
+    if threads >= 4 && area >= 960 * 540 && area < 1920 * 1080 {
+        aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_64X64 as c_int
+    } else {
+        aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_DYNAMIC as c_int
+    }
+}
+
 /// libaom AV1 software encoder handle.
 pub struct AomEncoder {
     ctx: aom_sys::aom_codec_ctx_t,
@@ -115,8 +144,10 @@ impl AomEncoder {
             }
             // 低延迟实时档全套（对齐 rustdesk libs/scrap/src/common/aom.rs
             // webrtc 配置，MYS-886 卡顿修复）：
-            //   - cpu_used 按分辨率分级（≤320x180=8、≤640x360=9、其余=10），
-            //     1080p 用 10 而非固定 8 —— 大幅降低单帧编码耗时
+            //   - cpu_used 按**面积**分级（对齐 rustdesk webrtc get_cpu_speed：
+            //     ≤320×180→8、≤640×360→9、其余→10）。用 w*h 而非"宽高各超"——
+            //     超宽/竖屏（640×180、1080×400）面积落低档用低 speed 更快，
+            //     逐边判断会把这类屏错判到 10，单帧编码耗时多 ~30%。
             //   - AOM_CONTENT_SCREEN：屏幕内容专用 tune（关闭电影类工具）
             //   - 显式关闭高耗时工具（warped/global/obmc/ref_frame_mvs/
             //     tpl/deltaq/order_hint/dual_filter/rect/restoration 等）
@@ -127,13 +158,7 @@ impl AomEncoder {
             // (libgav1/dav1d) 对多 tile 关键帧不兼容: 帧内多个 tile 会让其判断
             // "wasn't a key frame" 并拒绝 (实测: ffmpeg tile-columns 4 的帧被拒,
             // tile-columns 0 全 OK)。多线程交给 row_mt + g_threads, tile 留给单 tile。
-            let cpu_used = if w <= 320 && h <= 180 {
-                8
-            } else if w <= 640 && h <= 360 {
-                9
-            } else {
-                10
-            };
+            let cpu_used = av1_cpu_used(w, h) as c_int;
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AOME_SET_CPUUSED as c_int, cpu_used);
             // 屏幕内容 tune 优先（AOM_CONTENT_SCREEN 等价 webrtc 的 kScreensharing）
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_TUNE_CONTENT as c_int, aom_sys::aom_tune_content_AOM_CONTENT_SCREEN as c_int);
@@ -166,17 +191,11 @@ impl AomEncoder {
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_AQ_MODE as c_int, 3);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AOME_SET_MAX_INTRA_BITRATE_PCT as c_int, 300);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ROW_MT as c_int, 1);
-            // SUPERBLOCK_SIZE（rustdesk get_super_block_size）：≥4 线程且
-            // 540p≤分辨率<1080p 用 64x64，否则 DYNAMIC —— 降低分区搜索开销。
-            let sb = if cfg.g_threads >= 4
-                && w >= 960 && h >= 540
-                && w * h < 1920 * 1080
-            {
-                aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_64X64
-            } else {
-                aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_DYNAMIC
-            };
-            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_SUPERBLOCK_SIZE as c_int, sb as c_int);
+            // SUPERBLOCK_SIZE（对齐 rustdesk get_super_block_size，见
+            // `av1_superblock_size`）：≥4 线程且 540p≤面积<1080p 用 64x64，
+            // 否则 DYNAMIC —— 降低分区搜索开销。
+            let sb = av1_superblock_size(w, h, cfg.g_threads);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_SUPERBLOCK_SIZE as c_int, sb);
             // 其余 rustdesk 同款控件（对齐 libs/scrap/src/common/aom.rs webrtc 配置）：
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_CDEF as c_int, 1);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_PALETTE as c_int, 1);
@@ -411,6 +430,29 @@ impl crate::agent::desktop::encoder::VideoEncoder for AomEncoder {
 mod tests {
     use super::*;
     use crate::agent::desktop::encoder::VideoEncoder;
+
+    /// cpu_used / superblock 面积判据（#81，对齐 rustdesk webrtc
+    /// get_cpu_speed / get_super_block_size）。关键是**面积**而非宽高各超：
+    /// 超宽屏（640×180）面积 ≤230400 → cpu_used=9（旧判据会判 10）；
+    /// 1920×300 面积 ∈[960×540,1920×1080) → 64x64。
+    #[test]
+    fn test_area_based_cpu_used_and_superblock() {
+        // 常规 16:9：
+        assert_eq!(av1_cpu_used(320, 180), 8);
+        assert_eq!(av1_cpu_used(640, 360), 9);
+        assert_eq!(av1_cpu_used(1920, 1080), 10);
+        // 超宽屏（面积落低档，旧判据误判 10）：
+        assert_eq!(av1_cpu_used(640, 180), 9, "640x180 面积=115200 ≤ 640*360*1");
+        assert_eq!(av1_cpu_used(1080, 200), 9, "1080x200 面积=216000 ≤ 640*360*1");
+        // superblock：线程 ≥4 且 960×540 ≤ 面积 < 1920×1080 → 64x64
+        let s64 = aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_64X64 as c_int;
+        let dyn_ = aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_DYNAMIC as c_int;
+        assert_eq!(av1_superblock_size(1280, 720, 4), s64);
+        assert_eq!(av1_superblock_size(1920, 1080, 8), dyn_, "full-HD 面积到上限 → DYNAMIC");
+        assert_eq!(av1_superblock_size(1920, 300, 4), s64, "超宽屏面积在档内 → 64x64");
+        assert_eq!(av1_superblock_size(1280, 720, 2), dyn_, "线程 <4 → DYNAMIC");
+        assert_eq!(av1_superblock_size(640, 360, 8), dyn_, "面积 <960x540 → DYNAMIC");
+    }
 
     fn solid_i420(w: usize, h: usize, v: u8) -> Vec<u8> {
         vec![v; w * h + w * h / 2]
