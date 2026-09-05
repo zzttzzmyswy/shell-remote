@@ -1,5 +1,6 @@
 use anyhow::{bail, Context};
 use serde_json::json;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -84,6 +85,17 @@ pub struct RelayClient {
     pub tokens: Vec<(String, String)>,
     /// 自签 https relay 模式：上行(register/SSE/桌面WS)跳过证书校验。
     pub insecure_tls: bool,
+}
+
+/// 429（relay 对每 IP `agent:register` 限流，见 relay/ws.rs）时用固定
+/// 15s 退避：不在限流窗口内立即重试撞墙、也不指数放大（等待窗口自然
+/// 恢复）；其余错误按指数退避并封顶 `max`。
+fn next_retry_delay(is_rate_limited: bool, prev: Duration, max: Duration) -> Duration {
+    if is_rate_limited {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(std::cmp::min(prev.as_secs().saturating_mul(2), max.as_secs()))
+    }
 }
 
 impl RelayClient {
@@ -303,6 +315,8 @@ impl RelayClient {
                     if attempt == max_retries {
                         return Err(e);
                     }
+                    let is_429 = e.to_string().contains("HTTP 429");
+                    delay = next_retry_delay(is_429, delay, max_delay);
                     tracing::warn!(
                         "Connection attempt {} failed: {}. Retrying in {:?}...",
                         attempt + 1,
@@ -310,7 +324,6 @@ impl RelayClient {
                         delay
                     );
                     tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, max_delay);
                 }
             }
         }
@@ -445,5 +458,24 @@ mod tests {
         }
         // 纯构建测试：真正握手已由人工端到端验证（agent --relay-insecure
         // wss:// 注册+上行+https 拉流），此处不依赖网络。
+    }
+
+    #[test]
+    fn test_next_retry_delay_429_is_fixed_not_exponential() {
+        // 429（relay 限流）退避固定 15s：不随前置退避指数放大，等待窗口恢复。
+        let max = Duration::from_secs(300);
+        assert_eq!(next_retry_delay(true, Duration::from_secs(1), max), Duration::from_secs(15));
+        assert_eq!(next_retry_delay(true, Duration::from_secs(120), max), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_next_retry_delay_exponential_with_cap() {
+        let max = Duration::from_secs(300);
+        assert_eq!(next_retry_delay(false, Duration::from_secs(1), max), Duration::from_secs(2));
+        assert_eq!(next_retry_delay(false, Duration::from_secs(4), max), Duration::from_secs(8));
+        // 封顶
+        assert_eq!(next_retry_delay(false, Duration::from_secs(200), max), max);
+        // 429 与指数互不干扰
+        assert_eq!(next_retry_delay(true, Duration::from_secs(8), max), Duration::from_secs(15));
     }
 }

@@ -61,6 +61,10 @@ pub struct SharedState {
     pub server_auth: RwLock<String>,
     pub agent_event_buffers: RwLock<HashMap<String, EventBuffer>>,
     pub rate_limiter: RwLock<RateLimiter>,
+    /// Per-IP `agent:register` 限流上限（次/分钟）。默认 120 —— 同一出口 IP
+    /// 下多台 agent 同时注册/断线重连不至于被 429 拒掉（曾因 10/min 的
+    /// 过紧默认让正常部署注册失败）。防 DoS 的最低保护仍保留。
+    pub registration_rate_limit_per_min: std::sync::atomic::AtomicUsize,
     pub max_upload_size: u64,
     pub sse_sessions: RwLock<HashMap<String, mpsc::Sender<String>>>,
     /// Admin panel config. `admin_path` is `None` when `--admin-path` is
@@ -209,6 +213,7 @@ impl SharedState {
             server_auth: RwLock::new(server_auth),
             agent_event_buffers: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter::new()),
+            registration_rate_limit_per_min: std::sync::atomic::AtomicUsize::new(120),
             max_upload_size,
             sse_sessions: RwLock::new(HashMap::new()),
             admin_path,
@@ -222,6 +227,13 @@ impl SharedState {
             agent_upgrades: RwLock::new(HashMap::new()),
             upgrade_dir: RwLock::new(None),
         }
+    }
+
+    /// 设置每 IP 的 `agent:register` 限流（次/分钟）。CLI `--registration-rate-limit`
+    /// 落在 startup 时调用；测试可借此设小值验证 429 路径。
+    pub fn set_registration_rate_limit(&self, per_min: usize) {
+        self.registration_rate_limit_per_min
+            .store(per_min, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Append an access-audit entry (bounded). Non-blocking; used on the
@@ -1150,6 +1162,7 @@ pub async fn start(
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_disabled: bool,
+    registration_rate_limit: usize,
 ) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -1208,6 +1221,7 @@ pub async fn start(
     st.download_dir = download_dir
         .filter(|d| !d.is_empty())
         .map(std::path::PathBuf::from);
+    st.set_registration_rate_limit(registration_rate_limit);
     let state = Arc::new(st);
 
     // Agent self-upgrade artifacts: `--agent-upgrade-dir` stages binaries

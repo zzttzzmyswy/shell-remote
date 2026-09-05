@@ -77,6 +77,12 @@ enum Command {
         /// Default is HTTPS (self-signed) on the single listen port.
         #[arg(long)]
         no_tls: bool,
+
+        /// Per-IP `agent:register` rate limit (registrations/minute).
+        /// 同出口 IP 下多台 agent 同时注册/重连时放宽, 防 flood 的最低
+        /// 保护仍保留。默认 120/min。
+        #[arg(long, default_value_t = 120)]
+        registration_rate_limit: usize,
     },
 
     /// Run in agent mode (connects to a relay)
@@ -178,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
             tls_cert,
             tls_key,
             no_tls,
+            registration_rate_limit,
         } => {
             relay::start(
                 bind,
@@ -191,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
                 tls_cert,
                 tls_key,
                 no_tls,
+                registration_rate_limit,
             )
             .await?;
         }

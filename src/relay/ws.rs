@@ -492,7 +492,10 @@ pub async fn agent_send_handler(
             .to_string();
         {
             let mut rl = state.rate_limiter.write().await;
-            if !rl.check(&client_ip, 10, std::time::Duration::from_secs(60)) {
+            let limit = state
+                .registration_rate_limit_per_min
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if !rl.check(&client_ip, limit.max(1), std::time::Duration::from_secs(60)) {
                 return (
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     "Too many registrations from this address",
@@ -1629,6 +1632,25 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_register_rate_limited_per_ip() {
+        // 每 IP 注册限流（默认 120/min；测试设成 2 验证 429 路径）。
+        let state = make_state("");
+        state.set_registration_rate_limit(2);
+        let body = json!({"type":"agent:register","token_type":"rw"});
+        let headers = axum::http::HeaderMap::new();
+        for _ in 0..2 {
+            let resp = agent_send_handler(State(state.clone()), headers.clone(), Json(body.clone()))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), 200, "窗口内前 2 次应放行");
+        }
+        let resp = agent_send_handler(State(state.clone()), headers, Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 429, "窗口内超额注册应被限流");
     }
 
     #[tokio::test]
