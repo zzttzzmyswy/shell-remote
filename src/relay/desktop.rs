@@ -26,7 +26,21 @@ pub struct DesktopStream {
 struct ViewerCtx {
     tx: mpsc::Sender<Vec<u8>>,
     key_ok: bool,
+    /// 连续 try_send 丢帧计数：为"丢旧保新"而非"满即踢"。
+    ///
+    /// 缓冲满时 drop 是旧帧，viewer 仍留在 fan-out 里——瞬时积压（浏览器
+    /// 解码停顿/标签页切后台）会自己恢复，而不是被踢出去重连（重连走缓存
+    /// init 秒级恢复，但反复踢→重连会造成可感知的闪烁）。只有当 viewer
+    /// 长期跟不上（连续丢帧超过阈值，说明它已彻底失联/死亡），才在下一拍
+    /// 从 fan-out 移除 -- 对齐 rustdesk 丢帧重连语义（烂帧直接丢旧，订阅
+    /// 者涝死再踢）。
+    drop_count: u32,
 }
+
+/// 连续丢帧超过此值判定 viewer 死亡（30fps 下 ≈ 2s 完全无消费能力）。
+/// 主要触发场景是浏览器页面休眠/切走（rAF 停、fetch 停读），这类 viewer
+/// 保留无意义还白占内存 -- 到阈值即移除，浏览器回来时靠重连恢复。
+const MAX_CONSECUTIVE_DROPS: u32 = 60;
 
 struct Inner {
     /// Latest fMP4 init segment (ftyp+moov). New viewers are replayed this
@@ -60,6 +74,12 @@ impl DesktopStream {
     }
 
     /// Forward one media fragment. `is_key` marks a random-access frame.
+    ///
+    /// 背压策略（对齐 rustdesk 丢旧保新）：channel 满时**不立即踢 viewer**，
+    /// 而是让这一帧跳过该 viewer（它自然是旧帧）并累计 `drop_count`；
+    /// 只有连续丢帧超过 [`MAX_CONSECUTIVE_DROPS`] 才判定 viewer 死亡移除。
+    /// 瞬时积压（解码停顿/切后台几百 ms）能自愈，不至于"一满就踢→反复
+    /// 重连→闪烁"。
     pub async fn push_frag(&self, is_key: bool, bytes: Vec<u8>) {
         let mut viewers = self.inner.viewers.write().await;
         let mut dead = Vec::new();
@@ -68,8 +88,14 @@ impl DesktopStream {
                 continue;
             }
             ctx.key_ok = true;
-            if ctx.tx.try_send(bytes.clone()).is_err() {
-                dead.push(id.clone());
+            match ctx.tx.try_send(bytes.clone()) {
+                Ok(()) => ctx.drop_count = 0,
+                Err(_) => {
+                    ctx.drop_count += 1;
+                    if ctx.drop_count >= MAX_CONSECUTIVE_DROPS {
+                        dead.push(id.clone());
+                    }
+                }
             }
         }
         drop(viewers);
@@ -82,11 +108,20 @@ impl DesktopStream {
     }
 
     async fn broadcast_to_viewers(&self, bytes: Vec<u8>) {
-        let viewers = self.inner.viewers.read().await;
+        // 与 push_frag 一样用 write 锁：需要改 drop_count，且 init 重发是
+        // 低频事件（不会与并发读形成热路径竞争）。read 锁内嵌套 write 会
+        // 死锁（tokio RwLock write 等待 read 释放）。
+        let mut viewers = self.inner.viewers.write().await;
         let mut dead = Vec::new();
-        for (id, ctx) in viewers.iter() {
-            if ctx.tx.try_send(bytes.clone()).is_err() {
-                dead.push(id.clone());
+        for (id, ctx) in viewers.iter_mut() {
+            match ctx.tx.try_send(bytes.clone()) {
+                Ok(()) => ctx.drop_count = 0,
+                Err(_) => {
+                    ctx.drop_count += 1;
+                    if ctx.drop_count >= MAX_CONSECUTIVE_DROPS {
+                        dead.push(id.clone());
+                    }
+                }
             }
         }
         drop(viewers);
@@ -112,7 +147,7 @@ impl DesktopStream {
             .viewers
             .write()
             .await
-            .insert(id.clone(), ViewerCtx { tx, key_ok: false });
+            .insert(id.clone(), ViewerCtx { tx, key_ok: false, drop_count: 0 });
         let init = self.inner.init.read().await.clone();
         (id, rx, init)
     }
@@ -403,13 +438,53 @@ mod tests {
 
     #[tokio::test]
     async fn test_dead_viewer_cleaned_on_broadcast() {
+        // 与 push_frag 同一背压语义：drop rx 后 channel 满，try_send 失败
+        // 只累计 drop_count 不立即移除；超过 MAX_CONSECUTIVE_DROPS 才踢。
         let st = DesktopStream::new();
         let (vid, rx, _) = st.add_viewer().await;
         drop(rx);
-        st.push_frag(true, vec![1]).await;
+        // 先灌满 channel（它带 16 容量）——但未超阈值，viewer 保留。
+        for i in 0..16u8 {
+            st.push_frag(true, vec![i]).await;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            st.inner.viewers.read().await.len(),
+            1,
+            "buffer-full must NOT evict the viewer immediately (drop-old-keep-new)"
+        );
+        // 长期失联：再推超过阈值次数的帧后，viewer 被移除。
+        for i in 0..(MAX_CONSECUTIVE_DROPS + 2) as u8 {
+            st.push_frag(true, vec![i]).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            st.inner.viewers.read().await.len(),
+            0,
+            "viewer stuck beyond MAX_CONSECUTIVE_DROPS must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_burst_backpressure_does_not_evict_viewer() {
+        // 瞬时积压（一次多帧 push_frag 塞满 channel）不应把 viewer 踢出——
+        // 这正是"满即踢→反复重连→闪烁"的旧行为回归点。满后 viewer 仍在，
+        // 稍后消费（recv）恢复投递。
+        let st = DesktopStream::new();
+        let (vid, mut rx, _) = st.add_viewer().await;
+        // 突发塞满 16 帧 + 额外几帧（全部 try_send 失败也不踢）。
+        for i in 0..30u8 {
+            st.push_frag(true, vec![i]).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            st.inner.viewers.read().await.len(),
+            1,
+            "burst of 30 fragments must not evict a live viewer"
+        );
+        // 恢复消费后还能收到帧（丢旧保新：收到的是最后能塞进去的帧）。
+        assert!(rx.recv().await.is_some(), "live viewer resumes receiving");
         st.remove_viewer(&vid).await;
-        assert_eq!(st.inner.viewers.read().await.len(), 0);
     }
 
     // ── stream_handler integration ─────────────────────────────
