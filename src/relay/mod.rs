@@ -332,6 +332,25 @@ mod tests {
     use axum::http::{HeaderMap, Request};
     use std::sync::Arc;
 
+    #[test]
+    fn test_rate_limiter_namespaced_keys_do_not_interfere() {
+        // MYS-886 抖动回归守护：register/events/mcp/file_transfer 各用带
+        // 前缀的 key（reg:/ev:/mcp:/ft:），同 IP 下 register 的高频消耗
+        // 不得挤爆 events 的 30/min 配额。此测试验证不同 key 互不影响。
+        let mut rl = RateLimiter::new();
+        let window = Duration::from_secs(60);
+        // 同一底层 IP，两个命名空间各自计满自己的 max
+        for _ in 0..120 {
+            assert!(rl.check("reg:1.2.3.4", 120, window), "reg 前 120 次应放行");
+        }
+        assert!(!rl.check("reg:1.2.3.4", 120, window), "reg 第 121 次应被拒");
+        // events 命名空间独立计数，不受 reg 消耗影响
+        for _ in 0..30 {
+            assert!(rl.check("ev:1.2.3.4", 30, window), "ev 前 30 次应放行");
+        }
+        assert!(!rl.check("ev:1.2.3.4", 30, window), "ev 第 31 次应被拒");
+    }
+
     #[tokio::test]
     async fn test_static_handler_root_serves_index() {
         let uri = "/".parse::<Uri>().unwrap();

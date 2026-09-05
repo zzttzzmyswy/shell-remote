@@ -162,7 +162,7 @@ pub async fn get_handler(
         .to_string();
     {
         let mut rl = state.rate_limiter.write().await;
-        if !rl.check(&client_ip, 60, std::time::Duration::from_secs(60)) {
+        if !rl.check(&format!("ft:{client_ip}"), 60, std::time::Duration::from_secs(60)) {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
     }

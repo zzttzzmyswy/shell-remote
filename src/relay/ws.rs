@@ -495,7 +495,11 @@ pub async fn agent_send_handler(
             let limit = state
                 .registration_rate_limit_per_min
                 .load(std::sync::atomic::Ordering::Relaxed);
-            if !rl.check(&client_ip, limit.max(1), std::time::Duration::from_secs(60)) {
+            // key 带命名空间前缀：register/events/mcp/file_transfer 的限流
+            // 各自独立计数（MYS-886 抖动回归根因——旧版共用裸 IP 作 key，
+            // register 的高频消耗挤爆 events 的 30/min 配额 → SSE 被 429 →
+            // agent 断连雪崩）。
+            if !rl.check(&format!("reg:{client_ip}"), limit.max(1), std::time::Duration::from_secs(60)) {
                 return (
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     "Too many registrations from this address",
@@ -881,7 +885,7 @@ pub async fn agent_events_handler(
         .to_string();
     {
         let mut rl = state.rate_limiter.write().await;
-        if !rl.check(&client_ip, 30, std::time::Duration::from_secs(60)) {
+        if !rl.check(&format!("ev:{client_ip}"), 30, std::time::Duration::from_secs(60)) {
             return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
         }
     }

@@ -122,7 +122,7 @@ pub async fn messages_handler(
             .unwrap_or("unknown")
             .to_string();
         let mut rl = state.rate_limiter.write().await;
-        if !rl.check(&client_ip, 60, std::time::Duration::from_secs(60)) {
+        if !rl.check(&format!("mcp:{client_ip}"), 60, std::time::Duration::from_secs(60)) {
             return (
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                 "Too many requests",
