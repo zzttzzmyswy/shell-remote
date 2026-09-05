@@ -2674,6 +2674,7 @@ dependencies = [
  "gstreamer-app",
  "hex",
  "http-body-util",
+ "libc",
  "mime_guess",
  "openh264-sys2",
  "pkg-config",

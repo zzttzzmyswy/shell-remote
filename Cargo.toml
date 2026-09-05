@@ -29,7 +29,7 @@ encoding_rs = "0.8"
 sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["io"] }
 openh264-sys2 = { version = "0.9.8", features = ["source"] }
-x11rb = { version = "0.14", features = ["image", "composite"] }
+x11rb = { version = "0.14", features = ["image", "composite", "shm"] }
 enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
 tokio-tungstenite = { version = "0.23", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 futures-util = "0.3.34"
@@ -64,6 +64,9 @@ panic = "unwind"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_SystemServices", "Win32_System_Ole"] }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
 
 [target.x86_64-pc-windows-gnu.dependencies]
 windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D10", "Win32_Foundation", "Win32_System_Threading"] }
