@@ -169,10 +169,11 @@ impl ThreadedFrameSource {
                     if s1.load(O::Relaxed) {
                         break;
                     }
+                    let mut same = false; // 本拍画面未变（静止退化）
                     match inner.next_frame() {
                         Ok(f) => {
                             e1.store(0, O::Relaxed);
-                            let same = match &last_raw {
+                            same = match &last_raw {
                                 Some((lw, lh, buf)) => {
                                     (*lw == f.width && *lh == f.height && buf.as_slice() == f.bgra.as_slice())
                                 }
@@ -190,9 +191,17 @@ impl ThreadedFrameSource {
                             *le1.lock().unwrap() = Some(e);
                         }
                     }
-                    // 防空转：快源（测试 mock / Xvfb）全速产帧时让出 CPU；真实后端
-                    // 自带节流（X11 每帧一次 X 往返、DXGI 静止 200ms timeout）。
-                    std::thread::yield_now();
+                    // 防空转（对齐 rustdesk 静止停抓）：
+                    // - 动态（本拍画面变化）：让出 CPU 即可，快源（测试 mock）全速产帧；
+                    // - 静止（本拍画面未变）：退避 sleep 缩短抓帧频率——X 往返/DXGI
+                    //   acquire 在此刻只是白耗 CPU，静置桌面 agent 应空载（R3 乙85）。
+                    //   上限 ~100ms ≈ 10fps 轮询：内容一旦变化下一拍立即恢复全速
+                    //   （waiting-on-change 抓帧语义，R3 乙57/82）。
+                    if same {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    } else {
+                        std::thread::yield_now();
+                    }
                     }
                 };
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
@@ -1079,6 +1088,60 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(got >= 3, "must keep yielding frames, got {got}");
+    }
+
+    /// 静止退避（R3 乙57/82 对齐）：画面恒定的源 → 抓帧线程应退避 sleep 控制
+    /// 产帧频率（≤10fps 轮询），而不是全速空转。验证产帧被限频而非死锁：
+    /// 静止源在 1.2s 窗口内产出的可取帧数应明显少于全速源。
+    #[test]
+    fn test_threaded_static_source_backs_off() {
+        use std::sync::atomic::Ordering as O;
+        // 恒定画面源：每帧字节完全相同，would-block 判 `same` → 退避 sleep。
+        struct StaticSource {
+            w: usize,
+            h: usize,
+        }
+        impl FrameSource for StaticSource {
+            fn next_frame(&mut self) -> Result<Frame, String> {
+                Ok(Frame {
+                    bgra: vec![7u8; self.w * self.h * 4],
+                    width: self.w,
+                    height: self.h,
+                })
+            }
+            fn resolution(&self) -> (usize, usize) {
+                (self.w, self.h)
+            }
+        }
+        let src: Box<dyn FrameSource> = Box::new(StaticSource { w: 8, h: 8 });
+        let ts = ThreadedFrameSource::spawn(src).unwrap();
+        // 必须等到首帧：第一帧 same=false 发布，之后全部 same → 退避。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut first = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(f) = ts.try_latest() {
+                first = Some(f);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(first.is_some(), "static source must start producing");
+        // 消费掉首帧后，统计后续 1.2s 内到达的帧数——退避 100ms 应 ≤ ~12 帧
+        //（10fps 轮询），若仍然全速（无限产）则测试失败（回归不要退避）。
+        let mut got = 0u32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+        while std::time::Instant::now() < deadline {
+            if ts.try_latest().is_some() {
+                got += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // 上限：10fps × 1.2s ≈ 12 帧 + 调度余量；远小于全速（≥100 帧）。
+        assert!(
+            got <= 20,
+            "static capture must back off (10fps poll) instead of spinning: {got} frames in 1.2s"
+        );
+        drop(ts);
     }
 
     #[test]
