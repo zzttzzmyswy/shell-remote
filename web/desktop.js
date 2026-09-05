@@ -72,6 +72,10 @@
       this._ttfvMs = null;
       this._weakNetStrikes = 0;   // 连续 e2e>500ms 的观测次数（>2 tick 判弱网）
       this._weakNet = false;
+      // 帧超龄丢弃计数（R4 乙88：到达时已 >2s 旧 → 丢 + reqkey）
+      this._staleDropped = 0;
+      // 时钟慢校准定时器（R3 丙135：连接后每 15min 重校一次，对抗长会话漂移）
+      this._clockRecheckTimer = null;
     }
 
     // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
@@ -655,6 +659,17 @@
         // fps=1 时高达数百 ms）而非真实延迟。fps 越低保真度越高，会反过来把
         // QoS 压进低帧率自锁（MYS-886 卡顿死锁的源头之一）。
         this._lastE2eMs = Math.max(0, this._lastNewFrameAt + this._clockOffset - capMs);
+        // 帧超龄丢弃（对齐 R4 乙88）：解码链路若积压到帧已是 2s 前拍的旧画面，
+        // 它没有渲染价值（直播间追新语义）——直接丢掉，并请求关键帧让 agent
+        // 立即重出最新画面，而不是把这个陈旧帧画上去制造"慢半拍"观感。
+        // 阈值 2s 远高于正常 e2e（<150ms），只命中真正的积压崩溃；静态心跳
+        // IDR（≈10ms）与低 fps 正常帧（陈旧度≈1/fps ≤1s）都到不了这里。
+        if (this._lastE2eMs > 2000) {
+          this._staleDropped += 1;
+          try { frame.close(); } catch (e) {}
+          this._requestKey();
+          return; // 不渲染此帧
+        }
       }
       if (this._frames.length > 2) {
         // 渲染管线积压：丢最旧帧（保留最新），追新跳旧减陈旧度。
@@ -757,6 +772,8 @@
       this._ttfvMs = null;
       this._weakNetStrikes = 0;
       this._weakNet = false;
+      this._staleDropped = 0;
+      this._throttleCounter = 0;
       this._unbindInput();
       this._stopMetrics();
       const panel = document.getElementById('desktop-metrics');
@@ -794,6 +811,14 @@
       const panel = document.getElementById('desktop-metrics');
       if (!panel) return;
       const self = this;
+      // 长会话时钟漂移对抗（R3 丙135）：连接期间每 15min 重校一次 relay 时基，
+      // e2e 读数不因双机时钟 drift 缓慢失真。校准失败静默（保持原偏移）。
+      if (!this._clockRecheckTimer) {
+        this._clockRecheckTimer = setInterval(function() {
+          if (!self.connected) return;
+          self._calibrateClock();
+        }, 15 * 60 * 1000);
+      }
 
       // 显式按钮开关（session.html #desktop-metrics-btn）；旧的左上角
       // 隐藏点击区不可发现，已废弃。
@@ -845,7 +870,7 @@
           fps.textContent = actualFps;
           self._rafCount = 0;
           buf.textContent = self._dec ? self._dec.decodeQueueSize : '-';
-          drop.textContent = self._droppedFrames + ' 解码 / ' + self._seqDrop + ' 上行(seq)';
+          drop.textContent = self._droppedFrames + ' 解码 / ' + self._staleDropped + ' 超龄 / ' + self._seqDrop + ' 上行(seq)';
           // 帧到达 jitter（stddev）：稳定流应 ≪ 帧间隔（top 场景目标 <8ms）
           if (jitterEl) {
             const a = self._arrivals;
@@ -926,6 +951,10 @@
         clearInterval(this._metricsTimer);
         this._metricsTimer = null;
       }
+      if (this._clockRecheckTimer) {
+        clearInterval(this._clockRecheckTimer);
+        this._clockRecheckTimer = null;
+      }
       const btn = document.getElementById('desktop-metrics-btn');
       if (btn && this._onMetricsBtn) btn.removeEventListener('pointerdown', this._onMetricsBtn, true);
     }
@@ -962,9 +991,27 @@
         return { x: Math.round(x), y: Math.round(y) };
       };
 
+            // 弱网输入降采样（对齐 R2 丙104/109）：e2e>300ms 时鼠标 move 按 2:1
+      // 节流（只发奇数次），>800ms 时再减半（每 4 次发 1 次）。输入事件与
+      // 视频共享弱网上行带宽——主动降输入频率比让它拥塞造成视频/控制双向
+      // 卡顿更优（rustdesk 弱网输入节流语义）。点击/滚轮/按键是离散动作，
+      // 不做采样（一次点击漏发会错意），只节流连续 move。
+      this._throttleCounter = 0;
       this._onPointerMove = function(e) {
         const p = self._toDesktopXY(e);
-        if (p) send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
+        if (!p) return;
+        const e2e = self._e2eMs;
+        if (e2e !== undefined) {
+          self._throttleCounter += 1;
+          if (e2e > 300) {
+            if (e2e > 800) {
+              if (self._throttleCounter % 4 !== 0) return;
+            } else if (self._throttleCounter % 2 !== 0) {
+              return;
+            }
+          }
+        }
+        send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
       };
       this._onPointerDown = function(e) {
         const p = self._toDesktopXY(e);
