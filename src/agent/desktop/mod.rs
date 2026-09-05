@@ -131,6 +131,9 @@ pub struct DesktopManager {
     qos_frames: Arc<std::sync::atomic::AtomicU64>,
     /// QoS 上次采样墙钟（微秒，供 on_qos_delay 算 elapsed_s）。
     qos_last_sample: std::sync::atomic::AtomicU64,
+    /// 编码器当前目标码率（bps，由 pipeline 每次建/重建编码器时同步）。
+    /// QoS ratio 的 150kbps 限幅与 1Mbps 基线用它（rustdesk store_bitrate）。
+    qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
     /// 灰度模式（web 端可切）：编码前把 UV 平面置中性 128，色度≈0。
     /// 弱网下带宽占用显著下降（亮度是主观关键），画质降为灰度可接受。
     /// 运行时即时生效，不重建编码器/不重启流。
@@ -157,9 +160,10 @@ impl DesktopManager {
             quality: std::sync::RwLock::new(quality0),
             max_bps: std::sync::RwLock::new(max_bps0),
             qos_scale: Arc::new(std::sync::atomic::AtomicU32::new(1000)),
-            qos: tokio::sync::Mutex::new(QosAdaptive::new()),
+            qos: tokio::sync::Mutex::new(QosAdaptive::new(quality0)),
             qos_frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             qos_last_sample: std::sync::atomic::AtomicU64::new(0),
+            qos_bitrate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gray: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -208,9 +212,8 @@ impl DesktopManager {
         self.qos_frames.fetch_add(1, O::Relaxed);
     }
 
-    /// QoS 动态调整目标帧率（rustdesk 渐进式）：每次浏览器上报端到端延时，
-    /// 按 rustdesk `video_qos::user_network_delay` 渐进调整（好网 +1/+5、
-    /// 差网按比例降），非硬档跳变。帧数/时间差由内部采样。
+    /// QoS 动态调整目标帧率/码率（rustdesk `video_qos.rs` 移植）：每次浏览器
+    /// 上报端到端延时，按 user_network_delay + adjust_ratio 渐进调整。
     pub async fn on_qos_delay(&self, delay_ms: u32) -> (u32, u32, u64) {
         use std::sync::atomic::Ordering as O;
         let cap = (self.config.fps as u32).clamp(1, 60);
@@ -226,20 +229,27 @@ impl DesktopManager {
             0.0
         };
         let frames = self.qos_frames.swap(0, O::Relaxed) as u32;
+        let bitrate_bps = self.qos_bitrate.load(O::Relaxed);
+        let ctx = QosSampleCtx {
+            quality_ratio: self.config.quality.clamp(QOS_BR_SPEED, QOS_BR_BEST),
+            highest_fps: cap,
+            bitrate_kbps: (bitrate_bps / 1000).max(1) as u32,
+            now_us,
+        };
         let (fps, permille) = {
             let mut q = self.qos.lock().await;
-            q.on_delay(delay_ms, frames, elapsed_s)
+            q.on_delay(delay_ms, frames, elapsed_s, &ctx)
         };
         let fps = fps.clamp(1, cap);
         let permille = permille.clamp(100, 1000);
         self.fps.store(fps, O::Relaxed);
         self.qos_scale.store(permille, O::Relaxed);
         // 当前生效目标码率（对齐 rustdesk TestDelay 携带 target_bitrate 回传，
-        // MYS-886 #153）：用户硬顶 >0 用其值×缩放；否则按 min_bps 基×缩放。
+        // MYS-886 #153）：用户硬顶 >0 用其值×缩放；否则按 abr ceiling×缩放。
         let base_bps = if self.config.max_bps > 0 {
-            self.config.max_bps
+            self.config.max_bps.max(self.config.min_bps)
         } else {
-            self.config.min_bps
+            encoder::target_bitrate(1920, 1080, 0, self.config.quality).max(self.config.min_bps)
         };
         let bitrate_kbps = base_bps * (permille as u64) / 1000 / 1000;
         tracing::info!(delay_ms, fps, qos_scale = permille, cap, "desktop QoS: adaptive adjusted");
@@ -390,9 +400,10 @@ impl DesktopManager {
         let fps_ctl = self.fps.clone();
         let qos_scale = self.qos_scale.clone();
         let qos_frames = self.qos_frames.clone();
+        let qos_bitrate = self.qos_bitrate.clone();
         let gray = self.gray.clone();
         let task = tokio::task::spawn(async move {
-            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl, qos_scale, qos_frames, gray).await;
+            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl, qos_scale, qos_frames, qos_bitrate, gray).await;
         });
         *self.task.lock().await = Some(task);
     }
@@ -488,20 +499,21 @@ const MAX_CAPTURE_ERRORS: u32 = 150;
 pub const KF_AUTO_MAX_SECS: f64 = 5.0;
 
 /// 静止/活跃关键帧间隔（毫秒）。MYS-886 需求7-1：静止画面 P 帧近 0 字节，
-/// 关键帧是唯一带宽开销 → 心跳 IDR 从 500ms 拉长到 4.5s（带宽降至 1/9×）；
+/// 关键帧是唯一带宽开销 → 心跳 IDR 从 500ms 拉长到 4s（带宽降至 1/8×）；
 /// 活跃（帧均字节超阈值）时 1.5s 一个 IDR 保持 seek 与参考链健康。
 /// 判定用 [`avg_frame_bytes`]：> [`KF_ACTIVE_BYTES_FRAME`] 视为活跃。
-/// 静止间隔从 4.5s 收紧到 2s —— 过长会让浏览器在无变化期长时间收不到
-/// 帧（P 帧≈0 字节不 POST、关键帧太远），渲染长期停住、e2e 累加到秒级、
-/// 体感如"死机"（MYS-886）。2s 一关键帧仍能大幅省带宽且交互不"冻结"。
-pub const KF_QUIET_MS: u64 = 2000;
+/// 静止间隔取 4s：浏览器端已不因静止无新帧而把 e2e 累加虚高（见
+/// desktop.js 静止判定），渲染停住只是"画面本来就静止"，交互首帧由
+/// pipeline 的"有新帧立即编码"保证即时恢复——长间隔同时压低静态带宽
+/// （对齐 rustdesk 静止低带宽，MYS-886）。
+pub const KF_QUIET_MS: u64 = 4000;
 pub const KF_ACTIVE_MS: u64 = 1500;
 /// 帧均字节阈值：超过则视为活跃内容（需要高频关键帧）。
 pub const KF_ACTIVE_BYTES_FRAME: f64 = 2048.0;
 
 /// 动态关键帧间隔由 [`KF_QUIET_MS`]/[`KF_ACTIVE_MS`] 取代旧的 500ms 固定
-/// 静止心跳（MYS-886 需求7-1：静止 4.5s 一个 IDR，带宽降至 ~1/9，且远低于
-/// relay 观看者 30s 空闲超时，不会误判断流）。
+/// 静止心跳（MYS-886 需求7-1：静止 4s 一个 IDR，带宽显著低于 relay 观看者
+/// 30s 空闲超时，不会误判断流）。
 
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
@@ -519,6 +531,7 @@ async fn run_desktop_loop(
     fps_ctl: Arc<std::sync::atomic::AtomicU32>,
     qos_scale: Arc<std::sync::atomic::AtomicU32>,
     qos_frames: Arc<std::sync::atomic::AtomicU64>,
+    qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
     gray: Arc<std::sync::atomic::AtomicBool>,
 ) {
         let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
@@ -533,7 +546,7 @@ async fn run_desktop_loop(
         }
     };
     let (src, backend) = src;
-    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl, qos_scale, qos_frames, gray).await;
+    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl, qos_scale, qos_frames, qos_bitrate, gray).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -549,6 +562,7 @@ async fn run_desktop_pipeline(
     fps_ctl: Arc<std::sync::atomic::AtomicU32>,
     qos_scale: Arc<std::sync::atomic::AtomicU32>,
     qos_frames: Arc<std::sync::atomic::AtomicU64>,
+    qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
     gray: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // cfg 需可变：编码器 fallback 后回写实际 codec。
@@ -606,6 +620,8 @@ async fn run_desktop_pipeline(
         encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality).max(cfg.min_bps)
     };
     let mut abr = rate::Abr::new(cfg.min_bps, abr_ceiling);
+    // QoS ratio 的 current_bitrate 基准：同步编码器当前目标码率（bps）。
+    qos_bitrate.store(abr_ceiling, std::sync::atomic::Ordering::Relaxed);
 
     // fMP4 config is final once the first IDR carries SPS/PPS at the *current*
     // encode resolution; a resolution change rebuilds both.
@@ -646,31 +662,32 @@ async fn run_desktop_pipeline(
         }
     }));
 
-    // QoS 动态帧率（rustdesk 同款）：好网提升 fps、差网降低。每次 tick
-    // 前读目标 fps，sleep 对应间隔并同步编码器帧率模型（kf_max_dist）。
+    // QoS 动态帧率：fps 是"两次编码的最小间隔"（上限节奏），不是硬节拍。
+    // 反馈来自浏览器端到端延时（见 on_qos_delay），由 fps_ctl 读入。
     let start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
     // 上次强制 IDR 的虚拟墙钟（wall_ms 时基）。动态关键帧节拍用它判断
     // 是否到间隔（静止 KF_QUIET_MS / 活跃 KF_ACTIVE_MS，MYS-886 需求7-1）。
     let mut last_kf_wall: u64 = 0;
+    // 上次编码/上次墙钟采样点（真实时间，见下方循环内说明）。
+    let mut last_encode = std::time::Instant::now();
+    let mut last_wall = std::time::Instant::now();
 
     while running.load(Ordering::SeqCst) {
         let cur_fps = fps_ctl.load(Ordering::SeqCst).clamp(1, 60);
         enc.set_frame_rate(cur_fps as f32);
-        tokio::time::sleep(Duration::from_secs_f64(1.0 / cur_fps as f64)).await;
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
+        let min_gap = Duration::from_secs_f64(1.0 / cur_fps as f64);
+        // 墙钟按真实时间推进——静止无帧时也要走，否则 IDR 节拍被推没
+        // （IDR 是解码端 seek/清空后的重同步点，必须周期性刷新）。
+        let now_wall = std::time::Instant::now();
+        wall_ms += now_wall.duration_since(last_wall).as_millis() as u64;
+        last_wall = now_wall;
+
         // 动态关键帧节拍（MYS-886 需求7-1）：由内容活跃度决定 IDR 间隔。
         // 静止（帧均字节 ≤ 阈值）时 P 帧近 0 字节，关键帧是唯一带宽开销
-        // → 从 500ms 拉长到 4.5s，静止带宽降至 ~1/9；活跃时 1.5s 一 IDR
-        // 保持 seek 与参考链健康。首帧强制 IDR（同时就是 init 段的参数集）。
-        // 低延时管线（MYS-886）: **编码不跳帧**——每个 tick 都捕获+编码。
-        // 帧率阶梯（STRIDES）与降分辨率不再作用于编码路径, 编码器始终
-        // 以满帧率输出; 码率控制交给 ABR 的 set_bitrate。跳帧只发生在
-        // 上行（批量 POST 的丢旧保新, 见 agent::mod 的 batch 逻辑）和
-        // relay→浏览器（非关键帧丢弃）——两者都不破坏解码器状态。
-        wall_ms += frame_ms;
+        // → 静止 KF_QUIET_MS / 活跃 KF_ACTIVE_MS 一 IDR。首帧强制 IDR
+        // （同时就是 init 段的参数集）。低延时管线：编码不跳帧（跳过的是
+        // try_latest 追最新帧），码率控制交给 ABR 的 set_bitrate。
         let kf_ms = kf_interval_ms_for(avg_frame_bytes(&byte_win));
         if frame_idx == 0 || last_kf_wall + kf_ms <= wall_ms {
             enc.force_idr();
@@ -700,10 +717,22 @@ async fn run_desktop_pipeline(
                         threaded.last_err().unwrap_or_default()
                     );
                 }
-                // 无新帧：跳过本 tick（编码不被抓帧阻塞）。
+                // 无新帧：短轮询等帧，不按 fps 节拍空转——否则静止转动态的
+                // 首帧会白等一整拍（fps=1 时高达 1s），正是"静止→点一下等半
+                // 天才有反应"的体感根因之一。
+                tokio::time::sleep(Duration::from_millis(5)).await;
                 continue;
             }
         };
+        // 有新帧：fps 是两次编码的最小间隔（上限节奏）。间隔已满足 → 立即
+        // 编码；未满足 → 等余量再编（期间 try_latest 追最新帧，跳过中间帧）。
+        // 静止转动态：间隔通常早已满足，首帧立即编码（不整拍等）。
+        let gap = last_encode.elapsed();
+        if gap < min_gap {
+            tokio::time::sleep(min_gap - gap).await;
+            continue;
+        }
+        last_encode = std::time::Instant::now();
         let w = fr.width;
         let h = fr.height;
         // display 变更检测（rustdesk 对齐）：捕获源尺寸变了（X11/GDI 轮询、
@@ -738,6 +767,7 @@ async fn run_desktop_pipeline(
                         encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality).max(cfg.min_bps)
                     };
                     abr = rate::Abr::new(cfg.min_bps, ceiling);
+                    qos_bitrate.store(ceiling, std::sync::atomic::Ordering::Relaxed);
                     mp4_cfg = None;
                     seq = 1;
                     byte_win.clear();
@@ -784,9 +814,6 @@ async fn run_desktop_pipeline(
             }
         };
         frame_idx += 1;
-        // QoS DYNAMIC_SCREEN 统计：每编码一帧（含空帧）计数一次。
-        use std::sync::atomic::Ordering as O;
-        qos_frames.fetch_add(1, O::Relaxed);
 
         // 防御：RC 仍可能输出空帧（极少数情况）——空帧不 POST，记录为跳帧。
         // （pts 不动：空帧不产生 moof, 推 pts 会造成时间线空洞。）
@@ -798,8 +825,14 @@ async fn run_desktop_pipeline(
             while byte_win.len() > OBS {
                 byte_win.pop_front();
             }
+            // 空帧不计入 QoS DYNAMIC_SCREEN 帧数：静止屏持续空转（内容不变
+            // 也每拍编码）不能伪装成"动态屏"——否则高延迟会误当作差网
+            // 证据，把 fps/码率打压（MYS-886 卡顿死锁的另一半根因）。
             continue;
         }
+        // QoS DYNAMIC_SCREEN 统计：只计**实际产出字节**的帧（动态判定）。
+        use std::sync::atomic::Ordering as O;
+        qos_frames.fetch_add(1, O::Relaxed);
         // 按实际编码字节入窗: 决策依据 = avg(bytes/frame) vs 预算。
         byte_win.push_back(encoded.nalu.len() as u32);
         while byte_win.len() > OBS {
@@ -915,31 +948,44 @@ fn kf_interval_ms_for(avg_bytes: f64) -> u64 {
     }
 }
 
-/// QoS 渐进式码率/帧率控制器（完整移植 rustdesk `src/server/video_qos.rs`，
-/// MYS-886 继续对齐）。rustdesk 不是硬档跳变，而是：
-/// - fps：每个 delay 样本渐进调整（好网 <50ms 连 3 次 +5，<100ms +1，
-///   差网按比例降），且带 RTT 扣除、新连接 INIT_FPS=15、response_delayed 兜底
-/// - ratio：每 ADJUST_RATIO_INTERVAL=3s 按平均延时平滑缩放（×1.15~×0.8）
-/// 取代旧的硬档（60/30/15fps + 1000/750/500‰ 三段跳变）。
+/// QoS 渐进式码率/帧率控制器 —— rustdesk `src/server/video_qos.rs` 单用户版
+/// 移植（MYS-886 重做对齐）。核心语义（对照源码，非自创）：
+/// - **fps**：按端到端延时渐进调整 —— 好网 <50ms 连 3 次 +5、<100ms 且好转
+///   +1、中网维持 min_fps、差网按延时比例降；**下限 MIN_FPS=1**（rustdesk
+///   任意档位极端弱网都降到 1fps），上限 = `--desktop-fps`。
+/// - **ratio**（码率缩放）：每 3s 按平均延时平滑缩放（×1.15~×0.8）——
+///   动态屏（3s 内编码 ≥6 帧）好网才升、差网**无条件**降；每次最多 +150kbps
+///   限幅防陡升；上下限按质量档与 1Mbps 基线计算。
+/// - e2e 已由 relay 时钟校准为净端到端，无需 rustdesk 的 delay−RTT。
 pub struct QosAdaptive {
+    /// 全局当前 fps（对外生效值）。
     fps: u32,
-    ratio_permille: u32,
+    /// 码率缩放 ratio（rustdesk 语义：0.5/0.67/1.5 × 缩放倍数）。
+    ratio: f32,
+    /// 当前质量档 ratio（bound 到 0.5..=1.5）。
+    quality_ratio: f32,
     /// 最近一次浏览器上报的端到端延时（ms）。
     last_delay: u32,
+    /// 延期历史（HISTORY_DELAY_LEN=2）。
     delay_history: std::collections::VecDeque<u32>,
-    /// 连续好样本计数（<50ms 连 3 次 → 快速提 fps）。
+    /// 首个 delay 样本后的用户 fps（None = 未收过样本）。
+    delay_fps: Option<u32>,
+    /// 连续好样本计数（<50ms 连 3 次 → +5）。
     quick_increase_fps_count: u32,
-    /// 稳定好样本计数（<150ms 连 3 次 → 小幅 +1）。
+    /// 稳定好样本计数（<150ms 连 3 次 → +1）。
     increase_fps_count: u32,
-    /// 距上次 ratio 调整的秒数累计。
+    /// 距上次 ratio 调整的秒数累计（ADJUST_RATIO_INTERVAL=3s）。
     ratio_elapsed_s: u32,
-    /// 每秒编码帧数（用于 DYNAMIC_SCREEN 判定：每秒编码>2 视为动态屏）。
+    /// 本窗口编码帧数累计（DYNAMIC_SCREEN 判定，3s 一清）。
     frame_count_s: u32,
-    /// 编码器当前目标码率（bps），由 ABR/ceiling 同步进来。
-    bitrate_bps: u64,
+    /// 编码器当前目标码率（kbps，由 abr ceiling 同步进来）。
+    bitrate_kbps: u32,
+    /// 首个 delay 样本时刻（unix us），代理 rustdesk new_user_instant
+    /// （1s 内 cap INIT_FPS）。
+    first_sample_us: Option<u64>,
 }
 
-/// rustdesk 同款常量（video_qos.rs）。
+/// rustdesk `video_qos.rs` / `scrap/codec.rs` 同款常量。
 pub const QOS_FPS: u32 = 30;
 pub const QOS_MIN_FPS: u32 = 1;
 pub const QOS_MAX_FPS: u32 = 120;
@@ -948,32 +994,49 @@ pub const QOS_DELAY_THRESHOLD_150MS: u32 = 150;
 pub const QOS_BR_SPEED: f32 = 0.5;
 pub const QOS_BR_BALANCED: f32 = 0.67;
 pub const QOS_BR_BEST: f32 = 1.5;
-/// 码率缩放上限（=1.0，不超用户档）。
-pub const QOS_MAX_BR_MULTIPLE: f32 = 1.0;
-/// 低分辨率时 ratio 下限。
+/// BR_MIN（scrap）：ratio 绝对下限。
+pub const QOS_BR_MIN: f32 = 0.2;
+/// BR_MIN_HIGH_RESOLUTION（scrap）：高分屏 ratio 下限。
 pub const QOS_BR_MIN_HIGH_RESOLUTION: f32 = 0.1;
-const QOS_ADJUST_RATIO_INTERVAL_S: u32 = 3;
-const QOS_DYNAMIC_SCREEN_THRESHOLD: u32 = 2;
+/// MAX_BR_MULTIPLE=1.0：ratio 上限 = 当前质量档。
+pub const QOS_MAX_BR_MULTIPLE: f32 = 1.0;
+const QOS_ADJUST_RATIO_INTERVAL: u32 = 3; // 秒
+const QOS_DYNAMIC_SCREEN_THRESHOLD: u32 = 2; // 帧/秒
 const QOS_HISTORY_DELAY_LEN: usize = 2;
 
+/// `on_delay` 一次采样所需的会话资源（rustdesk video_qos 的输入）。
+#[derive(Clone, Copy)]
+pub struct QosSampleCtx {
+    /// 当前质量档 ratio（= cfg.quality，0.5/0.67/1.5）。
+    pub quality_ratio: f32,
+    /// 帧率上限（--desktop-fps，对应 rustdesk highest_fps）。
+    pub highest_fps: u32,
+    /// 编码器当前目标码率 kbps（对应 store_bitrate 的 current_bitrate）。
+    pub bitrate_kbps: u32,
+    /// 采样时刻（unix 微秒），用于 new_user 1s 窗口。
+    pub now_us: u64,
+}
+
 impl QosAdaptive {
-    pub fn new() -> Self {
+    pub fn new(quality: f32) -> Self {
+        let quality_ratio = quality.clamp(QOS_BR_SPEED, QOS_BR_BEST);
         Self {
             fps: QOS_FPS,
-            ratio_permille: 1000,
+            ratio: quality_ratio,
+            quality_ratio,
             last_delay: 0,
             delay_history: std::collections::VecDeque::new(),
+            delay_fps: None,
             quick_increase_fps_count: 0,
             increase_fps_count: 0,
             ratio_elapsed_s: 0,
             frame_count_s: 0,
-            bitrate_bps: 0,
+            bitrate_kbps: 0,
+            first_sample_us: None,
         }
     }
 
-    /// 平均延时（rustdesk `avg_delay`：近 HISTORY_DELAY_LEN 样本均值。
-    /// 我们端到端延时已由 relay 时钟校准，不再需要扣 RTT——校准后延时即
-    /// 净端到端，比 rustdesk 的 delay-RTT 更精确）。
+    /// 平均延时（rustdesk `avg_delay`：近 HISTORY_DELAY_LEN 样本均值）。
     fn avg_delay(&self) -> u32 {
         let len = self.delay_history.len();
         if len > 0 {
@@ -983,21 +1046,27 @@ impl QosAdaptive {
         }
     }
 
-    /// 用一次新延时样本更新状态，返回 (目标 fps, 码率缩放‰)。
-    /// `frame_count` = 距上次更新以来编码帧数；`elapsed_s` = 距上次更新秒数。
-    /// 内部按 rustdesk 的 user_network_delay + adjust_ratio 渐进逻辑计算。
-    pub fn on_delay(&mut self, delay_ms: u32, frame_count: u32, elapsed_s: f32) -> (u32, u32) {
-        let delay = delay_ms.max(10);
-        self.last_delay = delay;
-        self.frame_count_s += frame_count;
-        if self.delay_history.len() >= QOS_HISTORY_DELAY_LEN {
-            self.delay_history.pop_front();
+    /// 处理一次新延时样本，返回 (目标 fps, 码率缩放‰ 相对满档)。`frame_count`
+    /// = 距上次采样编码帧数；`elapsed_s` = 距上次采样秒数；`ctx` = 会话资源。
+    pub fn on_delay(
+        &mut self,
+        delay_ms: u32,
+        frame_count: u32,
+        elapsed_s: f32,
+        ctx: &QosSampleCtx,
+    ) -> (u32, u32) {
+        // 质量档/码率基准变化 → 按 rustdesk user_image_quality 重置 ratio。
+        let quality_ratio = ctx.quality_ratio.clamp(QOS_BR_SPEED, QOS_BR_BEST);
+        if self.quality_ratio != quality_ratio {
+            self.quality_ratio = quality_ratio;
+            self.ratio = quality_ratio;
         }
-        self.delay_history.push_back(delay);
-        let avg = self.avg_delay();
+        if self.bitrate_kbps != ctx.bitrate_kbps {
+            self.bitrate_kbps = ctx.bitrate_kbps;
+        }
 
-        // ── fps 渐进（rustdesk user_network_delay 移植）──
-        let target_ratio = 1.0; // 用户档在此简化为 1.0（实际档位在编码器侧）
+        let target_ratio = self.quality_ratio;
+        // rustdesk: 好网时 fps 的"理想下限"按质量档（best=8/balanced=10/speed=12）
         let (min_fps, normal_fps) = if target_ratio >= QOS_BR_BEST {
             (8, 16)
         } else if target_ratio >= QOS_BR_BALANCED {
@@ -1006,6 +1075,19 @@ impl QosAdaptive {
             (12, 24)
         };
         let dividend_ms = QOS_DELAY_THRESHOLD_150MS * min_fps;
+        let highest_fps = ctx.highest_fps.max(QOS_MIN_FPS);
+
+        // ── delay 历史与均值（rustdesk add_delay/avg_delay）──
+        let delay = delay_ms.max(10);
+        let old_avg = self.avg_delay();
+        self.last_delay = delay;
+        if self.delay_history.len() > QOS_HISTORY_DELAY_LEN {
+            self.delay_history.pop_front();
+        }
+        self.delay_history.push_back(delay);
+        let avg = self.avg_delay().max(10);
+
+        // ── fps 渐进（rustdesk user_network_delay 逐行）──
         let mut fps = self.fps;
         if avg < 50 {
             self.quick_increase_fps_count += 1;
@@ -1014,23 +1096,23 @@ impl QosAdaptive {
                 self.quick_increase_fps_count = 0;
                 step = 5;
             }
-            fps = min_fps.max(fps + step);
+            fps = min_fps.max(fps.saturating_add(step));
         } else if avg < 100 {
-            let step = if fps < normal_fps { 1 } else { 0 };
-            fps = min_fps.max(fps + step);
+            let step = if avg < old_avg && fps < normal_fps { 1 } else { 0 };
+            fps = min_fps.max(fps.saturating_add(step));
         } else if avg < QOS_DELAY_THRESHOLD_150MS {
             fps = min_fps.max(fps);
         } else {
-            let divide_fps =
+            let devide_fps =
                 ((fps as f32) / (avg as f32 / QOS_DELAY_THRESHOLD_150MS as f32)).ceil() as u32;
             if avg < 200 {
-                fps = min_fps.max(divide_fps);
+                fps = min_fps.max(devide_fps);
             } else if avg < 300 {
-                fps = min_fps.min(divide_fps);
+                fps = min_fps.min(devide_fps);
             } else if avg < 600 {
                 fps = dividend_ms / avg;
             } else {
-                fps = (dividend_ms / avg).min(divide_fps);
+                fps = (dividend_ms / avg).min(devide_fps);
             }
         }
         if avg < QOS_DELAY_THRESHOLD_150MS {
@@ -1045,58 +1127,131 @@ impl QosAdaptive {
         if avg > 50 {
             self.quick_increase_fps_count = 0;
         }
-        // fps 下限用 quality 档的 min_fps（balanced=10/best=8/speed=12），
-        // **不是全局 1** —— MYS-886 卡顿死锁根因：e2e 上限一高，fps 被
-        // 压到 1 → 交互变成 1fps → 体感"非常卡"，且帧率低→srtc 陈旧→
-        // e2e 再虚高→永远不恢复。至少保 8-12fps 交互底线（rustdesk
-        // 同款：min_fps 即下限）。
-        fps = fps.clamp(min_fps, QOS_MAX_FPS);
-        // 新连接 1s 内 cap 到 INIT_FPS（rustdesk adjust_fps 的 new_user_instant）
-        // ——我们无"用户加入"事件，用首次样本近似：fps 超过 INIT_FPS 且刚启动
-        // 由外部在 start 时初始化，这里保持渐进即可。
+        // 全局 clamp：下限 1（用户事实 + rustdesk MIN_FPS），上限 highest_fps。
+        fps = fps.clamp(QOS_MIN_FPS, highest_fps);
+
+        let first = self.delay_fps.is_none();
+        self.delay_fps = Some(fps);
+        // response_delayed：e2e > 2s → 视为响应超时，fps 压到 2（MIN_FPS+1）。
+        if delay_ms > 2000 && fps > QOS_MIN_FPS + 1 {
+            fps = QOS_MIN_FPS + 1;
+        }
+        // new_user_instant：首个样本起 1s 内 cap INIT_FPS。
+        match self.first_sample_us {
+            None => {
+                self.first_sample_us = Some(ctx.now_us);
+            }
+            Some(t) => {
+                if ctx.now_us >= t && ctx.now_us - t < 1_000_000 && fps > QOS_INIT_FPS {
+                    fps = QOS_INIT_FPS;
+                }
+            }
+        }
         self.fps = fps;
 
-        // ── ratio 渐进（rustdesk adjust_ratio 移植，每 3s 调一次）──
+        // ── ratio（rustdesk update_display_data：send_counter 每秒累计，
+        //    每 3s 调 adjust_ratio；首次样本也调一次）──
+        self.frame_count_s += frame_count;
         self.ratio_elapsed_s += elapsed_s.max(0.0) as u32;
-        if self.ratio_elapsed_s >= QOS_ADJUST_RATIO_INTERVAL_S {
+        if self.ratio_elapsed_s >= QOS_ADJUST_RATIO_INTERVAL {
             self.ratio_elapsed_s = 0;
-            // DYNAMIC_SCREEN：每秒编码 > 阈值 → 动态屏（可升 ratio）
-            let dynamic_screen = self.frame_count_s >= QOS_DYNAMIC_SCREEN_THRESHOLD;
+            // DYNAMIC_SCREEN：3s 内编码 ≥ ADJUST_RATIO_INTERVAL×阈值 帧
+            // （=每秒 ≥2 帧）才视为动态屏。
+            let dynamic =
+                self.frame_count_s >= QOS_ADJUST_RATIO_INTERVAL * QOS_DYNAMIC_SCREEN_THRESHOLD;
             self.frame_count_s = 0;
-            let mut v = self.ratio_permille as f32 / 1000.0;
-            v = if avg < 50 {
-                if dynamic_screen { v * 1.15 } else { v }
-            } else if avg < 100 {
-                if dynamic_screen { v * 1.1 } else { v }
-            } else if avg < QOS_DELAY_THRESHOLD_150MS {
-                if dynamic_screen { v * 1.05 } else { v }
-            } else if avg < 200 {
-                v * 0.95
-            } else if avg < 300 {
-                v * 0.9
-            } else if avg < 500 {
-                v * 0.85
-            } else {
-                v * 0.8
-            };
-            let max = QOS_MAX_BR_MULTIPLE;
-            let min = QOS_BR_MIN_HIGH_RESOLUTION;
-            v = v.clamp(min, max);
-            self.ratio_permille = (v * 1000.0).round() as u32;
+            self.adjust_ratio(dynamic);
+        } else if first {
+            self.adjust_ratio(false);
         }
 
-        (self.fps, self.ratio_permille)
+        (self.fps, self.ratio_permille())
     }
 
-    /// 同步当前编码器目标码率（用于 ratio 的 150kbps 限幅参考；简化实现中
-    /// 保持纯比例缩放即可）。
-    #[allow(dead_code)]
-    pub fn set_bitrate(&mut self, bps: u64) {
-        self.bitrate_bps = bps;
+    /// ratio 调整（rustdesk adjust_ratio 逐行）：动态屏好网才升、差网无条件
+    /// 降；+150kbps/3s 限幅防陡升；min 按质量档与 1Mbps 基线。
+    fn adjust_ratio(&mut self, dynamic: bool) {
+        let max_delay = self.avg_delay();
+        let target_ratio = self.quality_ratio;
+        let current_ratio = self.ratio;
+        let current_bitrate = self.bitrate_kbps as f32;
+
+        // 高分屏 1Mbps 等效保底（rustdesk ratio_1mbps）。
+        let ratio_1mbps = if current_bitrate > 0.0 {
+            Some((current_ratio * 1000.0 / current_bitrate).max(QOS_BR_MIN_HIGH_RESOLUTION))
+        } else {
+            None
+        };
+        // 每 3s 码率增量上限 +150kbps（rustdesk ratio_add_150kbps）。
+        let ratio_add_150kbps = if current_bitrate > 0.0 {
+            Some((current_bitrate + 150.0) * current_ratio / current_bitrate)
+        } else {
+            None
+        };
+
+        let min = if target_ratio >= QOS_BR_BEST {
+            let mut m = QOS_BR_BEST / 2.5;
+            if let Some(r1) = ratio_1mbps {
+                if m > r1 {
+                    m = r1;
+                }
+            }
+            m.max(QOS_BR_MIN)
+        } else if target_ratio >= QOS_BR_BALANCED {
+            let mut m = (QOS_BR_BALANCED / 2.0).min(0.4);
+            if let Some(r1) = ratio_1mbps {
+                if m > r1 {
+                    m = r1;
+                }
+            }
+            m.max(QOS_BR_MIN_HIGH_RESOLUTION)
+        } else {
+            QOS_BR_MIN_HIGH_RESOLUTION
+        };
+        let max = target_ratio * QOS_MAX_BR_MULTIPLE;
+
+        let mut v = current_ratio;
+        if max_delay < 50 {
+            if dynamic {
+                v = current_ratio * 1.15;
+            }
+        } else if max_delay < 100 {
+            if dynamic {
+                v = current_ratio * 1.1;
+            }
+        } else if max_delay < QOS_DELAY_THRESHOLD_150MS {
+            if dynamic {
+                v = current_ratio * 1.05;
+            }
+        } else if max_delay < 200 {
+            v = current_ratio * 0.95;
+        } else if max_delay < 300 {
+            v = current_ratio * 0.9;
+        } else if max_delay < 500 {
+            v = current_ratio * 0.85;
+        } else {
+            v = current_ratio * 0.8;
+        };
+
+        if let Some(r150) = ratio_add_150kbps {
+            if v > r150 && r150 > current_ratio && current_ratio >= QOS_BR_SPEED {
+                v = r150;
+            }
+        }
+        self.ratio = v.clamp(min, max);
+    }
+
+    /// 相对满档的千分比（=1000 表示满档，<1000 表示弱网已压码率）。
+    pub fn ratio_permille(&self) -> u32 {
+        if self.quality_ratio > 0.0 {
+            (self.ratio / self.quality_ratio * 1000.0).round().clamp(100.0, 1000.0) as u32
+        } else {
+            1000
+        }
     }
 
     pub fn current_ratio_permille(&self) -> u32 {
-        self.ratio_permille
+        self.ratio_permille()
     }
 }
 
@@ -1244,7 +1399,7 @@ mod tests {
         assert_eq!(kf_interval_ms_for(10_000.0), KF_ACTIVE_MS);
         // 刚过阈值仍是活跃
         assert_eq!(kf_interval_ms_for(KF_ACTIVE_BYTES_FRAME + 0.1), KF_ACTIVE_MS);
-        // 静止（帧均 ≤ 2KB）→ 4.5s
+        // 静止（帧均 ≤ 2KB）→ 长间隔（KF_QUIET_MS）
         assert_eq!(kf_interval_ms_for(KF_ACTIVE_BYTES_FRAME), KF_QUIET_MS);
         assert_eq!(kf_interval_ms_for(0.0), KF_QUIET_MS);
     }
@@ -1260,31 +1415,40 @@ mod tests {
         assert_eq!(qos_bitrate_scale_for_delay(900), 500);
     }
 
+    fn qos_ctx(quality: f32, bitrate_kbps: u32, now_us: u64) -> QosSampleCtx {
+        QosSampleCtx {
+            quality_ratio: quality,
+            highest_fps: 30,
+            bitrate_kbps,
+            now_us,
+        }
+    }
+
     #[test]
     fn test_qos_adaptive_gradual_increase_on_good_net() {
-        // 渐进式：好网（<50ms）连 3 次样本后 +5，非一次跳满（rustdesk 同款）
-        let mut q = QosAdaptive::new();
-        // 初始 fps=30；给 3 次 40ms 好样本（动态屏，帧数>2）
-        let (fps1, _) = q.on_delay(40, 30, 1.0);
-        let (fps2, _) = q.on_delay(40, 30, 1.0);
-        let (fps3, _) = q.on_delay(40, 30, 1.0);
-        // 每次 +1（低于 normal_fps 时），连 3 次后有一次 +5 的机会；
-        // 断言最终 fps > 初始（渐进上升，非跳变）
-        assert!(fps3 >= fps1 && fps3 >= 30, "good net must not drop fps");
-        // 好网 ratio 应保持或上升（动态屏 ×1.15）
+        // 好网（<50ms）动态屏：渐进调整，fps 不降；ratio 动态屏回升/保持满档
+        // （rustdesk：×1.15 但 clamp 到 max=质量档）。
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        let mut now = 2_000_000u64; // 越过 new_user 1s 窗口
+        let (fps1, _) = q.on_delay(40, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        now += 1_000_000;
+        let (fps2, _) = q.on_delay(40, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        now += 1_000_000;
+        let (fps3, _) = q.on_delay(40, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        assert!(fps3 >= fps1 && fps3 >= QOS_FPS, "good net must not drop fps");
         assert!(q.current_ratio_permille() >= 1000, "good net ratio >= 1000‰");
     }
 
     #[test]
     fn test_qos_adaptive_gradual_decrease_on_bad_net() {
-        // 渐进式：差网（>300ms）按比例降 fps、码率 ×0.85~×0.8
-        let mut q = QosAdaptive::new();
-        let (fps1, _) = q.on_delay(400, 0, 1.0);
-        assert!(fps1 < 30, "400ms should drop fps below initial 30, got {fps1}");
-        // 再给一个样本，且 elapsed_s=2.0 使累计 ≥3s → 触发 ratio 调整
-        let (fps2, _) = q.on_delay(500, 0, 2.0);
+        // 差网（>300ms）动态屏：按比例降 fps，码率 ×0.85~×0.8。
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        let mut now = 2_000_000u64;
+        let (fps1, _) = q.on_delay(400, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        now += 1_000_000;
+        assert!(fps1 < QOS_FPS, "400ms dynamic net should drop fps below 30, got {fps1}");
+        let (fps2, _) = q.on_delay(500, 30, 2.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
         assert!(fps2 <= fps1, "worse net must not raise fps");
-        // 码率应低于满额（比例降 ×0.85 或 ×0.8）
         assert!(
             q.current_ratio_permille() < 1000,
             "bad net ratio < 1000‰, got {}‰",
@@ -1293,23 +1457,47 @@ mod tests {
     }
 
     #[test]
-    fn test_qos_adaptive_terrible_net_keeps_interactive_fps_floor() {
-        // MYS-886 卡顿死锁回归：e2e 即使 2s/4s 级差网，fps 也必须停在
-        // quality 档下限（balanced=10），**绝不允许掉到 1fps**——否则
-        // 交互变 1fps 体感卡死且永远不恢复。修复: fps.clamp(min_fps, ..)。
-        let mut q = QosAdaptive::new();
-        let (fps, _) = q.on_delay(2000, 0, 1.0);
-        assert!(fps >= 10, "2s net must keep fps >= 10, got {fps}");
-        let (fps4, _) = q.on_delay(4000, 0, 1.0);
-        assert!(fps4 >= 10, "4s net must keep fps >= 10, got {fps4}");
-        assert!(fps4 <= fps, "worse net may lower or hold fps, not raise");
+    fn test_qos_dynamic_bad_net_drops_to_fps_floor_one() {
+        // rustdesk MIN_FPS=1：极端弱网（4s e2e）动态屏 fps 一路降到 1
+        //（用户事实 + video_qos.rs clamp(MIN_FPS=1, highest_fps)）。
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        let (fps, _) = q.on_delay(4000, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 700_000));
+        assert_eq!(fps, 1, "4s dynamic net must drop to floor 1, got {fps}");
+        // 网络恢复：好网样本按 rustdesk 渐进（+1 / 连 3 次 +5）从 1 爬回，
+        // 不再十几秒卡在 1（先前自创实现的死锁已随移植消除）。
+        let mut q2 = QosAdaptive::new(QOS_BR_BALANCED);
+        q2.on_delay(4000, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 700_000));
+        let mut f = 1;
+        let mut now = 1_700_000u64;
+        for _ in 0..8 {
+            let (nf, _) = q2.on_delay(30, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            f = nf;
+            now += 1_000_000;
+        }
+        assert!(f >= 8, "8 good samples should recover fps well above 1, got {f}");
+    }
+
+    #[test]
+    fn test_qos_bad_net_drops_fps_regardless_of_static_screen() {
+        // rustdesk 语义：fps 只由网络延时驱动，差网**无条件**降（静止时的高
+        // 延迟由浏览器端停报消除，agent 侧不加静止 gate —— 之前的"静止屏
+        // 豁免"是脱离源码的自创，已移除）。
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        let (fps, _) = q.on_delay(4000, 0, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 1_000_000));
+        assert_eq!(fps, 1, "bad net drops fps even with 0 frames, got {fps}");
+        assert!(
+            q.current_ratio_permille() < 1000,
+            "bad net ratio < 1000‰, got {}‰",
+            q.current_ratio_permille()
+        );
     }
 
     #[test]
     fn test_qos_adaptive_static_screen_no_ratio_increase() {
-        // 静止屏（每秒编码 ≤2 帧）好网时码率不升（rustdesk DYNAMIC_SCREEN）
-        let mut q = QosAdaptive::new();
-        let _ = q.on_delay(40, 1, 3.0); // 3s 只有 1 帧 → 非动态屏
+        // 动态屏判定（rustdesk DYNAMIC_SCREEN = 每秒≥2 帧编码）：3s 只有
+        // 1 帧 → 非动态屏 → 好网也不升码率。
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        let _ = q.on_delay(40, 1, 3.0, &qos_ctx(QOS_BR_BALANCED, 600, 3_000_000));
         assert_eq!(q.current_ratio_permille(), 1000, "static screen stays at 1000‰");
     }
 
@@ -1721,6 +1909,7 @@ mod tests {
                 Arc::new(std::sync::atomic::AtomicU32::new(30)),
                 Arc::new(std::sync::atomic::AtomicU32::new(1000)),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
@@ -1761,7 +1950,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1798,7 +1987,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(15)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(15)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1836,7 +2025,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;

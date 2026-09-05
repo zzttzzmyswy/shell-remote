@@ -43,7 +43,8 @@
       this._vpcLevel = 10;
       this._frames = [];          // decoded VideoFrames pending render
       this._lastCaptureMs = 0;    // 最新已渲染帧的采集时间（e2e 延时）
-      this._e2eMs = null;
+      this._lastNewFrameAt = 0;   // 最近一次解码帧到达的本地时刻（静止判定）
+      this._e2eMs = undefined;
       this._renderPending = false;
       this._droppedFrames = 0;
       // 浏览器与 relay 的时钟偏移（relay_epoch - 本地_epoch）。srtc 在 relay
@@ -566,6 +567,7 @@
       const capMs = this._captureByPts ? this._captureByPts.get(frame.timestamp) : null;
       if (this._captureByPts) this._captureByPts.delete(frame.timestamp);
       if (capMs) this._lastCaptureMs = capMs;
+      this._lastNewFrameAt = Date.now();
       if (this._frames.length > 4) {
         // 渲染管线积压：丢最旧帧（保留最新）。
         this._frames.shift().close();
@@ -617,12 +619,12 @@
       const dt = (now - this._bpsTs) / 1000;
       if (dt >= 1.0) {
         const kbps = Math.round(this._bpsBytes * 8 / dt / 1000);
-        // 峰值跟踪：静止桌面空帧窗口 kbps≈0 会把 2.5s 平均拉低, 让 agent
-        // 低估可用带宽 → 复杂内容时 eff_max 被压 → 码率上不去、画面模糊
-        // （MYS-886）。用 1s 窗口的峰值估计上行能力, 让 agent 敢于把
-        // 码率顶到用户设置的上限。
+        // 指标面板显示 1s 窗口的"实测均值"（对齐 rustdesk Target Bitrate 的
+        // 稳态语义，避免缓存灌入/I 帧瞬时 burst 把读数顶到几千 kbps 造成
+        // 误读，MYS-886）。
+        this._avgKbps = kbps;
+        // 峰值估计仍用于给 agent 评估上行能力（弱网降码率），不上面板。
         if (kbps > this._peakKbps) this._peakKbps = kbps;
-        this._lastKbps = this._peakKbps;
         this._bpsTs = now;
         this._bpsBytes = 0;
         if (this._peakKbps > 0 && window.shellRemote && window.shellRemote.send) {
@@ -649,6 +651,8 @@
       if (this._dec) { try { this._dec.close(); } catch (e) {} this._dec = null; }
       this._desc = null;
       this._lastCaptureMs = 0;
+      this._lastNewFrameAt = 0;
+      this._e2eMs = undefined;
       this._unbindInput();
       this._stopMetrics();
       const panel = document.getElementById('desktop-metrics');
@@ -701,11 +705,18 @@
           // e2e: 采集→渲染。srtc 已由 agent 校准到 relay 时基；本地 now 也加
           // _clockOffset 换算到 relay 时基 —— 两个值都在同一时间轴上，彻底
           // 摆脱 agent/浏览器两机系统时钟差（MYS-886 指标失真根因）。
-          if (self._lastCaptureMs) {
+          // 只有窗口内（~1.2s）有新帧到达才更新 e2e 并上报：静止时 srtc
+          // 陈旧，now-旧采集时间会单调虚高（2-4s 持续递增），喂给 QoS 会被
+          // 误判为差网、把 fps 压到 1 → 交互卡死（MYS-886 死锁根因）。
+          const fresh = self._lastNewFrameAt &&
+            (Date.now() - self._lastNewFrameAt) <= 1200;
+          if (fresh && self._lastCaptureMs) {
             const e2e = Math.max(0, (Date.now() + self._clockOffset) - self._lastCaptureMs);
             self._e2eMs = e2e;
             lag.textContent = e2e + ' ms';
           } else {
+            // 静止/无新帧：不更新 e2e、不向 agent 上报（静止延迟无意义且虚高）。
+            self._e2eMs = undefined;
             lag.textContent = '-';
           }
           res.textContent = self.canvas ? self.canvas.width + 'x' + self.canvas.height : '-';
@@ -713,7 +724,7 @@
           self._rafCount = 0;
           buf.textContent = self._dec ? self._dec.decodeQueueSize : '-';
           drop.textContent = self._droppedFrames;
-          br.textContent = self._lastKbps ? self._lastKbps + ' kbps' : '-';
+          br.textContent = self._avgKbps ? self._avgKbps + ' kbps' : '-';
           if (backend) backend.textContent = self._captureBackend || '-';
           if (uplink) uplink.textContent = self._uplinkMode || '-';
           if (decoder) decoder.textContent = self._decoderLabel();

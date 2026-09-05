@@ -650,6 +650,38 @@ mod bench_encode_time {
 
     #[test]
     #[ignore]
+    fn av1_1280x800_static_kbps_check() {
+        // 验证静态桌面稳态码率（对比 rustdesk 537kb）：静态帧+每2s关键帧
+        // +细微光标扰动，测实际输出字节/秒。
+        let mut enc = AomEncoder::new(1280, 800, 573_000, 30.0, 24, 45).expect("av1 init");
+        let (w, h) = (1280usize, 800usize);
+        let mut base = vec![128u8; w*h + w*h/2];
+        let mut total = 0u64; let mut frames = 0u64;
+        let start = std::time::Instant::now();
+        for t in 0..540u32 { // 18s @ 30fps
+            let mut f = base.clone();
+            if t % 60 == 0 { enc.force_idr(); }
+            if t % 30 == 0 {
+                // 光标位置移动（细微扰动）
+                let cx = (t as usize / 30) * 7 % (w-8);
+                let cy = 500 + (t as usize % 40);
+                for dy in 0..8usize { for dx in 0..8usize {
+                    f[(cy+dy)*w + cx+dx] = 240u8;
+                    let ui = w*h + ((cy+dy)/2)*(w/2) + (cx+dx)/2;
+                    f[ui] = 128; f[ui + w*h/4] = 128;
+                }}
+            }
+            let out = enc.encode(&f).expect("encode");
+            if !out.nalu.is_empty() { total += out.nalu.len() as u64; frames += 1; }
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let kbps = total as f64 * 8.0 / 1000.0 / secs;
+        eprintln!("av1 1280x800 static: {total} bytes {frames} frames in {secs:.1}s = {kbps:.0} kbps");
+        assert!(kbps < 900.0, "static desktop must stay near target ~573kb, got {kbps:.0} kbps");
+    }
+
+    #[test]
+    #[ignore]
     fn av1_dynamic_rc_reconfig_repro() {
         let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45).expect("av1 init");
         let mut qos = 1000u32; // 千分比
