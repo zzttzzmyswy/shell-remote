@@ -87,11 +87,11 @@
 | 27 | viewer 移除水位化（满即删→告警） | ✔ | 本轮：满时丢旧保新，超 MAX_CONSECUTIVE_DROPS=60 才移除（relay/desktop.rs） |
 | 28 | 20s WS ping | ◐ | |
 | 29 | 控制消息优先级 | ⬜ | |
-| 30 | 时钟校准 15min 慢校准 | ⬜ | 当前每次连接校准 |
+| 30 | 时钟校准 15min 慢校准 | ✔ | 连接期每 15min 重校（desktop.js:_startMetrics） |
 | 31 | 注册风暴防御 | ✔ | 120/min+冷却（agent/mod.rs） |
 | 32 | 剪贴板大文本走文件传输 | ⬜ | |
 | 33 | 输入 10ms 合并节流 | ⬜ | |
-| 34 | 弱网输入降采样 | ⬜ | |
+| 34 | 弱网输入降采样 | ✔ | e2e>300ms 2:1 / >800ms 4:1（desktop.js:_onPointerMove） |
 | 35 | 弱网控制消息直通 | ⬜ | |
 | 36-38 | KCP/白名单/IPv6 | ⬜ | 远期 |
 | 39 | 多会话隔离压测 | ⬜ | |
@@ -111,7 +111,7 @@
 | 48 | 控制消息轻通道 | ◐ | qos/reqkey 走 SSE；ack 100ms 批未做 |
 | 49-53 | 队列 24/2/停滞 500ms/接入 1.5s/解码错误分级 | ✔ | desktop.js 全链路 + reqkey |
 | 54 | demux 损坏 3 次重发 init | ◐ | 重同步有；3 次重发 init 缺 |
-| 55 | 帧超龄 >2s 丢弃 | ⬜ | |
+| 55 | 帧超龄 >2s 丢弃 | ✔ | e2e>2000ms 丢+reqkey（desktop.js:_onDecoded，面板超龄计数） |
 | 56 | 面板三组分组 | ⬜ | 单列未分组 |
 | 57-59 | 面板补行（目标帧率/quality/弱网） | ✔ | 本轮：gofps/reqkey/weaknet/TTFV 行（desktop.js+session.html） |
 | 60 | e2e 与解码排队分流 | ◐ | |
@@ -126,7 +126,7 @@
 
 ### 批次 3 · 编码器与 QoS 深化（81-120）
 
-⬜ 整体未做（除已有：ABR/灰度/IDR 纪律）。要点：cpu_used 面积判据、threads loadavg、AV1 测速门槛、编码耗时预算、H264 热备、质量 250ms 反馈、CBR 纪律、RTT 分带、弱网 KPI 矩阵。
+◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；其余（threads loadavg、AV1 测速门槛、编码耗时预算、H264 热备、质量 250ms 反馈、CBR 纪律、RTT 分带、弱网 KPI 矩阵）未做。
 
 ### 批次 4 · 抓帧能效（121-146）
 
@@ -135,7 +135,7 @@
 | 121 | X11 改 SHM 取像零拷贝 | ✔ | 本轮：MIT-SHM 快路径（capture.rs capture_shm + try_init_shm），Xvfb 单测 |
 | 122 | X11 字节判重静止停抓 | ✔ | ThreadedFrameSource last_raw memcmp（已合入，capture.rs:167） |
 | 123-124 | DXGI fastlane/静止节流 | ⬜ | Windows 侧 |
-| 125-126 | 抓帧速率联动/静止 sleep | ◐ | would-block 已停产；线程 sleep 未做（yield_now 兜底） |
+| 125-126 | 抓帧速率联动/静止 sleep | ✔ | 静止退避 100ms sleep（capture.rs 线程循环，`test_threaded_static_source_backs_off`） |
 | 127-128 | 捕获内存池/行拷贝 SIMD | ⬜ | |
 | 129 | GDI 静止停抓+缓存 DC | ◐ | GDI DC 缓存有；静止停抓缺 |
 | 130 | 捕获失败重试窗口 30 次 | ⬜ | |
@@ -158,10 +158,12 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **25%**（甲 帧率/IDR、乙 Player 主体、丁 弱网可见性）；⬜ 45%（丙遥测、戊发布门槛）；◐ 30%。
-- **R5 落地清单（200 点）**：✔ 类约 **20%**（可靠通道 7 项 / 前端 10 项 / 抓帧 2 项）；⬜ 60%。
-- **本轮（第 1 轮）新增合入**：
-  1. X11 MIT-SHM 捕获快路径（对齐 rustdesk capturer.rs，`capture.rs:capture_shm/try_init_shm/teardown_shm`，Xvfb 真机单测 `test_x11_shm_capture_on_xvfb`）；
-  2. relay viewer 背压"丢旧保新"（满不即踢、超 60 帧连续丢才移除，`relay/desktop.rs`，新增 `test_burst_backpressure_does_not_evict_viewer` + 改写 `test_dead_viewer_cleaned_on_broadcast`）；
-  3. 浏览器面板补全（目标帧率/活动行、reqkey 计数行、弱网模式/TTFV 行 + `desktop:qos-ack` 桥接，`desktop.js`/`session.js`/`session.html`）。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、X11 SHM 之后的捕获线程零轮询、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带/输入降采样、admin KPI 曲线等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **R4/5（200 点）**：✔ 类约 **30%**（甲 帧率/IDR、乙 Player 主体+韧性、丁 弱网可见性+输入节流）；⬜ 42%（丙遥测、戊发布门槛）；◐ 28%。
+- **R5 落地清单（200 点）**：✔ 类约 **26%**（可靠通道 7 项 / 前端 12 项 / 抓帧 3 项 / 编码器 1 项）；⬜ 55%。
+- **第 2 轮新增合入**：
+  1. 浏览器帧超龄丢弃（`desktop.js:_onDecoded`，etend>2000ms 丢+reqkey，面板"超龄"计数）→ R4 乙88 / R5#55；
+  2. 时钟 15min 慢校准（`desktop.js:_startMetrics`，连接期重校 relay 时基抗漂移）→ R5#30；
+  3. 弱网输入降采样（`desktop.js:_onPointerMove`，e2e>300ms 2:1、>800ms 4:1，鼠标 move 节流）→ R2 丙104/109 / R5#34；
+  4. 抓帧线程静止退避（`capture.rs` 线程循环，would-block 后 sleep 100ms 而非全速可空转，`test_threaded_static_source_backs_off`）→ R5#126 / R3 乙57/82；
+  5. 编码器面积判据（`aom.rs` 抽 `av1_cpu_used`/`av1_superblock_size` 纯函数，w*h±面积而非宽高各超——超宽屏档位修正，`test_area_based_cpu_used_and_superblock`）→ R5#81。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带（输入节流已做，区分探针未做）、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批等——在台账对应 ⬜/◐ 行，未宣称完成。
