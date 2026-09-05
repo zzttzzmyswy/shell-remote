@@ -265,7 +265,7 @@
         if (sel && codecs.length) {
             const cur = sel.value;
             sel.innerHTML = '';
-            for (const c of ['av1', 'vp9', 'h264']) {
+            for (const c of ['av1', 'vp9', 'vp8', 'h264']) {
                 if (codecs.indexOf(c) >= 0) {
                     const o = document.createElement('option');
                     o.value = c;

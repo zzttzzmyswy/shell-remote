@@ -334,6 +334,15 @@
       return { type: type, body: body };
     }
 
+    _hasBoxType(buf, type) {
+      const t0 = type.charCodeAt(0) & 0xff, t1 = type.charCodeAt(1) & 0xff;
+      const t2 = type.charCodeAt(2) & 0xff, t3 = type.charCodeAt(3) & 0xff;
+      for (let j = 0; j + 4 <= buf.length; j++) {
+        if (buf[j] === t0 && buf[j+1] === t1 && buf[j+2] === t2 && buf[j+3] === t3) return true;
+      }
+      return false;
+    }
+
     _handleMoov(body) {
       // 找 codec 配置 box：先扫 avcC（H.264），再扫 vpcC（VP9），再扫 av1C（AV1）。
       //   avcC payload: [i+4]=1(version) [i+5..i+7]=profile/compat/level
@@ -356,10 +365,12 @@
         if (body[i] === 0x76 && body[i+1] === 0x70 && body[i+2] === 0x63 && body[i+3] === 0x43) {
           // vpcC 是 FullBox：version/flags(4B) 后才是 profile/level。
           // 位置: [i+4]=version [i+5..i+7]=flags [i+8]=profile [i+9]=level
-          this._desc = null; // VP9 无 description
+          // VP8 与 VP9 共用 vpcC config record，靠 sample entry box 名区分
+          // （vp08 vs vp09）——扫 moov body 里的 vp08 判定。
+          this._desc = null; // VP9/VP8 无 description
           this._vpcProfile = body[i+8];
           this._vpcLevel = body[i+9];
-          this._codecKind = 'vp9';
+          this._codecKind = this._hasBoxType(body, 'vp08') ? 'vp8' : 'vp9';
           this._initDecoder();
           return;
         }
@@ -393,6 +404,25 @@
         const tier = this._av1Tier ? 'H' : 'M';
         const codec = 'av01.' + this._av1Profile + '.' +
           String(this._av1Level).padStart(2, '0') + tier + '.08';
+        this._dec = new VideoDecoder({
+          output: function(frame) { self._onDecoded(frame); },
+          error: function(e) {
+            self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
+            self.setStatus('解码错误: ' + e.message, true);
+            self._scheduleDecodeRecover();
+          }
+        });
+        this._dec.configure({
+          codec: codec,
+          optimizeForLatency: true
+        });
+        this._codecStr = codec;
+        return;
+      }
+      if (this._codecKind === 'vp8') {
+        // VP8: WebCodecs 注册名为裸 "vp8"（vp08.PP.LL 是 ISOBMFF sample entry
+        // 名，VideoDecoder 不认 → Unknown codec name）。无 profile/level 组件。
+        const codec = 'vp8';
         this._dec = new VideoDecoder({
           output: function(frame) { self._onDecoded(frame); },
           error: function(e) {

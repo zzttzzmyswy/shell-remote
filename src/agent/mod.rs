@@ -932,8 +932,10 @@ async fn run_session(
                 }
                 // HTTP 批量回退（老 relay / WS 持续失败）。
                 let batch: serde_json::Value = serde_json::Value::Array(out);
+                // 视频发送超时对齐 rustdesk SEND_TIMEOUT_VIDEO=12s：桌面帧在
+                // 弱网/大帧时允许更长发送窗口，避免误判断连触发回退（MYS-886）。
                 let send_outcome = tokio::time::timeout(
-                    Duration::from_secs(5),
+                    Duration::from_secs(12),
                     pc.post(format!("{base}/agent/send")).json(&batch).send(),
                 )
                 .await;
@@ -1514,28 +1516,29 @@ async fn run_session(
                                 }
 
                                 "desktop:qos" => {
-                                    // 端到端延时反馈 → 动态目标帧率+码率预算
-                                    // （rustdesk QoS 双维度：好网 fps 60 +
-                                    // 满码率 <150ms；差网降 fps+压码率，恢复
-                                    // 自动回升，MYS-886 需求7-3）。
+                                    // 端到端延时反馈 → 渐进式 QoS（rustdesk
+                                    // video_qos 同款：fps +1/+5 渐进、码率
+                                    // ×1.15~×0.8 每 3s 平滑缩放，非硬档跳变）。
                                     let delay_ms = msg
                                         .payload
                                         .get("delay_ms")
                                         .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    let fps = if delay_ms < 150 {
-                                        60
-                                    } else if delay_ms < 300 {
-                                        30
-                                    } else {
-                                        15
+                                        .unwrap_or(0) as u32;
+                                    let (fps, qos_scale, bitrate_kbps) =
+                                        desktop.on_qos_delay(delay_ms).await;
+                                    // 回传当前生效的 QoS 状态（对齐 rustdesk TestDelay
+                                    // 携带 target_bitrate，MYS-886 #153）：浏览器可展示
+                                    // 实际码率/帧率。
+                                    let qos_ack = Message {
+                                        msg_type: "desktop:qos-ack".to_string(),
+                                        session_id: client.session_id.clone(),
+                                        payload: serde_json::json!({
+                                            "fps": fps,
+                                            "qos_scale": qos_scale,
+                                            "bitrate_kbps": bitrate_kbps,
+                                        }),
                                     };
-                                    desktop.set_fps(fps);
-                                    // 码率缩放：<150ms 满额；150-300ms 压到
-                                    // 75%；≥300ms 压到 50%（弱网应急，恢复升回）。
-                                    let scale =
-                                        crate::agent::desktop::qos_bitrate_scale_for_delay(delay_ms);
-                                    desktop.set_qos_scale(scale);
+                                    out.control(qos_ack).await;
                                 }
 
                                 "desktop:quality" => {

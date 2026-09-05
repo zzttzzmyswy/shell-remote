@@ -141,6 +141,9 @@ pub struct X11Source {
     depth: u8,
     /// Lazily-initialised XComposite backend used when root `GetImage` fails.
     composite: Option<x11rb::protocol::xproto::Pixmap>,
+    /// 每 N 帧重查一次 root geometry（display 分辨率运行时变更检测，
+    /// rustdesk `Rect`/HotPlug 对齐）。X setup 缓存不反映 xrandr 变更。
+    recheck: u32,
 }
 
 impl X11Source {
@@ -171,6 +174,7 @@ impl X11Source {
             height,
             depth,
             composite: None,
+            recheck: 0,
         })
     }
 
@@ -300,6 +304,22 @@ impl FrameSource for X11Source {
     }
 
     fn next_frame(&mut self) -> Result<Frame, String> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        // 定期重查 root geometry：屏幕分辨率运行时变更（xrandr / 多屏切换）
+        // 时下一帧按新尺寸抓取，pipeline 据此重建编码器（rustdesk display
+        // 变更检测对齐）。失败静默（保持上次尺寸，下次再试）。
+        self.recheck += 1;
+        if self.recheck >= 30 {
+            self.recheck = 0;
+            if let Ok(cookie) = self.conn.get_geometry(self.root) {
+                if let Ok(geo) = cookie.reply() {
+                    if geo.width > 0 && geo.height > 0 {
+                        self.width = geo.width;
+                        self.height = geo.height;
+                    }
+                }
+            }
+        }
         let bgra = match self.capture_impl(self.root) {
             Ok(b) => b,
             Err(root_err) => match self.composite_capture() {
@@ -480,6 +500,19 @@ mod gdi {
 
         fn next_frame(&mut self) -> Result<Frame, String> {
             unsafe {
+                // display 分辨率运行时变更检测：GetSystemMetrics 极廉价，每帧
+                // 对比一次；变化则重建整个 GDI context（rustdesk display
+                // 变更对齐）。rebuild 内部会重新 GetSystemMetrics + 建
+                // screen DC / compatible bitmap，BitBlt 下一帧即新尺寸。
+                let sw = GetSystemMetrics(SM_CXSCREEN) as usize;
+                let sh = GetSystemMetrics(SM_CYSCREEN) as usize;
+                if sw > 0 && sh > 0 && (sw != self.width || sh != self.height) {
+                    tracing::info!(
+                        "gdi display resize: {}x{} -> {}x{}",
+                        self.width, self.height, sw, sh
+                    );
+                    self.rebuild()?;
+                }
                 self.blit()?;
                 let h = self.height;
                 let (w, h) = (self.width, h);

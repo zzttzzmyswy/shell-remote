@@ -222,9 +222,17 @@
       for (let i = 0; i + 8 <= u8.length; i++) {
         if (u8[i] === 0x76 && u8[i + 1] === 0x70 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) {
           // vpcC 是 FullBox：version/flags(4B) 后才是 profile/level。
+          // VP8 与 VP9 共用 vpcC，靠 sample entry box 名（vp08/vp09）区分。
+          let isVp8 = false;
+          for (let j = 0; j + 4 <= u8.length; j++) {
+            if (u8[j] === 0x76 && u8[j + 1] === 0x70 && u8[j + 2] === 0x30 && u8[j + 3] === 0x38) {
+              isVp8 = true;
+              break;
+            }
+          }
           const profile = u8[i + 8];
           const level = u8[i + 9];
-          return 'vp09.' + String(profile).padStart(2, '0') + '.' +
+          return (isVp8 ? 'vp08.' : 'vp09.') + String(profile).padStart(2, '0') + '.' +
             String(level).padStart(2, '0') + '.08';
         }
       }

@@ -17,7 +17,8 @@ use std::os::raw::{c_int, c_uint};
 /// so the shared pipeline does not need a codec-specific frame type.
 pub use crate::agent::desktop::encoder::EncodedFrame;
 
-/// libvpx VP9 encoder handle.
+/// libvpx VP8/VP9 encoder handle（rustdesk `VpxEncoder` 同款：一个结构
+/// 按 `VpxVideoCodecId` 区分 VP8/VP9，MYS-886 对齐）。
 pub struct Vp9Encoder {
     ctx: vpx_sys::vpx_codec_ctx_t,
     width: u32,
@@ -27,6 +28,9 @@ pub struct Vp9Encoder {
     /// 用户 --desktop-max-bitrate 覆盖（0 = 自动 rustdesk 模型）。
     max_bps: u64,
     quality: f32,
+    /// 是否 VP8（否则 VP9）。VP8 是低内存设备的降级档（rustdesk 4G 内存
+    /// 判定），浏览器 WebCodecs 原生支持 VP8 解码。
+    is_vp8: bool,
     /// 下一次 encode 强制关键帧（通过 encode flags 传 VPX_EFLAG_FORCE_KF）。
     force_kf: bool,
     /// 递增帧时间戳（timebase 1ms，对齐 rustdesk：每帧 +1000/fps）。
@@ -47,7 +51,7 @@ const VPX_IMG_FMT_I420: c_uint = 258; // VPX_IMG_FMT_I420 (bindgen rustified enu
 const VPX_FRAME_IS_KEY: c_uint = 0x1;
 
 impl Vp9Encoder {
-    /// Create a VP9 encoder pinned to `w x h` at `fps` frames/s.
+    /// Create a VP9 (or VP8 if `is_vp8`) encoder pinned to `w x h` at `fps`.
     pub fn new(
         w: u32,
         h: u32,
@@ -55,14 +59,19 @@ impl Vp9Encoder {
         fps: f64,
         q_min: u32,
         q_max: u32,
+        is_vp8: bool,
     ) -> Result<Self, String> {
         assert!(w % 2 == 0 && h % 2 == 0, "dimensions must be even for 4:2:0");
         assert!(bitrate_bps > 0 && fps > 0.0);
 
         unsafe {
-            let iface = vpx_sys::vpx_codec_vp9_cx();
+            let iface = if is_vp8 {
+                vpx_sys::vpx_codec_vp8_cx()
+            } else {
+                vpx_sys::vpx_codec_vp9_cx()
+            };
             if iface.is_null() {
-                return Err("vpx_codec_vp9_cx unavailable".into());
+                return Err("vpx_codec_cx unavailable".into());
             }
             // Get default config, then pin the fields that matter for live
             // screen casting (mirror rustdesk vpxcodec.rs).
@@ -91,12 +100,13 @@ impl Vp9Encoder {
             // 保持码率受控与帧率——桌面共享场景丢的是极端运动帧, 可接受。
             // (AV1 的 libaom CBR 无此问题, 用 dropframe=0 全帧保留。)
             cfg.rc_dropframe_thresh = 25;
-            cfg.kf_mode = vpx_sys::vpx_kf_mode::VPX_KF_AUTO;
+            // rustdesk 非录制（keyframe_interval=None）时 VPX_KF_DISABLED：
+            // 关键帧完全由外部 force_idr 控制（MYS-886 外部动态节奏：静止
+            // 4.5s / 活跃 1.5s + 首帧强制），编码器不自动插关键帧——避免与
+            // 外部节奏抢跑（静止期省带宽）且更贴近 rustdesk 行为。
+            cfg.kf_mode = vpx_sys::vpx_kf_mode::VPX_KF_DISABLED;
             cfg.kf_min_dist = 0;
-            // 关键帧节奏改由外部动态控制（MYS-886 需求7-1：静止 4.5s / 活跃
-            // 1.5s 心跳 IDR）。kf_max_dist 拉长到 5s 只是编码器兜底——防止
-            // 内部 AUTO 关键帧以 1s 固定节奏抢跑外部节奏（静止期省带宽）。
-            cfg.kf_max_dist = (fps.max(1.0) * crate::agent::desktop::KF_AUTO_MAX_SECS) as c_uint;
+            cfg.kf_max_dist = 0;
 
             let mut ctx: vpx_sys::vpx_codec_ctx_t = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
             let rc = vpx_sys::vpx_codec_enc_init_ver(
@@ -109,10 +119,15 @@ impl Vp9Encoder {
             if rc != vpx_sys::vpx_codec_err_t::VPX_CODEC_OK {
                 return Err(format!("vpx_codec_enc_init rc={rc:?}"));
             }
-            // 实时档: CPUUSED 7 (live), row-mt + tile-columns 多线程。
-            set_ctl(&mut ctx, vpx_sys::vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 7);
-            set_ctl(&mut ctx, vpx_sys::vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int, 1);
-            set_ctl(&mut ctx, vpx_sys::vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int, 4);
+            // 实时档：VP8 用 CPUUSED 12（rustdesk 同款，VP8 更简单无需
+            // row-mt/tile）；VP9 用 CPUUSED 7 + row-mt + tile-columns。
+            if is_vp8 {
+                set_ctl(&mut ctx, vpx_sys::vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 12);
+            } else {
+                set_ctl(&mut ctx, vpx_sys::vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 7);
+                set_ctl(&mut ctx, vpx_sys::vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int, 1);
+                set_ctl(&mut ctx, vpx_sys::vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int, 4);
+            }
 
             Ok(Self {
                 ctx,
@@ -121,6 +136,7 @@ impl Vp9Encoder {
                 fps,
                 bitrate_bps,
                 max_bps: 0,
+                is_vp8,
                 quality: crate::agent::desktop::encoder::QUALITY_BALANCED,
                 force_kf: false,
                 pts_ms: 0,
@@ -156,7 +172,7 @@ impl Vp9Encoder {
                 &mut self.ctx,
                 &img,
                 self.pts_ms as vpx_sys::vpx_codec_pts_t,
-                (1000.0 / self.fps).max(1.0) as std::os::raw::c_ulong,
+                1, // duration: timebase 1ms，rustdesk 同款（帧间隔由 pts 差表达）
                 flags,
                 vpx_sys::VPX_DL_REALTIME as std::os::raw::c_ulong,
             );
@@ -267,12 +283,12 @@ impl Vp9Encoder {
     /// Dynamically update the encoder's frame-rate model.
     pub fn set_frame_rate(&mut self, fps: f32) {
         self.fps = fps.clamp(1.0, 60.0) as f64;
-        // kf_max_dist keeps a fixed *wall-clock* key-frame ceiling (5s); it does
-        // not follow fps — external force_idr controls actual cadence (MYS-886).
+        // KF_DISABLED（rustdesk 非录制同款）：关键帧全由外部 force_idr
+        // 控制，这里只需同步帧率模型，kf_max_dist 保持 0。
         unsafe {
             let src_ptr = self.ctx.config.enc as *const vpx_sys::vpx_codec_enc_cfg_t;
             let mut cfg: vpx_sys::vpx_codec_enc_cfg_t = std::ptr::read(src_ptr);
-            cfg.kf_max_dist = (self.fps * crate::agent::desktop::KF_AUTO_MAX_SECS) as c_uint;
+            cfg.kf_max_dist = 0;
             vpx_sys::vpx_codec_enc_config_set(&mut self.ctx, &cfg);
         }
     }
@@ -351,12 +367,16 @@ impl crate::agent::desktop::encoder::VideoEncoder for Vp9Encoder {
     }
 
     fn codec(&self) -> &'static str {
-        "vp9"
+        if self.is_vp8 { "vp8" } else { "vp9" }
     }
 
     fn mux_sample(&self, _frame: &EncodedFrame) -> Option<crate::agent::desktop::encoder::VisualSample> {
-        // VP9: profile/level are static for our 8-bit 4:2:0 screen stream.
-        // Level 10 = 1.0 covers 720p30; level 20 = 2.0 covers 1080p30.
+        // VP9: profile/level 静态（8-bit 4:2:0 screen stream）。Level 10=1.0
+        // 覆盖 720p30、20=2.0 覆盖 1080p30。VP8 用 Vp8 变体（box `vp08` +
+        // codec 串 `vp08.*`），浏览器据此选 VP8 解码器而非 VP9。
+        if self.is_vp8 {
+            return Some(crate::agent::desktop::mp4::VisualSample::Vp8 { profile: 0, level: 10 });
+        }
         let level = if self.height > 720 { 20 } else { 10 };
         Some(crate::agent::desktop::mp4::VisualSample::Vp9 { profile: 0, level })
     }
@@ -372,8 +392,41 @@ mod tests {
     }
 
     #[test]
+    fn test_vp8_encoder_produces_frames() {
+        // rustdesk 4G 内存设备的 VP8 降级档：接口与 VP9 相同但走 vp8 iface。
+        let mut enc = Vp9Encoder::new(640, 360, 500_000, 30.0, 24, 50, true).expect("vp8 init");
+        assert_eq!(enc.codec(), "vp8");
+        assert!(matches!(
+            enc.mux_sample(&EncodedFrame { nalu: vec![], is_idr: true, sps: None, pps: None }),
+            Some(crate::agent::desktop::mp4::VisualSample::Vp8 { .. })
+        ), "vp8 must mux a Vp8 sample (vp08 box), not Vp9");
+        let (mut saw_key, mut bytes, mut out) = (false, 0usize, 0usize);
+        let mut buf = solid_i420(640, 360, 128);
+        for t in 0..40u32 {
+            // 移动窗口模拟桌面动画
+            if t % 4 == 0 {
+                for i in (0..buf.len()).step_by(131) {
+                    buf[i] = (t * 13) as u8;
+                }
+            }
+            let f = enc.encode(&buf).expect("encode");
+            if f.is_idr { saw_key = true; }
+            if !f.nalu.is_empty() {
+                out += 1;
+                bytes += f.nalu.len();
+            }
+        }
+        assert!(saw_key, "vp8 must produce a key frame");
+        assert!(out >= 30, "vp8 must output most frames, got {out}/40");
+        assert!(bytes > 0, "vp8 must produce compressed bytes");
+        let kbps = bytes as f64 * 8.0 / (40.0 / 30.0) / 1000.0;
+        eprintln!("vp8 500k target: actual {kbps:.0} kbps, {out}/40 frames");
+        assert!(kbps < 4000.0, "vp8 bitrate runaway: {kbps:.0} kbps");
+    }
+
+    #[test]
     fn test_vp9_encoder_produces_frames() {
-        let mut enc = Vp9Encoder::new(320, 240, 400_000, 15.0, 24, 50).expect("vp9 init");
+        let mut enc = Vp9Encoder::new(320, 240, 400_000, 15.0, 24, 50, false).expect("vp9 init");
         let mut saw_key = false;
         let mut bytes = 0usize;
         for t in 0..30 {
@@ -397,7 +450,7 @@ mod tests {
     #[test]
     fn test_vp9_bitrate_actually_controlled() {
         // 800k 目标下实测码率应收敛在目标附近（这是 OpenH264 skip=0 做不到的）。
-        let mut enc = Vp9Encoder::new(1280, 720, 800_000, 30.0, 24, 50).expect("vp9 init");
+        let mut enc = Vp9Encoder::new(1280, 720, 800_000, 30.0, 24, 50, false).expect("vp9 init");
         let (mut bytes, mut out) = (0usize, 0usize);
         // 模拟真实桌面动画: 静态底色 + 一个移动的高对比窗口(而非随机噪声,
         // 噪声的不可压缩性不反映真实桌面, 会让 RC 误判)。
@@ -441,7 +494,7 @@ mod static_kf_tests {
 
     #[test]
     fn static_frames_force_idr_produces_bytes() {
-        let mut enc = Vp9Encoder::new(640, 360, 400_000, 15.0, 24, 50).expect("vp9 init");
+        let mut enc = Vp9Encoder::new(640, 360, 400_000, 15.0, 24, 50, false).expect("vp9 init");
         let buf = vec![90u8; 640 * 360 + 640 * 360 / 2];
         let mut non_empty_kf = 0;
         let mut frames = 0;
@@ -477,7 +530,7 @@ mod bench_encode_time {
 
     #[test]
     fn bench_vp9_1080p_complex_encode_ms_per_frame() {
-        let mut enc = Vp9Encoder::new(1920, 1080, 800_000, 30.0, 24, 50).expect("vp9 init");
+        let mut enc = Vp9Encoder::new(1920, 1080, 800_000, 30.0, 24, 50, false).expect("vp9 init");
         let start = std::time::Instant::now();
         let n = 15u32;
         for t in 0..n {

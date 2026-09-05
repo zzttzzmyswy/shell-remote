@@ -95,12 +95,12 @@ impl AomEncoder {
             // 我 v0.27 曾错误套用 VP9 的 dropframe=25，实测 60 帧只输出 20 帧
             // （丢 2/3）——用户局域网"丢包/卡顿"的直接来源。AV1 CBR 靠
             // QP/undershoot 控码率，无需丢帧（libaom 高熵下 QP 自适应足够）。
-            cfg.kf_mode = aom_sys::aom_kf_mode_AOM_KF_AUTO;
+            // rustdesk 非录制（keyframe_interval=None）时 AOM_KF_DISABLED：
+            // 关键帧完全由外部 force_idr 控制（MYS-886 外部动态节奏：静止
+            // 4.5s / 活跃 1.5s + 首帧强制），编码器不自动插关键帧。
+            cfg.kf_mode = aom_sys::aom_kf_mode_AOM_KF_DISABLED;
             cfg.kf_min_dist = 0;
-            // 关键帧节奏改由外部动态控制（MYS-886 需求7-1：静止 4.5s / 活跃
-            // 1.5s 心跳 IDR）。kf_max_dist 拉长到 5s 只是编码器兜底——防止
-            // 内部 AUTO 关键帧以 1s 固定节奏抢跑外部节奏（静止期省带宽）。
-            cfg.kf_max_dist = (fps.max(1.0) * crate::agent::desktop::KF_AUTO_MAX_SECS) as c_uint;
+            cfg.kf_max_dist = 0;
 
             let mut ctx: aom_sys::aom_codec_ctx_t = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
             let rc = aom_sys::aom_codec_enc_init_ver(
@@ -166,6 +166,17 @@ impl AomEncoder {
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_AQ_MODE as c_int, 3);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AOME_SET_MAX_INTRA_BITRATE_PCT as c_int, 300);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ROW_MT as c_int, 1);
+            // SUPERBLOCK_SIZE（rustdesk get_super_block_size）：≥4 线程且
+            // 540p≤分辨率<1080p 用 64x64，否则 DYNAMIC —— 降低分区搜索开销。
+            let sb = if cfg.g_threads >= 4
+                && w >= 960 && h >= 540
+                && w * h < 1920 * 1080
+            {
+                aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_64X64
+            } else {
+                aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_DYNAMIC
+            };
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_SUPERBLOCK_SIZE as c_int, sb as c_int);
             // 其余 rustdesk 同款控件（对齐 libs/scrap/src/common/aom.rs webrtc 配置）：
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_CDEF as c_int, 1);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_ENABLE_PALETTE as c_int, 1);
@@ -222,7 +233,7 @@ impl AomEncoder {
                 &mut self.ctx,
                 &img,
                 self.pts_ms as aom_sys::aom_codec_pts_t,
-                (1000.0 / self.fps).max(1.0) as std::os::raw::c_ulong,
+                1, // duration: timebase 1ms，rustdesk 同款（帧间隔由 pts 差表达）
                 flags,
             );
             self.pts_ms += (1000.0 / self.fps).round().max(1.0) as u64;

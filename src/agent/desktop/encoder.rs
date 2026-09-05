@@ -158,7 +158,10 @@ pub fn new_encoder(
         "h264" => crate::agent::desktop::openh264::H264Encoder::new(w, h, target, fps)
             .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         #[cfg(feature = "vp9")]
-        "vp9" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, target, fps, q_min, q_max)
+        "vp9" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, target, fps, q_min, q_max, false)
+            .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
+        #[cfg(feature = "vp9")]
+        "vp8" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, target, fps, q_min, q_max, true)
             .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         #[cfg(feature = "av1")]
         "av1" => {
@@ -183,10 +186,11 @@ pub fn create_encoder_fallback(
 ) -> Result<(Box<dyn VideoEncoder>, String), String> {
     let codec_l = codec.to_ascii_lowercase();
     let chain: Vec<&str> = match codec_l.as_str() {
-        "av1" => vec!["av1", "vp9", "h264"],
-        "vp9" => vec!["vp9", "h264"],
+        "av1" => vec!["av1", "vp9", "vp8", "h264"],
+        "vp9" => vec!["vp9", "vp8", "h264"],
+        "vp8" => vec!["vp8", "h264"],
         "h264" => vec!["h264"],
-        other => vec![other, "vp9", "h264"],
+        other => vec![other, "vp9", "vp8", "h264"],
     };
     let mut last_err = String::new();
     for c in chain {

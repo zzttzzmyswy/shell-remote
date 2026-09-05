@@ -214,11 +214,12 @@ pub async fn stream_handler(
             return;
         };
         yield Ok::<_, Infallible>(Bytes::from(init));
-        // 空闲超时：健康流每秒都有帧（最差每 2s 一个 IDR），
-        // 30s 无字节说明 agent 侧已停/崩溃、或上行中断，主动收尾
-        // 让浏览器 fetch 结束、viewer 条目被清理，避免永久悬挂。
+        // 空闲超时：健康流每秒都有帧（静止桌面最差 4.5s 一个 IDR），
+        // 12s 无字节说明 agent 侧已停/崩溃、或上行中断（对齐 rustdesk
+        // SEND_TIMEOUT_VIDEO=12s，MYS-886），主动收尾让浏览器 fetch 结束、
+        // viewer 条目被清理，避免永久悬挂。
         loop {
-            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            match tokio::time::timeout(Duration::from_secs(12), rx.recv()).await {
                 Ok(Some(chunk)) => {
                     yield Ok::<_, Infallible>(Bytes::from(chunk));
                 }

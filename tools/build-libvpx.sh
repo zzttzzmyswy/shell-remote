@@ -43,19 +43,24 @@ for entry in "${PLATFORMS[@]}"; do
   out="$CACHE/libvpx-$target"
   rm -rf "$out"
   mkdir -p "$out/lib" "$out/include"
+  # armv7 gnueabihf 的 specs 自动注入 -latomic_asneeded（本地没有别名）→
+  # LDFLAGS=-fno-link-libatomic 跳过该注入。其它平台（musl 交叉 gcc 等）
+  # 不认这个选项，必须留空——否则 configure 的 check_ld 直接失败。
+  LDFLAGS=""
+  if [[ "$cc" == *gnueabihf* ]]; then LDFLAGS="-fno-link-libatomic"; fi
   (
     cd "$SRC"
     make distclean >/dev/null 2>&1 || true
     # LD 必须指向交叉编译器：libvpx configure 的 check_ld 回落宿主 gcc，
     # 否则链接测试产物格式不对 → "Toolchain is unable to link executables"。
     CC="$cc" CXX="$cxx" LD="$cc" \
-    LDFLAGS="-fno-link-libatomic" \
+    LDFLAGS="$LDFLAGS" \
     ./configure \
       --target="$cfg_target" \
       --disable-shared --enable-static \
       --disable-tools --disable-docs --disable-examples \
-      --disable-unit-tests --disable-webm-io --disable-vp8 --disable-vp8-decoder \
-      --disable-vp8-encoder --disable-vp9-decoder \
+      --disable-unit-tests --disable-webm-io \
+      --disable-vp9-decoder \
       $extra_args
     make -j"$(nproc)" libvpx.a
   )
