@@ -131,6 +131,10 @@ pub struct DesktopManager {
     qos_frames: Arc<std::sync::atomic::AtomicU64>,
     /// QoS 上次采样墙钟（微秒，供 on_qos_delay 算 elapsed_s）。
     qos_last_sample: std::sync::atomic::AtomicU64,
+    /// 灰度模式（web 端可切）：编码前把 UV 平面置中性 128，色度≈0。
+    /// 弱网下带宽占用显著下降（亮度是主观关键），画质降为灰度可接受。
+    /// 运行时即时生效，不重建编码器/不重启流。
+    gray: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DesktopManager {
@@ -156,6 +160,7 @@ impl DesktopManager {
             qos: tokio::sync::Mutex::new(QosAdaptive::new()),
             qos_frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             qos_last_sample: std::sync::atomic::AtomicU64::new(0),
+            gray: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -181,6 +186,20 @@ impl DesktopManager {
             self.start(post).await;
         }
         Ok(())
+    }
+
+    /// 灰度模式开关（web 端 `desktop:gray`）。只翻转编码前降色度 flag，
+    /// 下一帧即时生效——不重建编码器、不重启流（与 set_codec/set_quality
+    /// 的"重启重建"不同，灰度是纯编码前像素处理）。
+    pub fn set_gray(&self, enabled: bool) {
+        use std::sync::atomic::Ordering as O;
+        self.gray.store(enabled, O::Relaxed);
+        tracing::info!(enabled, "desktop gray mode {}", if enabled { "ON" } else { "OFF" });
+    }
+
+    pub fn gray_enabled(&self) -> bool {
+        use std::sync::atomic::Ordering as O;
+        self.gray.load(O::Relaxed)
     }
 
     /// 编码循环每帧调用：为 QoS DYNAMIC_SCREEN 统计编码帧数。
@@ -371,8 +390,9 @@ impl DesktopManager {
         let fps_ctl = self.fps.clone();
         let qos_scale = self.qos_scale.clone();
         let qos_frames = self.qos_frames.clone();
+        let gray = self.gray.clone();
         let task = tokio::task::spawn(async move {
-            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl, qos_scale, qos_frames).await;
+            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl, qos_scale, qos_frames, gray).await;
         });
         *self.task.lock().await = Some(task);
     }
@@ -496,6 +516,7 @@ async fn run_desktop_loop(
     fps_ctl: Arc<std::sync::atomic::AtomicU32>,
     qos_scale: Arc<std::sync::atomic::AtomicU32>,
     qos_frames: Arc<std::sync::atomic::AtomicU64>,
+    gray: Arc<std::sync::atomic::AtomicBool>,
 ) {
         let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok((src, backend)) => (src, backend),
@@ -509,7 +530,7 @@ async fn run_desktop_loop(
         }
     };
     let (src, backend) = src;
-    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl, qos_scale, qos_frames).await;
+    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl, qos_scale, qos_frames, gray).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -525,6 +546,7 @@ async fn run_desktop_pipeline(
     fps_ctl: Arc<std::sync::atomic::AtomicU32>,
     qos_scale: Arc<std::sync::atomic::AtomicU32>,
     qos_frames: Arc<std::sync::atomic::AtomicU64>,
+    gray: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // cfg 需可变：编码器 fallback 后回写实际 codec。
     let mut cfg = cfg;
@@ -731,11 +753,17 @@ async fn run_desktop_pipeline(
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let capture_ms = (cap_local + clock_offset_ms).max(0) as u64;
-        let i420 = if w == enc_w && h == enc_h {
+        let mut i420 = if w == enc_w && h == enc_h {
             color::bgra_to_i420(&fr.bgra, w, h, w * 4)
         } else {
             color::bgra_to_i420_scaled(&fr.bgra, w, h, w * 4, enc_w, enc_h)
         };
+        // 灰度模式（web 端可选，弱网省带宽）：编码前把 UV 平面置中性 128，
+        // 色度信息≈0，码率显著下降（亮度是弱网下的主观关键）。切换即时生效
+        // （下帧起），不重建编码器。
+        if gray.load(std::sync::atomic::Ordering::Relaxed) {
+            apply_gray(&mut i420);
+        }
         let encoded = match enc.encode(&i420) {
             Ok(e) => e,
             Err(e) => {
@@ -854,6 +882,14 @@ fn avg_frame_bytes(byte_win: &VecDeque<u32>) -> f64 {
         return 0.0;
     }
     byte_win.iter().map(|&b| b as f64).sum::<f64>() / byte_win.len() as f64
+}
+
+/// 灰度模式：把 I420 的 UV 平面（色度）置中性 128，Y（亮度）保留。
+/// 编码前调用，色度≈0 后码率显著下降——弱网下以"灰度"换取更低带宽占用
+/// 与更稳帧率（亮度是主观关键）。I420 中 Y = 前 2/3，UV 各 1/6。
+fn apply_gray(i420: &mut [u8]) {
+    let y_len = i420.len() * 2 / 3;
+    i420[y_len..].fill(128);
 }
 
 /// 动态关键帧间隔（MYS-886 需求7-1）：帧均字节（反映内容活跃度）高于
@@ -1255,6 +1291,30 @@ mod tests {
         assert_eq!(avg_frame_bytes(&VecDeque::new()), 0.0);
     }
 
+    #[test]
+    fn test_apply_gray_neutralizes_chroma_keeps_luma() {
+        // 8x8 I420: Y=64, U=16, V=16 字节。apply_gray 后 UV 全 128，Y 不动。
+        let w = 8usize;
+        let h = 8usize;
+        let mut i420 = vec![0u8; w * h * 3 / 2];
+        i420[..w * h].fill(90); // Y
+        i420[w * h..].fill(200); // UV
+        apply_gray(&mut i420);
+        assert_eq!(i420[..w * h].iter().min().copied().unwrap(), 90, "Y untouched");
+        assert_eq!(i420[w * h..].iter().max().copied().unwrap(), 128, "UV neutralized");
+        assert_eq!(i420[w * h..].iter().min().copied().unwrap(), 128, "UV neutralized");
+    }
+
+    #[test]
+    fn test_set_gray_flag_roundtrip() {
+        let dm = DesktopManager::new(DesktopConfig::default());
+        assert!(!dm.gray_enabled(), "gray defaults off");
+        dm.set_gray(true);
+        assert!(dm.gray_enabled());
+        dm.set_gray(false);
+        assert!(!dm.gray_enabled());
+    }
+
     fn budget(fps: f64) -> f64 {
         let cfg = DesktopConfig::default();
         cfg.max_bps as f64 / 8.0 / fps
@@ -1631,6 +1691,7 @@ mod tests {
                 Arc::new(std::sync::atomic::AtomicU32::new(30)),
                 Arc::new(std::sync::atomic::AtomicU32::new(1000)),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
@@ -1670,7 +1731,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1707,7 +1768,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(15)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(15)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1745,7 +1806,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false))));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;

@@ -27,6 +27,7 @@
         <div id="terminal-container"></div>
         <div id="desktop-container" class="desktop-container hidden">
             <div id="desktop-ctrl-bar" class="desktop-ctrl-bar hidden">
+                <span class="ctrl-group-label">显示</span>
                 <label class="desktop-ctrl-item">编码
                     <select id="desktop-codec-select" title="编码方案（切换后自动重建画面）">
                         <option value="av1">AV1</option>
@@ -43,12 +44,16 @@
                         <option value="custom">自定义…</option>
                     </select>
                 </label>
+                <label class="desktop-ctrl-item" title="灰度模式：弱网下省带宽（去除色度，画面变灰但更流畅）">
+                    <input type="checkbox" id="desktop-gray-toggle"> 灰度
+                </label>
+                <span class="ctrl-sep"></span>
+                <button id="desktop-metrics-btn" class="ctrl-btn" title="性能指标">指标</button>
+                <button id="desktop-clip-btn" class="ctrl-btn" title="剪贴板：本机⇄远端 同步文本">剪贴板</button>
             </div>
             <canvas id="desktop-canvas" class="desktop-canvas"></canvas>
             <video id="desktop-video" autoplay muted playsinline></video>
             <div id="desktop-status" class="desktop-status"></div>
-            <button id="desktop-metrics-btn" class="desktop-metrics-btn" title="性能指标">指标</button>
-            <button id="desktop-clip-btn" class="desktop-metrics-btn" title="剪贴板：本机⇄远端 同步文本">剪贴板</button>
             <div id="desktop-clip-panel" class="desktop-metrics hidden">
                 <div class="metrics-title">剪贴板同步 <span class="metrics-hint">(纯文本)</span></div>
                 <textarea id="desktop-clip-text" rows="5" style="width:100%;box-sizing:border-box;background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:4px;font-size:12px;padding:6px;" placeholder="粘贴或编辑文本…"></textarea>

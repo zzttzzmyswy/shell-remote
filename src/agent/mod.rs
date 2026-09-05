@@ -1572,6 +1572,17 @@ async fn run_session(
                                     }
                                 }
 
+                                "desktop:gray" => {
+                                    // 灰度模式开关（web 桌面控制栏，弱网省带宽）：
+                                    // 只翻编码前降色度 flag，即时生效不重建流。
+                                    let enabled = msg
+                                        .payload
+                                        .get("enabled")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    desktop.set_gray(enabled);
+                                }
+
                                 "desktop:mouse" => {
                                     // 浏览器键鼠注入：desktop:mouse
                                     // {type,x,y,button,dx,dy}（RW 权限校验

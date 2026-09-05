@@ -911,10 +911,10 @@ body {
     display: none !important;
 }
 
-/* 桌面性能指标面板（“指标”按钮开关） */
+/* 桌面性能指标面板（“指标”按钮开关）。top 下移避开顶部控制栏。 */
 .desktop-metrics {
     position: absolute;
-    top: 12px;
+    top: 46px;
     left: 12px;
     z-index: 30;
     background: rgba(20, 24, 32, 0.92);
@@ -927,19 +927,21 @@ body {
     user-select: none;
     pointer-events: auto;
 }
-/* 显式可见的指标开关按钮（MYS-886：隐藏点击区不可发现） */
-.desktop-metrics-btn {
-    position: absolute;
-    top: 12px;
-    right: 12px;
-    z-index: 31;
-    padding: 4px 14px;
-    background: rgba(20, 24, 32, 0.85);
+/* 控制栏内操作按钮（指标/剪贴板，收进顶部工具条统一层级） */
+.ctrl-btn {
+    padding: 2px 10px;
+    background: transparent;
     color: #b8c0cc;
     border: 1px solid #3a4152;
-    border-radius: 6px;
+    border-radius: 4px;
     font-size: 12px;
     cursor: pointer;
+    align-self: center;
+    white-space: nowrap;
+}
+.ctrl-btn:hover {
+    color: #e8ecf2;
+    border-color: #566178;
 }
 /* 桌面模式顶部工具条：编码/码率开关（仅桌面视图显示，MYS-886） */
 .desktop-ctrl-bar {
@@ -966,12 +968,26 @@ body {
     font-size: 12px;
     padding: 2px 4px;
 }
-.desktop-metrics-btn:hover {
-    color: #e8ecf2;
-    border-color: #566178;
+.desktop-ctrl-item input[type="checkbox"] {
+    accent-color: #58a6ff;
+    width: 13px;
+    height: 13px;
+    margin: 0;
+    cursor: pointer;
 }
-#desktop-clip-btn {
-    right: 76px;
+/* 控制栏分组标签与分隔线（人机功效：显示设置 / 操作 两组清晰分离） */
+.ctrl-group-label {
+    color: #7d8590;
+    font-size: 11px;
+    letter-spacing: .5px;
+    align-self: center;
+    user-select: none;
+}
+.ctrl-sep {
+    width: 1px;
+    height: 16px;
+    background: #3a4152;
+    align-self: center;
 }
 .desktop-metrics .metrics-title {
     font-weight: 600;

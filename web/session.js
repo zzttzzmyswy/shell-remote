@@ -140,6 +140,17 @@
         });
     }
 
+    // 灰度模式开关（弱网省带宽）：发送 desktop:gray，agent 编码前把色度
+    // 置中性，即时生效不重建流。
+    const grayToggle = document.getElementById('desktop-gray-toggle');
+    if (grayToggle) {
+        grayToggle.addEventListener('change', function() {
+            if (!desktopEnabled || !window.shellRemote) return;
+            window.shellRemote.send('desktop:gray', { enabled: this.checked });
+            showToast(this.checked ? '已开启灰度模式（省带宽）' : '已关闭灰度模式', '');
+        });
+    }
+
     toggleDesktopBtn.addEventListener('click', function() {
         if (!desktopEnabled) return;
         if (desktopActive) {
