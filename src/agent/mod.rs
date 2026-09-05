@@ -1516,16 +1516,26 @@ async fn run_session(
                                 }
 
                                 "desktop:qos" => {
-                                    // 端到端延时反馈 → 渐进式 QoS（rustdesk
-                                    // video_qos 同款：fps +1/+5 渐进、码率
-                                    // ×1.15~×0.8 每 3s 平滑缩放，非硬档跳变）。
+                                    // 端到端延时 + 解码背压反馈 → QoS（内容驱动
+                                    // fps：静态1fps/动态满帧/解码背压才降帧；码率由
+                                    // 拥塞增量平滑缩放，rustdesk delay−RTT 同构）。
                                     let delay_ms = msg
                                         .payload
                                         .get("delay_ms")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0) as u32;
+                                    let decode_fps = msg
+                                        .payload
+                                        .get("dfps")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as u32;
+                                    let decode_queue = msg
+                                        .payload
+                                        .get("dq")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as u32;
                                     let (fps, qos_scale, bitrate_kbps) =
-                                        desktop.on_qos_delay(delay_ms).await;
+                                        desktop.on_qos_delay(delay_ms, decode_fps, decode_queue).await;
                                     // 回传当前生效的 QoS 状态（对齐 rustdesk TestDelay
                                     // 携带 target_bitrate，MYS-886 #153）：浏览器可展示
                                     // 实际码率/帧率。
@@ -1539,6 +1549,13 @@ async fn run_session(
                                         }),
                                     };
                                     out.control(qos_ack).await;
+                                }
+
+                                "desktop:reqkey" => {
+                                    // 浏览器请求关键帧（接入/参考链断裂/解码错误，
+                                    // 对齐 rustdesk 控制端 refresh_video）：置 flag，
+                                    // 编码循环下一拍 force_idr 即时重同步。
+                                    desktop.request_idr();
                                 }
 
                                 "desktop:quality" => {

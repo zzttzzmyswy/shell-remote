@@ -19,10 +19,11 @@
   // 解码队列上限：积压超过 N 帧时丢弃旧的非关键帧（对齐 RustDesk
   // frame_controller 的丢帧策略——旧帧无意义，追新才保流畅）。
   // 注意阈值不能太小: AV1 软解 1080p 的瞬时入队深度实测到 ~24,
-  // 16 就丢帧会在参考链上撕口子 → WebCodecs "Decoding error" 整段卡死
-  // (MYS-886 实测)。96 只在真正严重积压时兜底, 平时靠 _onDecoded 的
-  // 渲染队列丢弃保新鲜 (decode 输入比 render 输出快时队列本来就浅)。
-  const MAX_DECODE_QUEUE = 96;
+  // 96 帧≈3s 的积压会让端到端延迟飙到秒级。降到 24（AV1 软解瞬时在飞
+  // 帧 ~24）并配合"丢非关键帧即请求关键帧(reqkey)"：参考链撕口子由 agent
+  // 立即 force_idr 补上（对齐 rustdesk 控制端 refresh_video 语义），
+  // 不再靠大缓冲硬扛。
+  const MAX_DECODE_QUEUE = 24;
 
   window.DesktopView = class {
     constructor() {
@@ -46,6 +47,10 @@
       this._lastE2eMs = undefined; // 最近一次解码时测得的即时管线延时（不含帧陈旧度）
       this._lastNewFrameAt = 0;   // 最近一次解码帧到达的本地时刻（静止判定）
       this._e2eMs = undefined;
+      this._gotFirstFrame = false; // 是否已渲染过首帧（接入 reqkey 快路径）
+      this._decodeCount = 0;      // 本 1s 窗口已解码帧数（解码背压上传）
+      this._reqKeyAt = 0;         // 上次 desktop:reqkey 发送时刻（限频）
+      this._reqKeyCount = 0;      // 最近 10s 内 reqkey 次数
       this._renderPending = false;
       this._droppedFrames = 0;
       // 浏览器与 relay 的时钟偏移（relay_epoch - 本地_epoch）。srtc 在 relay
@@ -142,6 +147,20 @@
       }, 1500);
     }
 
+    // 请求关键帧（对齐 rustdesk 控制端 refresh_video）：接入/参考链断裂/
+    // 解码错误/解码积压丢帧时，让 agent 立即 force_idr 重同步，不再等周期
+    // IDR（活跃期 6s）。限频：3s 最小间隔 + 10s 内最多 3 次，防刷新风暴。
+    _requestKey() {
+      if (!this.connected || !window.shellRemote || !window.shellRemote.send) return;
+      const now = Date.now();
+      if (now - this._reqKeyAt < 3000) return;
+      if (now - this._reqKeyWindowStart > 10000) { this._reqKeyWindowStart = now; this._reqKeyCount = 0; }
+      if (this._reqKeyCount >= 3) return;
+      this._reqKeyAt = now;
+      this._reqKeyCount += 1;
+      window.shellRemote.send('desktop:reqkey', {});
+    }
+
     connect() {
       if (this._decRecoverTimer) { clearTimeout(this._decRecoverTimer); this._decRecoverTimer = null; }
       this.disconnect(false);
@@ -196,6 +215,11 @@
         self._startMetrics();
         self.setStatus('桌面已连接 (WS)', false);
         self._buf = new Uint8Array(0);
+        // 接入快路径：1.5s 内没等到首帧（首 IDR 被 6s 活跃周期延迟）→
+        // reqkey 立即出关键帧，避免"接入黑屏等 IDR"。
+        self._firstFrameTimer = setTimeout(function() {
+          if (self.connected && !self._gotFirstFrame) self._requestKey();
+        }, 1500);
       };
       ws.onmessage = function(ev) {
         if (typeof ev.data === 'string') return; // 控制帧（如 ping 文本）
@@ -542,9 +566,12 @@
         this._decErr = false;
         this._initDecoder();
       }
-      // 积压保护：解码队列过深时丢旧的非关键帧。
+      // 积压保护：解码队列过深时丢旧的非关键帧，并请求关键帧修复参考链
+      //（丢弃即撕参考链，reqkey 让 agent 立即 force_idr 补上，对齐 rustdesk
+      //  控制端"队列满顶出旧帧 → refresh_video"）。
       if (this._dec.decodeQueueSize > MAX_DECODE_QUEUE && !p.isKey) {
         this._droppedFrames += 1;
+        this._requestKey();
         return;
       }
       // captureMs 由 timestamp 索引，输出帧时取回（VideoFrame 无自定义元数据）。
@@ -559,6 +586,8 @@
         this._dec.decode(chunk);
       } catch (e) {
         // config 变化（分辨率重配）等：丢弃该帧, 等下一个 IDR 重建解码器。
+        // 丢 decode 异常即请求刷新，不等 6s 周期 IDR。
+        this._requestKey();
         if (p.isKey && this._codecKind) this._initDecoder();
       }
     }
@@ -568,6 +597,8 @@
       const capMs = this._captureByPts ? this._captureByPts.get(frame.timestamp) : null;
       if (this._captureByPts) this._captureByPts.delete(frame.timestamp);
       this._lastNewFrameAt = Date.now();
+      this._gotFirstFrame = true;
+      this._decodeCount += 1;
       if (capMs) {
         this._lastCaptureMs = capMs;
         // e2e 在解码**到达时刻**测定（即时管线延时 = 本地now(relay时基) − 采集
@@ -576,8 +607,8 @@
         // QoS 压进低帧率自锁（MYS-886 卡顿死锁的源头之一）。
         this._lastE2eMs = Math.max(0, this._lastNewFrameAt + this._clockOffset - capMs);
       }
-      if (this._frames.length > 4) {
-        // 渲染管线积压：丢最旧帧（保留最新）。
+      if (this._frames.length > 2) {
+        // 渲染管线积压：丢最旧帧（保留最新），追新跳旧减陈旧度。
         this._frames.shift().close();
       }
       this._frames.push(frame);
@@ -662,6 +693,11 @@
       this._lastE2eMs = undefined;
       this._lastNewFrameAt = 0;
       this._e2eMs = undefined;
+      this._gotFirstFrame = false;
+      this._decodeCount = 0;
+      this._reqKeyAt = 0;
+      this._reqKeyCount = 0;
+      this._reqKeyWindowStart = 0;
       this._unbindInput();
       this._stopMetrics();
       const panel = document.getElementById('desktop-metrics');
@@ -737,10 +773,22 @@
           if (uplink) uplink.textContent = self._uplinkMode || '-';
           if (decoder) decoder.textContent = self._decoderLabel();
           if (encoder) encoder.textContent = self._encoderLabel();
-          // QoS 反馈：把端到端延时上报 agent，动态调目标帧率（rustdesk
-          // 同款：好网提升 fps、差网降低）。
+          // QoS 反馈：端到端延时 + 解码背压（解码帧率/队列深度）上报 agent。
+          //（agent 侧：fps 由内容活动驱动——静态 1fps/动态满帧，网络只调
+          //  码率；解码背压是唯一允许降帧的信号。）
+          const dfps = self._decodeCount;
+          self._decodeCount = 0;
           if (self._e2eMs !== undefined && window.shellRemote && window.shellRemote.send) {
-            window.shellRemote.send('desktop:qos', { delay_ms: Math.round(self._e2eMs) });
+            window.shellRemote.send('desktop:qos', {
+              delay_ms: Math.round(self._e2eMs),
+              dfps: dfps,
+              dq: self._dec ? self._dec.decodeQueueSize : 0
+            });
+          }
+          // 停滞检测：曾收到帧但现在 500ms 无新帧 → 关键帧断裂可能，请求刷新。
+          if (self.connected && self._gotFirstFrame && self._lastNewFrameAt &&
+            (Date.now() - self._lastNewFrameAt) > 500) {
+            self._requestKey();
           }
         } catch (e) { /* 面板只是展示 */ }
       }, 1000);

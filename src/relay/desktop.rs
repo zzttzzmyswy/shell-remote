@@ -102,10 +102,12 @@ impl DesktopStream {
     /// The receiver yields no fragments until the first key frame arrives.
     pub async fn add_viewer(&self) -> (String, mpsc::Receiver<Vec<u8>>, Option<Vec<u8>>) {
         let id = format!("dv_{}", uuid::Uuid::new_v4().simple());
-        // 256 帧缓冲（30fps ≈ 8.5s; 单帧 ~2-10KB, 内存上限 ~2.5MB）。
-// 之前 64 帧在浏览器解码短暂卡顿(标签页切后台)时 try_send 失败即把
-// viewer 踢掉——表现成局域网"丢帧"/断流（MYS-886 问题6）。
-let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+        // 16 帧缓冲（30fps ≈ 0.5s）。原 256 帧≈8.5s 是 13s 级端到端时延的
+        // 头号结构性来源：浏览器解码稍慢，relay 侧越积越多，观感"越来越卡"。
+        // 16 帧保住 <0.5s 延迟；解码停顿由浏览器 reqkey/重连兜底（不再靠
+        // 大缓冲硬扛）。标签页切后台等瞬时停顿仍可能 try_send 失败被踢，
+        // 但重连走缓存 init 秒级恢复（代价 << 8.5s 积压）。
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
         self.inner
             .viewers
             .write()
