@@ -953,10 +953,12 @@ fn kf_interval_ms_for(avg_bytes: f64) -> u64 {
 /// - **fps**：按端到端延时渐进调整 —— 好网 <50ms 连 3 次 +5、<100ms 且好转
 ///   +1、中网维持 min_fps、差网按延时比例降；**下限 MIN_FPS=1**（rustdesk
 ///   任意档位极端弱网都降到 1fps），上限 = `--desktop-fps`。
-/// - **ratio**（码率缩放）：每 3s 按平均延时平滑缩放（×1.15~×0.8）——
-///   动态屏（3s 内编码 ≥6 帧）好网才升、差网**无条件**降；每次最多 +150kbps
+/// - **ratio**（码率缩放）：每 3s 按拥塞增量（avg−基线）平滑缩放（×1.05~×0.8）——
+///   动态屏好网才升、拥塞**无条件**降；每次最多 +150kbps
 ///   限幅防陡升；上下限按质量档与 1Mbps 基线计算。
-/// - e2e 已由 relay 时钟校准为净端到端，无需 rustdesk 的 delay−RTT。
+/// - e2e 已由 relay 时钟校准为净端到端；ratio 降级采用 rustdesk 同思路的
+///   "减基线"判定（基线 = 漏桶式近端最低 avg，等价 `delay−RTT`），固定 RTT
+///   不触发降码率糊屏。
 pub struct QosAdaptive {
     /// 全局当前 fps（对外生效值）。
     fps: u32,
@@ -978,6 +980,13 @@ pub struct QosAdaptive {
     ratio_elapsed_s: u32,
     /// 本窗口编码帧数累计（DYNAMIC_SCREEN 判定，3s 一清）。
     frame_count_s: u32,
+    /// 最近一次采样的动态屏判定（字节帧率 ≥ 2 帧/秒）。fps 决策用——动态
+    /// 屏永不降到 `QOS_DYNAMIC_MIN_FPS` 以下。
+    dynamic: bool,
+    /// 健康基线延时（ms，漏桶式近端最低 avg，等价 rustdesk 的 RTT 估计）。
+    /// 从首个样本即开始学习；ratio/fps 只对"avg 显著高于基线"的增量（拥塞
+    /// 证据）做降档，固定传播延迟即使 800ms 也不降级。
+    baseline_delay: u32,
     /// 编码器当前目标码率（kbps，由 abr ceiling 同步进来）。
     bitrate_kbps: u32,
     /// 首个 delay 样本时刻（unix us），代理 rustdesk new_user_instant
@@ -1003,6 +1012,17 @@ pub const QOS_MAX_BR_MULTIPLE: f32 = 1.0;
 const QOS_ADJUST_RATIO_INTERVAL: u32 = 3; // 秒
 const QOS_DYNAMIC_SCREEN_THRESHOLD: u32 = 2; // 帧/秒
 const QOS_HISTORY_DELAY_LEN: usize = 2;
+/// 动态屏 fps 下限（用户口径：可接受模糊、不接受掉帧/1fps）：动态内容
+/// 即便极端弱网也**永不**降到该值以下（rustdesk 的 MIN_FPS=1 只保留给
+/// 静止屏——静止无内容，掉帧不可见）。
+const QOS_DYNAMIC_MIN_FPS: u32 = 12;
+/// 动态屏单次采样 fps 最大降幅：防单样本（偶发尖峰/解码器卡顿）把 30fps
+/// 一步打到底，配合动态下限避免"跌下去就爬不上来"的自锁。
+const QOS_FPS_MAX_STEP_DOWN: u32 = 6;
+/// 基线延时（健康 RTT）学习速率：每次样本把基线向当前 avg 收敛的比例。
+/// 基线 = 近端观察到的"不拥塞"端到端延时；ratio 只对显著高于基线的
+/// 增量（拥塞证据）做降档，固定 RTT 不会导致永久降码率糊屏。
+const QOS_BASELINE_LEAK: f32 = 0.05;
 
 /// `on_delay` 一次采样所需的会话资源（rustdesk video_qos 的输入）。
 #[derive(Clone, Copy)]
@@ -1031,6 +1051,8 @@ impl QosAdaptive {
             increase_fps_count: 0,
             ratio_elapsed_s: 0,
             frame_count_s: 0,
+            dynamic: false,
+            baseline_delay: 0,
             bitrate_kbps: 0,
             first_sample_us: None,
         }
@@ -1086,10 +1108,34 @@ impl QosAdaptive {
         }
         self.delay_history.push_back(delay);
         let avg = self.avg_delay().max(10);
+        // 基线延时更新（rustdesk RttCalculator 的简化版）：avg ≤ 基线立降，
+        // 否则每次样本按 QOS_BASELINE_LEAK 缓慢上抬——固定 RTT（传播延迟）
+        // 会慢慢被学成"新基线"，只有真正显著高于基线才判拥塞。
+        if self.baseline_delay == 0 || avg <= self.baseline_delay {
+            self.baseline_delay = avg;
+        } else {
+            self.baseline_delay = self.baseline_delay
+                + (((avg - self.baseline_delay) as f32) * QOS_BASELINE_LEAK) as u32;
+        }
+        // 本样本动态屏判定：距上次采样期间有实际编码字节的帧 ≥ 2 帧/秒。
+        // 静止屏（P 帧近 0 字节持续空转）为 false——静止掉帧不可见，可以
+        // 沿用 rustdesk MIN_FPS=1 省带宽；动态屏受 QOS_DYNAMIC_MIN_FPS 保底。
+        let dynamic = if elapsed_s >= 0.1 {
+            (frame_count as f32 / elapsed_s) >= QOS_DYNAMIC_SCREEN_THRESHOLD as f32
+        } else {
+            self.dynamic
+        };
+        self.dynamic = dynamic;
 
-        // ── fps 渐进（rustdesk user_network_delay 逐行）──
+        // 净延时 = avg − 基线（等价 rustdesk 的 `delay−RTT`）：只对"超出健康
+        // RTT 的增量"做 fps/ratio 反应。恒定传播延迟即使 800ms 也不触发降级
+        // ——这正是 rustdesk 同路径 70ms 满帧率，我们却 811ms→1fps 自锁、
+        // 走向两极端的分水岭。
+        let net = avg.saturating_sub(self.baseline_delay.max(10)).max(10);
+
+        // ── fps 渐进（rustdesk user_network_delay 逐行，判据换为 net）──
         let mut fps = self.fps;
-        if avg < 50 {
+        if net < 50 {
             self.quick_increase_fps_count += 1;
             let mut step = if fps < normal_fps { 1 } else { 0 };
             if self.quick_increase_fps_count >= 3 {
@@ -1097,25 +1143,25 @@ impl QosAdaptive {
                 step = 5;
             }
             fps = min_fps.max(fps.saturating_add(step));
-        } else if avg < 100 {
+        } else if net < 100 {
             let step = if avg < old_avg && fps < normal_fps { 1 } else { 0 };
             fps = min_fps.max(fps.saturating_add(step));
-        } else if avg < QOS_DELAY_THRESHOLD_150MS {
+        } else if net < QOS_DELAY_THRESHOLD_150MS {
             fps = min_fps.max(fps);
         } else {
             let devide_fps =
-                ((fps as f32) / (avg as f32 / QOS_DELAY_THRESHOLD_150MS as f32)).ceil() as u32;
-            if avg < 200 {
+                ((fps as f32) / (net as f32 / QOS_DELAY_THRESHOLD_150MS as f32)).ceil() as u32;
+            if net < 200 {
                 fps = min_fps.max(devide_fps);
-            } else if avg < 300 {
+            } else if net < 300 {
                 fps = min_fps.min(devide_fps);
-            } else if avg < 600 {
-                fps = dividend_ms / avg;
+            } else if net < 600 {
+                fps = dividend_ms / net;
             } else {
-                fps = (dividend_ms / avg).min(devide_fps);
+                fps = (dividend_ms / net).min(devide_fps);
             }
         }
-        if avg < QOS_DELAY_THRESHOLD_150MS {
+        if net < QOS_DELAY_THRESHOLD_150MS {
             self.increase_fps_count += 1;
         } else {
             self.increase_fps_count = 0;
@@ -1124,17 +1170,31 @@ impl QosAdaptive {
             self.increase_fps_count = 0;
             fps += 1;
         }
-        if avg > 50 {
+        if net > 50 {
             self.quick_increase_fps_count = 0;
         }
-        // 全局 clamp：下限 1（用户事实 + rustdesk MIN_FPS），上限 highest_fps。
-        fps = fps.clamp(QOS_MIN_FPS, highest_fps);
+        // 动态屏保护：低于下限的帧率对动态内容毫无价值（用户口径：可模糊、
+        // 不可掉帧）。静止屏保持 rustdesk MIN_FPS=1——静止无内容，掉帧不可见。
+        let floor = if dynamic { QOS_DYNAMIC_MIN_FPS } else { QOS_MIN_FPS };
+        if dynamic {
+            // 防悬崖：单样本最多降 QOS_FPS_MAX_STEP_DOWN。rustdesk 无此步进
+            // 是因为它的 delay 来自独立 TestDelay 探测，不存在"低fps→测量
+            // 虚高"耦合；我们防抖兜底，避免偶发尖峰一步打底。
+            let prev = self.fps;
+            if fps < prev {
+                fps = fps.max(prev.saturating_sub(QOS_FPS_MAX_STEP_DOWN));
+            }
+        }
+        // 全局 clamp：动态屏下限 QOS_DYNAMIC_MIN_FPS（≤12），静止屏下限
+        // MIN_FPS=1；上限 highest_fps（--desktop-fps）。
+        fps = fps.clamp(floor, highest_fps);
 
         let first = self.delay_fps.is_none();
         self.delay_fps = Some(fps);
-        // response_delayed：e2e > 2s → 视为响应超时，fps 压到 2（MIN_FPS+1）。
-        if delay_ms > 2000 && fps > QOS_MIN_FPS + 1 {
-            fps = QOS_MIN_FPS + 1;
+        // response_delayed：e2e > 2s → 视为响应超时；动态屏按 floor 兜底
+        // （不再一路压到 MIN_FPS+1=2——那正是用户投诉的"1帧"状态）。
+        if delay_ms > 2000 && fps > floor {
+            fps = floor;
         }
         // new_user_instant：首个样本起 1s 内 cap INIT_FPS。
         match self.first_sample_us {
@@ -1168,8 +1228,9 @@ impl QosAdaptive {
         (self.fps, self.ratio_permille())
     }
 
-    /// ratio 调整（rustdesk adjust_ratio 逐行）：动态屏好网才升、差网无条件
-    /// 降；+150kbps/3s 限幅防陡升；min 按质量档与 1Mbps 基线。
+    /// ratio 调整（对齐 rustdesk adjust_ratio 语义，判据改为基线相对）：
+    /// 动态屏好网（over 小）才升；`avg − 基线`（拥塞增量）大则无条件降；
+    /// +150kbps/3s 限幅防陡升；min 按质量档与 1Mbps 基线。
     fn adjust_ratio(&mut self, dynamic: bool) {
         let max_delay = self.avg_delay();
         let target_ratio = self.quality_ratio;
@@ -1211,23 +1272,21 @@ impl QosAdaptive {
         let max = target_ratio * QOS_MAX_BR_MULTIPLE;
 
         let mut v = current_ratio;
-        if max_delay < 50 {
-            if dynamic {
-                v = current_ratio * 1.15;
-            }
-        } else if max_delay < 100 {
-            if dynamic {
-                v = current_ratio * 1.1;
-            }
-        } else if max_delay < QOS_DELAY_THRESHOLD_150MS {
+        // 拥塞增量 = 当前 avg − 健康基线（等价 rustdesk 的 `delay−RTT`）：
+        // **固定传播 RTT 不触发降码率**。上一版按绝对延时降档，公网 relay
+        // 路径 200-400ms 固定 RTT 会把 ratio 一路压到下限（实测 321kbps、
+        // 动态画面永久糊屏）——那才是与 rustdesk 表现走向两极端的一环。
+        // 恢复路径（over 小）保留 rustdesk 的"动态屏才升"门。
+        let over = max_delay.saturating_sub(self.baseline_delay.max(10));
+        if over < 100 {
             if dynamic {
                 v = current_ratio * 1.05;
             }
-        } else if max_delay < 200 {
+        } else if over < 150 {
             v = current_ratio * 0.95;
-        } else if max_delay < 300 {
+        } else if over < 250 {
             v = current_ratio * 0.9;
-        } else if max_delay < 500 {
+        } else if over < 400 {
             v = current_ratio * 0.85;
         } else {
             v = current_ratio * 0.8;
@@ -1440,56 +1499,100 @@ mod tests {
     }
 
     #[test]
-    fn test_qos_adaptive_gradual_decrease_on_bad_net() {
-        // 差网（>300ms）动态屏：按比例降 fps，码率 ×0.85~×0.8。
+    fn test_qos_adaptive_gradual_decrease_only_on_congestion() {
+        // 对齐 rustdesk `delay−RTT` 语义：**恒定延时不等于拥塞**。800ms 固定
+        // 传播延迟（公网 relay 常态）基线学成后，fps 不压、码率满档——
+        // 这正是此前 811ms→1fps/321kbps 自锁糊死、与 rustdesk 走向两极端的
+        // 根因（固定 RTT 降 fps/降码率都毫无改善，只会更糊更卡）。
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
         let mut now = 2_000_000u64;
-        let (fps1, _) = q.on_delay(400, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
-        now += 1_000_000;
-        assert!(fps1 < QOS_FPS, "400ms dynamic net should drop fps below 30, got {fps1}");
-        let (fps2, _) = q.on_delay(500, 30, 2.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
-        assert!(fps2 <= fps1, "worse net must not raise fps");
+        for _ in 0..8 {
+            let (fps, _) = q.on_delay(800, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            now += 1_000_000;
+            assert_eq!(fps, QOS_FPS, "constant 800ms must keep full fps, got {fps}");
+        }
+        assert!(
+            q.current_ratio_permille() >= 1000,
+            "constant 800ms != congestion: ratio stays full, got {}‰",
+            q.current_ratio_permille()
+        );
+
+        // 真实拥塞：净延时超基线（800→1800）→ fps 有动态下限、ratio 降档（模糊）。
+        let samples: Vec<u32> = (0..6)
+            .map(|_| {
+                let (f, _) = q.on_delay(1800, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+                now += 1_000_000;
+                f
+            })
+            .collect();
+        assert!(
+            samples.iter().all(|f| *f >= QOS_DYNAMIC_MIN_FPS),
+            "congestion must keep dynamic fps floor, got {samples:?}"
+        );
         assert!(
             q.current_ratio_permille() < 1000,
-            "bad net ratio < 1000‰, got {}‰",
+            "congestion increment must cut bitrate ratio, got {}‰",
             q.current_ratio_permille()
         );
     }
 
     #[test]
-    fn test_qos_dynamic_bad_net_drops_to_fps_floor_one() {
-        // rustdesk MIN_FPS=1：极端弱网（4s e2e）动态屏 fps 一路降到 1
-        //（用户事实 + video_qos.rs clamp(MIN_FPS=1, highest_fps)）。
+    fn test_qos_dynamic_bad_net_never_drops_to_one() {
+        // 用户口径：可接受模糊、不接受掉帧/1fps。动态屏极端弱网**永不归 1**：
+        // ① 响应超时（e2e>2s）按动态下限兜底；② 拥塞（净延时高）逐档下滑，
+        //    单样本最多 -6，停在下限 QOS_DYNAMIC_MIN_FPS（旧自锁：fps=1 →
+        //    帧稀疏 → e2e 读数畸高 → 维持 1）。
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
         let (fps, _) = q.on_delay(4000, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 700_000));
-        assert_eq!(fps, 1, "4s dynamic net must drop to floor 1, got {fps}");
-        // 网络恢复：好网样本按 rustdesk 渐进（+1 / 连 3 次 +5）从 1 爬回，
-        // 不再十几秒卡在 1（先前自创实现的死锁已随移植消除）。
+        assert_eq!(
+            fps, QOS_DYNAMIC_MIN_FPS,
+            "response timeout floors dynamic fps, got {fps}"
+        );
+
+        // 拥塞：健康基线 100ms 下净延时升到 ~190 → 逐档下滑、步进保护。
         let mut q2 = QosAdaptive::new(QOS_BR_BALANCED);
-        q2.on_delay(4000, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 700_000));
-        let mut f = 1;
-        let mut now = 1_700_000u64;
-        for _ in 0..8 {
-            let (nf, _) = q2.on_delay(30, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
-            f = nf;
+        let mut now = 2_000_000u64;
+        for _ in 0..3 {
+            q2.on_delay(100, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
             now += 1_000_000;
         }
-        assert!(f >= 8, "8 good samples should recover fps well above 1, got {f}");
+        let (f1, _) = q2.on_delay(500, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        assert!(
+            f1 >= QOS_FPS - QOS_FPS_MAX_STEP_DOWN,
+            "first congestion sample: step-down cap holds, got {f1}"
+        );
+        let mut sink = f1;
+        for _ in 0..6 {
+            let (nf, _) = q2.on_delay(500, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            sink = nf;
+            now += 1_000_000;
+        }
+        assert_eq!(
+            sink, QOS_DYNAMIC_MIN_FPS,
+            "sustained congestion glides to dynamic floor, got {sink}"
+        );
+
+        // 网络恢复：好网样本渐进爬回（<50ms 连 3 次 +5 / 稳定 +1）。
+        let mut now3 = 1_700_000u64;
+        let mut f = sink;
+        for _ in 0..8 {
+            let (nf, _) = q2.on_delay(30, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now3));
+            f = nf;
+            now3 += 1_000_000;
+        }
+        assert!(
+            f >= QOS_DYNAMIC_MIN_FPS + 6,
+            "8 good samples should recover fps beyond the floor, got {f}"
+        );
     }
 
     #[test]
     fn test_qos_bad_net_drops_fps_regardless_of_static_screen() {
-        // rustdesk 语义：fps 只由网络延时驱动，差网**无条件**降（静止时的高
-        // 延迟由浏览器端停报消除，agent 侧不加静止 gate —— 之前的"静止屏
-        // 豁免"是脱离源码的自创，已移除）。
+        // 静止屏（无字节帧）不受动态下限保护：4s e2e 响应超时 fps 直接压到
+        // MIN_FPS=1——静止无内容，掉帧不可见，保住带宽给他人/后续使用。
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
         let (fps, _) = q.on_delay(4000, 0, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 1_000_000));
         assert_eq!(fps, 1, "bad net drops fps even with 0 frames, got {fps}");
-        assert!(
-            q.current_ratio_permille() < 1000,
-            "bad net ratio < 1000‰, got {}‰",
-            q.current_ratio_permille()
-        );
     }
 
     #[test]

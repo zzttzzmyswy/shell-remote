@@ -744,7 +744,7 @@ async fn run_session(
             // 或连接失败时自动回退到 HTTP 批量 POST 路径。
             // 积压保护仍保留：队列深度超过阈值时丢最旧的非关键帧，
             // 控制消息（started/stopped/error）绝不丢弃。
-            const MAX_PENDING_FRAMES: usize = 90; // 60fps × 1.5s
+            const MAX_PENDING_FRAMES: usize = 24; // ≈ 30fps×0.8s：稳态积压有界（旧 90 ≈3s）
             let ws_url = {
                 // 配置是 http/https，视频上行内部映射 http→ws / https→wss。
                 let mut u = base.replace("http://", "ws://").replace("https://", "wss://");

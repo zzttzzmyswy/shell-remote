@@ -42,7 +42,8 @@
       this._vpcProfile = 0;
       this._vpcLevel = 10;
       this._frames = [];          // decoded VideoFrames pending render
-      this._lastCaptureMs = 0;    // 最新已渲染帧的采集时间（e2e 延时）
+      this._lastCaptureMs = 0;    // 最新解码帧的采集时间（e2e 延时）
+      this._lastE2eMs = undefined; // 最近一次解码时测得的即时管线延时（不含帧陈旧度）
       this._lastNewFrameAt = 0;   // 最近一次解码帧到达的本地时刻（静止判定）
       this._e2eMs = undefined;
       this._renderPending = false;
@@ -566,8 +567,15 @@
       // 从 timestamp 索引取回采集时间，供 e2e 延时计算。
       const capMs = this._captureByPts ? this._captureByPts.get(frame.timestamp) : null;
       if (this._captureByPts) this._captureByPts.delete(frame.timestamp);
-      if (capMs) this._lastCaptureMs = capMs;
       this._lastNewFrameAt = Date.now();
+      if (capMs) {
+        this._lastCaptureMs = capMs;
+        // e2e 在解码**到达时刻**测定（即时管线延时 = 本地now(relay时基) − 采集
+        // epoch），不沿用"指标tick再算 now−旧采集"——那是帧陈旧度（≈1/fps，
+        // fps=1 时高达数百 ms）而非真实延迟。fps 越低保真度越高，会反过来把
+        // QoS 压进低帧率自锁（MYS-886 卡顿死锁的源头之一）。
+        this._lastE2eMs = Math.max(0, this._lastNewFrameAt + this._clockOffset - capMs);
+      }
       if (this._frames.length > 4) {
         // 渲染管线积压：丢最旧帧（保留最新）。
         this._frames.shift().close();
@@ -651,6 +659,7 @@
       if (this._dec) { try { this._dec.close(); } catch (e) {} this._dec = null; }
       this._desc = null;
       this._lastCaptureMs = 0;
+      this._lastE2eMs = undefined;
       this._lastNewFrameAt = 0;
       this._e2eMs = undefined;
       this._unbindInput();
@@ -702,16 +711,15 @@
         const encoder = document.getElementById('metric-encoder');
         if (!lag) return;
         try {
-          // e2e: 采集→渲染。srtc 已由 agent 校准到 relay 时基；本地 now 也加
-          // _clockOffset 换算到 relay 时基 —— 两个值都在同一时间轴上，彻底
-          // 摆脱 agent/浏览器两机系统时钟差（MYS-886 指标失真根因）。
-          // 只有窗口内（~1.2s）有新帧到达才更新 e2e 并上报：静止时 srtc
-          // 陈旧，now-旧采集时间会单调虚高（2-4s 持续递增），喂给 QoS 会被
-          // 误判为差网、把 fps 压到 1 → 交互卡死（MYS-886 死锁根因）。
+          // e2e: 采集→解码。数值在 _onDecoded 解码到达时刻测定（即时管线延时，
+          // 不含"距上一帧多久"的陈旧度——陈旧度随 fps 升高而膨胀，会喂给 QoS
+          // 形成低帧率自锁，MYS-886 卡顿死锁根因）。这里只负责"新鲜窗口内
+          // 转发最近样本"：静止（1.5s 无新帧）时 srtc 陈旧不更新不误报。
           const fresh = self._lastNewFrameAt &&
-            (Date.now() - self._lastNewFrameAt) <= 1200;
-          if (fresh && self._lastCaptureMs) {
-            const e2e = Math.max(0, (Date.now() + self._clockOffset) - self._lastCaptureMs);
+            self._lastE2eMs !== undefined &&
+            (Date.now() - self._lastNewFrameAt) <= 1500;
+          if (fresh) {
+            const e2e = self._lastE2eMs;
             self._e2eMs = e2e;
             lag.textContent = e2e + ' ms';
           } else {
