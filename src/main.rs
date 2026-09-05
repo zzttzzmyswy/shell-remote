@@ -141,9 +141,16 @@ enum Command {
         #[arg(long, default_value_t = 30.0)]
         desktop_fps: f64,
 
-        /// Maximum encode bitrate in kbps (user request: 最高 800).
-        #[arg(long, default_value_t = 800)]
+        /// Maximum encode bitrate in kbps. 0 = 自动按 rustdesk 模型
+        /// （base_bitrate(分辨率) × 质量档，1080p balanced ≈1388kbps）。
+        /// 显式设值则作为硬顶（向 rustdesk 配置靠拢, MYS-886）。
+        #[arg(long, default_value_t = 0)]
         desktop_max_bitrate: u64,
+
+        /// 编码质量档：speed / balanced / best（rustdesk BR_SPEED=0.5 /
+        /// BR_BALANCED=0.67 / BR_BEST=1.5，决定目标码率与 QP 区间）。
+        #[arg(long, default_value = "balanced")]
+        desktop_quality: String,
 
         /// Minimum encode bitrate in kbps (static desktop ~80; dynamic raised by ABR).
         #[arg(long, default_value_t = 80)]
@@ -214,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
             desktop_codec,
             desktop_fps,
             desktop_max_bitrate,
+            desktop_quality,
             desktop_min_bitrate,
             desktop_display,
         } => {
@@ -234,6 +242,11 @@ async fn main() -> anyhow::Result<()> {
                 fps: desktop_fps,
                 min_bps: desktop_min_bitrate * 1000,
                 max_bps: desktop_max_bitrate * 1000,
+                quality: match desktop_quality.as_str() {
+                    "speed" => crate::agent::desktop::encoder::QUALITY_SPEED,
+                    "best" => crate::agent::desktop::encoder::QUALITY_BEST,
+                    _ => crate::agent::desktop::encoder::QUALITY_BALANCED,
+                },
                 display: desktop_display,
             };
             agent::start(

@@ -24,6 +24,9 @@ pub struct AomEncoder {
     height: u32,
     fps: f64,
     bitrate_bps: u64,
+    /// 用户 `--desktop-max-bitrate` 覆盖（0 = 自动 rustdesk 模型）。
+    max_bps: u64,
+    quality: f32,
     force_kf: bool,
 }
 
@@ -40,9 +43,20 @@ const AOM_FRAME_IS_KEY: c_uint = 0x1;
 
 impl AomEncoder {
     /// Create an AV1 encoder pinned to `w x h` at `fps` frames/s.
-    pub fn new(w: u32, h: u32, bitrate_bps: u64, fps: f64) -> Result<Self, String> {
+    /// `bitrate_bps` = 目标码率（已由 encoder::target_bitrate 计算）；
+    /// `q_min/q_max` = 质量档对应的 QP 区间（rustdesk 同款）。
+    pub fn new(
+        w: u32,
+        h: u32,
+        bitrate_bps: u64,
+        fps: f64,
+        q_min: u32,
+        q_max: u32,
+    ) -> Result<Self, String> {
         assert!(w % 2 == 0 && h % 2 == 0, "dimensions must be even for 4:2:0");
         assert!(bitrate_bps > 0 && fps > 0.0);
+        let max_bps = 0; // new 阶段未知用户覆盖；ABR 里由 set_bitrate 直接设目标
+        let quality = crate::agent::desktop::encoder::QUALITY_BALANCED;
 
         unsafe {
             let iface = aom_sys::aom_codec_av1_cx();
@@ -65,8 +79,8 @@ impl AomEncoder {
             cfg.g_lag_in_frames = 0;
             cfg.rc_end_usage = aom_sys::aom_rc_mode_AOM_CBR;
             cfg.rc_target_bitrate = (bitrate_bps / 1000).min(u32::MAX as u64) as c_uint;
-            cfg.rc_min_quantizer = 0;
-            cfg.rc_max_quantizer = 63;
+            cfg.rc_min_quantizer = q_min;
+            cfg.rc_max_quantizer = q_max;
             cfg.rc_undershoot_pct = 25;
             cfg.rc_overshoot_pct = 25;
             // 不丢帧: 用户明确"接受模糊、不接受掉帧"(MYS-886)。CBR 靠 QP
@@ -102,6 +116,8 @@ impl AomEncoder {
                 height: h,
                 fps,
                 bitrate_bps,
+                max_bps,
+                quality,
                 force_kf: false,
             })
         }
@@ -182,6 +198,27 @@ impl AomEncoder {
         }
     }
 
+    /// 按质量档动态调整（rustdesk QoS 同款）：重算目标码率 + QP 区间。
+    pub fn set_quality(&mut self, ratio: f32) {
+        self.quality = ratio;
+        let (q_min, q_max) = crate::agent::desktop::encoder::calc_q_values(ratio);
+        let target = crate::agent::desktop::encoder::target_bitrate(
+            self.width,
+            self.height,
+            self.max_bps,
+            ratio,
+        );
+        self.bitrate_bps = target;
+        unsafe {
+            let src_ptr = self.ctx.config.enc as *const aom_sys::aom_codec_enc_cfg_t;
+            let mut cfg: aom_sys::aom_codec_enc_cfg_t = std::ptr::read(src_ptr);
+            cfg.rc_target_bitrate = (target / 1000).min(u32::MAX as u64) as c_uint;
+            cfg.rc_min_quantizer = q_min;
+            cfg.rc_max_quantizer = q_max;
+            aom_sys::aom_codec_enc_config_set(&mut self.ctx, &cfg);
+        }
+    }
+
     /// Read back the current target bitrate (bps).
     pub fn bitrate_bps(&self) -> u64 {
         self.bitrate_bps
@@ -242,6 +279,10 @@ impl crate::agent::desktop::encoder::VideoEncoder for AomEncoder {
         AomEncoder::set_bitrate(self, bps);
     }
 
+    fn set_quality(&mut self, ratio: f32) {
+        AomEncoder::set_quality(self, ratio);
+    }
+
     fn bitrate_bps(&self) -> u64 {
         AomEncoder::bitrate_bps(self)
     }
@@ -286,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_av1_encoder_produces_frames() {
-        let mut enc = AomEncoder::new(320, 240, 400_000, 15.0).expect("av1 init");
+        let mut enc = AomEncoder::new(320, 240, 400_000, 15.0, 24, 50).expect("av1 init");
         let mut saw_key = false;
         let mut bytes = 0usize;
         for t in 0..30 {
@@ -313,7 +354,7 @@ mod tests {
     fn test_av1_bitrate_actually_controlled() {
         // 800k 目标下实测码率应收敛在目标附近 (CBR, 固定分辨率 —— 这正是
         // 用户要求"禁止自动降低分辨率"的底气)。
-        let mut enc = AomEncoder::new(1280, 720, 800_000, 30.0).expect("av1 init");
+        let mut enc = AomEncoder::new(1280, 720, 800_000, 30.0, 24, 50).expect("av1 init");
         let (mut bytes, mut out) = (0usize, 0usize);
         for t in 0..60u32 {
             let mut buf = solid_i420(1280, 720, (t % 251) as u8);
@@ -337,7 +378,7 @@ mod tests {
     fn test_av1_1080p_complex_throughput_bench() {
         // 1080p 高熵内容下 realtime 档的实际编码吞吐 —— 复杂内容"4-8s 延时"
         // 的直接瓶颈衡量（MYS-886 需求2）。不设断言, 输出 fps 供人工评估。
-        let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0).expect("av1 init");
+        let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0, 24, 50).expect("av1 init");
         let start = std::time::Instant::now();
         let n = 30u32;
         for t in 0..n {

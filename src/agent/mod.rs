@@ -1513,6 +1513,24 @@ async fn run_session(
                                     }
                                 }
 
+                                "desktop:qos" => {
+                                    // 浏览器端到端延时反馈 → 动态目标帧率
+                                    // （rustdesk 同款：<150ms 提升、差网降低）。
+                                    let delay_ms = msg
+                                        .payload
+                                        .get("delay_ms")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let fps = if delay_ms < 150 {
+                                        60
+                                    } else if delay_ms < 300 {
+                                        30
+                                    } else {
+                                        15
+                                    };
+                                    desktop.set_fps(fps);
+                                }
+
                                 "desktop:mouse" => {
                                     // 浏览器键鼠注入：desktop:mouse
                                     // {type,x,y,button,dx,dy}（RW 权限校验

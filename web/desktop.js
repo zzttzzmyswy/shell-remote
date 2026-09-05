@@ -667,6 +667,11 @@
           if (uplink) uplink.textContent = self._uplinkMode || '-';
           if (decoder) decoder.textContent = self._decoderLabel();
           if (encoder) encoder.textContent = self._encoderLabel();
+          // QoS 反馈：把端到端延时上报 agent，动态调目标帧率（rustdesk
+          // 同款：好网提升 fps、差网降低）。
+          if (self._e2eMs !== undefined && window.shellRemote && window.shellRemote.send) {
+            window.shellRemote.send('desktop:qos', { delay_ms: Math.round(self._e2eMs) });
+          }
         } catch (e) { /* 面板只是展示 */ }
       }, 1000);
     }

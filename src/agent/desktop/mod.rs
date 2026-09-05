@@ -52,6 +52,9 @@ pub struct DesktopConfig {
     pub max_bps: u64,
     /// Optional X11 display override (`--desktop-display`).
     pub display: Option<String>,
+    /// 质量档倍率（speed=0.5 / balanced=0.67 / best=1.5，rustdesk 同款）。
+    /// 决定目标码率（base_bitrate × quality）与 QP 区间。
+    pub quality: f32,
 }
 
 impl Default for DesktopConfig {
@@ -66,8 +69,11 @@ impl Default for DesktopConfig {
             fps: 30.0,
             // 静态桌面 ~80k 足够 (openh264 实测 84k 满帧); 动态由 ABR 拉回
             min_bps: 80_000,
-            max_bps: 800_000,
+            // 0 = 自动按 rustdesk 模型（base_bitrate × quality，1080p balanced
+            // ≈1388kbps）；显式设值作为硬顶。
+            max_bps: 0,
             display: None,
+            quality: crate::agent::desktop::encoder::QUALITY_BALANCED,
         }
     }
 }
@@ -107,12 +113,15 @@ pub struct DesktopManager {
     /// 运行时编码方案（av1/vp9/h264）。初始 = config.codec，前端可通过
     /// desktop:codec 热切换（重建桌面流），见 [`Self::set_codec`]。
     codec: std::sync::RwLock<String>,
+    /// 运行时目标编码帧率（QoS 动态调，rustdesk 同款：延时好提升、差降低）。
+    fps: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DesktopManager {
     pub fn new(config: DesktopConfig) -> Self {
         let bps = config.max_bps;
         let codec = config.codec.clone();
+        let fps0 = config.fps.clamp(1.0, 60.0) as u32;
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
@@ -122,7 +131,18 @@ impl DesktopManager {
             clipboard: tokio::sync::Mutex::new(None),
             clock_offset: std::sync::atomic::AtomicI64::new(0),
             codec: std::sync::RwLock::new(codec),
+            fps: Arc::new(std::sync::atomic::AtomicU32::new(fps0)),
         }
+    }
+
+    /// QoS 动态调整目标帧率（rustdesk 同款）：浏览器端到端延时 <150ms 提升
+    /// 到 60fps、<300ms 维持 30fps、更差降到 15fps 保流畅。编码循环按此值
+    /// 动态改 tick 周期。
+    pub fn set_fps(&self, fps: u32) {
+        let fps = fps.clamp(1, 60);
+        use std::sync::atomic::Ordering as O;
+        self.fps.store(fps, O::Relaxed);
+        tracing::info!(fps, "desktop QoS: target fps adjusted");
     }
 
     /// 运行时热切换编码方案（av1/vp9/h264）。仅当桌面正在运行时重建
@@ -234,8 +254,9 @@ impl DesktopManager {
         cfg.codec = codec;
         let bandwidth = self.bandwidth.clone();
         let clock_offset = self.clock_offset.load(std::sync::atomic::Ordering::Relaxed);
+        let fps_ctl = self.fps.clone();
         let task = tokio::task::spawn(async move {
-            run_desktop_loop(cfg, running, post, bandwidth, clock_offset).await;
+            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl).await;
         });
         *self.task.lock().await = Some(task);
     }
@@ -344,6 +365,7 @@ async fn run_desktop_loop(
     post: PostFn,
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
     clock_offset_ms: i64,
+    fps_ctl: Arc<std::sync::atomic::AtomicU32>,
 ) {
         let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok((src, backend)) => (src, backend),
@@ -357,7 +379,7 @@ async fn run_desktop_loop(
         }
     };
     let (src, backend) = src;
-    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms).await;
+    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -370,7 +392,10 @@ async fn run_desktop_pipeline(
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
     backend: String,
     clock_offset_ms: i64,
+    fps_ctl: Arc<std::sync::atomic::AtomicU32>,
 ) {
+    // cfg 需可变：编码器 fallback 后回写实际 codec。
+    let mut cfg = cfg;
     let (w0, h0) = src.resolution();
     if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
         (post)(serde_json::json!({
@@ -380,18 +405,34 @@ async fn run_desktop_pipeline(
         return;
     }
 
-    let mut enc: Box<dyn encoder::VideoEncoder> =
-        match encoder::new_encoder(&cfg.codec, w0 as u32, h0 as u32, cfg.max_bps, cfg.fps) {
-            Ok(e) => e,
-            Err(e) => {
-                (post)(serde_json::json!({
-                    "type": "desktop:started",
-                    "payload": { "codec": cfg.codec, "error": format!("encoder init failed: {e}") }
-                }));
-                return;
-            }
-        };
-    let mut abr = rate::Abr::new(cfg.min_bps, cfg.max_bps);
+    let (mut enc, actual_codec) = match encoder::create_encoder_fallback(
+        &cfg.codec,
+        w0 as u32,
+        h0 as u32,
+        cfg.max_bps,
+        cfg.fps,
+        cfg.quality,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            (post)(serde_json::json!({
+                "type": "desktop:started",
+                "payload": { "codec": cfg.codec, "error": format!("encoder init failed: {e}") }
+            }));
+            return;
+        }
+    };
+    if actual_codec != cfg.codec {
+        tracing::warn!(requested = %cfg.codec, actual = %actual_codec, "desktop codec fell back");
+    }
+    cfg.codec = actual_codec;
+    // ABR 上限：用户 max_bps>0 用其值，否则用 rustdesk 模型（base×quality）。
+    let abr_ceiling = if cfg.max_bps > 0 {
+        cfg.max_bps
+    } else {
+        encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality)
+    };
+    let mut abr = rate::Abr::new(cfg.min_bps, abr_ceiling);
 
     // fMP4 config is final once the first IDR carries SPS/PPS at the *current*
     // encode resolution; a resolution change rebuilds both.
@@ -433,8 +474,8 @@ async fn run_desktop_pipeline(
         }
     }));
 
-    let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / cfg.fps));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // QoS 动态帧率（rustdesk 同款）：好网提升 fps、差网降低。每次 tick
+    // 前读目标 fps，sleep 对应间隔并同步编码器帧率模型（kf_max_dist）。
     let start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
     let mut err_count: u32 = 0;
@@ -443,13 +484,15 @@ async fn run_desktop_pipeline(
     let mut last_posted_wall: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
-        tick.tick().await;
+        let cur_fps = fps_ctl.load(Ordering::SeqCst).clamp(1, 60);
+        enc.set_frame_rate(cur_fps as f32);
+        tokio::time::sleep(Duration::from_secs_f64(1.0 / cur_fps as f64)).await;
         if !running.load(Ordering::SeqCst) {
             break;
         }
         // 每 2 秒一个 IDR, 以真实采集帧计算（与 stride 无关）。
         cap_no += 1;
-        if cap_no % (cfg.fps as u64 * 2) == 0 {
+        if cap_no % (cur_fps as u64 * 2) == 0 {
             enc.force_idr();
         }
         // 低延时管线（MYS-886）: **编码不跳帧**——每个 tick 都捕获+编码。
@@ -577,8 +620,15 @@ async fn run_desktop_pipeline(
         if frame_idx % 10 == 0 {
             let now = start.elapsed().as_secs_f64();
             // 弱网：以浏览器实测带宽为动态天花板(clamp 到 [min, 配置峰值])。
+            // 峰值上限：用户 --desktop-max-bitrate>0 用其值，否则按 rustdesk
+            // 模型 base_bitrate(分辨率)×质量档（1080p balanced ≈1388kbps）。
             use std::sync::atomic::Ordering as O;
-            let eff_max = bandwidth.load(O::Relaxed).min(cfg.max_bps).max(cfg.min_bps);
+            let ceiling = if cfg.max_bps > 0 {
+                cfg.max_bps
+            } else {
+                encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality)
+            };
+            let eff_max = bandwidth.load(O::Relaxed).min(ceiling).max(cfg.min_bps);
             abr.set_ceiling(eff_max);
             let budget = (eff_max as f64 / 8.0 / cfg.fps).max(1.0);
             let byte_ratio = avg_frame_bytes(&byte_win) / budget;
@@ -705,7 +755,7 @@ fn maybe_rescale(
     if nw < 2 || nh < 2 {
         return;
     }
-    match encoder::new_encoder(&cfg.codec, nw as u32, nh as u32, cfg.max_bps, cfg.fps) {
+    match encoder::new_encoder(&cfg.codec, nw as u32, nh as u32, cfg.max_bps, cfg.fps, cfg.quality) {
         Ok(mut new_enc) => {
             tracing::warn!(
                 "desktop: {} encode resolution {enc_w}x{enc_h} -> {nw}x{nh} (bytes={:.0}% budget)",
@@ -755,7 +805,7 @@ mod tests {
         // MYS-886: 分辨率阶梯已禁用 (SCALES = [1.0])。超预算时 maybe_rescale
         // **不再降分辨率** —— 码率交给 AV1/VP9 CBR 在固定分辨率下控制。
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 0usize;
         let (mut enc_w, mut enc_h) = (w0, h0);
@@ -782,7 +832,7 @@ mod tests {
     #[test]
     fn test_maybe_rescale_restores_on_lightly_budgeted_content() {
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 1usize;
         let (mut enc_w, mut enc_h) = (1440usize, 810usize);
@@ -804,7 +854,7 @@ mod tests {
     fn test_tune_once_prefers_resolution_before_stride() {
         // 新策略: 超预算先降分辨率(模糊不掉帧), 分辨率到底才降帧率。
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut stride_idx = 0usize;
         let mut scale_idx = 0usize;
@@ -828,7 +878,7 @@ mod tests {
         // 分辨率已到顶仍超预算 → 降帧率
         let mut byte_win2: VecDeque<u32> = (0..48).map(|_| (budget(cfg.fps) * 1.5) as u32).collect();
         let mut since_change2 = 30u32;
-        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
         let mut stride2 = 0usize;
         let mut scale2 = SCALES.len() - 1;
         let (mut ew2, mut eh2) = (480usize, 270usize);
@@ -844,7 +894,7 @@ mod tests {
     #[test]
     fn test_tune_once_restores_slowly() {
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut stride_idx = 2usize;
         let mut scale_idx = 1usize; // 分辨率与帧率都降过
@@ -876,7 +926,7 @@ mod tests {
     #[test]
     fn test_maybe_rescale_respects_cooldown_and_bounds() {
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 0usize;
         let (mut enc_w, mut enc_h) = (w0, h0);
@@ -891,7 +941,7 @@ mod tests {
         );
         assert_eq!(scale_idx, 0, "cooldown must block change");
         // 已经是最小档: 极端超预算也不能再降
-        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps).unwrap();
+        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
         let mut scale_idx = SCALES.len() - 1;
         let (mut ew, mut eh) = (480usize, 270usize);
         let mut byte_win2: VecDeque<u32> = (0..48).map(|_| (budget(cfg.fps) * 1.5) as u32).collect();
@@ -1085,6 +1135,7 @@ mod tests {
                 Arc::new(std::sync::atomic::AtomicU64::new(bw)),
                 "test".to_string(),
                 0,
+                Arc::new(std::sync::atomic::AtomicU32::new(30)),
             ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
@@ -1124,7 +1175,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30))));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -1164,7 +1215,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30))));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;

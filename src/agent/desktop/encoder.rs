@@ -36,22 +36,157 @@ pub trait VideoEncoder: Send {
     /// the init segment. H.264 needs SPS/PPS from an IDR frame; VP9 carries
     /// profile/level statically.
     fn mux_sample(&self, frame: &EncodedFrame) -> Option<VisualSample>;
+    /// 运行时按质量档调整编码（rustdesk QoS 行为）：重算目标码率 + QP 区间。
+    /// 默认 no-op（H.264 软编不支持动态质量）。
+    fn set_quality(&mut self, _ratio: f32) {}
+}
+
+/// rustdesk 同款质量档 → 码率倍率（`libs/scrap/src/common/codec.rs`）。
+pub const QUALITY_SPEED: f32 = 0.5;
+pub const QUALITY_BALANCED: f32 = 0.67;
+pub const QUALITY_BEST: f32 = 1.5;
+
+/// 按分辨率给基准码率（kbps 级，rustdesk `base_bitrate` 表）。
+/// 1080p → 2073kbps；目标码率 = base_bitrate × quality 档。
+pub fn base_bitrate(width: u32, height: u32) -> u64 {
+    const PRESETS: &[(u32, u32, u64)] = &[
+        (640, 480, 400),
+        (800, 600, 500),
+        (1024, 768, 800),
+        (1280, 720, 1000),
+        (1366, 768, 1100),
+        (1440, 900, 1300),
+        (1600, 900, 1500),
+        (1920, 1080, 2073),
+        (2048, 1080, 2200),
+        (2560, 1440, 3000),
+        (3440, 1440, 4000),
+        (3840, 2160, 5000),
+        (7680, 4320, 12000),
+    ];
+    let pixels = (width as u64) * (height as u64);
+    let (preset_pixels, preset_bitrate) = PRESETS
+        .iter()
+        .map(|(w, h, b)| (*w as u64 * *h as u64, *b))
+        .min_by_key(|(pp, _)| {
+            if *pp >= pixels {
+                *pp - pixels
+            } else {
+                pixels - *pp
+            }
+        })
+        .unwrap_or(((1920 * 1080) as u64, 2073));
+    (preset_bitrate as f64 * (pixels as f64 / preset_pixels as f64)).round() as u64
+}
+
+/// rustdesk 同款 QP 区间映射（`vpxcodec::calc_q_values`）：
+/// q_min∈[0,36]、q_max∈[37,56]，高质量档区间更紧（清晰）、极速档更松（模糊但快）。
+pub fn calc_q_values(ratio: f32) -> (u32, u32) {
+    let b = (ratio * 100.0) as u32;
+    let b = b.min(200);
+    let (q_min1, q_min2) = (36u32, 0u32);
+    let (q_max1, q_max2) = (56u32, 37u32);
+    let t = b as f32 / 200.0;
+    let q_min = (((1.0 - t) * q_min1 as f32 + t * q_min2 as f32).round() as u32).clamp(q_min2, q_min1);
+    let q_max = (((1.0 - t) * q_max1 as f32 + t * q_max2 as f32).round() as u32).clamp(q_max2, q_max1);
+    (q_min, q_max)
+}
+
+/// 目标码率（bps）：rustdesk 模型 `base_bitrate(w,h) × quality`（base 单位
+/// kbps，乘 1000 转 bps），用户 `--desktop-max-bitrate` 显式设值时作为
+/// 硬顶（max_bps>0）；0 = 自动跟随 rustdesk 模型。
+pub fn target_bitrate(width: u32, height: u32, max_bps: u64, quality: f32) -> u64 {
+    let auto = (base_bitrate(width, height) as f64 * quality as f64 * 1000.0).round() as u64;
+    if max_bps > 0 {
+        auto.min(max_bps)
+    } else {
+        auto
+    }
 }
 
 /// Construct an encoder for a codec name (`av1` / `vp9` / `h264`).
+/// `max_bps` 语义：0 = 自动按 rustdesk 模型（base_bitrate × quality），
+/// >0 = 用户硬顶。`quality` = 质量档倍率（speed/balanced/best）。
 pub fn new_encoder(
     codec: &str,
     w: u32,
     h: u32,
     max_bps: u64,
     fps: f64,
+    quality: f32,
 ) -> Result<Box<dyn VideoEncoder>, String> {
+    let target = target_bitrate(w, h, max_bps, quality);
+    let (q_min, q_max) = calc_q_values(quality);
     match codec.to_ascii_lowercase().as_str() {
-        "h264" => crate::agent::desktop::openh264::H264Encoder::new(w, h, max_bps, fps).map(|e| Box::new(e) as Box<dyn VideoEncoder>),
+        "h264" => crate::agent::desktop::openh264::H264Encoder::new(w, h, target, fps)
+            .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         #[cfg(feature = "vp9")]
-        "vp9" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, max_bps, fps).map(|e| Box::new(e) as Box<dyn VideoEncoder>),
+        "vp9" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, target, fps, q_min, q_max)
+            .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         #[cfg(feature = "av1")]
-        "av1" => crate::agent::desktop::aom::AomEncoder::new(w, h, max_bps, fps).map(|e| Box::new(e) as Box<dyn VideoEncoder>),
+        "av1" => crate::agent::desktop::aom::AomEncoder::new(w, h, target, fps, q_min, q_max)
+            .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         other => Err(format!("unsupported desktop codec: {other}")),
+    }
+}
+
+/// 自动降级创建编码器（rustdesk `set_fallback` 行为）：请求的 codec 初始化
+/// 失败时按 `av1 → vp9 → h264` 顺序回退，返回 (编码器, 实际生效 codec)。
+/// 用于硬件不可用/静态链接缺失时保证桌面流仍能启动。
+pub fn create_encoder_fallback(
+    codec: &str,
+    w: u32,
+    h: u32,
+    max_bps: u64,
+    fps: f64,
+    quality: f32,
+) -> Result<(Box<dyn VideoEncoder>, String), String> {
+    let codec_l = codec.to_ascii_lowercase();
+    let chain: Vec<&str> = match codec_l.as_str() {
+        "av1" => vec!["av1", "vp9", "h264"],
+        "vp9" => vec!["vp9", "h264"],
+        "h264" => vec!["h264"],
+        other => vec![other, "vp9", "h264"],
+    };
+    let mut last_err = String::new();
+    for c in chain {
+        match new_encoder(c, w, h, max_bps, fps, quality) {
+            Ok(e) => return Ok((e, c.to_string())),
+            Err(e) => last_err = format!("{c}: {e}"),
+        }
+    }
+    Err(format!("all encoders failed — {last_err}"))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_base_bitrate_rustdesk_table() {
+        // rustdesk 同款分辨率基准：1080p→2073k、720p→1000k。
+        assert_eq!(base_bitrate(1920, 1080), 2073);
+        assert_eq!(base_bitrate(1280, 720), 1000);
+        assert_eq!(base_bitrate(640, 480), 400);
+    }
+
+    #[test]
+    fn test_target_bitrate_quality_model() {
+        // 1080p balanced(0.67) → ≈1389kbps；best(1.5) → ≈3110kbps。
+        let b = target_bitrate(1920, 1080, 0, QUALITY_BALANCED);
+        assert!((1_350_000..1_430_000).contains(&b), "1080p balanced = {b}");
+        let best = target_bitrate(1920, 1080, 0, QUALITY_BEST);
+        assert!((3_000_000..3_220_000).contains(&best), "1080p best = {best}");
+        // 用户硬顶覆盖
+        let capped = target_bitrate(1920, 1080, 800_000, QUALITY_BEST);
+        assert_eq!(capped, 800_000);
+    }
+
+    #[test]
+    fn test_calc_q_values_maps_quality() {
+        // 高质量档 QP 更紧（清晰），极速档更松。
+        let (q_min, q_max) = calc_q_values(QUALITY_BEST);
+        assert!(q_min < q_max && q_min <= 36 && q_max >= 37);
+        let (q_min_s, q_max_s) = calc_q_values(QUALITY_SPEED);
+        assert!(q_min_s >= q_min && q_max_s >= q_max, "speed 应比 best 更松");
     }
 }

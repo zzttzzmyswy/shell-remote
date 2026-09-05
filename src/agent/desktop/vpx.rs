@@ -24,6 +24,9 @@ pub struct Vp9Encoder {
     height: u32,
     fps: f64,
     bitrate_bps: u64,
+    /// 用户 --desktop-max-bitrate 覆盖（0 = 自动 rustdesk 模型）。
+    max_bps: u64,
+    quality: f32,
     /// 下一次 encode 强制关键帧（通过 encode flags 传 VPX_EFLAG_FORCE_KF）。
     force_kf: bool,
 }
@@ -41,7 +44,14 @@ const VPX_FRAME_IS_KEY: c_uint = 0x1;
 
 impl Vp9Encoder {
     /// Create a VP9 encoder pinned to `w x h` at `fps` frames/s.
-    pub fn new(w: u32, h: u32, bitrate_bps: u64, fps: f64) -> Result<Self, String> {
+    pub fn new(
+        w: u32,
+        h: u32,
+        bitrate_bps: u64,
+        fps: f64,
+        q_min: u32,
+        q_max: u32,
+    ) -> Result<Self, String> {
         assert!(w % 2 == 0 && h % 2 == 0, "dimensions must be even for 4:2:0");
         assert!(bitrate_bps > 0 && fps > 0.0);
 
@@ -67,9 +77,10 @@ impl Vp9Encoder {
             cfg.g_lag_in_frames = 0;
             cfg.rc_end_usage = vpx_sys::vpx_rc_mode::VPX_CBR;
             cfg.rc_target_bitrate = (bitrate_bps / 1000).min(u32::MAX as u64) as c_uint;
-            cfg.rc_min_quantizer = 0;
-            cfg.rc_max_quantizer = 63;
-            cfg.rc_undershoot_pct = 95;
+            cfg.rc_min_quantizer = q_min;
+            cfg.rc_max_quantizer = q_max;
+            cfg.rc_undershoot_pct = 25;
+            cfg.rc_overshoot_pct = 25;
             // VP9 的 RC 需要 dropframe 作高熵压力阀: dropframe=0 时高熵内容
             // 码率彻底失控(实测 7367kbps @ 800k 目标)且编码速度暴跌
             // (156ms/帧, CBR 死命压大帧)。保留 25 让 RC 丢弃过盈的高熵帧
@@ -102,6 +113,8 @@ impl Vp9Encoder {
                 height: h,
                 fps,
                 bitrate_bps,
+                max_bps: 0,
+                quality: crate::agent::desktop::encoder::QUALITY_BALANCED,
                 force_kf: false,
             })
         }
@@ -189,6 +202,27 @@ impl Vp9Encoder {
         }
     }
 
+    /// 按质量档动态调整（rustdesk QoS 同款）：重算目标码率 + QP 区间。
+    pub fn set_quality(&mut self, ratio: f32) {
+        self.quality = ratio;
+        let (q_min, q_max) = crate::agent::desktop::encoder::calc_q_values(ratio);
+        let target = crate::agent::desktop::encoder::target_bitrate(
+            self.width,
+            self.height,
+            self.max_bps,
+            ratio,
+        );
+        self.bitrate_bps = target;
+        unsafe {
+            let src_ptr = self.ctx.config.enc as *const vpx_sys::vpx_codec_enc_cfg_t;
+            let mut cfg: vpx_sys::vpx_codec_enc_cfg_t = std::ptr::read(src_ptr);
+            cfg.rc_target_bitrate = (target / 1000).min(u32::MAX as u64) as c_uint;
+            cfg.rc_min_quantizer = q_min;
+            cfg.rc_max_quantizer = q_max;
+            vpx_sys::vpx_codec_enc_config_set(&mut self.ctx, &cfg);
+        }
+    }
+
     /// Read back the current target bitrate (bps).
     pub fn bitrate_bps(&self) -> u64 {
         self.bitrate_bps
@@ -250,6 +284,10 @@ impl crate::agent::desktop::encoder::VideoEncoder for Vp9Encoder {
         Vp9Encoder::set_bitrate(self, bps);
     }
 
+    fn set_quality(&mut self, ratio: f32) {
+        Vp9Encoder::set_quality(self, ratio);
+    }
+
     fn bitrate_bps(&self) -> u64 {
         Vp9Encoder::bitrate_bps(self)
     }
@@ -293,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_vp9_encoder_produces_frames() {
-        let mut enc = Vp9Encoder::new(320, 240, 400_000, 15.0).expect("vp9 init");
+        let mut enc = Vp9Encoder::new(320, 240, 400_000, 15.0, 24, 50).expect("vp9 init");
         let mut saw_key = false;
         let mut bytes = 0usize;
         for t in 0..30 {
@@ -317,7 +355,7 @@ mod tests {
     #[test]
     fn test_vp9_bitrate_actually_controlled() {
         // 800k 目标下实测码率应收敛在目标附近（这是 OpenH264 skip=0 做不到的）。
-        let mut enc = Vp9Encoder::new(1280, 720, 800_000, 30.0).expect("vp9 init");
+        let mut enc = Vp9Encoder::new(1280, 720, 800_000, 30.0, 24, 50).expect("vp9 init");
         let (mut bytes, mut out) = (0usize, 0usize);
         // 模拟真实桌面动画: 静态底色 + 一个移动的高对比窗口(而非随机噪声,
         // 噪声的不可压缩性不反映真实桌面, 会让 RC 误判)。
