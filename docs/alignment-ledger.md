@@ -90,7 +90,7 @@
 | 30 | 时钟校准 15min 慢校准 | ✔ | 连接期每 15min 重校（desktop.js:_startMetrics） |
 | 31 | 注册风暴防御 | ✔ | 120/min+冷却（agent/mod.rs） |
 | 32 | 剪贴板大文本走文件传输 | ⬜ | |
-| 33 | 输入 10ms 合并节流 | ⬜ | |
+| 33 | 输入 10ms 合并节流 | ✔ | mousemove 10ms 合并最后坐标（desktop.js:_onPointerMove，与 #34 叠加） |
 | 34 | 弱网输入降采样 | ✔ | e2e>300ms 2:1 / >800ms 4:1（desktop.js:_onPointerMove） |
 | 35 | 弱网控制消息直通 | ⬜ | |
 | 36-38 | KCP/白名单/IPv6 | ⬜ | 远期 |
@@ -144,7 +144,7 @@
 
 ### 批次 5 · 测试与遥测（147-167）
 
-◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）已入仓。统一时间线/13s 决策树/admin KPI 曲线/带宽记账/log 轮转/crash.log 上报/评分卡聚合/告警未做。
+◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现。统一时间线/13s 决策树/admin KPI 曲线/带宽记账/crash.log 上报/告警未做。
 
 ### 批次 6 · 风险与回滚（168-177）
 
@@ -158,11 +158,10 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **36%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复、丁 弱网可见性+输入节流、丙 遥测基线）；⬜ 38%（丙遥测剩余、戊发布门槛）；◐ 26%。
-- **R5 落地清单（200 点）**：✔ 类约 **34%**（可靠通道 7 项 / 前端 17 项 / 抓帧 3 项 / 编码器 2 项 / 遥测测试 4 项）；⬜ 48%。
-- **第 4 轮新增合入**：
-  1. QoS 快照结构化（`mod.rs` desktop QoS 日志带 decode_fps/decode_queue/bitrate_kbps）→ R5#149；
-  2. 心跳扩展 KPI（`agent/mod.rs sender_loop` 心跳带 running/codec/fps/quality_permille/bitrate_kbps，`test_sender_loop_heartbeat_carries_desktop_kpi`）→ R3 丙140 / R5#150；
-  3. 弱网矩阵脚本（`tools/weaknet_matrix.sh`：netem 6 组 RTT×丢包 + 浏览器采样评分卡）→ R5#156；
-  4. 重连矩阵脚本（`tools/reconnect_matrix.sh`：agent/relay/browser 三源 ×5 恢复检测）→ R3 戊165 / R5#164。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批、log 轮转等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **R4/5（200 点）**：✔ 类约 **38%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复、丁 弱网可见性+输入节流、丙 遥测基线+日志）；⬜ 36%（丙遥测剩余、戊发布门槛）；◐ 26%。
+- **R5 落地清单（200 点）**：✔ 类约 **38%**（可靠通道 7 项 / 前端 18 项 / 抓帧 3 项 / 编码器 2 项 / 遥测测试 7 项）；⬜ 45%。
+- **第 5 轮新增合入**：
+  1. 输入 10ms 合并节流（`desktop.js:_onPointerMove` 缓存最后坐标 10ms flush，与 #34 弱网降采样叠加）→ R3 己188 / R5#33；
+  2. 日志轮转（`main.rs` `SR_LOG_DIR` 环境变量 → hourly rolling file + non_blocking，实测生成 `shell-remote.log.YYYY-MM-DD-HH`）→ R3 己191 / R5#153；
+  3. 评分卡脚本（`tools/scorecard.sh`：浏览器采样 fps/e2e/seq 丢帧率 → JSON 评分卡 + R4 戊172 门槛判定）→ R3 戊176 / R5#155。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批等——在台账对应 ⬜/◐ 行，未宣称完成。
