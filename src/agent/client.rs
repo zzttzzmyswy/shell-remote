@@ -79,6 +79,45 @@ struct Transport {
     _task: tokio::task::JoinHandle<()>,
 }
 
+/// 构建注册时声明的能力集（R5#44 capability 协商）：codec 按编译 feature
+/// （与 `DesktopConfig::supports_codec` 对齐），backend 按**平台 + 运行时
+/// 探测**真实声明——Linux 不声明 Windows 专属 GDI/DXGI；Wayland 需编译
+/// feature 且 `WAYLAND_DISPLAY` 可达才声明（无 feature 恒不声明）。
+fn build_capabilities() -> Vec<String> {
+    let mut caps: Vec<String> = Vec::new();
+    caps.push("codec:h264".to_string());
+    #[cfg(feature = "vp9")]
+    caps.push("codec:vp9".to_string());
+    #[cfg(feature = "av1")]
+    caps.push("codec:av1".to_string());
+    #[cfg(target_os = "linux")]
+    {
+        caps.push("backend:x11".to_string());
+        #[cfg(feature = "wayland")]
+        if std::env::var("WAYLAND_DISPLAY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            caps.push("backend:wayland".to_string());
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        caps.push("backend:gdi".to_string());
+        caps.push("backend:dxgi".to_string());
+    }
+    for f in [
+        "desktop:gray",
+        "desktop:quality",
+        "desktop:clipboard",
+        "desktop:cursor",
+        "desktop:test-delay",
+    ] {
+        caps.push(f.to_string());
+    }
+    caps
+}
+
 pub struct RelayClient {
     transport: Transport,
     pub session_id: String,
@@ -167,12 +206,10 @@ impl RelayClient {
         register_msg["agent_version"] = json!(env!("CARGO_PKG_VERSION"));
         // R5#44 capability 协商最小子集：注册时声明能力集（codec/后端/
         // 桌面功能），relay 存储并在 admin overview 展示，浏览器可据此协商。
-        register_msg["capabilities"] = json!([
-            "codec:av1", "codec:vp9", "codec:h264",
-            "backend:x11", "backend:wayland", "backend:gdi", "backend:dxgi",
-            "desktop:gray", "desktop:quality", "desktop:clipboard",
-            "desktop:cursor", "desktop:test-delay",
-        ]);
+        // 后端按**平台 + 运行时探测**真实声明（Linux 不声明 Windows 专属
+        // GDI/DXGI；Wayland 需编译 feature 且 WAYLAND_DISPLAY 可达）——
+        // 避免 capability 声明不实误导浏览器/admin。
+        register_msg["capabilities"] = json!(build_capabilities());
 
         let resp = http_client
             .post(&send_url)
@@ -403,6 +440,53 @@ impl RelayClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_capabilities_platform_accurate() {
+        // R5#44 细化：capability 声明真实——codec 按编译 feature，后端按平台。
+        let caps = build_capabilities();
+        // codec：h264 恒在，av1/vp9 按 feature。
+        assert!(caps.iter().any(|c| c == "codec:h264"));
+        #[cfg(feature = "av1")]
+        assert!(caps.iter().any(|c| c == "codec:av1"));
+        #[cfg(feature = "vp9")]
+        assert!(caps.iter().any(|c| c == "codec:vp9"));
+        // 平台后端声明真实：非 Windows 不声明 Windows 专属 GDI/DXGI。
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            !caps.iter().any(|c| c == "backend:gdi" || c == "backend:dxgi"),
+            "非 Windows 不应声明 backend:gdi/dxgi（此前硬编码声明不实）"
+        );
+        // 桌面功能齐全。
+        for f in [
+            "desktop:gray",
+            "desktop:quality",
+            "desktop:clipboard",
+            "desktop:cursor",
+            "desktop:test-delay",
+        ] {
+            assert!(caps.iter().any(|c| c == f), "缺少 {f}");
+        }
+    }
+
+    #[test]
+    fn test_build_capabilities_wayland_detection() {
+        // Wayland 后端仅在编译 feature + WAYLAND_DISPLAY 可达时声明。
+        std::env::remove_var("WAYLAND_DISPLAY");
+        let off = build_capabilities();
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        let on = build_capabilities();
+        std::env::remove_var("WAYLAND_DISPLAY");
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
+        {
+            assert!(!off.iter().any(|c| c == "backend:wayland"), "无 WAYLAND_DISPLAY 不应声明");
+            assert!(on.iter().any(|c| c == "backend:wayland"), "WAYLAND_DISPLAY 可达应声明");
+        }
+        // 默认 feature 无 wayland：恒不声明（覆盖非 linux/无 feature 情形）。
+        #[cfg(not(all(target_os = "linux", feature = "wayland")))]
+        assert!(!on.iter().any(|c| c == "backend:wayland"), "无 wayland feature 不应声明");
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
 
     #[tokio::test]
     async fn test_pump_sse_events_forwards_data_payloads() {
