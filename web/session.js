@@ -348,6 +348,16 @@
         }
     });
 
+    // 远端光标 overlay（R5#64 光标独立通道）：X11 捕获画面（GetImage）不含
+    // 光标层——远程用户看不到鼠标指针。agent 独立查询位置（100ms 节流）经
+    // desktop:cursor 轻量消息下发，此处转发给播放器 overlay 渲染。
+    window.shellRemote.on('desktop:cursor', function(msg) {
+        if (desktopView && typeof desktopView.updateCursor === 'function') {
+            const p = msg.payload || {};
+            desktopView.updateCursor(Number(p.x), Number(p.y), p.shown !== false);
+        }
+    });
+
     // ── 剪贴板同步（纯文本）──────────────────────────────────
     // → 远端：读文本框（为空则读本机剪贴板）发给 agent 设置远端剪贴板。
     // 远端 → 本机：请求 agent 读远端剪贴板，回包写入文本框并尝试写本机

@@ -28,6 +28,10 @@ pub trait FrameSource: Send {
     fn next_frame(&mut self) -> Result<Frame, String>;
     /// Fixed capture resolution in pixels.
     fn resolution(&self) -> (usize, usize);
+    /// 光标位置回调（R5#64 光标独立通道）：默认 no-op，X11 实现注入生效。
+    /// 捕获画面通常不含光标层——独立查询位置经 `desktop:cursor` 轻量消息
+    /// 发给浏览器 overlay（光标移动不触发整帧重编码）。
+    fn set_cursor_cb(&mut self, _cb: Box<dyn FnMut(i32, i32, bool) + Send>) {}
 }
 
 /// Open a capture source. `kind` is one of `auto`, `x11`, `wayland`,
@@ -317,6 +321,14 @@ pub struct X11Source {
     /// 注册后 `next_frame` 用 `poll_for_event` 读事件——只有真变更才触发
     /// 重建，替代固定 30 帧一次的 `get_geometry` 轮询往返。
     randr_registered: bool,
+    /// 光标位置回调（R5#64 光标独立通道）：X11 `GetImage`/`ShmGetImage`
+    /// **不含光标层**——远程用户看不到鼠标指针。`next_frame` 每 100ms 查询
+    /// 一次 root 指针位置，经此回调以 `desktop:cursor {x,y,shown}` 轻量消息
+    /// 发给浏览器 overlay（光标移动不再触发整帧重编码）。None = 非 X11
+    /// 后端或未注入。
+    cursor_cb: Option<Box<dyn FnMut(i32, i32, bool) + Send>>,
+    /// 上次光标查询时刻（100ms 节流）。
+    last_cursor_at: std::time::Instant,
 }
 
 /// MIT-SHM segment: SysV shared memory mapped into our address space and
@@ -372,6 +384,8 @@ impl X11Source {
             shm_failed: false,
             recheck: 0,
             randr_registered: false,
+            cursor_cb: None,
+            last_cursor_at: std::time::Instant::now(),
         };
         // 注册 XRANDR ScreenChangeNotify（R5#131）：分辨率事件驱动替代轮询。
         // 失败静默——事件驱动是优化，无扩展时回落现有 30 帧轮询。
@@ -731,11 +745,49 @@ impl FrameSource for X11Source {
                 },
             },
         };
+        // 光标位置通道（R5#64）：X11 GetImage 不含光标层——独立查询位置，
+        // 经 cursor_cb 发 desktop:cursor 轻量消息（100ms 节流，不触发整帧
+        // 重编码）。static 帧退避期也会被周期性调用，光标仍实时更新。
+        self.poll_cursor();
         Ok(Frame {
             bgra,
             width: self.width as usize,
             height: self.height as usize,
         })
+    }
+
+    /// 注入光标位置回调（R5#64）：捕获线程 `next_frame` 每 100ms 节流查询
+    /// root 指针位置后调用。须在 source move 进抓帧线程前设置。
+    fn set_cursor_cb(&mut self, cb: Box<dyn FnMut(i32, i32, bool) + Send>) {
+        self.cursor_cb = Some(cb);
+    }
+}
+
+impl X11Source {
+    /// 光标位置查询（R5#64 光标独立通道）：X11 捕获画面不含光标层，远程
+    /// 用户看不到鼠标指针。每 100ms 节流查询 root 指针位置并经 `cursor_cb`
+    /// 回调上报（agent 侧转成 `desktop:cursor` 轻量消息，浏览器 overlay 渲染）。
+    /// 失败静默（光标只是叠加层，不阻塞画面流）。
+    fn poll_cursor(&mut self) {
+        if self.cursor_cb.is_none() {
+            return;
+        }
+        if self.last_cursor_at.elapsed() < std::time::Duration::from_millis(100) {
+            return;
+        }
+        self.last_cursor_at = std::time::Instant::now();
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        match self.conn.query_pointer(self.root) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => {
+                    if let Some(cb) = self.cursor_cb.as_mut() {
+                        cb(reply.root_x as i32, reply.root_y as i32, true);
+                    }
+                }
+                Err(e) => tracing::debug!(%e, "query_pointer reply failed"),
+            },
+            Err(e) => tracing::debug!(%e, "query_pointer failed"),
+        }
     }
 }
 

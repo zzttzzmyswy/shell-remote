@@ -70,6 +70,9 @@
       this._probeSeq = 0;
       this._probeRttMs = 0;
       this._testDelayTimer = null;
+      // 远端光标 overlay（R5#64）：X11 GetImage 不含光标层，agent 独立发
+      // 位置（100ms 节流），本 div 绝对定位叠加在视频上。懒创建。
+      this._cursorEl = null;
       // agent 经 desktop:qos-ack 回传的当前 QoS 状态（目标帧率/码率档）。
       // 面板"目标帧率/活动"行展示：与渲染帧率对照，可分辨"是我在降帧
       // 还是解码跟不上"（对齐 rustdesk TestDelay/target fps，MYS-886）。
@@ -915,6 +918,45 @@
           });
         }
       }, 1000);
+    }
+    // 远端光标 overlay（R5#64 光标独立通道）：agent 独立查询位置（X11
+    // GetImage 不含光标层）经 desktop:cursor 下发，此处把光标渲染到视频
+    // 上方。坐标从 agent 捕获分辨率映射到实际显示尺寸（容器缩放后仍准）。
+    updateCursor(x, y, shown) {
+      const v = this._targetEl();
+      if (!v) return;
+      if (!shown) {
+        if (this._cursorEl) this._cursorEl.style.display = 'none';
+        return;
+      }
+      const srcW = this._videoW(), srcH = this._videoH();
+      if (!srcW || !srcH) return;
+      const rect = v.getBoundingClientRect();
+      const dispW = rect.width, dispH = rect.height;
+      if (!dispW || !dispH) return;
+      let el = this._cursorEl;
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'sr-cursor-overlay';
+        el.style.cssText = 'position:absolute;pointer-events:none;z-index:10;width:20px;height:20px;' +
+          'background-image:url(\'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><path d="M2 1 L2 13 L5.5 10.2 L8 14.5 L10 13.5 L7.5 9.3 L11 9.3 Z" fill="rgba(0,0,0,0.85)" stroke="white" stroke-width="1.2"/></svg>\');' +
+          'background-size:contain;background-repeat:no-repeat;';
+        const container = v.parentElement || document.body;
+        if (container) {
+          if (getComputedStyle(container).position === 'static') {
+            container.style.position = 'relative';
+          }
+          container.appendChild(el);
+        }
+        this._cursorEl = el;
+      }
+      const cont = el.parentElement;
+      const contRect = cont ? cont.getBoundingClientRect() : { left: 0, top: 0 };
+      const left = (rect.left - contRect.left) + (x / srcW) * dispW;
+      const top = (rect.top - contRect.top) + (y / srcH) * dispH;
+      el.style.left = Math.max(0, Math.round(left)) + 'px';
+      el.style.top = Math.max(0, Math.round(top)) + 'px';
+      el.style.display = 'block';
     }
     _startMetrics() {
       if (this._metricsTimer) return;

@@ -668,7 +668,7 @@ async fn run_desktop_loop(
     gray: Arc<std::sync::atomic::AtomicBool>,
     idr_request: Arc<std::sync::atomic::AtomicBool>,
 ) {
-        let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
+        let mut src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok((src, backend)) => (src, backend),
         Err(e) => {
             tracing::error!("desktop capture open failed: {}", e);
@@ -689,11 +689,10 @@ async fn run_desktop_pipeline(
     cfg: DesktopConfig,
     running: Arc<AtomicBool>,
     post: PostFn,
-    src: Box<dyn capture::FrameSource>,
+    mut src: Box<dyn capture::FrameSource>,
     bandwidth: Arc<std::sync::atomic::AtomicU64>,
     backend: String,
-    clock_offset_ms: i64,
-    fps_ctl: Arc<std::sync::atomic::AtomicU32>,
+    clock_offset_ms: i64,    fps_ctl: Arc<std::sync::atomic::AtomicU32>,
     qos_scale: Arc<std::sync::atomic::AtomicU32>,
     qos_frames: Arc<std::sync::atomic::AtomicU64>,
     qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
@@ -702,6 +701,16 @@ async fn run_desktop_pipeline(
 ) {
     // cfg 需可变：编码器 fallback 后回写实际 codec。
     let mut cfg = cfg;
+    // 光标独立通道（R5#64）：X11 GetImage 不含光标层，远程用户看不到鼠标
+    // 指针。注入位置回调 → `desktop:cursor {x,y,shown}` 轻量消息（100ms 节流，
+    // 光标移动不触发整帧重编码）。须在 src move 进抓帧线程前设置。
+    let cursor_post = post.clone();
+    src.set_cursor_cb(Box::new(move |x, y, shown| {
+        (cursor_post)(serde_json::json!({
+            "type": "desktop:cursor",
+            "payload": { "x": x, "y": y, "shown": shown }
+        }));
+    }));
     // 截图线程化（rustdesk capture 线程对齐）：capture 挪到独立线程持续
     // 抓帧，编码循环 try_latest 非阻塞取最新帧——抓帧（X11/DXGI）不再拖慢
     // 编码，慢抓帧时跳帧追最新。src 被 move 进抓帧线程。

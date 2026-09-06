@@ -202,6 +202,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "desktop:uplink",
             "desktop:clipboard",
             "desktop:qos-ack",
+            "desktop:cursor",
             "test-delay-ack",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {
@@ -392,6 +393,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 "desktop:uplink",
                 "desktop:clipboard",
                 "desktop:qos-ack",
+                "desktop:cursor",
                 "test-delay-ack",
                 "mcp:result",
                 "mcp:exec_result",
