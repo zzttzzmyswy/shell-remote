@@ -40,7 +40,7 @@
 
 ### 丙 遥测（111-140）
 
-◐ 部分。QoS 快照结构化日志（R5#149）、心跳扩展 KPI（#150）、relay 带宽记账（#152）、评分卡脚本（#155）已有；**admin KPI 曲线已做**（第 16 轮：relay 采样 agent 心跳 KPI——15s×120 点 FIFO，`/api/session/kpi/:sid` 时间序列 + admin 面板 📈 canvas 折线 fps/bitrate）；**13s 归因决策树已做**（第 23 轮：`tools/qos_attribution.py` 解析 QoS 快照按 probe/qos_state/dq/dfps 归因 network/decode/encode/static/good + 中位延迟建议，分支单测 + 真实日志验证）。统一时间线未做；**crash.log 上报已做**（第 24 轮：`main.rs` panic hook 带时间戳/pid/backtrace/append，崩溃留痕）。第 36 轮核实修正。
+◐ 部分。QoS 快照结构化日志（R5#149）、心跳扩展 KPI（#150）、relay 带宽记账（#152）、评分卡脚本（#155）已有；**admin KPI 曲线已做**（第 16 轮：relay 采样 agent 心跳 KPI——15s×120 点 FIFO，`/api/session/kpi/:sid` 时间序列 + admin 面板 📈 canvas 折线 fps/bitrate）；**13s 归因决策树已做**（第 23 轮：`tools/qos_attribution.py` 解析 QoS 快照按 probe/qos_state/dq/dfps 归因 network/decode/encode/static/good + 中位延迟建议，分支单测 + 真实日志验证）。统一时间线**最小子集已做**（第 47 轮：`tools/timeline_merge.py`——agent/relay/KPI 事件按墙钟 unix-ms 聚合为统一时间线，弱网排查看三端因果）；**crash.log 上报已做**（第 24 轮：`main.rs` panic hook 带时间戳/pid/backtrace/append，崩溃留痕）。第 36 轮核实修正。
 
 ### 丁 弱网纵深（141-170）
 
@@ -146,7 +146,7 @@
 
 ### 批次 5 · 测试与遥测（147-167）
 
-◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）；**crash.log 崩溃日志已增强**（第 24 轮：`main.rs` panic hook 补时间戳/pid/backtrace/`SR_LOG_DIR` 路径/append 多次崩溃保留——基础 hook 前已有，本轮补齐字段与保留策略）。统一时间线未做；**告警雏形已做**（第 44 轮：relay KPI 采样处 `kpi_anomalous(active, fps)` 判据——内容活跃但 fps<10（动态异常降帧，用户铁律动态不降帧）→ `tracing::warn` 告警日志，≥30s/会话限频；静止 active=false 不误报；纯函数 `kpi_anomalous` + 单测，采样测试断言 active/bp_count 落库）。第 43 轮：心跳扩展 KPI 补 **active（内容活跃/静止）+ bp_count（relay 拥塞累计）** 字段（`DesktopKpi` + `kpi_snapshot` + sender_loop 心跳 JSON，测试断言扩展）——admin KPI 曲线可观测静止/活跃与传输段拥塞时间线。
+◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）；**crash.log 崩溃日志已增强**（第 24 轮：`main.rs` panic hook 补时间戳/pid/backtrace/`SR_LOG_DIR` 路径/append 多次崩溃保留——基础 hook 前已有，本轮补齐字段与保留策略）。统一时间线**最小子集已做**（第 47 轮：`tools/timeline_merge.py` 聚合 agent/relay/KPI 墙钟事件）；**告警雏形已做**（第 44 轮：relay KPI 采样处 `kpi_anomalous(active, fps)` 判据——内容活跃但 fps<10（动态异常降帧，用户铁律动态不降帧）→ `tracing::warn` 告警日志，≥30s/会话限频；静止 active=false 不误报；纯函数 `kpi_anomalous` + 单测，采样测试断言 active/bp_count 落库）。第 43 轮：心跳扩展 KPI 补 **active（内容活跃/静止）+ bp_count（relay 拥塞累计）** 字段（`DesktopKpi` + `kpi_snapshot` + sender_loop 心跳 JSON，测试断言扩展）——admin KPI 曲线可观测静止/活跃与传输段拥塞时间线。
 
 ### 批次 6 · 风险与回滚（168-177）
 
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **93%**（可靠通道 30 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 15 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **94%**（可靠通道 30 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 16 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -244,4 +244,6 @@
   1. 内存画像最小子集（R5#136-146 部分）：agent 心跳 KPI 加 `rss_kb`（`self_rss_kb` 读 `/proc/self/statm` resident×4KB，非 Linux 回退 0）+ 单测 `test_self_rss_kb_reports_positive`；relay `AgentKpiSample.rss_kb` 解析 → admin `/api/session/kpi` 可见 **agent 内存时间线**（长稳验收 RSS 判据的旁证，运维可发现内存泄漏趋势）。测试：采样测试断言 rss_kb 落库。全量 `cargo test` **392 通过**（+1）。
 - **第 46 轮新增合入**：
   1. 功耗采样最小子集（R5#136-146 部分）：agent 心跳 KPI 加 `cpu_ms`（`cpu_ms_from_stat` 纯函数解析 `/proc/self/stat` utime+stime（字段 14/15，comm 含空格用 rsplit）→ ×tick 换算 ms；`self_cpu_ms` 真读 + sysconf(_SC_CLK_TCK)）→ relay `AgentKpiSample.cpu_ms` → 两次心跳采样差 = **区间 CPU 使用率**，admin KPI 可见 agent 功耗画像。测试 `test_cpu_ms_from_stat_parses_ticks`（构造 stat 含空格 comm / 100+200 ticks / 字段不足与 hz=0 回退）。全量 `cargo test` **393 通过**（+1）。
+- **第 47 轮新增合入**：
+  1. 统一时间线聚合工具（R4 丙 统一时间线遥测 最小可验证子集）：`tools/timeline_merge.py`——解析 agent/relay tracing 日志（ISO8601→unix ms，模块含 `::` 容错）与 admin KPI JSON（`at_unix_ms` 样本），按墙钟时间升序合并成统一时间线并标来源进程（agent/relay/kpi）——弱网问题排查可在同一时间轴看三端因果（agent QoS 快照 / relay 流生命周期与背压 / KPI fps-active-bp）。**验证**：样例三端日志/KPI 输入，输出按时间交错排序 + 来源标注正确（relay desktop:started → kpi fps30 → agent capture started → kpi bp1 → agent congested）。纯工具脚本，无 Rust 回归面。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
