@@ -35,7 +35,7 @@
 | 61-70 | 连接与能力 | ◐ | 时钟校准 7 次剔除>500ms（desktop.js:_calibrateClock）、WS 优先回退 HTTP、TTFV 已打点（本轮）；能力探测缓存/MSE 能力协商等未做 |
 | 71-80 | 拉流与解复用 | ◐ | seqn 解析+真实丢帧（desktop.js:_handleMoof）、demux 重同步已有；逐帧 binary 帧头协议未做（仍在 JSON 批） |
 | 81-90 | 解码与渲染 | ◐ | 解码即渲染、队列 24/2、停滞 500ms reqkey 均有；**光标叠加层已做**（第 18 轮：X11 GetImage 不含光标层——agent `poll_cursor` 100ms 节流 XQueryPointer → `desktop:cursor` 轻量消息 → 浏览器 `.sr-cursor-overlay` 叠加渲染，实测光标跟随鼠标）；超龄丢弃 2s 已做 |
-| 91-100 | 指标与面板 | ◐ | jitter/丢帧(seq)/e2e/目标帧率/TTFV/弱网标记（本轮补齐）；JS 内存曲线/离开 stop 未补 |
+| 91-100 | 指标与面板 | ◐ | jitter/丢帧(seq)/e2e/目标帧率/TTFV/弱网标记（本轮补齐）；JS 内存曲线**已做**（第 22 轮批次2 #61：当前+峰值行）、离开 stop **已做**（session.js pagehide/beforeunload → notifyDesktopLeave → desktopView.disconnect 停流）；第 35 轮核实修正 |
 | 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；30s 判死/重连降质/能力回退链待补 |
 
 ### 丙 遥测（111-140）
@@ -82,7 +82,7 @@
 | 22 | WS/HTTP 限流等价 | ✔ | agent_conn_rate_ok 共享 ev: 30/min 配额（agent_events_handler + agent_ws_send_handler，测试 test_agent_conn_rate_shared_ws_http） |
 | 23 | 崩溃重启会话 key 续接 | ✔ | agent 崩溃重启后 cached_tokens replay → relay `register_existing` 续接同一 session（client.rs 缓存 token + connect_with_retry 重放）；与 #10 同机制，代码级核实修正 |
 | 24 | 桌面流 map 生命周期追踪 | ✔ | created/removed 带原因日志（ws.rs desktop:started/stopped/agent断线，实测三路径） |
-| 25 | 空闲回收可见性 | ⬜ | |
+| 25 | 空闲回收可见性 | ✔ | 第 35 轮：agent 上报活跃度——编码循环每收到真实新帧刷新 `last_active_at`（unix ms），qos-ack 回传 `active = 距最近新帧 ≤1.5s`（`active_at` 纯函数 + 单测）；浏览器"目标帧率/活动"行显示 **静止/活跃**（优先用 agent 实测 active，未回传回退 ack≥15 推断）——静止时 agent 已回收编码资源（仅 KF_QUIET_MS 4s 静态 IDR），用户在面板可见"静止"而非误以为卡死；静止回收本身（#126 零轮询 + KF_QUIET 心跳）此前已实现 |
 | 26 | token 过期快速重鉴权 | ✔ | `client.rs connect_with_retry` 接收 `&mut cached_tokens`——注册被拒（HTTP 401/409，旧 token 失效）→ 清缓存回退固定 key 全新注册（此前永远用失效 token 重试卡死）；判定纯函数 `token_stale_registration` + 单测 `test_token_stale_registration_detection` |
 | 27 | viewer 移除水位化（满即删→告警） | ✔ | 本轮：满时丢旧保新，超 MAX_CONSECUTIVE_DROPS=60 才移除（relay/desktop.rs） |
 | 28 | 20s WS ping | ✔ | handle_agent_ws_uplink 每 20s server-side ping（agent 死链 ~35s 检出），台账此前误标 ◐，第 17 轮代码级核实修正 |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **87%**（可靠通道 28 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **88%**（可靠通道 28 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -217,4 +217,6 @@
   1. agent 重连退避上限对齐 rustdesk 60s（R5#9）：`connect_with_retry` max_delay 300s → **60s**——指数退避 1→2→4→8→16→32→60 封顶，429 固定 15s 不变；断线/弱网 agent 最坏 1min 内恢复（原 5min 封顶恢复太慢）；单测更新 `test_next_retry_delay_exponential_with_cap`（32→60 / 300→60 封顶断言）+ 429 用例。全量 `cargo test` **385 通过**。顺带核实 #8：agent SSE idle 60s = 心跳 15s × 4 裕量（已实现），浏览器显式空闲计数未独立实现，如实标注 ◐。
 - **第 34 轮新增合入**：
   1. 重连矩阵验收脚本（R5#40 批次验收 / R3 戊165）：`tools/reconnect_matrix.sh` 由旧 playwright 雏形**重写为进程级**（不依赖浏览器，符合验证环境约束）——自带 relay+agent 生命周期，三破坏源：① agent 崩溃重启（kill -9 → 同 `--key/--session-id` 重启 → register_existing 按 key 续接）；② relay 重启（agent 指数退避 60s 上限自动重连）；③ 连续 kill-重启 flap（幂等替换 + 退避不崩）。验证点：admin overview `agent_online` + agent 日志 session established。**实测 8/8 全过**（baseline + agent×2 + relay×2 + flap×3）。修复：SID 默认值去掉非法连字符、overview 解析用 `agent_online` 顶层字段。
+- **第 35 轮新增合入**：
+  1. 空闲回收可见性（R5#25）：agent 编码循环每收到真实新帧刷新 `DesktopManager.last_active_at`（unix ms，`AtomicI64`，参数链 start→run_desktop_loop→run_desktop_pipeline）；qos-ack 回传 `active`（`DesktopManager::is_active` = 距最近新帧 ≤1.5s）；浏览器 `receiveQosAck` 存 `_ackActive`，面板"目标帧率/活动"行显示 **静止/活跃**（agent 实测优先，未回传回退 ack≥15 推断）。纯判定函数 `active_at` + 单测（800ms 活跃 / 1499 边界活跃 / 1500 起静止 / 时钟回退不 panic）。**验证**：全量 `cargo test` **386 通过**（+1）——跑批时 Xvfb :98 段错误致 4 个 X11 测试失败，查明环境问题（GLX 扩展段错误）后以 `-extension GLX` 重启 Xvfb，4 测试恢复全绿，代码无涉。顺带核实修正 R4/5 表：JS 内存曲线（第 22 轮）与离开 stop（session.js pagehide/beforeunload → disconnect）均已做。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
