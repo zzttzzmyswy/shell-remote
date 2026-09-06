@@ -122,7 +122,7 @@
 | 72 | qos 250ms + ack 100ms 批 | ◐ | qos 250ms 独立上报已做（desktop.js，dfps×4 折算保 agent 语义，实测 3/s）；ack 100ms 批未做 |
 | 73 | 首帧 TTFV<500ms 打点 | ✔ | 本轮：_ttfvMs 面板展示（desktop.js） |
 | 74-78 | 解码器黑名单/reqkey 计数/崩溃日志/离开停抓/白闪 | ◐ | 黑名单切 codec（desktop.js:_onDecodeError）+ reqkey 计数 + **崩溃日志**（main.rs crash.log，第 24 轮增强）+ 离页停抓（session.js pagehide）+ 光标 overlay 断开清理（第 25 轮）+ **白闪修复**（第 27 轮：`#desktop-loading` 覆盖层连接时显示、首帧后隐藏——WebCodecs `_onDecoded` / MSE `loadeddata` 双路径；JS 语法+结构验证） |
-| 79-80 | 打包单测/前端验收 | ⬜ | |
+| 79-80 | 打包单测/前端验收 | ◐ | **打包单测补齐**（第 28 轮：mp4.rs +3 项——多帧 seqn 严格单调递增（浏览器 seqn gap 丢帧统计依赖）、空 sample 打包结构完整 + mdat 空、大 sample（300KB）mdat size 不截断）；前端验收脚本已有（verify_r* 系列） |
 
 ### 批次 3 · 编码器与 QoS 深化（81-120）
 
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **79%**（可靠通道 23 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 13%。
+- **R5 落地清单（200 点）**：✔ 类约 **80%**（可靠通道 23 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 12%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -202,4 +202,6 @@
   2. 台账核实修正：#6 /agent/send 绑定校验（agent_send_handler 校验 session 注册）、#13 多 agent 同 IP（registration_rate_limit 120/min 放宽）、#15 控制/媒体通道分离（control_tx 64 bounded + post_tx unbounded）经代码级核实均已实现。
 - **第 27 轮新增合入**：
   1. 白闪修复（`web/session.html` + `style.css` + `desktop.js`）：新增 `#desktop-loading` 覆盖层（半透明"正在连接桌面…"绝对定位）——连接/切流/重连时显示，首帧后隐藏（WebCodecs `_onDecoded` 首帧 + MSE `video loadeddata` 事件双路径；disconnect 隐藏 + 监听清理）。消除切流/重连时 canvas 白屏闪烁给用户的"卡死/黑屏"错觉 → 批次2 #74-78 白闪。**验证**：`node --check` 语法通过 + loading 控制逻辑完整性检查（`_showLoading`/`_hideLoading`/`_mseFirstFrame` 引用齐全）；浏览器全链实测因本轮验证环境受限（连续 playwright 会话 join 偶发不稳）未完成，如实标注。
+- **第 28 轮新增合入**：
+  1. mp4 打包单测补齐（`mp4.rs` +3 项）：多帧 `seqn` 严格单调递增（序断言 1→5——浏览器 `_handleMoof` 的 seqn gap 丢帧统计依赖 seqn 严格递增）；空 sample 打包结构完整 + mdat 空（静态帧 0 字节）；大 sample（300KB 高熵帧量级）mdat size 与 payload 不截断。mp4 模块 12 测试全绿，全量 `cargo test` **383 通过** → R5#79 打包单测。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
