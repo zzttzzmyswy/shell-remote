@@ -355,7 +355,8 @@ async fn send_state(ctrl: &tokio::sync::mpsc::Sender<String>, sid: &str, state: 
 
 /// 选出对外广播的 host candidate IP：UDP connect 到公共 IP 让内核挑源地址
 /// （纯路由选择，不发包），失败回退 `127.0.0.1`（同机回测/无外网）。
-fn pick_advertised_ip() -> std::net::Ipv4Addr {
+/// `pub(crate)`：同时被 LAN 直连（agent/lan.rs，阶段2）用作广播地址。
+pub(crate) fn pick_advertised_ip() -> std::net::Ipv4Addr {
     if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
         if s.connect(SocketAddr::from(([8, 8, 8, 8], 80))).is_ok() {
             if let Ok(local) = s.local_addr() {

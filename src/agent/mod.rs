@@ -4,6 +4,7 @@ pub mod desktop;
 pub mod encoding;
 pub mod exec_sessions;
 pub mod fs;
+pub mod lan;
 pub mod p2p;
 pub mod shell;
 pub mod upgrade;
@@ -1129,6 +1130,31 @@ async fn run_session(
             });
         }
     }
+    // Task 4（阶段2 LAN 直连基础）：agent 本地 HTTP server 暴露与 relay 同构的
+    // /agent/desktop/stream，同局域网浏览器直连 agent 拉桌面流、绕开中转。
+    // 仅显式 --desktop-lan-port N（lan_port != 0）开启；默认 0 不开任何端口。
+    // 会话结束 drop 时 LanDesktop 中止 server/feed 任务，端口释放供重连重新 bind。
+    let lan_desktop = if desktop_cfg.lan_port != 0 {
+        match crate::agent::lan::LanDesktop::spawn(desktop_cfg.lan_port).await {
+            Ok(lan) => {
+                tracing::info!(
+                    addr = %lan.addr_report(),
+                    "LAN desktop stream server up (--desktop-lan-port)"
+                );
+                Some(lan)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lan_port = desktop_cfg.lan_port,
+                    "LAN desktop server bind failed: {e}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Task 3：P2P 已建连时把 desktop:video 的 fMP4 字节镜像一份进 DataChannel
     //（relay POST 行为/编码/QoS 零改动，仅加一条镜像投递）。闭包外 clone，
     // Arc 引用计数使闭包与消息循环共享同一个投递口。
@@ -1148,6 +1174,16 @@ async fn run_session(
                 if let Some(bytes) = crate::agent::fs::decode_b64(data_b64) {
                     if kind == Some("init") {
                         *last_init.write().unwrap() = Some(bytes.clone());
+                    }
+                    // LAN 直连镜像（Task 4）：同源 fMP4 字节喂给本地 DesktopStream
+                    // fan-out（init→set_init，frag→push_frag；关键帧标志取
+                    // payload.key 或 flags=="key"，与 WS 二进制上行判定一致）。
+                    if let Some(lan) = lan_desktop.as_ref() {
+                        let is_init = kind == Some("init");
+                        let is_key = is_init
+                            || msg["payload"]["key"].as_bool().unwrap_or(false)
+                            || msg["payload"]["flags"].as_str() == Some("key");
+                        lan.feed(is_init, is_key, bytes.clone());
                     }
                     if let Ok(guard) = video_tx.read() {
                         if let Some(tx) = guard.as_ref() {

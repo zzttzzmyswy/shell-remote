@@ -91,6 +91,10 @@ pub struct DesktopConfig {
     /// 质量档倍率（speed=0.5 / balanced=0.67 / best=1.5，rustdesk 同款）。
     /// 决定目标码率（base_bitrate × quality）与 QP 区间。
     pub quality: f32,
+    /// LAN 直连桌面流监听端口（agent 本地 HTTP server，阶段2 基础）。
+    /// `0` = 不启动（默认，不开任何端口）；显式指定则同局域网浏览器可直连
+    /// `http://<agent-lan-ip>:<port>/agent/desktop/stream` 拉桌面流（绕开 relay）。
+    pub lan_port: u16,
 }
 
 impl Default for DesktopConfig {
@@ -111,6 +115,7 @@ impl Default for DesktopConfig {
             max_bps: 0,
             display: None,
             quality: crate::agent::desktop::encoder::QUALITY_BALANCED,
+            lan_port: 0,
         }
     }
 }
