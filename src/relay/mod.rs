@@ -85,6 +85,10 @@ pub struct SharedState {
     /// Desktop video fan-out per session (lazily created on first
     /// `desktop:video` message).
     pub desktop_streams: RwLock<HashMap<String, crate::relay::desktop::DesktopStream>>,
+    /// 每会话最近一次桌面运行状态（R5#12）：`desktop:started` → true、
+    /// `desktop:stopped` → false。浏览器 SSE 建立/重建时 relay 据此立即补发
+    /// `desktop:state` 快照，UI 无需依赖仍在事件缓冲中的历史事件即可恢复视图。
+    pub desktop_states: RwLock<HashMap<String, bool>>,
     /// Last `agent:upgrade_progress` payload per session (drives the admin
     /// device panel's upgrade status cell). Keyed by session id.
     pub agent_upgrades: RwLock<HashMap<String, serde_json::Value>>,
@@ -245,6 +249,7 @@ impl SharedState {
             recorder,
             conn_log: RwLock::new(std::collections::VecDeque::new()),
             desktop_streams: RwLock::new(HashMap::new()),
+            desktop_states: RwLock::new(HashMap::new()),
             agent_upgrades: RwLock::new(HashMap::new()),
             upgrade_dir: RwLock::new(None),
             kpi_history: RwLock::new(HashMap::new()),

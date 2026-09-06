@@ -170,6 +170,12 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 .await
                 .entry(session_id.to_string())
                 .or_insert_with(crate::relay::desktop::DesktopStream::new);
+            // R5#12：记录当前运行状态，供 SSE（重建）握手补发 desktop:state。
+            state
+                .desktop_states
+                .write()
+                .await
+                .insert(session_id.to_string(), true);
             tracing::info!(
                 session = %session_id,
                 reason = "desktop:started",
@@ -179,6 +185,11 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
         if proto_msg.msg_type == "desktop:stopped" {
             // 生命周期追踪：agent 主动停止 → 移除并记原因。
             let removed = state.desktop_streams.write().await.remove(session_id);
+            state
+                .desktop_states
+                .write()
+                .await
+                .insert(session_id.to_string(), false);
             tracing::info!(
                 session = %session_id,
                 reason = "desktop:stopped",
@@ -1000,6 +1011,18 @@ async fn agent_conn_rate_ok(state: &Arc<SharedState>, headers: &axum::http::Head
     rl.check(&format!("ev:{client_ip}"), 30, std::time::Duration::from_secs(60))
 }
 
+/// R5#12：SSE 建立/重建时补发的桌面状态快照事件字符串。从 `desktop_states`
+/// 缓存读该会话最近一次 `desktop:started`/`desktop:stopped` 记录；从未出现
+/// 过桌面事件（无人点过开始）返回 None，避免多余事件。
+async fn desktop_state_snapshot(state: &SharedState, session_id: &str) -> Option<String> {
+    let states = state.desktop_states.read().await;
+    let running = *states.get(session_id)?;
+    Some(
+        serde_json::json!({ "type": "desktop:state", "payload": { "running": running } })
+            .to_string(),
+    )
+}
+
 pub async fn agent_events_handler(
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
@@ -1041,6 +1064,15 @@ pub async fn agent_events_handler(
     let sid_clone = session_id.clone();
 
     let stream = async_stream::stream! {
+        // R5#12：SSE 首次连接/断线重建时，立即补发当前桌面运行状态快照。
+        // 首连无 last_event_id、或事件缓冲已过期时，浏览器仍能据此恢复视图
+        // （running=true → 进入桌面观看；false → 退回终端），不再依赖历史
+        // 事件恰好还在缓冲里。快照未入 EventBuffer，每次握手现读现发。
+        if let Some(snapshot) = desktop_state_snapshot(&state_clone, &sid_clone).await {
+            yield Ok::<_, Infallible>(
+                axum::response::sse::Event::default().data(snapshot)
+            );
+        }
         if let Some(last_id) = last_event_id {
             let buffers = state_clone.agent_event_buffers.read().await;
             if let Some(buf) = buffers.get(&sid_clone) {
@@ -1466,6 +1498,41 @@ mod tests {
             .await
             .insert(session_id.to_string(), cm);
         (tx, rx)
+    }
+
+    #[tokio::test]
+    async fn test_desktop_state_snapshot_reflects_latest() {
+        // R5#12：SSE 握手补发 desktop:state —— started 后 running=true、
+        // stopped 后 false、从未出现桌面事件则不发（不打扰未开桌面的会话）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+
+        assert!(
+            desktop_state_snapshot(&state, &sid).await.is_none(),
+            "no desktop:state until a desktop event was seen"
+        );
+
+        let started = serde_json::json!({
+            "type": "desktop:started",
+            "session_id": sid,
+            "payload": {}
+        });
+        route_agent_message(&state, &sid, &started.to_string()).await;
+        let snap = desktop_state_snapshot(&state, &sid).await.expect("snapshot after started");
+        let v: serde_json::Value = serde_json::from_str(&snap).unwrap();
+        assert_eq!(v["type"], "desktop:state");
+        assert_eq!(v["payload"]["running"], true);
+
+        let stopped = serde_json::json!({
+            "type": "desktop:stopped",
+            "session_id": sid,
+            "payload": {}
+        });
+        route_agent_message(&state, &sid, &stopped.to_string()).await;
+        let snap = desktop_state_snapshot(&state, &sid).await.expect("snapshot after stopped");
+        let v: serde_json::Value = serde_json::from_str(&snap).unwrap();
+        assert_eq!(v["payload"]["running"], false);
     }
 
     #[tokio::test]

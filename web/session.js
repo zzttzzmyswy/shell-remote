@@ -310,6 +310,24 @@
         }
     });
 
+    window.shellRemote.on('desktop:state', function(msg) {
+        // R5#12：SSE 首次连接/断线重建时 relay 立即补发的桌面运行状态快照。
+        // 断线重连后不再依赖 desktop:capabilities 恰好仍在事件缓冲里——
+        // 拿着这个快照即可恢复视图（与 capabilities 的 running 处理一致）。
+        const running = !!(msg.payload && msg.payload.running);
+        if (running) {
+            if (!desktopActive && !desktopStarting) {
+                // 桌面在跑：直接进入观看并拉流。
+                showDesktopView();
+                desktopView.connect();
+            }
+        } else if (desktopActive && !window.__codecSwitchPending) {
+            // 桌面已停且不在编码热切换：退回终端视图。
+            desktopView.disconnect();
+            showTerminalView();
+        }
+    });
+
     window.shellRemote.on('desktop:started', function(msg) {
         desktopStarting = false;
         toggleDesktopBtn.disabled = !desktopEnabled;
