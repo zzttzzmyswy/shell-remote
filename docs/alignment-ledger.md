@@ -33,7 +33,7 @@
 | # | 点 | 状态 | 证据 |
 |---|---|---|---|
 | 61-70 | 连接与能力 | ◐ | 时钟校准 7 次剔除>500ms（desktop.js:_calibrateClock）、WS 优先回退 HTTP、TTFV 已打点（本轮）；**MSE/WebCodecs 能力协商已做**（desktop.js：`_webcodecsAvailable` 安全上下文+VideoDecoder 检测 → 模式选择 webcodecs/mse/none → sessionStorage 缓存复用，重连/切页直接取）、**能力探测缓存已做**（sessionStorage，desktop.js:287）、解码方案面板行已渲染（metric-decoder）；第 40 轮核实修正 |
-| 71-80 | 拉流与解复用 | ◐ | seqn 解析+真实丢帧（desktop.js:_handleMoof）、demux 重同步已有；逐帧 binary 帧头协议未做（仍在 JSON 批） |
+| 71-80 | 拉流与解复用 | ✔ | seqn 解析+真实丢帧（desktop.js:_handleMoof）、demux 重同步已有；**逐帧 binary 帧头协议已做**（第 69 轮 #41 闭环：agent 上行 binary 帧 `[flags:u8][seq:u32 LE][len:u32 LE][fMP4 字节]`，浏览器桌面 WS 下行原样 fMP4 字节流，`kind` 已由 `flags`（init/key/delta）分辨——JSON 批时代结束） |
 | 81-90 | 解码与渲染 | ◐ | 解码即渲染、队列 24/2、停滞 500ms reqkey 均有；**光标叠加层已做**（第 18 轮：X11 GetImage 不含光标层——agent `poll_cursor` 100ms 节流 XQueryPointer → `desktop:cursor` 轻量消息 → 浏览器 `.sr-cursor-overlay` 叠加渲染，实测光标跟随鼠标）；超龄丢弃 2s 已做 |
 | 91-100 | 指标与面板 | ◐ | jitter/丢帧(seq)/e2e/目标帧率/TTFV/弱网标记（本轮补齐）；JS 内存曲线**已做**（第 22 轮批次2 #61：当前+峰值行）、离开 stop **已做**（session.js pagehide/beforeunload → notifyDesktopLeave → desktopView.disconnect 停流）；第 35 轮核实修正 |
 | 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；**30s 判死已做**（第 37 轮：浏览器播放器 `_lastDataAt` 看门狗——曾连上但 30s 无任何视频数据 → 判死重连，静止安全因 4s IDR 心跳仍到达）；**能力回退链已做**（`_onDecodeError` 黑名单切 codec → `desktop:codec` 请求 agent 降档 + `_scheduleDecodeRecover` 1500ms 防抖重建流兜底）；**重连降质已做**（第 41 轮：session.js `requestReconnect`——30s 窗口 ≥2 次重连（join 看门狗/30s 判死/SSE 断线）判重连风暴 → 标记降质，join 成功后 `applyQualityOnJoin` 请求 speed 低码率档，稳定 15s 无重连自动恢复 best） |
@@ -71,7 +71,7 @@
 | 11 | relay 重启后重发 init 状态机 | ✔ | 第 21 轮：agent 会话级 `desktop_want_running` 跨重连传递——断线退出时记录桌面状态并显式 stop（防 orphan task 向失效连接发帧），重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init）。实测两轮 relay 重启均 `auto-restoring desktop stream` + `capture started 1280x720` |
 | 12 | SSE 重建补 desktop:state | ✔ | 第 32 轮：relay 缓存每会话最近桌面运行状态（`SharedState.desktop_states`，started→true / stopped→false）→ SSE 首次连接/断线重建握手时**先**补发 `desktop:state {running}` 快照（`agent_events_handler` + `desktop_state_snapshot`，未入缓冲每次现读现发）→ 浏览器 `desktop:state` 监听按 running 恢复视图（true→进入桌面拉流，false→退回终端，编码热切换保护）。此前浏览器仅靠 `desktop:capabilities {running}` 恰好仍在事件缓冲中才能恢复视图；测试 `test_desktop_state_snapshot_reflects_latest` |
 | 13 | 多 agent 同 IP 白名单 | ✔ | `registration_rate_limit_per_min` 默认 120/min（--registration-rate-limit 可调）——同一出口 IP 多 agent 注册/重连不误拒；第 26 轮代码级核实修正 |
-| 14 | 混合通道二进制分辨 | ⬜ | 第 57 轮核实：架构上混合通道**已分离**——agent 控制（`control_tx` 64 有界）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道分离（#15/#29）；浏览器 SSE 控制 text vs 桌面 WS binary 也分离。JSON 阶段 base64 由 `kind`（init/frag）分辨；**二进制帧分辨协议在 #41 binary 化时落地**（依赖架构重构，远期） |
+| 14 | 混合通道二进制分辨 | ✔ | 第 57 轮核实：架构上混合通道**已分离**——agent 控制（`control_tx` 64 有界）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道分离（#15/#29）；浏览器 SSE 控制 text vs 桌面 WS binary 也分离；**二进制帧分辨协议已随 #41 落地**（第 69 轮：`proto::encode_bin_frame`/`decode_bin_frame` 的 `flags` 位分辨 init/frag/key/delta、`seq` 递增帧号，relay `route_bin_desktop_frame` 按 flags 直转 set_init/push_frag）——JSON 阶段 base64 由 `kind` 分辨，binary 阶段由 flags/seq 分辨，**#14 闭环** |
 | 15 | agent 控制消息独立有界 channel | ✔ | 已分离：`control_tx`（bounded 64，控制消息）+ `post_tx`（unbounded，媒体帧，批内丢旧）+ `shell_tx`（终端输出）；第 26 轮代码级核实修正 |
 | 16 | relay→agent 背压回传 | ✔ | 第 36 轮：relay fan-out 丢旧保新（viewer 缓冲满）时限频（≥5s）向 agent 回传 `desktop:congested {dropped}`（`push_frag` 返回被跳过 viewer 数 → `route_agent_message` desktop:video 分支经 `SharedState.last_congest_notify` 限频 → agent `desktop:congested` 分支记录"传输段拥塞"日志，不直接改 QoS 决策——码率收敛仍由浏览器段 e2e/dq 主导，relay drop 作补充证据）。viewer 缓冲 16 帧此前已降。测试 `test_push_frag_reports_congested_drops` + `test_desktop_congested_backpressure_to_agent` |
 | 17 | 12s 超时统一 ≤5s | ✔ | join ack 看门狗 8s → **5s**（session.js，对齐 rustdesk 5s 超时语义——弱网更快失败恢复）；SSE 重连退避 1→10s 上限已核实；无残留 12s 单一超时 |
@@ -160,7 +160,7 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 71 轮合计实（剩余远期项落地可行性审计收口，R5 99% 保持）。
+- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 72 轮合计实（#14/71-80 随 #41 核实收口，R5 99% 保持）。
 - **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / SSE 空闲看门狗 1 项 / **弱网降级提示 1 项（第 66 轮）**）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
@@ -266,6 +266,9 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 72 轮：#14/71-80 核实收口（随 #41 闭环）**：
+  1. **#14 混合通道二进制分辨标 ✔**：#41 binary 化（第 69 轮）后二进制帧分辨协议落地——`flags` 位分辨 init/frag/key/delta、`seq` 递增帧号（`proto::encode_bin_frame`/`decode_bin_frame`），relay `route_bin_desktop_frame` 按 flags 直转 set_init/push_frag；JSON 阶段 `kind` 分辨 → binary 阶段 `flags` 分辨，**#14 闭环**（第 57 轮"架构已分离"核实 + 第 69 轮分辨协议落地）。
+  2. **R4/5 乙 71-80 拉流与解复用标 ✔**：逐帧 binary 帧头协议已做（agent 上行 binary 帧头 + 浏览器 WS 下行原样 fMP4，`kind` 由 `flags` 分辨）——JSON 批时代结束。R4/5 乙段全闭合。
 - **第 71 轮：剩余 ⬜ 落地可行性审计（诚实收口）**：
   1. 逐项代码级核实剩余 ⬜（全部为架构/平台级远期，本环境 Linux X11 无可安全落地子集）：
      - **#36-38 KCP**：代码库**无任何 UDP/KCP 通道**（纯 WS/TCP 上行 + 浏览器 WS/SSE 下行）——KCP 是全新传输层（UDP 拥塞控制替换 TCP），需 agent/relay/浏览器三端协议重构，阻塞 = 架构级。
