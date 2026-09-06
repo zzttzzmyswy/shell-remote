@@ -126,7 +126,7 @@
 
 ### 批次 3 · 编码器与 QoS 深化（81-120）
 
-◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；#82 编码线程数 loadavg 自适应已合入（`encoder.rs codec_thread_num` 用 `(核数-loadavg)×0.5`，负载高自动减线程，测试 `test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）；#84 编码耗时预算已合入（`mod.rs` 慢帧 >66ms×10 → `next_lower_codec` 降档）；#111 RTT 分带 + #113 中值滤波已合入（`mod.rs`，测试覆盖）。其余（AV1 测速门槛、H264 热备、质量 250ms 反馈、CBR 纪律、弱网 KPI 矩阵）未做。
+◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；#82 编码线程数 loadavg 自适应已合入（`encoder.rs codec_thread_num` 用 `(核数-loadavg)×0.5`，负载高自动减线程，测试 `test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）；#84 编码耗时预算已合入（`mod.rs` 慢帧 >66ms×10 → `next_lower_codec` 降档）；#85 编码器故障热备已合入（第 15 轮：`mod.rs next_degrade_codec` 统一 #84 慢帧/#85 encode-Err 降级出口，`rebuild_encoder_degrade` 复用重建动作，连续 5 帧 Err → av1→vp9→h264；测试 `test_next_degrade_codec_trigger`）；#89 CBR 纪律**已做**（`aom.rs:111 AOM_CBR` + `vpx.rs:91 VPX_CBR` + undershoot/overshoot 50% + 缓冲 600/600/1000 + `AOM_KF_DISABLED` 外部 force_idr，前轮已合入、本台账此前误标未做，第 15 轮修正）；#111 RTT 分带 + #113 中值滤波已合入（`mod.rs`，测试覆盖）。其余（AV1 测速门槛、质量 250ms 反馈、弱网 KPI 矩阵）未做。
 
 ### 批次 4 · 抓帧能效（121-146）
 
@@ -161,9 +161,12 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **54%**（甲 帧率/IDR/RTT分带/TestDelay探针、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 21%（丙遥测剩余、戊发布门槛）；◐ 25%。
-- **R5 落地清单（200 点）**：✔ 类约 **57%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 5 项 / 打包 3 项 / 遥测测试 8 项 / TestDelay 探针 1 项）；⬜ 28%。
+- **R5 落地清单（200 点）**：✔ 类约 **59%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 8 项 / TestDelay 探针 1 项）；⬜ 27%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
   1. TestDelay 探针全链路（对齐 rustdesk `cm::TestDelay`）：浏览器每 1s 发 `desktop:test-delay {seq,t0}`（performance.now 单调时钟）→ relay 直转 → agent 即时 echo `test-delay-ack {seq,t0}` → relay 加 `broadcast_types`/KNOWN 白名单回传 → 浏览器本地单调时钟算**纯网络层 RTT**（不含编码/解码/渲染管线、不依赖时钟校准；与 e2e 的 `_clockOffset` 校准正交）→ qos 上报加 `probe_ms` → agent QoS 日志快照含 `probe_ms`，`QosAdaptive` 5 窗口中值 + `pipeline_bloated` 判据（网络健康+100ms 预算仍 ≤ e2e 中值 ⇒ over 来自管线/解码积压，不降码率；probe=0 未上报 ⇒ 沿用原判据，兼容老浏览器/测试）。测试 `test_qos_probe_confirms_network_congestion`（健康 probe 不降/高 probe 降/无 probe 降三场景）、`test_qos_probe_median_filters_spike`、`test_qos_probe_absent_returns_zero`。**浏览器实测**：网络 RTT 行 5ms（8 次采样稳定）、agent 日志 `delay_ms=15 probe_ms=4`（管线/网络正确分离）、静态屏 fps=1 且 qos_scale=1000（probe 健康不误降）→ R4 甲 A1 / R5#148。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、admin KPI 曲线、光标独立通道、独立 100ms ack 批、AV1 测速门槛、H264 热备、质量 250ms 反馈、CBR 纪律等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **第 15 轮新增合入**：
+  1. 编码器故障热备（`mod.rs next_degrade_codec` + `rebuild_encoder_degrade`）：统一 #84 慢帧 / #85 encode-Err 降级出口——encode 连续 5 帧返回 Err（编码器故障/崩溃，区别于 #84 慢帧）自动重建为 fallback 链下一档（av1→vp9→h264），mp4_cfg 置 None + force_idr 重发 init；测试 `test_next_degrade_codec_trigger`（阈值/降档/一次性/末档 7 断言）→ R2 乙77 / R5#85。
+  2. 台账修正：**#89 CBR 纪律此前已做**（`aom.rs:111 AOM_CBR` + `vpx.rs:91 VPX_CBR` + undershoot/overshoot 50% + KF_DISABLED 外部 force_idr）——上轮台账误标未做，本轮代码级核实后标 ✔。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、admin KPI 曲线、光标独立通道、独立 100ms ack 批、AV1 测速门槛、质量 250ms 反馈等——在台账对应 ⬜/◐ 行，未宣称完成。
