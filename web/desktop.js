@@ -48,6 +48,9 @@
       this._lastNewFrameAt = 0;   // 最近一次解码帧到达的本地时刻（静止判定）
       this._e2eMs = undefined;
       this._gotFirstFrame = false; // 是否已渲染过首帧（接入 reqkey 快路径）
+      // MSE 模式首帧监听句柄（WebCodecs 走 _onDecoded；MSE 用 video
+      // loadeddata 事件作为"已有画面"信号，用于隐藏 loading 覆盖）。
+      this._mseFirstFrame = null;
       this._decodeCount = 0;      // 本 1s 窗口已解码帧数（解码背压上传）
       this._reqKeyAt = 0;         // 上次 desktop:reqkey 发送时刻（限频）
       this._reqKeyCount = 0;      // 最近 10s 内 reqkey 次数
@@ -245,9 +248,32 @@
       window.shellRemote.send('desktop:reqkey', {});
     }
 
+    // 白闪修复（R5#74-78）：连接/切流/重连时显示"正在连接桌面…"覆盖层，
+    // 首帧解码后隐藏——避免 canvas 空白/白屏闪烁给用户卡死错觉。
+    _showLoading() {
+      const el = document.getElementById('desktop-loading');
+      if (el) el.classList.remove('hidden');
+    }
+    _hideLoading() {
+      const el = document.getElementById('desktop-loading');
+      if (el) el.classList.add('hidden');
+    }
+
     connect() {
       if (this._decRecoverTimer) { clearTimeout(this._decRecoverTimer); this._decRecoverTimer = null; }
       this.disconnect(false);
+      this._showLoading();
+      const self = this;
+      // MSE 模式首帧信号：video loadeddata（WebCodecs 已走 _onDecoded）。
+      if (this._mse && this.video) {
+        this._mseFirstFrame = function() {
+          self._hideLoading();
+          self._gotFirstFrame = true;
+          self._lastNewFrameAt = Date.now();
+          if (self.video) self.video.removeEventListener('loadeddata', self._mseFirstFrame);
+        };
+        this.video.addEventListener('loadeddata', this._mseFirstFrame);
+      }
       this._ttfvStart = Date.now(); // TTFV 打点起点（对齐 R2 乙60）
       this._ttfvMs = null;
       // 能力探测缓存（R3 己195 / R5#65）：第一次探测后把解码路径
@@ -738,6 +764,7 @@
       if (this._captureByPts) this._captureByPts.delete(frame.timestamp);
       this._lastNewFrameAt = Date.now();
       this._gotFirstFrame = true;
+      this._hideLoading();
       this._decodeCount += 1;
       // TTFV：从 connect() 到首帧解码完成的毫秒（对齐 R2 乙60，面板打点）。
       if (this._ttfvMs === null && this._ttfvStart) {
@@ -832,6 +859,10 @@
         this._mse.disconnect(resetRetries);
         this._mse = null;
       }
+      if (this.video && this._mseFirstFrame) {
+        try { this.video.removeEventListener('loadeddata', this._mseFirstFrame); } catch (e) {}
+        this._mseFirstFrame = null;
+      }
       if (this.controller) { this.controller.abort(); this.controller = null; }
       if (this.reader) { this.reader.cancel().catch(function() {}); this.reader = null; }
       this.connected = false;
@@ -845,6 +876,8 @@
       if (this._dec) { try { this._dec.close(); } catch (e) {} this._dec = null; }
       // 光标 overlay 清理（R5#64 通道断开后移除，避免元素/样式残留）。
       if (this._cursorEl) { try { this._cursorEl.remove(); } catch (e) {} this._cursorEl = null; }
+      // loading 覆盖：断开即隐藏（下次 connect 再显示）。
+      this._hideLoading();
       this._desc = null;
       this._lastCaptureMs = 0;
       this._lastE2eMs = undefined;

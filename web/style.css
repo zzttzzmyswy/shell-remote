@@ -864,6 +864,21 @@ body {
     justify-content: center;
     overflow: hidden;
 }
+/* 白闪修复（R5#74-78）：连接/切流/重连时显示覆盖层，首帧解码后隐藏——
+   避免 canvas 空白/白屏闪烁给用户"卡死/黑屏"的错觉。 */
+.desktop-loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.6);
+    color: #c8c8c8;
+    font-size: 14px;
+    letter-spacing: 1px;
+    z-index: 5;
+    pointer-events: none;
+}
 #desktop-video {
     width: 100%;
     height: 100%;
