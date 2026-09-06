@@ -105,9 +105,9 @@
 | 42 | seq 真实丢帧 | ✔ | desktop.js:_handleMoof seqn gap |
 | 43 | relay 二进制直转 | ⬜ | |
 | 44 | 老版本兼容/capability | ⬜ | |
-| 45 | moof 复用（tfhd 缓存） | ⬜ | |
+| 45 | moof 复用（tfhd 缓存） | ✔ | Mp4Muxer 缓存 tfhd 模板、每帧只重建变化部分（mp4.rs，测试逐字节一致） |
 | 46 | init 最小化 | ⬜ | |
-| 47 | WebCodecs keyframe 判定一致 | ◐ | isKey 判定已统一；断言单测缺 |
+| 47 | WebCodecs keyframe 判定一致 | ✔ | test_keyframe_flag_matches_browser_detection 断言 agent flags 与浏览器判定逐字一致 |
 | 48 | 控制消息轻通道 | ◐ | qos/reqkey 走 SSE；ack 100ms 批未做 |
 | 49-53 | 队列 24/2/停滞 500ms/接入 1.5s/解码错误分级 | ✔ | desktop.js 全链路 + reqkey |
 | 54 | demux 损坏 3 次重发 init | ✔ | 连续3次非法box→reqkey reinit 3s限频（desktop.js:_parseNextBox） |
@@ -115,7 +115,7 @@
 | 56 | 面板三组分组 | ✔ | session.html 流畅度/质量/传输 三段（R3 己197） |
 | 57-59 | 面板补行（目标帧率/quality/弱网） | ✔ | 本轮：gofps/reqkey/weaknet/TTFV 行（desktop.js+session.html） |
 | 60 | e2e 与解码排队分流 | ◐ | |
-| 61-64 | 内存曲线/rAF 暂停/光标通道 | ⬜ | |
+| 61-64 | 内存曲线/rAF 暂停/光标通道 | ◐ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；光标通道未做 |
 | 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect） |
 | 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ◐ | MSE 回退有 |
 | 71 | 帧到达 jitter 面板 | ✔ | metric-jitter（v0.42） |
@@ -158,10 +158,10 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **38%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复、丁 弱网可见性+输入节流、丙 遥测基线+日志）；⬜ 36%（丙遥测剩余、戊发布门槛）；◐ 26%。
-- **R5 落地清单（200 点）**：✔ 类约 **38%**（可靠通道 7 项 / 前端 18 项 / 抓帧 3 项 / 编码器 2 项 / 遥测测试 7 项）；⬜ 45%。
-- **第 5 轮新增合入**：
-  1. 输入 10ms 合并节流（`desktop.js:_onPointerMove` 缓存最后坐标 10ms flush，与 #34 弱网降采样叠加）→ R3 己188 / R5#33；
-  2. 日志轮转（`main.rs` `SR_LOG_DIR` 环境变量 → hourly rolling file + non_blocking，实测生成 `shell-remote.log.YYYY-MM-DD-HH`）→ R3 己191 / R5#153；
-  3. 评分卡脚本（`tools/scorecard.sh`：浏览器采样 fps/e2e/seq 丢帧率 → JSON 评分卡 + R4 戊172 门槛判定）→ R3 戊176 / R5#155。
+- **R4/5（200 点）**：✔ 类约 **40%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复+内存观测、丁 弱网可见性+输入节流、丙 遥测基线+日志）；⬜ 34%（丙遥测剩余、戊发布门槛）；◐ 26%。
+- **R5 落地清单（200 点）**：✔ 类约 **41%**（可靠通道 7 项 / 前端 19 项 / 抓帧 3 项 / 编码器 2 项 / 打包 2 项 / 遥测测试 7 项）；⬜ 42%。
+- **第 6 轮新增合入**：
+  1. moof 复用（`mp4.rs Mp4Muxer`：tfhd 模板缓存、每帧只重建变化部分，`test_muxer_output_identical_to_fragment` 逐字节一致）→ R3 甲20/21 / R5#45；
+  2. keyframe 判定一致断言单测（`mp4.rs test_keyframe_flag_matches_browser_detection`：agent trun flags 与浏览器 `(flags&0x03)==0x02` 判定逐字一致）→ R3 甲23 / R5#47；
+  3. JS 内存曲线（`desktop.js` performance.memory 当前+峰值、`session.html` 进程组行，长会话泄漏观测）→ R2 丁131 / R5#61。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批等——在台账对应 ⬜/◐ 行，未宣称完成。
