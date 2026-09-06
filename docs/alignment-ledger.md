@@ -146,7 +146,7 @@
 
 ### 批次 5 · 测试与遥测（147-167）
 
-◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）；**crash.log 崩溃日志已增强**（第 24 轮：`main.rs` panic hook 补时间戳/pid/backtrace/`SR_LOG_DIR` 路径/append 多次崩溃保留——基础 hook 前已有，本轮补齐字段与保留策略）。统一时间线/告警未做。第 43 轮：心跳扩展 KPI 补 **active（内容活跃/静止）+ bp_count（relay 拥塞累计）** 字段（`DesktopKpi` + `kpi_snapshot` + sender_loop 心跳 JSON，测试断言扩展）——admin KPI 曲线可观测静止/活跃与传输段拥塞时间线。
+◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）；**crash.log 崩溃日志已增强**（第 24 轮：`main.rs` panic hook 补时间戳/pid/backtrace/`SR_LOG_DIR` 路径/append 多次崩溃保留——基础 hook 前已有，本轮补齐字段与保留策略）。统一时间线未做；**告警雏形已做**（第 44 轮：relay KPI 采样处 `kpi_anomalous(active, fps)` 判据——内容活跃但 fps<10（动态异常降帧，用户铁律动态不降帧）→ `tracing::warn` 告警日志，≥30s/会话限频；静止 active=false 不误报；纯函数 `kpi_anomalous` + 单测，采样测试断言 active/bp_count 落库）。第 43 轮：心跳扩展 KPI 补 **active（内容活跃/静止）+ bp_count（relay 拥塞累计）** 字段（`DesktopKpi` + `kpi_snapshot` + sender_loop 心跳 JSON，测试断言扩展）——admin KPI 曲线可观测静止/活跃与传输段拥塞时间线。
 
 ### 批次 6 · 风险与回滚（168-177）
 
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **90%**（可靠通道 30 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **91%**（可靠通道 30 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 13 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -238,4 +238,6 @@
 - **第 43 轮新增合入**：
   1. 心跳 KPI 扩展补字段（R5#150 增强）：`DesktopKpi` 加 `active`（内容活跃 ≤1.5s，R5#25）+ `bp_count`（relay 拥塞累计，R5#16），`kpi_snapshot` 与 sender_loop 心跳 JSON 同步携带——admin KPI 曲线可观测**静止/活跃**与**传输段拥塞**时间线；测试 `test_sender_loop_heartbeat_carries_desktop_kpi` 断言扩展。全量 `cargo test` **390 通过**。
   2. 核实收口：65-66 能力探测缓存已做（sessionStorage 复用解码模式）；#48 轻通道决策关闭（独立 100ms ack 批无消费者端，限产机制落地再评估）；#14/#41-44 线协议整块、#36-38 KCP、#123-124/#129 GDI/DXGI Windows、#132-134 Wayland、#136-146 功耗画像、#127-128 SIMD、丙统一时间线、153 grader——均为远期/环境限制/架构决策，如实标注。
+- **第 44 轮新增合入**：
+  1. KPI 采样补齐 active/bp_count + 告警雏形（批次5 遥测测试）：`AgentKpiSample` 加 `active`/`bp_count`（第 43 轮 agent 心跳已带但 relay 采样未解析——admin KPI API 实际取不到，本轮补上）；新增 `kpi_anomalous(active, fps)` 告警判据（内容活跃但 fps<10 = 动态异常降帧，用户铁律动态不降帧）→ `tracing::warn`（≥30s/会话限频），静止（active=false）不误报。测试：`test_kpi_anomalous_threshold`（动态 fps5/9 告警、10/30 不告警、静止不告警）+ 采样测试断言 active/bp_count 落库。全量 `cargo test` **391 通过**（+1）。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
