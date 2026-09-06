@@ -76,6 +76,13 @@
       this._staleDropped = 0;
       // 时钟慢校准定时器（R3 丙135：连接后每 15min 重校一次，对抗长会话漂移）
       this._clockRecheckTimer = null;
+      // demux 损坏重同步计数（R3 丁150）：连续 3 次非法 box → 重发 init。
+      this._demuxCorrupt = 0;
+      // 解码器黑名单（R2 己155/R3 丁155）：连续解码错误触发（这里是解码器
+      // error 回调内的重建防抖已在 _scheduleDecodeRecover；此处补充"错误计数
+      // 达阈值请求切 codec"——避免持续软解失败空转重连）。阈值：30s 内 3 次。
+      this._decErrCount = 0;
+      this._decErrWindowStart = 0;
     }
 
     // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
@@ -154,6 +161,37 @@
       return { h264: 'H.264', vp9: 'VP9', av1: 'AV1' }[this._codecKind] || this._codecKind;
     }
 
+    // 解码器错误计数（R2 己155/R3 丁155 黑名单）：30s 窗口内 >=3 次解码器
+    // error → 判定当前 codec 在浏览器端不可解（黑名单），请求 agent 切换
+    // 下一个可用编码（av1→vp9→h264）。与 _scheduleDecodeRecover（重建流）
+    // 互补：重建治"参考链"，切 codec 治"解码器不支持该码流"。
+    _onDecodeError(e) {
+      const now = Date.now();
+      if (now - this._decErrWindowStart > 30000) {
+        this._decErrWindowStart = now;
+        this._decErrCount = 0;
+      }
+      this._decErrCount += 1;
+      if (this._decErrCount < 3) return;
+      this._decErrCount = 0; // 切换到下一档前重置（避免同窗口反复触发）
+      const codecs = ['av1', 'vp9', 'h264'];
+      if (!this._codecKind || codecs.indexOf(this._codecKind) < 0) return;
+      const nextIdx = codecs.indexOf(this._codecKind) + 1;
+      if (nextIdx >= codecs.length) return; // 已到 h264，不再可切
+      const next = codecs[nextIdx];
+      this._codecBlacklisted = this._codecBlacklisted || [];
+      if (this._codecBlacklisted.indexOf(next) >= 0) return; // 已黑名单过，防循环
+      this._codecBlacklisted.push(next);
+      this.setStatus('解码器持续报错，切换编码到 ' + next.toUpperCase(), false);
+      const sel = document.getElementById('desktop-codec-select');
+      if (sel && Array.from(sel.options).some(function(o) { return o.value === next; })) {
+        sel.value = next;
+        sel.dispatchEvent(new Event('change'));
+      } else if (window.shellRemote && window.shellRemote.send) {
+        window.shellRemote.send('desktop:codec', { codec: next });
+      }
+    }
+
     // 解码错误自动恢复（MYS-886）：WebCodecs 解码器持续报错时，延迟重建
     // 整个桌面流（disconnect → 清 init → connect 重新拉流）。带防抖避免
     // 连续报错触发重连风暴；正常关键帧自愈（_decErr）优先，这里兜底。
@@ -191,6 +229,17 @@
       this.disconnect(false);
       this._ttfvStart = Date.now(); // TTFV 打点起点（对齐 R2 乙60）
       this._ttfvMs = null;
+      // 能力探测缓存（R3 己195 / R5#65）：第一次探测后把解码路径
+      // （webcodecs / mse / none）写进 sessionStorage，重连/切页直接复用，
+      // 不再重复实例化 VideoDecoder 探测（长会话里避免每次重连一帧的浪费）。
+      if (typeof sessionStorage !== 'undefined') {
+        const key = 'sr-capability-v1';
+        const cached = sessionStorage.getItem(key);
+        if (!cached || Date.now() - Number(cached.split('|')[0] || 0) > 3600 * 1000) {
+          const cap = this._webcodecsAvailable() ? 'webcodecs' : (window.DesktopViewMse ? 'mse' : 'none');
+          sessionStorage.setItem(key, Date.now() + '|' + cap);
+        }
+      }
       if (this._webcodecsAvailable()) {
         this._mode = 'webcodecs';
         if (this.canvas) this.canvas.classList.remove('hidden');
@@ -378,6 +427,22 @@
       if (size < 8 || size > 32 * 1024 * 1024) {
         // 流损坏：丢掉缓冲重新同步（丢帧由下一个关键帧恢复）。
         this._buf = new Uint8Array(0);
+        // 连续 3 次损坏 → 参考链已不可信，重发 init 让 agent 重出参数集
+        //（对齐 R3 丁150：demux 抗损坏的升级动作——静默重同步只治标，
+        //  反复损坏说明流本身坏了）。
+        this._demuxCorrupt += 1;
+        if (this._demuxCorrupt >= 3) {
+          this._demuxCorrupt = 0;
+          if (!this._codecKind) return null; // 尚无 init，无 decode 上下文
+          if (!this._lastInitReq) this._lastInitReq = 0;
+          const now = Date.now();
+          // 3s 限频，防 reqkey/init 风暴与损坏帧共振。
+          if (now - this._lastInitReq > 3000) {
+            this._lastInitReq = now;
+            window.shellRemote.send('desktop:reqkey', { reinit: true });
+            this._reqKeyCount += 1;
+          }
+        }
         return null;
       }
       if (b.length < size) return null;
@@ -462,6 +527,7 @@
           error: function(e) {
             self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
             self.setStatus('解码错误: ' + e.message, true);
+            self._onDecodeError(e);
             self._scheduleDecodeRecover();
           }
         });
@@ -481,6 +547,7 @@
           error: function(e) {
             self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
             self.setStatus('解码错误: ' + e.message, true);
+            self._onDecodeError(e);
             self._scheduleDecodeRecover();
           }
         });
@@ -500,6 +567,7 @@
           error: function(e) {
             self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
             self.setStatus('解码错误: ' + e.message, true);
+            self._onDecodeError(e);
             self._scheduleDecodeRecover();
           }
         });
@@ -515,7 +583,9 @@
       this._dec = new VideoDecoder({
         output: function(frame) { self._onDecoded(frame); },
         error: function(e) {
+          self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
           self.setStatus('解码错误: ' + e.message, true);
+          self._onDecodeError(e);
           self._scheduleDecodeRecover();
         }
       });

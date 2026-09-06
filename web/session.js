@@ -521,4 +521,18 @@
     document.addEventListener('mouseup', () => {
         isResizing = false;
     });
+
+    // 离开页面即停桌面（R3 己100 / R5#77）：刷新、关标签、切走都触发
+    // pagehide（beforeunload 在移动端/部分浏览器不可靠）。停流省 agent
+    // 抓帧+编码资源；离开后 client 端断开由 SSE 层自己处理，这里只保证
+    // 主动通知 agent 不再发帧。
+    function notifyDesktopLeave() {
+        if (desktopActive && window.shellRemote && window.shellRemote.send) {
+            try { window.shellRemote.send('desktop:stop', {}); } catch (e) {}
+            if (desktopView) desktopView.disconnect();
+            desktopActive = false;
+        }
+    }
+    window.addEventListener('pagehide', notifyDesktopLeave);
+    window.addEventListener('beforeunload', notifyDesktopLeave);
 })();
