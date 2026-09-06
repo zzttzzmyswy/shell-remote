@@ -117,7 +117,7 @@
 | 60 | e2e 与解码排队分流 | ✔ | 解码队列行加时延估算 dq/dfps×1000ms（desktop.js，e2e 归因分流） |
 | 61-64 | 内存曲线/rAF 暂停/光标通道 | ◐ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；**光标独立通道已做**（第 18 轮：agent XQueryPointer 100ms 节流 → desktop:cursor → 浏览器 overlay，X11 GetImage 不含光标层是真实缺口） |
 | 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect）；第 43 轮核实：能力探测缓存已做（`sessionStorage` 保存解码模式 webcodecs/mse，重连/切页复用） |
-| 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ◐ | MSE 回退有（`_webcodecsAvailable ? webcodecs : mse`）；**解码器释放已实现**（disconnect 完整清理：MSE disconnect + `_dec.close()` + frames close + reader cancel，第 25 轮核实）；弱网降级提示/重连降质部分 |
+| 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ✔ | MSE 回退有（`_webcodecsAvailable ? webcodecs : mse`）；**解码器释放已实现**（disconnect 完整清理：MSE disconnect + `_dec.close()` + frames close + reader cancel，第 25 轮核实）；**重连降质已做**（第 41 轮：重连风暴 → join 后 speed 档 → 15s 稳定恢复 best）；**弱网降级提示已做**（第 66 轮：desktop.js `receiveQosAck` 检测 QoS 进入 Degraded/Critical 或 `qos_scale<800‰`（码率被压降）→ 状态条提示"网络较弱：已降码率/画质保帧（QoS …）"（弱网可见性主动提示，非仅面板小字）；恢复后清除（仅清自己设置的文本，不误清临时错误消息）；状态跃迁限频） |
 | 71 | 帧到达 jitter 面板 | ✔ | metric-jitter（v0.42） |
 | 72 | qos 250ms + ack 100ms 批 | ◐ | qos 250ms 独立上报已做（desktop.js，dfps×4 折算保 agent 语义，实测 3/s）；ack 100ms 批未做 |
 | 73 | 首帧 TTFV<500ms 打点 | ✔ | 本轮：_ttfvMs 面板展示（desktop.js） |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-43、KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 64 轮合计实（capability 声明真实性，R5 99% 保持）。
-- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / **SSE 空闲看门狗 1 项（第 65 轮）**）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / SSE 空闲看门狗 1 项 / **弱网降级提示 1 项（第 66 轮）**）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -266,6 +266,8 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 66 轮新增合入**：
+  1. 弱网降级提示（R5 #67-70 弱网降级提示部分闭合）：`web/desktop.js` `receiveQosAck` 检测 QoS 状态跃迁——`qos_state` 进入 **Degraded/Critical** 或 `qos_scale<800‰`（agent 码率被 QoS 压降）→ 状态条提示"**网络较弱：已降码率/画质保帧（QoS …）**"（弱网可见性主动提示，非仅面板"QoS 状态"小字）；恢复到 Good/码率回升后清除（仅清自己设置的文本，不误清"解码异常/等待就绪"等临时错误消息）；状态跃迁限频（不重复刷）。纯前端改动，**验证**：`node --check`（desktop.js）通过 + 状态机静态审查（初始化 `_qosDegradedShown/_qosDegradeText`、跃迁设置、定向清除）；无 Rust 回归面。R5 #67-70 标 ✔（MSE 回退 / 解码器释放 / 重连降质 / 弱网降级提示 四件套闭合）。
 - **第 65 轮新增合入**：
   1. 浏览器 SSE 空闲看门狗（R5 #8 SSE 空闲超时对齐心跳的浏览器侧显式计数）：`web/sse.js` 新增 `lastSseAt`（每次 SSE 块刷新）+ 连接建立后惰性 `setInterval(checkSseIdle, 5s)`——**30s 无任何块判定半开**（relay `AGENT_SSE_IDLE_TIMEOUT=60s` 兜底的一半，弱网事件稀疏时更快检出半开连接）→ abort 旧流 + `scheduleReconnect` 退避重连；connected 前 `lastSseAt==0` 不判死（交 join 看门狗 5s）。阈值 30s = agent 下行心跳 15s × 2 裕量，正常连接不误杀；与桌面 30s 判死（desktop.js `_lastDataAt`）对称。**验证**：`node --check`（sse.js）通过 + 三处引用一致（`lastSseAt` 定义/checkSseIdle 检查/handleBlock 刷新、`sseIdleTimer` 定义/启动）；纯前端改动无 Rust 回归面。R5 #8 标 ✔（agent 60s 兜底 + 浏览器 30s 显式看门狗互补）。
 - **第 64 轮新增合入**：
