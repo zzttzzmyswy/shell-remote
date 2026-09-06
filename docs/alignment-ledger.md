@@ -69,7 +69,7 @@
 | 9 | 重连退避 60s 上限 | ◐ | 浏览器 10 次退避已有；agent 控制优先待补 |
 | 10 | agent 重连幂等替换 | ✔ | relay `SessionRegistry::register_existing`（session.rs:153）——agent 断线重连 replay cached_tokens 走 register_existing 替换旧 session（第 21 轮 #11 恢复依赖它）；代码级核实修正 |
 | 11 | relay 重启后重发 init 状态机 | ✔ | 第 21 轮：agent 会话级 `desktop_want_running` 跨重连传递——断线退出时记录桌面状态并显式 stop（防 orphan task 向失效连接发帧），重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init）。实测两轮 relay 重启均 `auto-restoring desktop stream` + `capture started 1280x720` |
-| 12 | SSE 重建补 desktop:state | ⬜ | |
+| 12 | SSE 重建补 desktop:state | ✔ | 第 32 轮：relay 缓存每会话最近桌面运行状态（`SharedState.desktop_states`，started→true / stopped→false）→ SSE 首次连接/断线重建握手时**先**补发 `desktop:state {running}` 快照（`agent_events_handler` + `desktop_state_snapshot`，未入缓冲每次现读现发）→ 浏览器 `desktop:state` 监听按 running 恢复视图（true→进入桌面拉流，false→退回终端，编码热切换保护）。此前浏览器仅靠 `desktop:capabilities {running}` 恰好仍在事件缓冲中才能恢复视图；测试 `test_desktop_state_snapshot_reflects_latest` |
 | 13 | 多 agent 同 IP 白名单 | ✔ | `registration_rate_limit_per_min` 默认 120/min（--registration-rate-limit 可调）——同一出口 IP 多 agent 注册/重连不误拒；第 26 轮代码级核实修正 |
 | 14 | 混合通道二进制分辨 | ⬜ | 线协议整块（批次 2 #41）未做 |
 | 15 | agent 控制消息独立有界 channel | ✔ | 已分离：`control_tx`（bounded 64，控制消息）+ `post_tx`（unbounded，媒体帧，批内丢旧）+ `shell_tx`（终端输出）；第 26 轮代码级核实修正 |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **84%**（可靠通道 26 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **85%**（可靠通道 27 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -211,4 +211,6 @@
   1. 剪贴板大文本防护（`mod.rs clipboard_truncate` + `CLIPBOARD_MAX_CHARS` 512KB）：set/get 双向安全截断到最近 UTF-8 字符边界（`floor_char_boundary`）——防超大控制消息阻塞上行 / 远端剪贴板写入卡顿（完整文本走文件传输为远期方向）。测试 `test_clipboard_truncate_boundary`（未超限原样 / 英文精确截断 / 中文不切半字 / 混排合法 UTF-8），全量 `cargo test` **384 通过** → R5#32。
 - **第 31 轮新增合入**：
   1. 多会话隔离压测（`tools/multi_session_isolation.sh`，R5#39）：同一 relay 下并行起 N 个独立 agent（各自 `--key` + `--session-id`，`--desktop-capture none` 验证会话级共存）→ 注册逐条确认（agent 日志 session established）→ admin `overview` 校验会话数/在线数 → PASS 断言。实测 **3 agent：3/3 注册成功、overview 会话数=3 在线=3**（多会话共存正常，注册/心跳隔离，桌面互不干扰）。
+- **第 32 轮新增合入**：
+  1. SSE 重建补桌面状态（R5#12）：relay 新增 `SharedState.desktop_states`（每会话最近 `desktop:started`→true / `desktop:stopped`→false 缓存）；`agent_events_handler` SSE 首次连接/断线重建握手时经 `desktop_state_snapshot` **先补发** `desktop:state {running}` 快照（现读现发、不入 EventBuffer——不依赖历史事件仍在缓冲里）；浏览器 `session.js` 新增 `desktop:state` 监听：running=true 且本机未在看 → 进桌面视图拉流（与 `desktop:capabilities` 的 running 逻辑一致），false 且非编码热切换 → 退回终端。测试 `test_desktop_state_snapshot_reflects_latest`（无历史不发 / started 后 running=true / stopped 后 false），全量 `cargo test` **385 通过**。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
