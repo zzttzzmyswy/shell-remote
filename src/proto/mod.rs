@@ -222,6 +222,12 @@ pub fn requires_write(msg_type: &str) -> bool {
         "mcp:result",
         "mcp:exec_result",
         "mcp:exec_list",
+        // R5 授权细化：只读观看会话允许的桌面**只读**操作——关键帧请求
+        // （弱网/丢帧恢复）、TestDelay 探针（只读网络测量）、剪贴板读取。
+        // 控制类（mouse/key/clipboard:set/quality/codec/gray）仍要求写权限。
+        "desktop:reqkey",
+        "desktop:test-delay",
+        "desktop:clipboard:get",
     ];
     if read_only_types.contains(&msg_type) {
         return false;
@@ -334,6 +340,15 @@ mod tests {
         assert!(!requires_write("fs:read"));
         assert!(!requires_write("session:users"));
         assert!(!requires_write("mcp:result"));
+        // R5 授权细化：只读桌面操作允许（ro 观看可 reqkey 恢复/TestDelay 测量/
+        // 剪贴板读取）；控制类仍要求写。
+        assert!(!requires_write("desktop:reqkey"));
+        assert!(!requires_write("desktop:test-delay"));
+        assert!(!requires_write("desktop:clipboard:get"));
+        assert!(requires_write("desktop:mouse"));
+        assert!(requires_write("desktop:key"));
+        assert!(requires_write("desktop:clipboard:set"));
+        assert!(requires_write("desktop:quality"));
         assert!(requires_write("unknown:whatever")); // unknown → fail-closed
     }
 

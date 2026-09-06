@@ -154,14 +154,14 @@
 
 ### 批次 7 · 远期（178-200）
 
-⬜ 全部远期（i444/HW 编码/portal 直通/P2P/多显示器/多流/授权细化等）。
+⬜ 全部远期（i444/HW 编码/portal 直通/P2P/多显示器选屏/多流等）——**授权细化子集已做**（第 59 轮：`requires_write` read_only_types 补 `desktop:reqkey`/`desktop:test-delay`/`desktop:clipboard:get`——ro 只读观看会话可 reqkey 弱网恢复/TestDelay 测量/剪贴板读取，控制类（mouse/key/clipboard:set/quality/codec/gray）仍要求写权限；测试 `test_requires_write` 断言扩展）。
 
 ---
 
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD）；◐ 10%（部分依赖架构远期）。第 56 轮合计实。
-- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 31 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -266,6 +266,8 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 59 轮新增合入**：
+  1. 授权细化最小子集（批次7 授权细化）：`requires_write` read_only_types 补 `desktop:reqkey` / `desktop:test-delay` / `desktop:clipboard:get`——**ro 只读观看会话可 reqkey 弱网恢复 / TestDelay 网络测量 / 剪贴板读取**，控制类（mouse/key/clipboard:set/quality/codec/gray）仍要求写权限（403 拒绝）——只读观看体验与安全性兼顾。测试 `test_requires_write` 断言扩展（3 只读允许 + 4 控制拒绝）。全量 `cargo test` **399 通过**。
 - **第 54 轮综合 review**：
   1. 全量验收矩阵重验当前 master（用户铁律交叉验证）：① **重连矩阵**（`tools/reconnect_matrix.sh`）8 场景全过（agent 崩溃重启续接 / relay 重启退避重连 / 连续 flap 幂等）；② **4-top 动态基准**（`tools/bench_top4_verify.sh`）PASS——fps 中值 30.0 满帧、bitrate 670kbps（**动态内容不降帧**铁律实测成立）；③ **长稳短跑**（`tools/stability_verify.sh 60`）PASS——4 样本无重连、RSS 末两点 +0%（无泄漏）、fps 30.0（**降质不降帧** + 稳定）。全量 `cargo test` 398 已在此前通过。R5 ✔ 类 99% 保持（可合入项闭合，剩余 ⬜ 架构/平台级远期）。
 - **第 53 轮新增合入**：
