@@ -399,6 +399,9 @@
         desktopView.connect();
         window._srDesktopInfo = window._srDesktopInfo || {};
         window._srDesktopInfo.backend = (msg.payload && msg.payload.backend) || null;
+        // R5#136-146 多显示器拓扑：agent 枚举的 RANDR 输出列表随 started
+        // 上报，面板"远端显示器"行展示（多屏选屏的前置观察面）。
+        window._srDesktopInfo.displays = (msg.payload && msg.payload.displays) || [];
         if (desktopView && desktopView._captureBackend !== undefined) {
             desktopView._captureBackend = window._srDesktopInfo.backend;
         }

@@ -1154,6 +1154,20 @@
           }
           br.textContent = self._avgKbps ? self._avgKbps + ' kbps' : '-';
           if (backend) backend.textContent = self._captureBackend || '-';
+          // R5#136-146 远端显示器拓扑（agent started 上报 displays）：面板
+          // 显示数量 + 各分辨率——多屏选屏的前置观察面。
+          const mon = document.getElementById('metric-monitors');
+          if (mon) {
+            const displays = (window._srDesktopInfo && window._srDesktopInfo.displays) || [];
+            if (displays.length) {
+              const parts = displays.map(function(d) {
+                return d.width && d.height ? (d.width + 'x' + d.height) : (d.name || '?');
+              });
+              mon.textContent = displays.length + ' 台 · ' + parts.join(' + ');
+            } else {
+              mon.textContent = '-';
+            }
+          }
           if (uplink) uplink.textContent = self._uplinkMode || '-';
           if (decoder) decoder.textContent = self._decoderLabel();
           if (encoder) encoder.textContent = self._encoderLabel();
