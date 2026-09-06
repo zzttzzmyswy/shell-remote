@@ -597,6 +597,59 @@ pub const KF_ACTIVE_BYTES_FRAME: f64 = 2048.0;
 
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
+/// 编码器降级决策（R5#84 慢帧 / R5#85 故障热备统一出口）：返回应降级到的
+/// 下一档 codec（av1→vp9→vp8→h264），None = 不降。触发条件二选一：
+/// 连续 [`SLOW_ENCODE_TRIGGER`] 帧单帧编码 > [`SLOW_ENCODE_MS`]（CPU 跑
+/// 不动，慢），或连续 [`ENCODE_ERR_TRIGGER`] 帧 encode 返回 Err（编码器
+/// 实际故障/崩溃，坏）。已降级过（`already_degraded`，一次性防重建风暴）
+/// 或已是末档（h264，`next_lower_codec` 返回 None）都不再降。
+const SLOW_ENCODE_TRIGGER: u32 = 10;
+/// 编码器故障热备阈值（R5#85）：encode 连续返回 Err 达此数即判定编码器
+/// 故障，降级到更低 codec（区别于 #84 的"慢"——这是"坏"）。
+const ENCODE_ERR_TRIGGER: u32 = 5;
+
+fn next_degrade_codec(codec: &str, slow_streak: u32, err_streak: u32, already_degraded: bool) -> Option<String> {
+    if already_degraded {
+        return None;
+    }
+    let hit = slow_streak >= SLOW_ENCODE_TRIGGER || err_streak >= ENCODE_ERR_TRIGGER;
+    if !hit {
+        return None;
+    }
+    next_lower_codec(codec)
+}
+
+/// 编码器降级重建（R5#84 / R5#85 共用）：重建为 `lower` codec 并回写实际
+/// 生效档。参数集变化 → `mp4_cfg` 置 None + `seq` 重置（下个 IDR 携带新
+/// 参数集重发 init，广播给所有 viewer）；`force_idr` 让重建后首帧即关键帧。
+/// 成功返回实际生效 codec，失败 Err（调用方置 `encode_degraded` 防重建风暴）。
+async fn rebuild_encoder_degrade(
+    enc: &mut Box<dyn encoder::VideoEncoder>,
+    cfg: &mut DesktopConfig,
+    lower: &str,
+    enc_w: usize,
+    enc_h: usize,
+    mp4_cfg: &mut Option<mp4::Mp4Config>,
+    seq: &mut u32,
+) -> Result<String, String> {
+    let (new_enc, actual) = encoder::create_encoder_fallback(
+        lower,
+        enc_w as u32,
+        enc_h as u32,
+        cfg.max_bps,
+        cfg.fps,
+        cfg.quality,
+    )?;
+    *enc = new_enc;
+    cfg.codec = actual.clone();
+    if mp4_cfg.is_some() {
+        *mp4_cfg = None;
+        *seq = 1;
+    }
+    enc.force_idr();
+    Ok(actual)
+}
+
 /// desktops at 200-800 kbps: RC drops nearly every P frame): skipped frames
 /// are never POSTed, the bitrate is pinned to the ceiling while skipping, and
 /// a persistently high skip ratio degrades the encode resolution until the
@@ -763,9 +816,11 @@ async fn run_desktop_pipeline(
     // 复用 fallback 链）。避免"持续超帧预算 → e2e 堆积 → QoS 误判拥塞"的
     // 假阳性路径；降级一次性，成功后重置计数。
     let mut slow_encode_streak: u32 = 0;
+    // 编码器故障热备（R2 乙77 / R5#85）：encode 返回 Err 连续计数——编码器
+    // 实际故障/崩溃（区别于 #84 的慢帧），达 ENCODE_ERR_TRIGGER 即降级。
+    let mut encode_err_streak: u32 = 0;
     let mut encode_degraded = false;
     const SLOW_ENCODE_MS: f64 = 66.0;
-    const SLOW_ENCODE_TRIGGER: u32 = 10;
     // moof 复用 muxer（R5#45）：tfhd 模板缓存，每帧只重建变化部分，
     // 减少高频路径的 moof 构建分配。
     let muxer = mp4::Mp4Muxer::new();
@@ -957,69 +1012,83 @@ async fn run_desktop_pipeline(
         }
         let encode_t0 = std::time::Instant::now();
         let encoded = match enc.encode(&i420) {
-            Ok(e) => e,
+            Ok(e) => {
+                encode_err_streak = 0;
+                e
+            }
             Err(e) => {
-                tracing::warn!("encode error: {}", e);
-                continue;
+                // 编码器故障热备（R5#85）：连续 encode 报错（区别于 #84 慢帧）
+                // 说明编码器实际故障/崩溃。不用 continue 直接丢弃——用空帧
+                // 哨兵走统一降级出口（下方 next_degrade_codec 检查 err_streak），
+                // 触发则重建为更低 codec；未触发则被下方空帧分支自然跳过。
+                encode_err_streak += 1;
+                tracing::warn!(streak = encode_err_streak, "encode error: {e}");
+                crate::agent::desktop::encoder::EncodedFrame {
+                    nalu: Vec::new(),
+                    is_idr: false,
+                    sps: None,
+                    pps: None,
+                }
             }
         };
         let encode_ms = encode_t0.elapsed().as_secs_f64() * 1000.0;
-        // 编码耗时预算（R5#84）：软编单帧 >66ms 且连续 10 帧 → 当前 codec
-        // 在 CPU 上跑不动，降级到 fallback 链的下一档（av1→vp9→h264）。
-        // 触发前先看是否有更低档可降（h264 是末档，不再降——此时保持现状
-        // 只是丢帧追新，比反复重建更稳）。
+        // 编码耗时预算（R5#84）+ 编码器故障热备（R5#85）统一降级出口：
+        // 慢帧（连续 >66ms）或故障（连续 Err）任一触发 → 重建为 fallback 链
+        // 下一档 codec。一次性（encode_degraded）防重建风暴；h264 末档不再降。
         if !encode_degraded {
             if encode_ms > SLOW_ENCODE_MS {
                 slow_encode_streak += 1;
             } else {
                 slow_encode_streak = 0;
             }
-            if slow_encode_streak >= SLOW_ENCODE_TRIGGER {
-                let next = next_lower_codec(&cfg.codec);
-                if let Some(lower) = next {
-                    tracing::warn!(
-                        codec = %cfg.codec,
-                        next = %lower,
-                        ms = format!("{encode_ms:.0}"),
-                        "encode budget exceeded ({SLOW_ENCODE_TRIGGER} frames > {SLOW_ENCODE_MS}ms) — degrading codec"
-                    );
-                    match encoder::create_encoder_fallback(
-                        &lower,
-                        enc_w as u32,
-                        enc_h as u32,
-                        cfg.max_bps,
-                        cfg.fps,
-                        cfg.quality,
-                    ) {
-                        Ok((new_enc, actual)) => {
-                            tracing::warn!(
-                                codec = %cfg.codec,
-                                next = %actual,
-                                "encode degraded to {actual} (soft-encode budget)"
-                            );
-                            enc = new_enc;
-                            cfg.codec = actual;
-                            if mp4_cfg.is_some() {
-                                mp4_cfg = None; // 参数集变了：下个 IDR 重发 init
-                                seq = 1;
-                            }
-                            enc.force_idr();
-                            encode_degraded = true; // 一次性，成功后不再反复触发
-                        }
-                        Err(e) => {
-                            tracing::warn!("encode degrade to {lower} failed: {e}");
-                            encode_degraded = true; // 失败也停止重试，防重建风暴
-                        }
+            if let Some(lower) = next_degrade_codec(
+                &cfg.codec,
+                slow_encode_streak,
+                encode_err_streak,
+                encode_degraded,
+            ) {
+                match rebuild_encoder_degrade(
+                    &mut enc,
+                    &mut cfg,
+                    &lower,
+                    enc_w,
+                    enc_h,
+                    &mut mp4_cfg,
+                    &mut seq,
+                )
+                .await
+                {
+                    Ok(actual) => {
+                        tracing::warn!(
+                            codec = %cfg.codec,
+                            next = %actual,
+                            ms = format!("{encode_ms:.0}"),
+                            err_streak = encode_err_streak,
+                            "encode degraded to {actual} (soft-encode budget / fault)"
+                        );
+                        encode_degraded = true;
                     }
-                } else {
-                    // 已到最廉 codec（h264）：不再降，仅记录——丢帧追新兜底。
-                    encode_degraded = true;
-                    tracing::warn!(
-                        ms = format!("{encode_ms:.0}"),
-                        "encode budget exceeded but codec is already lowest ({}) — keeping",
-                        cfg.codec
-                    );
+                    Err(e) => {
+                        tracing::warn!("encode degrade to {lower} failed: {e}");
+                        encode_degraded = true;
+                    }
                 }
+                if encoded.nalu.is_empty() {
+                    // #85 Err 空哨兵触发降级：本帧无内容可 POST，重建完成后
+                    // 下轮再编（#84 慢帧有真实帧，继续走原流程不丢帧）。
+                    continue;
+                }
+            } else if slow_encode_streak >= SLOW_ENCODE_TRIGGER
+                || encode_err_streak >= ENCODE_ERR_TRIGGER
+            {
+                // 达阈值但无档可降（已是 h264 末档）：一次性记录并停止，防刷屏。
+                tracing::warn!(
+                    ms = format!("{encode_ms:.0}"),
+                    err_streak = encode_err_streak,
+                    "encode degrade triggered but no lower codec ({}) — keeping",
+                    cfg.codec
+                );
+                encode_degraded = true;
             }
         }
         frame_idx += 1;
@@ -1985,6 +2054,24 @@ mod tests {
         let avg = avg_frame_bytes(&w);
         assert!((avg - 3250.0).abs() < 1.0);
         assert_eq!(avg_frame_bytes(&VecDeque::new()), 0.0);
+    }
+
+    /// #85 编码器故障热备 + #84 慢帧：统一降级决策纯函数。
+    #[test]
+    fn test_next_degrade_codec_trigger() {
+        // 未达阈值：不降。
+        assert_eq!(next_degrade_codec("av1", 9, 0, false), None, "slow <10 不降");
+        assert_eq!(next_degrade_codec("av1", 0, 4, false), None, "err <5 不降");
+        // #84 慢帧：连续 10 帧 >66ms → 降一档（av1→vp9）。
+        assert_eq!(next_degrade_codec("av1", 10, 0, false).as_deref(), Some("vp9"));
+        // #85 故障热备：连续 5 帧 encode Err → 降一档。
+        assert_eq!(next_degrade_codec("av1", 0, 5, false).as_deref(), Some("vp9"));
+        // 两路径都达：仍只降一档（复用 fallback 链）。
+        assert_eq!(next_degrade_codec("vp9", 10, 5, false).as_deref(), Some("vp8"));
+        // 已降级过：不再降（一次性防重建风暴）。
+        assert_eq!(next_degrade_codec("vp9", 10, 5, true), None);
+        // h264 末档：无更低 codec，不降（丢帧追新兜底）。
+        assert_eq!(next_degrade_codec("h264", 10, 5, false), None);
     }
 
     #[test]
