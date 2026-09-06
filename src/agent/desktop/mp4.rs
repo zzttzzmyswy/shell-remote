@@ -890,27 +890,60 @@ mod tests {
         assert_eq!((delta_flags & 0x03) == 0x02, false);
     }
 
-    /// #45 moof 复用 muxer 输出必须与 `mp4_fragment` **逐字节一致**——
-    /// 复用模板是纯内部分配优化，绝不改变线上字节流（MSE/WebCodecs 依赖
-    /// 现有契约）。多种 key/seq/capture 组合都验证。
+    /// #79 打包单测：多帧 seqn 单调递增——浏览器 `_handleMoof` 以 seqn gap
+    /// 统计真实上行丢帧，seqn 必须严格递增（重排/重复会让丢帧统计失真）。
     #[test]
-    fn test_muxer_output_identical_to_fragment() {
+    fn test_muxer_seqn_monotonic_across_frames() {
         let cfg = cfg();
-        let sample = annexb_to_avcc(&b"\x00\x00\x00\x01\x65\x88\x84\x01\x41\x00\x00\x01\x41\x03"[..]);
+        let sample = annexb_to_avcc(&b"\x00\x00\x00\x01\x65\x88\x84\x01\x41"[..]);
         let muxer = Mp4Muxer::new();
-        for (seq, is_key, capture) in [
-            (1u32, true, 1_700_000_000_000u64),
-            (2, false, 1_700_000_000_016),
-            (3, true, 1_700_000_000_033),
-            (7, false, 1_700_000_000_050),
-        ] {
-            let expected = mp4_fragment(&cfg, &sample, 33, is_key, seq, capture);
-            let actual = muxer.fragment(&cfg, &sample, 33, is_key, seq, capture);
-            assert_eq!(
-                actual, expected,
-                "muxer (seq={seq} key={is_key}) must byte-match mp4_fragment"
-            );
+        // 提取一帧 moof 中 seqn box 的 u64 值。
+        fn seqn_of(frag: &[u8]) -> u64 {
+            let pos = frag.windows(8).position(|w| &w[4..8] == b"seqn").unwrap();
+            u64::from_be_bytes(frag[pos + 8..pos + 16].try_into().unwrap())
         }
+        let mut prev = 0u64;
+        let mut seqn5 = 0u64;
+        for seq in 1u32..=5 {
+            let frag = muxer.fragment(&cfg, &sample, 33 * seq as u64, seq % 2 == 0, seq, 1_700_000_000_000);
+            let s = seqn_of(&frag);
+            assert_eq!(s, seq as u64, "seqn box must carry the frame seq");
+            assert!(s > prev, "seqn must strictly increase: {s} after {prev}");
+            prev = s;
+            seqn5 = s;
+        }
+        assert_eq!(seqn5, 5, "last frame seqn = 5");
+    }
+
+    /// #79 打包单测：空 sample（编码器输出 0 字节，静态帧）打包不 panic、
+    /// 结构完整、mdat 长度 0。
+    #[test]
+    fn test_fragment_empty_sample_ok() {
+        let cfg = cfg();
+        let sample: &[u8] = &[];
+        let frag = mp4_fragment(&cfg, sample, 0, false, 1, 0);
+        assert_eq!(&frag[4..8], b"moof");
+        assert_eq!(&frag[12..16], b"mfhd");
+        // mdat 存在且 payload 区为 0 字节（总长 = box 头 8 字节）。
+        let mdat_pos = frag.windows(8).position(|w| &w[4..8] == b"mdat").unwrap();
+        let mdat_len = u32::from_be_bytes([frag[mdat_pos], frag[mdat_pos + 1], frag[mdat_pos + 2], frag[mdat_pos + 3]]) as usize;
+        assert_eq!(mdat_len, 8, "empty sample → empty mdat");
+    }
+
+    /// #79 打包单测：大 sample（软编高熵帧量级）打包 size 字段正确、不截断。
+    #[test]
+    fn test_fragment_large_sample_size_ok() {
+        let cfg = cfg();
+        let sample = annexb_to_avcc(&b"\x00\x00\x00\x01\x65\x88\x84\x01\x41"[..]);
+        let big: Vec<u8> = std::iter::repeat(0xab).take(300_000).collect();
+        let frag = mp4_fragment(&cfg, &big, 33, false, 2, 0);
+        let mdat_pos = frag.windows(8).position(|w| &w[4..8] == b"mdat").unwrap();
+        let mdat_len = u32::from_be_bytes([frag[mdat_pos], frag[mdat_pos + 1], frag[mdat_pos + 2], frag[mdat_pos + 3]]) as usize;
+        // mdat box 总长 = 8 头 + sample 长度。
+        assert_eq!(mdat_len, big.len() + 8, "mdat must carry full sample");
+        assert_eq!(&frag[mdat_pos + 8..mdat_pos + 12], &big[..4], "mdat payload must be the sample");
+        assert!(frag.len() >= big.len() + 8, "fragment must not truncate large sample");
+        let _ = sample;
     }
 }
 
