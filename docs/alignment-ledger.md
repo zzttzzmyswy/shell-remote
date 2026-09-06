@@ -115,14 +115,14 @@
 | 56 | 面板三组分组 | ✔ | session.html 流畅度/质量/传输 三段（R3 己197） |
 | 57-59 | 面板补行（目标帧率/quality/弱网） | ✔ | 本轮：gofps/reqkey/weaknet/TTFV 行（desktop.js+session.html） |
 | 60 | e2e 与解码排队分流 | ✔ | 解码队列行加时延估算 dq/dfps×1000ms（desktop.js，e2e 归因分流） |
-| 61-64 | 内存曲线/rAF 暂停/光标通道 | ◐ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；**光标独立通道已做**（第 18 轮：agent XQueryPointer 100ms 节流 → desktop:cursor → 浏览器 overlay，X11 GetImage 不含光标层是真实缺口） |
-| 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect）；第 43 轮核实：能力探测缓存已做（`sessionStorage` 保存解码模式 webcodecs/mse，重连/切页复用） |
+| 61-64 | 内存曲线/rAF 暂停/光标通道 | ✔ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；**光标独立通道已做**（第 18 轮：agent XQueryPointer 100ms 节流 → desktop:cursor → 浏览器 overlay，X11 GetImage 不含光标层是真实缺口）。第 74 轮核实全闭合 |
+| 65-66 | 能力探测/时钟 7 次 | ✔ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect）；第 43 轮核实：能力探测缓存已做（`sessionStorage` 保存解码模式 webcodecs/mse，重连/切页复用）。第 74 轮核实全闭合 |
 | 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ✔ | MSE 回退有（`_webcodecsAvailable ? webcodecs : mse`）；**解码器释放已实现**（disconnect 完整清理：MSE disconnect + `_dec.close()` + frames close + reader cancel，第 25 轮核实）；**重连降质已做**（第 41 轮：重连风暴 → join 后 speed 档 → 15s 稳定恢复 best）；**弱网降级提示已做**（第 66 轮：desktop.js `receiveQosAck` 检测 QoS 进入 Degraded/Critical 或 `qos_scale<800‰`（码率被压降）→ 状态条提示"网络较弱：已降码率/画质保帧（QoS …）"（弱网可见性主动提示，非仅面板小字）；恢复后清除（仅清自己设置的文本，不误清临时错误消息）；状态跃迁限频） |
 | 71 | 帧到达 jitter 面板 | ✔ | metric-jitter（v0.42） |
 | 72 | qos 250ms + ack 100ms 批 | ◐ | qos 250ms 独立上报已做（desktop.js，dfps×4 折算保 agent 语义，实测 3/s）；ack 100ms 批未做 |
 | 73 | 首帧 TTFV<500ms 打点 | ✔ | 本轮：_ttfvMs 面板展示（desktop.js） |
-| 74-78 | 解码器黑名单/reqkey 计数/崩溃日志/离开停抓/白闪 | ◐ | 黑名单切 codec（desktop.js:_onDecodeError）+ reqkey 计数 + **崩溃日志**（main.rs crash.log，第 24 轮增强）+ 离页停抓（session.js pagehide）+ 光标 overlay 断开清理（第 25 轮）+ **白闪修复**（第 27 轮：`#desktop-loading` 覆盖层连接时显示、首帧后隐藏——WebCodecs `_onDecoded` / MSE `loadeddata` 双路径；JS 语法+结构验证） |
-| 79-80 | 打包单测/前端验收 | ◐ | **打包单测补齐**（第 28 轮：mp4.rs +3 项——多帧 seqn 严格单调递增（浏览器 seqn gap 丢帧统计依赖）、空 sample 打包结构完整 + mdat 空、大 sample（300KB）mdat size 不截断）；前端验收脚本已有（verify_r* 系列） |
+| 74-78 | 解码器黑名单/reqkey 计数/崩溃日志/离开停抓/白闪 | ✔ | 黑名单切 codec（desktop.js:_onDecodeError）+ reqkey 计数 + **崩溃日志**（main.rs crash.log，第 24 轮增强）+ 离页停抓（session.js pagehide）+ 光标 overlay 断开清理（第 25 轮）+ **白闪修复**（第 27 轮：`#desktop-loading` 覆盖层连接时显示、首帧后隐藏——WebCodecs `_onDecoded` / MSE `loadeddata` 双路径；JS 语法+结构验证）。第 74 轮核实全闭合 |
+| 79-80 | 打包单测/前端验收 | ✔ | **打包单测补齐**（第 28 轮：mp4.rs +3 项——多帧 seqn 严格单调递增（浏览器 seqn gap 丢帧统计依赖）、空 sample 打包结构完整 + mdat 空、大 sample（300KB）mdat size 不截断）；前端验收脚本已有（verify_r* 系列）。第 74 轮核实全闭合 |
 
 ### 批次 3 · 编码器与 QoS 深化（81-120）
 
@@ -160,8 +160,8 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 73 轮合计实（台账一致性审计，统计与代码对齐，R5 99% 保持）。
-- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / SSE 空闲看门狗 1 项 / 弱网降级提示 1 项 / **#41/#43/#14 binary 线协议闭环 3 项（第 67-69 轮）+ #8/#67-70 收口**）；⬜ **~2%**（#123-124 DXGI/GDI Windows + #132-134 Wayland，均平台/依赖阻塞）；◐ **~5%**（#36-38 KCP 本体 / #44 老版本二进制兼容 / #48/#72 决策关闭 / #61-66 已做 / #74-80 已做 / #127-128 内存池 / #129 Windows——主体已做或决策关闭/平台阻塞）。第 73 轮统计修正（原"⬜ 9%"为第 13 轮旧值，实际 ⬜ 仅 #123-124/#132-134 两行平台项）。
+- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 74 轮合计实（R5 剩余 ◐ 核实闭合，可合入项 100% 闭合）。
+- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / SSE 空闲看门狗 1 项 / 弱网降级提示 1 项 / **#41/#43/#14 binary 线协议闭环 3 项（第 67-69 轮）+ #8/#67-70 收口**）；⬜ **~2%**（#123-124 DXGI/GDI Windows + #132-134 Wayland，均平台/依赖阻塞）；◐ **~3%**（#36-38 KCP 本体 / #44 老版本二进制兼容 / #48/#72 决策关闭 / #127-128 内存池 / #129 Windows——决策关闭或平台/架构阻塞）。第 74 轮核实闭合 #61-66/#74-80（此前"已做待标 ✔"），可合入项 100% 闭合。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -266,6 +266,10 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 74 轮：R5 剩余 ◐ 核实闭合 + 循环收口**：
+  1. 代码级核实 R5 剩余 ◐ 项中"主体已做"的 4 行全部子项有实现证据，标 ✔：**#61-64**（JS 内存行 + rAF 静止暂停 + 光标独立通道第 18 轮）、**#65-66**（时钟 7 次 + 能力探测缓存 sessionStorage）、**#74-78**（黑名单切 codec + reqkey 计数 + crash.log + 离开停抓 + overlay 清理 + 白闪修复第 27 轮）、**#79-80**（mp4.rs 打包单测 +3 + 前端验收 verify_r*）。
+  2. 收口后 R5 ⬜ 仅 **#123-124/#132-134**（平台阻塞）、◐ 仅 **#36-38 KCP 本体 / #44 老版本二进制兼容 / #48/#72 决策关闭 / #127-128 内存池 / #129 Windows**（决策关闭或平台/架构阻塞）——**可合入项 100% 闭合**。
+  3. **循环收口说明**：从第 60 轮起连续 15 轮完成多显示器选屏、像素转换 SIMD、IPv6 核实、capability 真实性、SSE 空闲看门狗、弱网降级提示、#41/#43 binary 全链路闭环、台账核实收口等；当前 master 全验收矩阵全绿（第 70 轮综合回归 + 第 70 轮后 binary 化回归）。剩余 ⬜ 全部为**环境/架构阻塞**（Windows 平台 / Wayland 会话 / UDP 传输层 / 编码器+解码端双端改造 / 框架级内存池）——非当前 Linux X11 环境可安全推进，建议按平台专项或待环境就绪后继续。
 - **第 73 轮：台账一致性审计（统计修正）**：
   1. 全量核对 R5 清单状态标记（55-143 行）：**⬜ 实际仅 2 行**——#123-124（DXGI/GDI Windows）+ #132-134（Wayland），均平台/依赖阻塞；**◐ 10 行**（#36-38 KCP 本体 / #44 老版本二进制兼容 / #48/#72 决策关闭 / #61-66 已做待标 ✔ / #74-80 已做待标 ✔ / #127-128 内存池 / #129 Windows）；其余 ✔ 55 行。**统计行"⬜ 9%"为第 13 轮旧值，严重过时**——修正为"⬜ ~2%（#123-124/#132-134）、◐ ~5%、✔ 类 99%"。
   2. 核实未闭合项无遗漏：#14/#41/#43（第 67-72 轮收口）、#8（第 65 轮）、#67-70（第 66 轮）均已正确标 ✔；R4/5 统计 78% + ⬜ 12% + ◐ 10% 与第 56-71 轮核实一致。**台账状态与代码实际完全对齐**。
