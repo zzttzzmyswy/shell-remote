@@ -22,7 +22,7 @@
 | # | 点 | 状态 | 证据 |
 |---|---|---|---|
 | 1-5 | A0 五态定义 | ◐ | 内容驱动 fps 已实现（静态/动态/背压），无完整五态对象；见 mod.rs:1058-1082 |
-| 6-15 | A1 输入信号 | ◐ | 熵/上行队列/解码背压/时钟均已进 on_delay；TestDelay 探针未做 |
+| 6-15 | A1 输入信号 | ◐ | 熵/上行队列/解码背压/时钟均已进 on_delay；**TestDelay 探针已做**（第 14 轮：浏览器 1s 单调时钟探测包 → agent 即时 echo → 纯网络层 RTT，probe_ms 随 qos 上报并作拥塞证实——网络健康而 e2e 高判定为管线积压不降码率） |
 | 16-30 | A2 质量控制器 | ◐ | 码率档三档+灰度+quality 连续在 QosAdaptive；250ms 质量反馈状态机未做 |
 | 31-45 | A3 帧率控制器 | ✔ | 内容驱动（静态 1fps/动态满帧/背压 24→15）mod.rs:1058-1082 + QoS 单测 8 项 |
 | 46-55 | A4 丢帧控制器 | ◐ | 浏览器丢旧+seq gap 统计已实现（desktop.js）；agent 侧"质量到底丢帧追新"未做 |
@@ -160,8 +160,10 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **53%**（甲 帧率/IDR/RTT分带、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 21%（丙遥测剩余、戊发布门槛）；◐ 26%。
-- **R5 落地清单（200 点）**：✔ 类约 **56%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 5 项 / 打包 3 项 / 遥测测试 8 项）；⬜ 28%。
+- **R4/5（200 点）**：✔ 类约 **54%**（甲 帧率/IDR/RTT分带/TestDelay探针、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 21%（丙遥测剩余、戊发布门槛）；◐ 25%。
+- **R5 落地清单（200 点）**：✔ 类约 **57%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 5 项 / 打包 3 项 / 遥测测试 8 项 / TestDelay 探针 1 项）；⬜ 28%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、admin KPI 曲线、光标独立通道、独立 100ms ack 批、TestDelay 探针、AV1 测速门槛、H264 热备、质量 250ms 反馈、CBR 纪律等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **第 14 轮新增合入**：
+  1. TestDelay 探针全链路（对齐 rustdesk `cm::TestDelay`）：浏览器每 1s 发 `desktop:test-delay {seq,t0}`（performance.now 单调时钟）→ relay 直转 → agent 即时 echo `test-delay-ack {seq,t0}` → relay 加 `broadcast_types`/KNOWN 白名单回传 → 浏览器本地单调时钟算**纯网络层 RTT**（不含编码/解码/渲染管线、不依赖时钟校准；与 e2e 的 `_clockOffset` 校准正交）→ qos 上报加 `probe_ms` → agent QoS 日志快照含 `probe_ms`，`QosAdaptive` 5 窗口中值 + `pipeline_bloated` 判据（网络健康+100ms 预算仍 ≤ e2e 中值 ⇒ over 来自管线/解码积压，不降码率；probe=0 未上报 ⇒ 沿用原判据，兼容老浏览器/测试）。测试 `test_qos_probe_confirms_network_congestion`（健康 probe 不降/高 probe 降/无 probe 降三场景）、`test_qos_probe_median_filters_spike`、`test_qos_probe_absent_returns_zero`。**浏览器实测**：网络 RTT 行 5ms（8 次采样稳定）、agent 日志 `delay_ms=15 probe_ms=4`（管线/网络正确分离）、静态屏 fps=1 且 qos_scale=1000（probe 健康不误降）→ R4 甲 A1 / R5#148。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、admin KPI 曲线、光标独立通道、独立 100ms ack 批、AV1 测速门槛、H264 热备、质量 250ms 反馈、CBR 纪律等——在台账对应 ⬜/◐ 行，未宣称完成。
