@@ -320,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 display: desktop_display,
                 lan_port: desktop_lan_port,
+                lan_addr: None, // 由 run_session 在 LanDesktop::spawn 后注入
             };
             agent::start(
                 relay_url,

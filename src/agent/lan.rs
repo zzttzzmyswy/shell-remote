@@ -70,7 +70,10 @@ impl LanDesktop {
         // 由显式 --desktop-lan-port N 开启才有；默认 0 不 spawn（零暴露）。
         let handler_stream = stream.clone();
         let app = axum::Router::new()
-            .route("/agent/desktop/stream", axum::routing::get(lan_stream_handler))
+            .route(
+                "/agent/desktop/stream",
+                axum::routing::get(lan_stream_handler).options(cors_preflight),
+            )
             .with_state(handler_stream);
         let _server = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -150,7 +153,25 @@ async fn lan_stream_handler(State(ds): State<DesktopStream>) -> Response {
         .header(header::CONTENT_TYPE, "video/mp4")
         .header(header::CACHE_CONTROL, "no-cache")
         .header("x-accel-buffering", "no")
+        // 跨源直连（Task 5）：浏览器页面由 relay 站点（如 http://127.0.0.1:3120）
+        // 提供，LAN 直连却指向 agent 本地的 http://<lan-ip>:port —— 跨源 fetch
+        // 请求体必须被允许读取，否则 probe 读到 CORS 过滤响应（body=null）而
+        // 误判不可用、回退 P2P/relay。LAN 端点本身无认证，放行任意源。
+        .header("Access-Control-Allow-Origin", "*")
         .body(body)
+        .unwrap()
+}
+
+/// CORS 预检：默认 GET+Accept 已属 simple request 不触发预检；兜底处理
+/// OPTIONS，避免后续给探测请求加自定义头时被预检挡住。
+async fn cors_preflight() -> Response {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        .header("Access-Control-Allow-Headers", "*")
+        .header("Access-Control-Max-Age", "86400")
+        .body(Body::empty())
         .unwrap()
 }
 

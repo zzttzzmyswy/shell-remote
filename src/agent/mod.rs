@@ -735,6 +735,36 @@ async fn run_session(
         );
     }
 
+    // Task 4（阶段2 LAN 直连基础）：agent 本地 HTTP server 暴露与 relay 同构的
+    // /agent/desktop/stream，同局域网浏览器直连 agent 拉桌面流、绕开中转。
+    // 仅显式 --desktop-lan-port N（lan_port != 0）开启；默认 0 不开任何端口。
+    // 会话结束 drop 时 LanDesktop 中止 server/feed 任务，端口释放供重连重新 bind。
+    // 必须在 register 与 DesktopManager::new 之前：绑定端口/出口 IP 只有 spawn
+    // 后才知道，注册消息的 lan_addr 与 desktop:capabilities.lan_addrs 都要它。
+    let lan_desktop = if desktop_cfg.lan_port != 0 {
+        match crate::agent::lan::LanDesktop::spawn(desktop_cfg.lan_port).await {
+            Ok(lan) => {
+                tracing::info!(
+                    addr = %lan.addr_report(),
+                    "LAN desktop stream server up (--desktop-lan-port)"
+                );
+                Some(lan)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lan_port = desktop_cfg.lan_port,
+                    "LAN desktop server bind failed: {e}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // 上报地址（"ip:port"，None = 未开启）：注册消息随 `lan_addr` 上报 relay，
+    // 同时注入 DesktopManager 的 config（capabilities_json 的 lan_addrs）。
+    let lan_addr_report = lan_desktop.as_ref().map(|lan| lan.addr_report());
+
     let mut client = RelayClient::connect_with_retry(
         relay_url,
         key.clone(),
@@ -743,6 +773,7 @@ async fn run_session(
         cached_tokens,
         10,
         insecure_tls,
+        lan_addr_report.clone(),
     )
     .await?;
 
@@ -771,7 +802,10 @@ async fn run_session(
     // single-task FIFO so the byte stream reaches the relay in order
     // (concurrent sends could reorder fragments and break playback).
     // 先建 DesktopManager，心跳扩展（R5#150）需要它的 KPI 快照。
-    let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(desktop_cfg.clone()));
+    // lan_addr 已由上面的 LanDesktop::spawn 得出（None = 未开启阶段2）。
+    let mut dm_cfg = desktop_cfg.clone();
+    dm_cfg.lan_addr = lan_addr_report.clone();
+    let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(dm_cfg));
     // Task 2 P2P 信令会话槽：None = 无活动协商；offer 到达时宿主 peer +
     // 驱动任务，desktop:stop / 二次 offer / 会话结束 时回收。
     let p2p_state = crate::agent::p2p::P2pState::default();
@@ -1130,31 +1164,6 @@ async fn run_session(
             });
         }
     }
-    // Task 4（阶段2 LAN 直连基础）：agent 本地 HTTP server 暴露与 relay 同构的
-    // /agent/desktop/stream，同局域网浏览器直连 agent 拉桌面流、绕开中转。
-    // 仅显式 --desktop-lan-port N（lan_port != 0）开启；默认 0 不开任何端口。
-    // 会话结束 drop 时 LanDesktop 中止 server/feed 任务，端口释放供重连重新 bind。
-    let lan_desktop = if desktop_cfg.lan_port != 0 {
-        match crate::agent::lan::LanDesktop::spawn(desktop_cfg.lan_port).await {
-            Ok(lan) => {
-                tracing::info!(
-                    addr = %lan.addr_report(),
-                    "LAN desktop stream server up (--desktop-lan-port)"
-                );
-                Some(lan)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    lan_port = desktop_cfg.lan_port,
-                    "LAN desktop server bind failed: {e}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // Task 3：P2P 已建连时把 desktop:video 的 fMP4 字节镜像一份进 DataChannel
     //（relay POST 行为/编码/QoS 零改动，仅加一条镜像投递）。闭包外 clone，
     // Arc 引用计数使闭包与消息循环共享同一个投递口。

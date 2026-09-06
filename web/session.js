@@ -398,6 +398,14 @@
             showDesktopView();
             desktopView.connect();
         }
+        // 阶段2 LAN 直连：agent 同网段直连地址（"ip:port"），浏览器据此
+        // 优先 http://<addr>/agent/desktop/stream 直连拉流（绕开 relay）。
+        // 数组缺省/空 = 未开启 --desktop-lan-port，desktop.js 直接落 P2P。
+        const lanAddrs = (msg.payload && msg.payload.lan_addrs) || [];
+        desktopView._lanAddrs = Array.isArray(lanAddrs)
+            ? lanAddrs.filter(function (a) { return typeof a === 'string' && a.length > 0; })
+            : [];
+        window._srLanAddrs = desktopView._lanAddrs;
     });
 
     window.shellRemote.on('desktop:state', function(msg) {

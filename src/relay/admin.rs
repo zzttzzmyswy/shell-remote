@@ -171,6 +171,7 @@ pub async fn overview_handler(
             "device": info.device,
             "agent_version": info.agent_version,
             "capabilities": info.capabilities,
+            "lan_addr": info.lan_addr,
             "desktop_proto": state
                 .desktop_proto
                 .read()

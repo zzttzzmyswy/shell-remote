@@ -54,6 +54,16 @@ pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) {
     }
 }
 
+/// 阶段2 LAN 直连：解析注册消息的 `lan_addr` 字段（agent 本地桌面流 HTTP
+/// 端点地址 "ip:port"）。缺省/空串/非字符串 → None（老版本 agent 或未开启
+/// `--desktop-lan-port`，兼容）。
+fn parse_lan_addr(body: &Value) -> Option<String> {
+    body.get("lan_addr")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// 批次5 告警判据：内容活跃（非静止）但编码帧率 <10 —— 动态内容异常降帧
 /// （用户铁律：动态画面不降帧，正常动态 fps ≥15）。静止（active=false，
 /// fps=1）属正常，不告警。纯函数便于单测。
@@ -915,6 +925,14 @@ pub async fn agent_send_handler(
                     .await;
             }
         }
+
+        // 阶段2 LAN 直连：注册消息可带 `lan_addr`（"ip:port"），存入会话表
+        // 供 admin 展示；浏览器经 agent 的 desktop:capabilities.lan_addrs 拿到
+        // 同网段探测直连地址。老版本 / 未开启 --desktop-lan-port → None。
+        state
+            .sessions
+            .set_lan_addr(&session_id, parse_lan_addr(&body))
+            .await;
 
         let tokens_json: Vec<Value> = tokens
             .iter()
@@ -1938,6 +1956,41 @@ mod tests {
         ];
         state.sessions.update_capabilities(&sid, caps.clone()).await;
         assert_eq!(state.sessions.get_capabilities(&sid).await, caps);
+    }
+
+    #[tokio::test]
+    async fn test_register_lan_addr_roundtrip() {
+        // 阶段2 LAN 直连：agent:register 消息带 lan_addr → parse → set_lan_addr
+        // 存进 SessionInfo；缺省/空串/非字符串保持 None（老版本兼容）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        assert!(
+            state.sessions.get(&sid).await.unwrap().lan_addr.is_none(),
+            "未上报 lan_addr 应为 None"
+        );
+
+        let with_addr = serde_json::json!({
+            "type": "agent:register",
+            "lan_addr": "192.168.1.5:43210",
+        });
+        state
+            .sessions
+            .set_lan_addr(&sid, parse_lan_addr(&with_addr))
+            .await;
+        assert_eq!(
+            state.sessions.get(&sid).await.unwrap().lan_addr.as_deref(),
+            Some("192.168.1.5:43210")
+        );
+
+        // 空串 → None（不存空地址）。
+        let empty = serde_json::json!({ "type": "agent:register", "lan_addr": "" });
+        assert!(parse_lan_addr(&empty).is_none(), "空串 lan_addr 应解析为 None");
+        // 缺省字段 / 非字符串 → None。
+        let missing = serde_json::json!({ "type": "agent:register" });
+        assert!(parse_lan_addr(&missing).is_none());
+        let non_str = serde_json::json!({ "type": "agent:register", "lan_addr": 42 });
+        assert!(parse_lan_addr(&non_str).is_none(), "非字符串 lan_addr 应解析为 None");
     }
 
     #[tokio::test]

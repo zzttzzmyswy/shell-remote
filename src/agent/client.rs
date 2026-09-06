@@ -166,6 +166,7 @@ impl RelayClient {
         desired_session_id: Option<&str>,
         cached_tokens: Option<&[(String, String)]>,
         insecure_tls: bool,
+        lan_addr: Option<String>,
     ) -> anyhow::Result<Self> {
         let base = relay_url.trim_end_matches('/');
         // 配置只接受 http/https 路径；ws/wss 由程序内部推导（http→ws、
@@ -224,6 +225,16 @@ impl RelayClient {
         // GDI/DXGI；Wayland 需编译 feature 且 WAYLAND_DISPLAY 可达）——
         // 避免 capability 声明不实误导浏览器/admin。
         register_msg["capabilities"] = json!(build_capabilities());
+
+        // 阶段2 LAN 直连：agent 本地桌面流 HTTP 端点地址（"ip:port"），relay
+        // 存进 session 表、admin 展示；浏览器经 desktop:capabilities.lan_addrs
+        // 拿到后同网段探测直连（绕开 relay）。老版本 / 未开启
+        // --desktop-lan-port 时无此字段（兼容）。
+        if let Some(addr) = lan_addr {
+            if !addr.is_empty() {
+                register_msg["lan_addr"] = json!(addr);
+            }
+        }
 
         let resp = http_client
             .post(&send_url)
@@ -367,6 +378,8 @@ impl RelayClient {
         cached_tokens: &mut Option<Vec<(String, String)>>,
         max_retries: u32,
         insecure_tls: bool,
+        // LAN 直连地址（"ip:port"）随每次注册上报；None = 未开启（不带上报）。
+        lan_addr: Option<String>,
     ) -> anyhow::Result<Self> {
         let relay_url = relay_url.trim_end_matches('/');
         let mut delay = tokio::time::Duration::from_secs(1);
@@ -383,6 +396,7 @@ impl RelayClient {
                 desired_session_id,
                 use_tokens,
                 insecure_tls,
+                lan_addr.clone(),
             )
             .await
             {
