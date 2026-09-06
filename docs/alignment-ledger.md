@@ -114,12 +114,12 @@
 | 55 | 帧超龄 >2s 丢弃 | ✔ | e2e>2000ms 丢+reqkey（desktop.js:_onDecoded，面板超龄计数） |
 | 56 | 面板三组分组 | ✔ | session.html 流畅度/质量/传输 三段（R3 己197） |
 | 57-59 | 面板补行（目标帧率/quality/弱网） | ✔ | 本轮：gofps/reqkey/weaknet/TTFV 行（desktop.js+session.html） |
-| 60 | e2e 与解码排队分流 | ◐ | |
+| 60 | e2e 与解码排队分流 | ✔ | 解码队列行加时延估算 dq/dfps×1000ms（desktop.js，e2e 归因分流） |
 | 61-64 | 内存曲线/rAF 暂停/光标通道 | ◐ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；光标通道未做 |
 | 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect） |
 | 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ◐ | MSE 回退有 |
 | 71 | 帧到达 jitter 面板 | ✔ | metric-jitter（v0.42） |
-| 72 | qos 250ms + ack 100ms 批 | ◐ | qos 1s 上报（desktop.js），ack 批未做 |
+| 72 | qos 250ms + ack 100ms 批 | ◐ | qos 250ms 独立上报已做（desktop.js，dfps×4 折算保 agent 语义，实测 3/s）；ack 100ms 批未做 |
 | 73 | 首帧 TTFV<500ms 打点 | ✔ | 本轮：_ttfvMs 面板展示（desktop.js） |
 | 74-78 | 解码器黑名单/reqkey 计数/崩溃日志/离开停抓/白闪 | ◐ | 黑名单切 codec（desktop.js:_onDecodeError）+ reqkey 计数 + 离页停抓（session.js pagehide）；崩溃日志/白闪缺 |
 | 79-80 | 打包单测/前端验收 | ⬜ | |
@@ -158,10 +158,9 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **40%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复+内存观测、丁 弱网可见性+输入节流、丙 遥测基线+日志）；⬜ 34%（丙遥测剩余、戊发布门槛）；◐ 26%。
-- **R5 落地清单（200 点）**：✔ 类约 **41%**（可靠通道 7 项 / 前端 19 项 / 抓帧 3 项 / 编码器 2 项 / 打包 2 项 / 遥测测试 7 项）；⬜ 42%。
-- **第 6 轮新增合入**：
-  1. moof 复用（`mp4.rs Mp4Muxer`：tfhd 模板缓存、每帧只重建变化部分，`test_muxer_output_identical_to_fragment` 逐字节一致）→ R3 甲20/21 / R5#45；
-  2. keyframe 判定一致断言单测（`mp4.rs test_keyframe_flag_matches_browser_detection`：agent trun flags 与浏览器 `(flags&0x03)==0x02` 判定逐字一致）→ R3 甲23 / R5#47；
-  3. JS 内存曲线（`desktop.js` performance.memory 当前+峰值、`session.html` 进程组行，长会话泄漏观测）→ R2 丁131 / R5#61。
+- **R4/5（200 点）**：✔ 类约 **42%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流、丙 遥测基线+日志）；⬜ 32%（丙遥测剩余、戊发布门槛）；◐ 26%。
+- **R5 落地清单（200 点）**：✔ 类约 **43%**（可靠通道 7 项 / 前端 20 项 / 抓帧 3 项 / 编码器 2 项 / 打包 2 项 / 遥测测试 7 项）；⬜ 40%。
+- **第 7 轮新增合入**：
+  1. QoS 反馈 250ms 独立上报（`desktop.js` 独立定时器，dfps×4 折算保 agent 背压阈值语义；实测 agent 决策频率 3/s，停滞检测同步移至 250ms 更早发现）→ R5#72（部分）；
+  2. e2e 归因分流（`desktop.js` 解码队列行加时延估算 dq/dfps×1000ms，e2e 高时区分"解码积压"还是"上游慢"）→ R2 己175 / R5#60。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批等——在台账对应 ⬜/◐ 行，未宣称完成。
