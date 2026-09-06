@@ -161,6 +161,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "desktop:uplink",
             "desktop:clipboard",
             "desktop:qos-ack",
+            "test-delay-ack",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {
             // fs:result is browser-facing (file manager reads + downloads).
@@ -350,6 +351,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 "desktop:uplink",
                 "desktop:clipboard",
                 "desktop:qos-ack",
+                "test-delay-ack",
                 "mcp:result",
                 "mcp:exec_result",
                 "fs:result",

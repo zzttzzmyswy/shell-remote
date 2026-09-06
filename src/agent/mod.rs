@@ -1541,6 +1541,14 @@ async fn run_session(
                                         .get("delay_ms")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0) as u32;
+                                    // TestDelay 网络层探针（R4 甲 A1 / R5#148，
+                                    // 对齐 rustdesk cm::TestDelay）：浏览器单调
+                                    // 时钟往返、纯网络 RTT（0 = 未上报）。
+                                    let probe_ms = msg
+                                        .payload
+                                        .get("probe_ms")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as u32;
                                     let decode_fps = msg
                                         .payload
                                         .get("dfps")
@@ -1556,8 +1564,9 @@ async fn run_session(
                                         .get("lseq")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0);
-                                    let (fps, qos_scale, bitrate_kbps) =
-                                        desktop.on_qos_delay(delay_ms, decode_fps, decode_queue, ack_seq).await;
+                                    let (fps, qos_scale, bitrate_kbps) = desktop
+                                        .on_qos_delay(delay_ms, probe_ms, decode_fps, decode_queue, ack_seq)
+                                        .await;
                                     // 回传当前生效的 QoS 状态（对齐 rustdesk TestDelay
                                     // 携带 target_bitrate，MYS-886 #153）：浏览器可展示
                                     // 实际码率/帧率。
@@ -1571,6 +1580,34 @@ async fn run_session(
                                         }),
                                     };
                                     out.control(qos_ack).await;
+                                }
+
+                                "desktop:test-delay" => {
+                                    // TestDelay 探针（R4 甲 A1 / R5#148，对齐
+                                    // rustdesk cm::TestDelay）：浏览器单调时钟探测
+                                    // 包，agent 收到即原样 echo——浏览器用本地单调
+                                    // 时钟算往返 RTT（纯网络层，不含编码/解码/渲染
+                                    // 管线、不依赖时钟校准）。t0 原样返回即可，agent
+                                    // 侧处理时间被包含在 RTT 内（即时回包，微秒级）。
+                                    let seq = msg
+                                        .payload
+                                        .get("seq")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let t0 = msg
+                                        .payload
+                                        .get("t0")
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
+                                    let ack = Message {
+                                        msg_type: "test-delay-ack".to_string(),
+                                        session_id: client.session_id.clone(),
+                                        payload: serde_json::json!({
+                                            "seq": seq,
+                                            "t0": t0,
+                                        }),
+                                    };
+                                    out.control(ack).await;
                                 }
 
                                 "desktop:reqkey" => {

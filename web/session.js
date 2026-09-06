@@ -339,6 +339,15 @@
         }
     });
 
+    // TestDelay 探针回包（R4 甲 A1 / R5#148）：agent 原样 echo，浏览器本地
+    // 单调时钟算纯网络层 RTT（面板"网络 RTT"行；随 qos 上报 agent 作为拥塞
+    // 证据）。
+    window.shellRemote.on('test-delay-ack', function(msg) {
+        if (desktopView && typeof desktopView.receiveTestDelayAck === 'function') {
+            desktopView.receiveTestDelayAck(msg.payload || {});
+        }
+    });
+
     // ── 剪贴板同步（纯文本）──────────────────────────────────
     // → 远端：读文本框（为空则读本机剪贴板）发给 agent 设置远端剪贴板。
     // 远端 → 本机：请求 agent 读远端剪贴板，回包写入文本框并尝试写本机

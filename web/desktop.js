@@ -61,6 +61,15 @@
       // 转发时被改写为 relay 墙钟，e2e 用 本地now+偏移 与 srtc 对齐，彻底摆脱
       // 双机系统时间差（MYS-886 指标失真根因）。
       this._clockOffset = 0;
+      // TestDelay 探针（R4 甲 A1 / R5#148，对齐 rustdesk cm::TestDelay）：
+      // 每 1s 发一个探测包，agent 收到即时原样 echo——浏览器用本地单调时钟
+      // （performance.now）算往返 RTT。这是**纯网络层**往返：不含编码/解码/
+      // 渲染管线、不依赖时钟校准（e2e 依赖 _clockOffset，探针不依赖）。随
+      // qos 上报给 agent 作为"网络层拥塞证据"（e2e 高但网络健康 = 管线积压，
+      // 不误降码率）。
+      this._probeSeq = 0;
+      this._probeRttMs = 0;
+      this._testDelayTimer = null;
       // agent 经 desktop:qos-ack 回传的当前 QoS 状态（目标帧率/码率档）。
       // 面板"目标帧率/活动"行展示：与渲染帧率对照，可分辨"是我在降帧
       // 还是解码跟不上"（对齐 rustdesk TestDelay/target fps，MYS-886）。
@@ -886,11 +895,33 @@
         this._ackScale = Number(ack.qos_scale);
       }
     }
+    // TestDelay 探针回包：agent 原样 echo t0，本地单调时钟算纯网络 RTT。
+    receiveTestDelayAck(ack) {
+      if (!ack || typeof ack.t0 !== 'number') return;
+      const rtt = performance.now() - ack.t0;
+      if (!(rtt >= 0) || rtt > 5000) return; // 异常样本丢弃（时钟重置/断连）
+      this._probeRttMs = Math.round(rtt);
+    }
+    _startTestDelay() {
+      if (this._testDelayTimer) return;
+      const self = this;
+      this._testDelayTimer = setInterval(function() {
+        if (!self.connected) return;
+        self._probeSeq += 1;
+        if (window.shellRemote && window.shellRemote.send) {
+          window.shellRemote.send('desktop:test-delay', {
+            seq: self._probeSeq,
+            t0: performance.now()
+          });
+        }
+      }, 1000);
+    }
     _startMetrics() {
       if (this._metricsTimer) return;
       const panel = document.getElementById('desktop-metrics');
       if (!panel) return;
       const self = this;
+      this._startTestDelay();
       // 长会话时钟漂移对抗（R3 丙135）：连接期间每 15min 重校一次 relay 时基，
       // e2e 读数不因双机时钟 drift 缓慢失真。校准失败静默（保持原偏移）。
       if (!this._clockRecheckTimer) {
@@ -911,6 +942,7 @@
           if (self._e2eMs !== undefined && window.shellRemote && window.shellRemote.send) {
             window.shellRemote.send('desktop:qos', {
               delay_ms: Math.round(self._e2eMs),
+              probe_ms: self._probeRttMs || 0,
               dfps: self._qosDfps,
               dq: self._dec ? self._dec.decodeQueueSize : 0,
               lseq: self._lastSeq || 0
@@ -998,6 +1030,10 @@
               jitterEl.textContent = '-';
             }
           }
+          // TestDelay 网络层 RTT（R5#148）：与端到端延时对照——网络 RTT 正常
+          // 而 e2e 高 → 延迟在管线/解码侧而非网络。
+          const probeEl = document.getElementById('metric-probe');
+          if (probeEl) probeEl.textContent = self._probeRttMs ? self._probeRttMs + ' ms' : '-';
           br.textContent = self._avgKbps ? self._avgKbps + ' kbps' : '-';
           if (backend) backend.textContent = self._captureBackend || '-';
           if (uplink) uplink.textContent = self._uplinkMode || '-';
@@ -1069,6 +1105,10 @@
       if (this._clockRecheckTimer) {
         clearInterval(this._clockRecheckTimer);
         this._clockRecheckTimer = null;
+      }
+      if (this._testDelayTimer) {
+        clearInterval(this._testDelayTimer);
+        this._testDelayTimer = null;
       }
       const btn = document.getElementById('desktop-metrics-btn');
       if (btn && this._onMetricsBtn) btn.removeEventListener('pointerdown', this._onMetricsBtn, true);

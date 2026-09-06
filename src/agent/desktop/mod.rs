@@ -255,6 +255,7 @@ impl DesktopManager {
     pub async fn on_qos_delay(
         &self,
         delay_ms: u32,
+        probe_ms: u32,
         decode_fps: u32,
         decode_queue: u32,
         ack_seq: u64,
@@ -284,7 +285,7 @@ impl DesktopManager {
         };
         let (fps, permille) = {
             let mut q = self.qos.lock().await;
-            q.on_delay(delay_ms, frames, elapsed_s, &ctx)
+            q.on_delay(delay_ms, probe_ms, frames, elapsed_s, &ctx)
         };
         let fps = fps.clamp(1, cap);
         let permille = permille.clamp(100, 1000);
@@ -303,6 +304,7 @@ impl DesktopManager {
         // 还原每 1s 的 QoS 决策轨迹（对齐 rustdesk QoS 可观测性）。
         tracing::info!(
             delay_ms,
+            probe_ms,
             fps,
             qos_scale = permille,
             bitrate_kbps,
@@ -1184,6 +1186,11 @@ pub struct QosAdaptive {
     /// RTT 尖峰中值窗口（R2 甲25 / R5#113）：9 样本，取中值替代 2 窗口均值
     /// ——单次尖峰（TCP 重传/GC 停顿）不会瞬时触发降码率。
     median_window: std::collections::VecDeque<u32>,
+    /// TestDelay 探针窗口（R4 甲 A1 / 对齐 rustdesk `cm::TestDelay`）：浏览器
+    /// 单调时钟往返、纯网络层 RTT（不含编码/解码/渲染管线、不依赖时钟校准）。
+    /// 5 样本中值抗尖峰。空 = 未上报（probe_ms=0，老浏览器/测试），
+    /// [`probe_median_delay`] 返回 0 → 沿用原 e2e 判据。
+    probe_window: std::collections::VecDeque<u32>,
     /// 首个 delay 样本后的用户 fps（None = 未收过样本）。
     delay_fps: Option<u32>,
     /// 距上次 ratio 调整的秒数累计（ADJUST_RATIO_INTERVAL=3s）。
@@ -1262,6 +1269,7 @@ impl QosAdaptive {
             last_delay: 0,
             delay_history: std::collections::VecDeque::new(),
             median_window: std::collections::VecDeque::new(),
+            probe_window: std::collections::VecDeque::new(),
             delay_fps: None,
             ratio_elapsed_s: 0,
             frame_count_s: 0,
@@ -1292,6 +1300,18 @@ impl QosAdaptive {
         v[v.len() / 2]
     }
 
+    /// TestDelay 网络层中值（R4 甲 A1 / 对齐 rustdesk `cm::TestDelay`）：
+    /// 5 窗口排序取中位。0 = 未上报（probe_ms=0，老浏览器/测试）——
+    /// 调用方沿用原 e2e 判据，不做网络层加固。
+    fn probe_median_delay(&self) -> u32 {
+        if self.probe_window.is_empty() {
+            return 0;
+        }
+        let mut v: Vec<u32> = self.probe_window.iter().copied().collect();
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
     /// RTT 分带（R4 丁142 / R5#111）：按中值延时返回弱网档位，
     /// 供 adjust_ratio 参考——<100 正常 / 100-300 微调 / 300-800 低档 /
     /// >800 预警。返回 0=正常, 1=微调, 2=低档, 3=预警。
@@ -1308,11 +1328,13 @@ impl QosAdaptive {
         }
     }
 
-    /// 处理一次新延时样本，返回 (目标 fps, 码率缩放‰ 相对满档)。`frame_count`
-    /// = 距上次采样编码帧数；`elapsed_s` = 距上次采样秒数；`ctx` = 会话资源。
+    /// 处理一次新延时样本，返回 (目标 fps, 码率缩放‰ 相对满档)。`probe_ms` =
+    /// TestDelay 网络层 RTT（0 = 未上报）；`frame_count` = 距上次采样编码帧数；
+    /// `elapsed_s` = 距上次采样秒数；`ctx` = 会话资源。
     pub fn on_delay(
         &mut self,
         delay_ms: u32,
+        probe_ms: u32,
         frame_count: u32,
         elapsed_s: f32,
         ctx: &QosSampleCtx,
@@ -1343,6 +1365,15 @@ impl QosAdaptive {
         }
         self.median_window.push_back(delay);
         let med = self.median_delay().max(10);
+        // TestDelay 探针窗口（R5#148 对齐 rustdesk cm::TestDelay）：
+        // probe_ms=0 表示未上报（老浏览器/测试），跳过——probe_median_delay()
+        // 返回 0 = 无探针，沿用原 e2e 判据。
+        if probe_ms > 0 {
+            if self.probe_window.len() > 4 {
+                self.probe_window.pop_front();
+            }
+            self.probe_window.push_back(probe_ms.max(1));
+        }
         // 基线延时更新（rustdesk RttCalculator 的简化版）：avg ≤ 基线立降，
         // 否则每次样本按 QOS_BASELINE_LEAK 缓慢上抬——固定 RTT（传播延迟）
         // 会慢慢被学成"新基线"，只有真正显著高于基线才判拥塞。
@@ -1477,6 +1508,13 @@ impl QosAdaptive {
         // 动态画面永久糊屏）——那才是与 rustdesk 表现走向两极端的一环。
         // 恢复路径（over 小）保留 rustdesk 的"动态屏才升"门。
         let over = max_delay.saturating_sub(self.baseline_delay.max(10));
+        // TestDelay 网络层探针（R4 甲 A1 / 对齐 rustdesk cm::TestDelay）：
+        // probe 是纯网络往返（不含编码/解码/渲染管线）。probe 健康而 e2e
+        // 中值显著更高 → over 来自管线/解码积压而非网络拥塞——降码率只更糊
+        // 无改善（动态画面保清晰铁律；解码积压已由 fps 背压降帧处理），
+        // 跳过降档。probe 未上报（0）或 probe 同样高 → 维持原判据。
+        let probe_med = self.probe_median_delay();
+        let pipeline_bloated = probe_med >= 1 && probe_med + 100 <= max_delay;
         // RTT 分带（R4 丁142 / R5#111）：中值延时档位修正阈值——绝对 RTT 已
         // 很高的会话（band>=2），相对增量更小的拥塞也要降（弱网韧性）。
         // **不绕过 over 主判据**：恒定高 RTT（baseline 学成后 over≈0）是
@@ -1484,7 +1522,12 @@ impl QosAdaptive {
         // band 3（>800ms 预警）只是把降档步长加大，仍要求 over 证实拥塞。
         let band = self.rtt_band();
         let threshold = if band >= 2 { 60 } else { 100 }; // 低档带阈值收紧
-        if over < threshold {
+        if pipeline_bloated {
+            // 网络层健康、e2e 高来自管线积压：不降 ratio；动态屏保持升档。
+            if dynamic {
+                v = current_ratio * 1.05;
+            }
+        } else if over < threshold {
             if dynamic {
                 v = current_ratio * 1.05;
             }
@@ -1710,13 +1753,13 @@ mod tests {
         // 9 个正常样本 40ms。
         let mut now = 2_000_000u64;
         for _ in 0..9 {
-            q.on_delay(40, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            q.on_delay(40, 0, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
             now += 1_000_000;
         }
         let before = q.median_delay();
         assert_eq!(before, 40, "9x40ms 中值 = 40");
         // 一个 2000ms 尖峰。
-        q.on_delay(2000, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        q.on_delay(2000, 0, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
         let after = q.median_delay();
         assert!(
             after <= 40 || after == 40 || after < 1000,
@@ -1743,7 +1786,7 @@ mod tests {
             let mut q = QosAdaptive::new(QOS_BR_BALANCED);
             let mut now = 2_000_000u64;
             for _ in 0..9 {
-                q.on_delay(delay, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+                q.on_delay(delay, 0, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
                 now += 1_000_000;
             }
             assert_eq!(q.rtt_band(), want, "rtt {delay}ms -> band {want}");
@@ -1755,11 +1798,11 @@ mod tests {
         // 好网动态屏：内容驱动 fps → 满档 30；ratio 动态屏回升/保持满档。
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
         let mut now = 2_000_000u64; // 越过 new_user 1s 窗口
-        let (fps1, _) = q.on_delay(40, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        let (fps1, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
         now += 1_000_000;
-        let (fps2, _) = q.on_delay(40, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        let (fps2, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
         now += 1_000_000;
-        let (fps3, _) = q.on_delay(40, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        let (fps3, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
         assert!(fps3 >= fps1 && fps3 >= QOS_FPS, "good net must keep full fps");
         assert!(q.current_ratio_permille() >= 1000, "good net ratio >= 1000‰");
     }
@@ -1773,7 +1816,7 @@ mod tests {
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
         let mut now = 2_000_000u64;
         for _ in 0..8 {
-            let (fps, _) = q.on_delay(800, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            let (fps, _) = q.on_delay(800, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
             now += 1_000_000;
             assert_eq!(fps, QOS_FPS, "constant 800ms must keep full fps, got {fps}");
         }
@@ -1791,12 +1834,12 @@ mod tests {
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
         let mut now = 2_000_000u64;
         for _ in 0..3 {
-            q.on_delay(800, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            q.on_delay(800, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
             now += 1_000_000;
         }
         let samples: Vec<u32> = (0..6)
             .map(|_| {
-                let (f, _) = q.on_delay(1800, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+                let (f, _) = q.on_delay(1800, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
                 now += 1_000_000;
                 f
             })
@@ -1818,12 +1861,12 @@ mod tests {
         //（radically 反转旧的"延时→降fps"逻辑，用户投诉的 1 帧状态从机制上
         // 出局）；慢网络的影响全部落在 ratio/质量上。
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
-        let (fps, _) = q.on_delay(4000, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 700_000));
+        let (fps, _) = q.on_delay(4000, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 700_000));
         assert_eq!(fps, QOS_FPS, "4s dynamic net must keep full fps, got {fps}");
         let mut sink = fps;
         let mut now = 1_700_000u64;
         for _ in 0..8 {
-            let (nf, _) = q.on_delay(4000, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            let (nf, _) = q.on_delay(4000, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
             sink = nf;
             now += 1_000_000;
         }
@@ -1836,13 +1879,13 @@ mod tests {
         // 24 → 15（下限）；背压消失立即回 30。
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
         let mut now = 2_000_000u64;
-        let (fps1, _) = q.on_delay(40, 30, 1.0, &qos_ctx_bp(QOS_BR_BALANCED, 600, now, 18, 20));
+        let (fps1, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx_bp(QOS_BR_BALANCED, 600, now, 18, 20));
         assert_eq!(fps1, 24, "mild backpressure steps to 24, got {fps1}");
         now += 1_000_000;
-        let (fps2, _) = q.on_delay(40, 30, 1.0, &qos_ctx_bp(QOS_BR_BALANCED, 600, now, 9, 30));
+        let (fps2, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx_bp(QOS_BR_BALANCED, 600, now, 9, 30));
         assert_eq!(fps2, QOS_DYNAMIC_MIN_FPS, "severe backpressure floors at 15, got {fps2}");
         now += 1_000_000;
-        let (fps3, _) = q.on_delay(40, 30, 1.0, &qos_ctx_bp(QOS_BR_BALANCED, 600, now, 30, 0));
+        let (fps3, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx_bp(QOS_BR_BALANCED, 600, now, 30, 0));
         assert_eq!(fps3, QOS_FPS, "backpressure gone -> full fps back, got {fps3}");
     }
 
@@ -1851,7 +1894,7 @@ mod tests {
         // 静止屏（无字节帧）不受动态下限保护：4s e2e fps 直接压到 MIN_FPS=1
         // ——静止无内容，掉帧不可见，省带宽。网络对静止屏不影响行为。
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
-        let (fps, _) = q.on_delay(4000, 0, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 1_000_000));
+        let (fps, _) = q.on_delay(4000, 0, 0, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, 1_000_000));
         assert_eq!(fps, 1, "static screen at 1fps, got {fps}");
     }
 
@@ -1860,8 +1903,80 @@ mod tests {
         // 动态屏判定（rustdesk DYNAMIC_SCREEN = 每秒≥2 帧编码）：3s 只有
         // 1 帧 → 非动态屏 → 好网也不升码率。
         let mut q = QosAdaptive::new(QOS_BR_BALANCED);
-        let _ = q.on_delay(40, 1, 3.0, &qos_ctx(QOS_BR_BALANCED, 600, 3_000_000));
+        let _ = q.on_delay(40, 0, 1, 3.0, &qos_ctx(QOS_BR_BALANCED, 600, 3_000_000));
         assert_eq!(q.current_ratio_permille(), 1000, "static screen stays at 1000‰");
+    }
+
+    /// TestDelay 探针（R4 甲 A1 / 对齐 rustdesk cm::TestDelay）：probe 是纯
+    /// 网络层往返（不含解码/渲染管线）。probe 健康而 e2e 高 → 拥塞证据不成立
+    /// （管线/解码积压）→ 不降码率（动态画面保清晰铁律）；probe 也高（真
+    /// 拥塞）或未上报（0）→ 维持原 e2e 判据降档。
+    #[test]
+    fn test_qos_probe_confirms_network_congestion() {
+        // 健康期：baseline 学到 40ms。
+        let mut now = 3_000_000u64;
+        let mut warm = QosAdaptive::new(QOS_BR_BALANCED);
+        for _ in 0..9 {
+            now += 300_000;
+            warm.on_delay(40, 20, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        // 场景 1：probe 恒 20ms（网络健康），e2e 跳到 800ms 并持续（管线积压）
+        // → 即使 over 大也不降码率（pipeline_bloated 分支）。
+        let mut q1 = warm;
+        for _ in 0..24 {
+            now += 300_000;
+            q1.on_delay(800, 20, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        let p1 = q1.ratio_permille();
+        assert!(p1 >= 900, "网络健康+管线积压不应降码率，实际 {p1}‰");
+        // 场景 2：probe 与 e2e 同步高（真网络拥塞）→ 降码率。
+        now = 3_000_000u64;
+        let mut q2 = QosAdaptive::new(QOS_BR_BALANCED);
+        for _ in 0..9 {
+            now += 300_000;
+            q2.on_delay(40, 40, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        for _ in 0..24 {
+            now += 300_000;
+            q2.on_delay(800, 800, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        let p2 = q2.ratio_permille();
+        assert!(p2 < 900, "真拥塞应降码率，实际 {p2}‰");
+        // 场景 3：probe 未上报（0，老浏览器/测试）→ 原 e2e 判据降档。
+        now = 3_000_000u64;
+        let mut q3 = QosAdaptive::new(QOS_BR_BALANCED);
+        for _ in 0..9 {
+            now += 300_000;
+            q3.on_delay(40, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        for _ in 0..24 {
+            now += 300_000;
+            q3.on_delay(800, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        let p3 = q3.ratio_permille();
+        assert!(p3 < 900, "无探针沿用原判据应降码率，实际 {p3}‰");
+    }
+
+    /// probe 中值抗尖峰：单次 probe 尖峰不移动网络层中值（降档证据稳定）。
+    #[test]
+    fn test_qos_probe_median_filters_spike() {
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        let mut now = 3_000_000u64;
+        // 5 个健康 probe 样本后塞一个 2000ms 尖峰：5 窗口中值应保持健康。
+        for _ in 0..5 {
+            now += 300_000;
+            q.on_delay(40, 20, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        now += 300_000;
+        q.on_delay(40, 2000, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        assert_eq!(q.probe_median_delay(), 20, "单次 probe 尖峰不应移动中值");
+    }
+
+    /// probe 未上报（0）：probe_median_delay() 返回 0 = 无探针。
+    #[test]
+    fn test_qos_probe_absent_returns_zero() {
+        let q = QosAdaptive::new(QOS_BR_BALANCED);
+        assert_eq!(q.probe_median_delay(), 0, "未上报时 probe 中值应为 0（兼容）");
     }
 
     #[test]
