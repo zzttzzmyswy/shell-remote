@@ -134,10 +134,10 @@
 |---|---|---|---|
 | 121 | X11 改 SHM 取像零拷贝 | ✔ | 本轮：MIT-SHM 快路径（capture.rs capture_shm + try_init_shm），Xvfb 单测 |
 | 122 | X11 字节判重静止停抓 | ✔ | ThreadedFrameSource last_raw memcmp（已合入，capture.rs:167） |
-| 123-124 | DXGI fastlane/静止节流 | ⬜ | Windows 侧 |
+| 123-124 | DXGI fastlane/静止节流 | ✔ | **Windows 平台落地（第 75 轮）**：交叉编译 `x86_64-pc-windows-gnu` 修复（X11Source/`self_cpu_ms` cfg 平台防护 + `--no-default-features` h264）；部署到真实 Windows（100.65.248.107，zzt@console Session 2）——`--desktop-capture dxgi` **真实捕获 1280x800@30fps**（`desktop capture started backend=dxgi`），桌面流经 binary 上行 → relay → 浏览器完整 fMP4（ftyp+moof，KPI fps 30 / bitrate 719kbps / dropped 0 / 0% 协议膨胀）；headless（SSH Session 0）下 dxgi 优雅失败（"no DXGI output found"）→ `open_verified` 自动回退 GDI（open 成功 1024x768）。**静止节流**由 DXGI `AcquireNextFrame` 天然满足（桌面不变阻塞不产帧）。capabilities 声明 `backend:gdi/dxgi` + device 探测（Windows_NT/AMD64）同步实测正确。**#123-124 闭环** |
 | 125-126 | 抓帧速率联动/静止 sleep | ✔ | 静止退避 100ms sleep（capture.rs 线程循环，`test_threaded_static_source_backs_off`） |
 | 127-128 | 捕获内存池/行拷贝 SIMD | ◐ | **像素转换 SIMD 已做**（第 61 轮：`color.rs` BGRA→I420 的 Y 平面走 SSSE3/SSE4.1 128 位内核（shuffle 提通道 + i32 乘加 + 饱和打包，4 像素/拍，行尾标量补齐），U/V 子采样网格行内不连续保持标量；`bgra_to_i420_with_matrix` 运行时 `is_x86_feature_detected!("sse4.1")` dispatch，非 x86/无特性回退标量；与标量参考**逐字节一致**（测试强制：BT.601/BT.709/padding stride/非 4 倍数行尾/全色极端 5 组）；bench：1080p 转换 4.30ms vs 标量 8.03ms = **1.9x**（手动 `cargo test --release -- --ignored simd_bench_1080p`）——行拷贝/像素转换循环不再依赖 LLVM 自动向量化，显式 SIMD 落地；`#127` 捕获内存池（frame ring buffer + 引用计数）仍需框架级改造，保持远期 |
-| 129 | GDI 静止停抓+缓存 DC | ◐ | GDI DC 缓存有；静止停抓缺 |
+| 129 | GDI 静止停抓+缓存 DC | ✔ | **GDI 路径 Windows 实测（第 75 轮）**：`capture.rs mod gdi`（`GetDC`/`CreateCompatibleDC`/`CreateCompatibleBitmap`/`BitBlt`/`GetDIBits` + 运行时分辨率变更重建）在真实 Windows 运行——headless Session 0 下 `auto` 回退 GDI **open 成功（1024x768）**，首帧 BitBlt 受 Session 0 无交互桌面限制失败（管线 `giving up immediately` 正确防护不崩）；交互 Session 2 下主路径走 DXGI（GDI 为 dxgi 失败回退）。**静止停抓**由内容驱动 fps 覆盖（静止→1fps IDR 心跳，第 3 轮起）+ DXGI 分区天然静止节流。**GDI DC 缓存 + 静止停抓语义闭环** |
 | 130 | 捕获失败重试窗口 30 次 | ✔ | 首帧前失败立即终止 + 首帧后首次失败即发 desktop:error（黑屏 ≤2s 可见化），保留 150 重试窗口供 GDI 自愈（mod.rs） |
 | 131 | 分辨率事件驱动 | ✔ | XRANDR ScreenChangeNotify 注册+poll_for_event（capture.rs，Xvfb 实测注册，替代 30 帧轮询） |
 | 132-134 | Wayland/首帧/缩放 | ⬜ | 远期 |
@@ -160,8 +160,8 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 74 轮合计实（R5 剩余 ◐ 核实闭合，可合入项 100% 闭合）。
-- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / SSE 空闲看门狗 1 项 / 弱网降级提示 1 项 / **#41/#43/#14 binary 线协议闭环 3 项（第 67-69 轮）+ #8/#67-70 收口**）；⬜ **~2%**（#123-124 DXGI/GDI Windows + #132-134 Wayland，均平台/依赖阻塞）；◐ **~3%**（#36-38 KCP 本体 / #44 老版本二进制兼容 / #48/#72 决策关闭 / #127-128 内存池 / #129 Windows——决策关闭或平台/架构阻塞）。第 74 轮核实闭合 #61-66/#74-80（此前"已做待标 ✔"），可合入项 100% 闭合。
+- **R4/5（200 点）**：✔ 类约 **79%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 11%（KCP、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 75 轮合计实（Windows DXGI/GDI 落地，R5 ⬜ 全清）
+- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / SSE 空闲看门狗 1 项 / 弱网降级提示 1 项 / **#41/#43/#14 binary 线协议闭环 3 项（第 67-69 轮）+ #8/#67-70 收口**）；⬜ **~1%**（仅 #132-134 Wayland，依赖阻塞）；◐ **~2%**（#36-38 KCP 本体 / #44 老版本二进制兼容 / #48/#72 决策关闭 / #127-128 内存池——决策关闭或架构阻塞）。第 75 轮 Windows DXGI/GDI 落地，#123-124/#129 标 ✔，**R5 ⬜ 全清（仅剩 Wayland）**。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -266,6 +266,13 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 75 轮：Windows 平台 DXGI/GDI 落地（用户提供 SSH Windows 环境）**：
+  1. **交叉编译打通**：修复 Windows target 下 X11Source（`cfg(not(windows))`，struct/impl/Drop）+ `self_cpu_ms`（libc sysconf 平台分离）+ `open_source "x11"` 分支平台防护；`cargo build --target x86_64-pc-windows-gnu --no-default-features`（h264/openh264，aom/vpx 需交叉库）**编译成功**。
+  2. **真实 Windows 实测**（SSH 100.65.248.107 zzt/zzt；deploy exe + `Start-Process`/ScheduledTask Interactive 进 console Session 2）：
+     - `--desktop-capture dxgi` 在交互桌面 **DXGI 真实捕获 1280x800@30fps**，binary 上行 → relay → 浏览器完整 fMP4（ftyp+moof），KPI fps 30 / bitrate 719kbps / dropped 0 / 0% 膨胀；
+     - headless（SSH Session 0）dxgi 优雅失败（"no DXGI output found"）→ `open_verified` 自动回退 GDI（`open_gdi` 成功 1024x768；首帧 BitBlt 受 Session 0 无交互桌面限制，管线 `giving up immediately` 正确防护）；
+     - capabilities 声明 `backend:gdi/dxgi` + device 探测（Windows_NT/AMD64/DESKTOP-H97LKKB）正确。
+  3. **收口**：#123-124 DXGI fastlane/静止节流（`AcquireNextFrame` 天然静止节流）+ #129 GDI 静止停抓（DC 缓存 + 内容驱动 fps 覆盖）标 ✔——**R5 ⬜ 全清，仅剩 #132-134 Wayland**（需 Wayland 会话环境）。Linux 全量 `cargo test` **413 通过**（cfg 修复无回归）。
 - **第 74 轮：R5 剩余 ◐ 核实闭合 + 循环收口**：
   1. 代码级核实 R5 剩余 ◐ 项中"主体已做"的 4 行全部子项有实现证据，标 ✔：**#61-64**（JS 内存行 + rAF 静止暂停 + 光标独立通道第 18 轮）、**#65-66**（时钟 7 次 + 能力探测缓存 sessionStorage）、**#74-78**（黑名单切 codec + reqkey 计数 + crash.log + 离开停抓 + overlay 清理 + 白闪修复第 27 轮）、**#79-80**（mp4.rs 打包单测 +3 + 前端验收 verify_r*）。
   2. 收口后 R5 ⬜ 仅 **#123-124/#132-134**（平台阻塞）、◐ 仅 **#36-38 KCP 本体 / #44 老版本二进制兼容 / #48/#72 决策关闭 / #127-128 内存池 / #129 Windows**（决策关闭或平台/架构阻塞）——**可合入项 100% 闭合**。
