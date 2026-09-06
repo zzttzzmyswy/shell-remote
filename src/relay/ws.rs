@@ -121,15 +121,29 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
         // 懒创建，会立刻 404 → 黑屏（真实用户复现）。预建后 viewer 加入即
         // 挂起等待，init 一到就全量广播。
         if proto_msg.msg_type == "desktop:started" {
+            // 桌面流生命周期追踪（R2 丙129 / R5#24）：创建原因入日志，供
+            // 复盘"流为何存在/何时创建"，避免长期残留无从查起。
             state
                 .desktop_streams
                 .write()
                 .await
                 .entry(session_id.to_string())
                 .or_insert_with(crate::relay::desktop::DesktopStream::new);
+            tracing::info!(
+                session = %session_id,
+                reason = "desktop:started",
+                "desktop stream created/pre-existed"
+            );
         }
         if proto_msg.msg_type == "desktop:stopped" {
-            state.desktop_streams.write().await.remove(session_id);
+            // 生命周期追踪：agent 主动停止 → 移除并记原因。
+            let removed = state.desktop_streams.write().await.remove(session_id);
+            tracing::info!(
+                session = %session_id,
+                reason = "desktop:stopped",
+                existed = removed.is_some(),
+                "desktop stream removed"
+            );
         }
 
         let broadcast_types = [
@@ -316,6 +330,40 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                         }
                     }
                 }
+            }
+        }
+
+        // 未知消息丢弃（R3 丙137 / R5#21）：agent 上行类型不在白名单 →
+        // 显式丢弃并记日志（防垃圾/未知控制消息进入广播或 MCP 通道）。
+        // 白名单 = 上方已处理的所有类型 + 浏览器控制输入（terminal:input
+        // 等经 /agent/send 单独路由，不在此函数）。这里只防"agent 侧未知
+        // 类型"静默吞掉造成排障盲区——记一条 info 足够，不误杀新增类型。
+        {
+            const KNOWN: &[&str] = &[
+                "agent:upgrade_progress",
+                "terminal:output",
+                "desktop:video",
+                "desktop:started",
+                "desktop:stopped",
+                "desktop:error",
+                "desktop:capabilities",
+                "desktop:uplink",
+                "desktop:clipboard",
+                "desktop:qos-ack",
+                "mcp:result",
+                "mcp:exec_result",
+                "fs:result",
+                "fs:mkdir",
+                "session:users",
+                "session:tab_list",
+                "session:tab_switched",
+            ];
+            if !KNOWN.contains(&proto_msg.msg_type.as_str()) {
+                tracing::info!(
+                    session = %session_id,
+                    msg_type = %proto_msg.msg_type,
+                    "dropping unknown agent message (not in whitelist)"
+                );
             }
         }
     }
@@ -761,8 +809,14 @@ impl Drop for AgentEventsCleanup {
                         );
                         // Agent genuinely gone：清理其桌面流与升级任务，防止
                         // desktop_streams / agent_upgrades 长期残留（审计缺口，
-                        // MYS-886）。
-                        state.desktop_streams.write().await.remove(&session_id);
+                        // MYS-886）。生命周期追踪（R5#24）：记移除原因。
+                        let removed = state.desktop_streams.write().await.remove(&session_id);
+                        tracing::info!(
+                            session = %session_id,
+                            reason = "agent_sse_disconnect",
+                            existed = removed.is_some(),
+                            "desktop stream removed on agent disconnect"
+                        );
                         state.agent_upgrades.write().await.remove(&session_id);
                         // No newer connection replaced this one → the agent is
                         // genuinely gone. Tell every connected browser so it can
