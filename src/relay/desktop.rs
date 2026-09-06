@@ -15,6 +15,17 @@ use tokio::sync::mpsc;
 
 use crate::relay::SharedState;
 
+/// 带宽记账快照（#152）：会话级转发统计，relay admin/遥测画 KPI 曲线用。
+#[derive(Clone, Debug, Default)]
+pub struct DesktopStreamStats {
+    /// 当前连接的 viewer 数。
+    pub viewer_count: usize,
+    /// 累计成功投递的字节数。
+    pub forwarded_bytes: u64,
+    /// 累计成功投递的帧数。
+    pub forwarded_frames: u64,
+}
+
 /// Shared, cloneable fan-out state for one session's desktop stream.
 #[derive(Clone)]
 pub struct DesktopStream {
@@ -35,6 +46,10 @@ struct ViewerCtx {
     /// 从 fan-out 移除 -- 对齐 rustdesk 丢帧重连语义（烂帧直接丢旧，订阅
     /// 者涝死再踢）。
     drop_count: u32,
+    /// 带宽记账（R3 丙113 / R5#152）：成功投递给该 viewer 的字节与帧数。
+    /// relay admin/遥测据此画每 viewer 转发曲线（带宽用量可观测）。
+    bytes: u64,
+    frames: u64,
 }
 
 /// 连续丢帧超过此值判定 viewer 死亡（30fps 下 ≈ 2s 完全无消费能力）。
@@ -89,7 +104,13 @@ impl DesktopStream {
             }
             ctx.key_ok = true;
             match ctx.tx.try_send(bytes.clone()) {
-                Ok(()) => ctx.drop_count = 0,
+                Ok(()) => {
+                    ctx.drop_count = 0;
+                    // 带宽记账（#152）：只在真正投递时计数，丢帧不计（丢帧
+                    // 本身由 drop_count 追踪）。
+                    ctx.bytes += bytes.len() as u64;
+                    ctx.frames += 1;
+                }
                 Err(_) => {
                     ctx.drop_count += 1;
                     if ctx.drop_count >= MAX_CONSECUTIVE_DROPS {
@@ -115,7 +136,11 @@ impl DesktopStream {
         let mut dead = Vec::new();
         for (id, ctx) in viewers.iter_mut() {
             match ctx.tx.try_send(bytes.clone()) {
-                Ok(()) => ctx.drop_count = 0,
+                Ok(()) => {
+                    ctx.drop_count = 0;
+                    // 带宽记账（#152）：init 也是 relay 转发的字节，计入。
+                    ctx.bytes += bytes.len() as u64;
+                }
                 Err(_) => {
                     ctx.drop_count += 1;
                     if ctx.drop_count >= MAX_CONSECUTIVE_DROPS {
@@ -147,13 +172,32 @@ impl DesktopStream {
             .viewers
             .write()
             .await
-            .insert(id.clone(), ViewerCtx { tx, key_ok: false, drop_count: 0 });
+            .insert(id.clone(), ViewerCtx { tx, key_ok: false, drop_count: 0, bytes: 0, frames: 0 });
         let init = self.inner.init.read().await.clone();
         (id, rx, init)
     }
 
     pub async fn remove_viewer(&self, id: &str) {
         self.inner.viewers.write().await.remove(id);
+    }
+
+    /// 带宽记账快照（R3 丙113 / R5#152）：会话级累计转发字节与帧数（全部
+    /// viewer 求和），relay admin/遥测据此画每 session 带宽曲线。
+    pub async fn stats(&self) -> DesktopStreamStats {
+        let viewers = self.inner.viewers.read().await;
+        let mut bytes = 0u64;
+        let mut frames = 0u64;
+        for ctx in viewers.values() {
+            bytes += ctx.bytes;
+            frames += ctx.frames;
+        }
+        let viewer_count = viewers.len();
+        drop(viewers);
+        DesktopStreamStats {
+            viewer_count,
+            forwarded_bytes: bytes,
+            forwarded_frames: frames,
+        }
     }
 
     /// Wait for the first init segment to be cached (a viewer that joins right
@@ -485,6 +529,28 @@ mod tests {
         // 恢复消费后还能收到帧（丢旧保新：收到的是最后能塞进去的帧）。
         assert!(rx.recv().await.is_some(), "live viewer resumes receiving");
         st.remove_viewer(&vid).await;
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_stats_track_forwarded_bytes() {
+        // #152 带宽记账：成功投递的帧计入 stats，丢帧（满缓冲）不计。
+        let st = DesktopStream::new();
+        let (_vid, mut rx, _) = st.add_viewer().await;
+        st.set_init(vec![1, 2, 3]).await; // init 广播投递（也计入 bytes——它是转发字节）
+        assert_eq!(rx.recv().await.unwrap().len(), 3); // init 先到
+        // 投递 3 帧（key+2 delta），各帧字节数可累加。
+        st.push_frag(true, vec![0xaa; 10]).await;
+        st.push_frag(false, vec![0xbb; 20]).await;
+        st.push_frag(false, vec![0xcc; 30]).await;
+        // 消费掉，确保全部真正投递（channel 未满）。
+        assert_eq!(rx.recv().await.unwrap().len(), 10);
+        assert_eq!(rx.recv().await.unwrap().len(), 20);
+        assert_eq!(rx.recv().await.unwrap().len(), 30);
+        let stats = st.stats().await;
+        assert_eq!(stats.viewer_count, 1);
+        // init(3) + 3 帧(10+20+30) = 63 字节——init 也是 relay 转发的字节。
+        assert_eq!(stats.forwarded_bytes, 3 + 60, "init(3) + 3 帧(10+20+30)");
+        assert_eq!(stats.forwarded_frames, 3);
     }
 
     // ── stream_handler integration ─────────────────────────────
