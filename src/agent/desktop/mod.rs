@@ -19,6 +19,7 @@ pub mod input;
 pub mod mp4;
 pub mod openh264;
 pub mod rate;
+pub mod webrtc;
 #[cfg(feature = "vp9")]
 pub mod vpx;
 #[cfg(feature = "av1")]
