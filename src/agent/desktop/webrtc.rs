@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
-use str0m::channel::ChannelId;
+use str0m::channel::{ChannelConfig, ChannelId, Reliability};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
@@ -163,9 +163,26 @@ impl WebRtcPeer {
     }
 
     /// 发起方：建 DataChannel（label "desktop"）并产 SDP offer（JSON 字符串）。
+    ///
+    /// Task 6 起固定为**不可靠 + 无序**（`MaxRetransmits{0}` + `ordered:false`）：
+    /// fMP4 丢旧保新、帧时效优先——丢包不重传、不阻塞后续消息（有序通道的
+    /// 丢包会造成 head-of-line 卡顿，重传队列还会拖慢拥塞窗口）。浏览器侧
+    /// `createDataChannel('desktop', {ordered:false, maxRetransmits:0})` 同步
+    /// 该配置（真实建连中浏览器是 channel 发起方，参数以浏览器为准）。
     pub fn make_offer(&mut self) -> Result<String, WebrtcError> {
+        self.make_offer_with_config(ChannelConfig {
+            label: "desktop".to_string(),
+            ordered: false,
+            reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            ..Default::default()
+        })
+    }
+
+    /// 按给定 channel config 产 offer（吞吐对比/单测用；生产固定走
+    /// [`Self::make_offer`] 的不可靠+无序）。
+    pub fn make_offer_with_config(&mut self, config: ChannelConfig) -> Result<String, WebrtcError> {
         let mut change = self.rtc.sdp_api();
-        let cid = change.add_channel("desktop".to_string());
+        let cid = change.add_channel_with_config(config);
         self.channel = Some(cid);
         let (offer, pending) = change.apply().ok_or(WebrtcError::Sdp)?;
         self.pending_offer = Some(pending);
@@ -761,5 +778,172 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    // ── Task 6：真实 UDP socket 吞吐专项 ──────────────────────
+    // 内存传输（mem-transport）看不到网络延迟：SACK 即时回环 → cwnd 爆发式增长，
+    // 测得 57MB/s（controller /tmp/str0m-gate 实验）。本组测试用**真实 UDP 回环
+    // socket** 走完整 ICE/DTLS/SCTP 栈，并可通过 `drive_delay` 注入链路延迟
+    // （模拟真实网络的 RTT），诚实复现 cwnd 慢启动对延迟的敏感。
+
+    /// 真实 UDP 回环 socket 双 peer 握手到 Connected。`reliable=true` 用默认
+    /// 可靠有序通道；false 用 `MaxRetransmits{0} + unordered`（与生产 make_offer
+    /// 一致）。`drive_delay` 于每次 drive 之间注入，模拟链路 RTT。
+    fn socket_pair_connected(
+        reliable: bool,
+        drive_delay: Duration,
+    ) -> (WebRtcPeer, WebRtcPeer) {
+        let t_a = UdpTransport::bind("127.0.0.1:0").expect("bind A");
+        let a_addr = t_a.local_addr();
+        let mut a = WebRtcPeer::with_transport(a_addr, Box::new(t_a));
+        let config = if reliable {
+            ChannelConfig {
+                label: "desktop".to_string(),
+                ..Default::default()
+            }
+        } else {
+            ChannelConfig {
+                label: "desktop".to_string(),
+                ordered: false,
+                reliability: Reliability::MaxRetransmits { retransmits: 0 },
+                ..Default::default()
+            }
+        };
+        let offer = a.make_offer_with_config(config).expect("make offer");
+
+        let t_b = UdpTransport::bind("127.0.0.1:0").expect("bind B");
+        let b_addr = t_b.local_addr();
+        let mut b = WebRtcPeer::with_transport(b_addr, Box::new(t_b));
+        let answer = b.answer_offer(&offer).expect("answer offer");
+        a.handle_answer(&answer).expect("handle answer");
+        // 显式互喂 host candidate（offer sdp 内联 + 信令候选双保险）。
+        for c in b.local_candidates() {
+            a.add_remote_candidate(str0m::Candidate::from_sdp_string(&c).expect("B cand"));
+        }
+        for c in a.local_candidates() {
+            b.add_remote_candidate(str0m::Candidate::from_sdp_string(&c).expect("A cand"));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            a.drive(Instant::now());
+            b.drive(Instant::now());
+            if a.state() == WebRtcState::Connected && b.state() == WebRtcState::Connected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "socket pair handshake timed out (reliable={reliable})"
+            );
+            std::thread::sleep(drive_delay);
+        }
+        (a, b)
+    }
+
+    /// 跑一次吞吐窗口：`window` 秒内持续把 16KiB 消息塞给 sender（SCTP 背压时
+    /// 退避重试），统计接收端实际收到的总字节数。返回 (发送字节, 接收字节, MB/s)。
+    fn socket_throughput_once(
+        reliable: bool,
+        drive_delay: Duration,
+        window: Duration,
+    ) -> (usize, usize, f64) {
+        let (mut sender, mut receiver) = socket_pair_connected(reliable, drive_delay);
+        let received = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let cb = received.clone();
+        receiver.on_data(Box::new(move |d| *cb.lock().unwrap() += d.len()));
+
+        const CHUNK: usize = 16 * 1024;
+        let start = Instant::now();
+        let mut sent: usize = 0;
+        let mut stalls: u32 = 0;
+        while Instant::now() - start < window {
+            let now = Instant::now();
+            sender.drive(now);
+            receiver.drive(now);
+            // 连续推入多条直到写缓冲满（对齐生产 drain_video_to_channel 的
+            // 持续发送语义；capped 防单轮无限占用）。
+            for _ in 0..256 {
+                match sender.send(&[0u8; CHUNK]) {
+                    Ok(()) => {
+                        sent += CHUNK;
+                        stalls = 0;
+                    }
+                    Err(_) => {
+                        // SCTP 背压（cwnd/写缓冲满）：退避，避免忙轮询占满 CPU。
+                        stalls += 1;
+                        if stalls % 8 == 0 {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        break;
+                    }
+                }
+            }
+            if !drive_delay.is_zero() {
+                std::thread::sleep(drive_delay);
+            }
+        }
+        let elapsed = Instant::now().saturating_duration_since(start);
+        let recv = *received.lock().unwrap();
+        let mbps = recv as f64 / 1024.0 / 1024.0 / elapsed.as_secs_f64().max(1e-9);
+        (sent, recv, mbps)
+    }
+
+    /// 真实 socket 吞吐复测（主要交付物）：`--ignored --nocapture` 运行。
+    /// 回环 RTT≈0 → 数据通路/库层上限；注入 drive 延迟模拟 WAN RTT → 可见
+    /// cwnd 慢启动对延迟敏感（可靠/不可靠都被拖低——SCTP cwnd 增长依赖 SACK
+    /// 往返，与 DCEP 可靠参数无关）。结果用于报告，不做硬阈值断言。
+    #[test]
+    #[ignore = "perf smoke: run with cargo test -- --ignored --nocapture"]
+    fn socket_throughput_reliable_vs_unreliable() {
+        let cases: &[(bool, Duration, &str)] = &[
+            (false, Duration::from_millis(1), "unreliable 1ms (loop近零RTT)"),
+            (true, Duration::from_millis(1), "reliable   1ms"),
+            (false, Duration::from_millis(5), "unreliable 5ms (生产 drive tick)"),
+            (true, Duration::from_millis(5), "reliable   5ms"),
+            (false, Duration::from_millis(50), "unreliable 50ms (模拟 WAN RTT)"),
+            (true, Duration::from_millis(50), "reliable   50ms"),
+        ];
+        let window = Duration::from_secs(4);
+        println!("=== real-socket DataChannel throughput (loopback, 16KiB msgs, {}s window) ===", window.as_secs());
+        for (reliable, delay, name) in cases {
+            let (sent, recv, mbps) = socket_throughput_once(*reliable, *delay, window);
+            println!("{name:<40} sent={} recv={} {mbps:.2} MB/s", sent, recv);
+        }
+        assert!(true);
+    }
+
+    /// 真实 socket 发送语义无回归（普通测试，随套件跑）：回环上不可靠+无序
+    /// 通道投递小载荷（模拟 init 段 + 若干帧），字节必须完整到达且内容一致。
+    #[test]
+    fn socket_pair_send_path_unreliable_delivers_bytes() {
+        let (mut sender, mut receiver) = socket_pair_connected(false, Duration::from_millis(1));
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cb = got.clone();
+        receiver.on_data(Box::new(move |d| cb.lock().unwrap().extend_from_slice(&d)));
+
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut sent_ok = false;
+        loop {
+            if !sent_ok {
+                sent_ok = sender.send(&payload).is_ok();
+            }
+            sender.drive(Instant::now());
+            receiver.drive(Instant::now());
+            if sent_ok && got.lock().unwrap().len() >= payload.len() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unreliable send path did not deliver 4KiB in time"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let g = got.lock().unwrap();
+        assert_eq!(
+            g.as_slice(),
+            payload.as_slice(),
+            "delivered bytes must equal payload on the unreliable channel"
+        );
     }
 }
