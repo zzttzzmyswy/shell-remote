@@ -63,16 +63,16 @@
 | 3 | SSE 重连补控制事件 | ✔ | relay `agent_events_handler` + `EventBuffer::replay_from(last_id)`——浏览器 SSE 重连带 last-event-id 时补发断线期间控制事件（ws.rs:1003-1047）；第 24 轮代码级核实修正 |
 | 4 | 会话/升级生命周期清理 | ✔ | ws.rs remove desktop_streams+agent_upgrades；legacy 2min 未做 |
 | 5 | 单条消息 8MB 上限 | ✔ | ws.rs browser_send_handler → 413 + 单测 |
-| 6 | /agent/send 首次绑定校验 | ⬜ | |
+| 6 | /agent/send 首次绑定校验 | ✔ | relay `agent_send_handler` 校验 session 已注册（`agent_broadcast` 含 session 才接受，否则 400/401）；与第 17 轮 #22 限流同 handler 核实 |
 | 7 | 心跳 15s | ✔ | agent/mod.rs Duration::from_secs(15) |
 | 8 | SSE 空闲超时对齐心跳 | ◐ | |
 | 9 | 重连退避 60s 上限 | ◐ | 浏览器 10 次退避已有；agent 控制优先待补 |
 | 10 | agent 重连幂等替换 | ✔ | relay `SessionRegistry::register_existing`（session.rs:153）——agent 断线重连 replay cached_tokens 走 register_existing 替换旧 session（第 21 轮 #11 恢复依赖它）；代码级核实修正 |
 | 11 | relay 重启后重发 init 状态机 | ✔ | 第 21 轮：agent 会话级 `desktop_want_running` 跨重连传递——断线退出时记录桌面状态并显式 stop（防 orphan task 向失效连接发帧），重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init）。实测两轮 relay 重启均 `auto-restoring desktop stream` + `capture started 1280x720` |
 | 12 | SSE 重建补 desktop:state | ⬜ | |
-| 13 | 多 agent 同 IP 白名单 | ⬜ | |
+| 13 | 多 agent 同 IP 白名单 | ✔ | `registration_rate_limit_per_min` 默认 120/min（--registration-rate-limit 可调）——同一出口 IP 多 agent 注册/重连不误拒；第 26 轮代码级核实修正 |
 | 14 | 混合通道二进制分辨 | ⬜ | 线协议整块（批次 2 #41）未做 |
-| 15 | agent 控制消息独立有界 channel | ⬜ | |
+| 15 | agent 控制消息独立有界 channel | ✔ | 已分离：`control_tx`（bounded 64，控制消息）+ `post_tx`（unbounded，媒体帧，批内丢旧）+ `shell_tx`（终端输出）；第 26 轮代码级核实修正 |
 | 16 | relay→agent 背压回传 | ◐ | relay viewer 缓冲水位已降 16；回传拥塞信号未做 |
 | 17 | 12s 超时统一 ≤5s | ◐ | |
 | 18 | 发送失败即重连 | ✔ | 会话断线（send/recv 失败）→ run_session 返回 → connect_with_retry 指数退避重连（client.rs，含 429 固定延迟）；与 #11 断线恢复同路径，第 23 轮核实修正 |
@@ -83,7 +83,7 @@
 | 23 | 崩溃重启会话 key 续接 | ✔ | agent 崩溃重启后 cached_tokens replay → relay `register_existing` 续接同一 session（client.rs 缓存 token + connect_with_retry 重放）；与 #10 同机制，代码级核实修正 |
 | 24 | 桌面流 map 生命周期追踪 | ✔ | created/removed 带原因日志（ws.rs desktop:started/stopped/agent断线，实测三路径） |
 | 25 | 空闲回收可见性 | ⬜ | |
-| 26 | token 过期快速重鉴权 | ⬜ | |
+| 26 | token 过期快速重鉴权 | ✔ | `client.rs connect_with_retry` 接收 `&mut cached_tokens`——注册被拒（HTTP 401/409，旧 token 失效）→ 清缓存回退固定 key 全新注册（此前永远用失效 token 重试卡死）；判定纯函数 `token_stale_registration` + 单测 `test_token_stale_registration_detection` |
 | 27 | viewer 移除水位化（满即删→告警） | ✔ | 本轮：满时丢旧保新，超 MAX_CONSECUTIVE_DROPS=60 才移除（relay/desktop.rs） |
 | 28 | 20s WS ping | ✔ | handle_agent_ws_uplink 每 20s server-side ping（agent 死链 ~35s 检出），台账此前误标 ◐，第 17 轮代码级核实修正 |
 | 29 | 控制消息优先级 | ◐ | 部分：`is_lossy_msg_type` 区分数据（terminal:output 静默丢）/控制（non-lossy 满时告警丢）已有，基本优先级语义成立；channel 满时控制仍可能丢（无腾位机制），第 22 轮核实 |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **76%**（可靠通道 19 项 / 前端 21 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 16%。
+- **R5 落地清单（200 点）**：✔ 类约 **78%**（可靠通道 23 项 / 前端 21 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 14%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -197,4 +197,7 @@
 - **第 25 轮新增合入**：
   1. 光标 overlay 断开清理补漏（`web/desktop.js` disconnect 移除 `.sr-cursor-overlay`——第 18 轮 R5#64 遗漏的 DOM 残留清理，断开后元素/样式不再残留）。**浏览器实测**：overlay 随 xdotool 移动出现 → disconnect 后从 DOM 清除 ✓、桌面出画 1280x720 正常。
   2. 台账核实修正：#67-70 **解码器释放已实现**（disconnect 完整清理：MSE disconnect + `_dec.close()` + frames close + reader cancel）；#76 崩溃日志（main.rs crash.log 第 24 轮）；#77 离开停抓（pagehide）均已实现。
+- **第 26 轮新增合入**：
+  1. token 过期快速重鉴权（`client.rs connect_with_retry`）：接收 `&mut cached_tokens`——注册被拒（HTTP 401 token 无效 / 409 session 占用，relay 重启或 token 轮换后旧缓存失效）→ 清缓存回退固定 key 全新注册，**否则永远用失效 token 重试注册卡死无法恢复**；判定纯函数 `token_stale_registration` + 单测（401/409 命中，429/网络错误不命中）。**冒烟**：正常连接 + 桌面 1280x720 无回归 → R5#26。
+  2. 台账核实修正：#6 /agent/send 绑定校验（agent_send_handler 校验 session 注册）、#13 多 agent 同 IP（registration_rate_limit 120/min 放宽）、#15 控制/媒体通道分离（control_tx 64 bounded + post_tx unbounded）经代码级核实均已实现。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
