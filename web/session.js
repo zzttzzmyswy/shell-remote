@@ -464,6 +464,34 @@
         }
     });
 
+    // ── P2P 信令消息层（Task 2 只搭通道，Task 3 才触发协商并实现传输）────
+    // desktop:p2p-offer 发出后，agent 经 relay 回 desktop:p2p-answer /
+    // desktop:p2p-candidate / desktop:p2p-state。这里统一路由到可选的
+    // window.__p2pTransport 句柄：不存在说明该会话未启用 P2P，静默忽略，
+    // 不影响现有桌面流行为。
+    window.shellRemote.on('desktop:p2p-answer', function (msg) {
+        if (window.__p2pTransport && window.__p2pTransport.handleAnswer) {
+            window.__p2pTransport.handleAnswer(msg);
+        }
+    });
+    window.shellRemote.on('desktop:p2p-candidate', function (msg) {
+        if (window.__p2pTransport && window.__p2pTransport.handleRemoteCandidate) {
+            window.__p2pTransport.handleRemoteCandidate(msg);
+        }
+    });
+    window.shellRemote.on('desktop:p2p-state', function (msg) {
+        if (window.__p2pTransport && window.__p2pTransport.handleState) {
+            window.__p2pTransport.handleState(msg);
+        }
+    });
+    // P2P 发送辅助：将信令消息发到 agent。实际调用点由 Task 3 决定
+    // （desktop:started 后、RTCPeerConnection 就绪时）——本 task 不在
+    // started 处理器里触发协商，避免引入 Task 3 前不存在的调用链。
+    function sendDesktopP2p(message) {
+        window.shellRemote.send('desktop:p2p-offer', message);
+        window.shellRemote.send('desktop:p2p-candidate', message);
+    }
+
     // agent 上行链路方式（ws | http）变化时上报，指标面板展示。
     window.shellRemote.on('desktop:uplink', function(msg) {
         window._srDesktopInfo = window._srDesktopInfo || {};

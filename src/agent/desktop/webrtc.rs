@@ -7,7 +7,7 @@
 //! 驱动循环（sans-I/O）：调用方持有 peer 并周期调用 [`WebRtcPeer::drive`]：
 //! 喂入收到的 UDP 报文 + 时间片，排干 str0m 输出（Transmit → 发出 / Event → 状态
 //! 机与回调）。生产环境在 tokio 任务里 select socket recv 与 rtc 超时即可，见
-//! `desktop/mod.rs` 的 `desktop:p2p-*` 信令接线（Task 2）。
+//! `agent/p2p.rs` 的 `desktop:p2p-*` 信令接线（Task 2）。
 
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -30,11 +30,56 @@ pub enum WebRtcState {
 
 /// 报文传输缝：生产用真实 UDP socket（std/tokio `try_recv`/`try_send_to`）驱动，
 /// 测试注入内存转发，不碰 socket。保持单缝，不过度抽象（YAGNI）。
-pub trait Transport {
+///
+/// `Send` 是必需的：agent 侧 P2P 驱动任务在 tokio 里 `spawn` 持有 peer
+/// （`Arc<Mutex<WebRtcPeer>>`），非 Send 的传输会导致 future 无法跨线程。
+/// `UdpTransport`（std socket）与测试用内存传输（Arc<Mutex>）均满足。
+pub trait Transport: Send {
     /// 发一个 UDP 报文到 `dest`。
     fn send(&mut self, dest: SocketAddr, data: &[u8]);
     /// 非阻塞取一个收到的报文（source, data）；无则为 `None`。
     fn recv(&mut self) -> Option<(SocketAddr, Vec<u8>)>;
+}
+
+/// 生产用 UDP 传输（Task 2）：std 同步非阻塞 socket，天然适配 [`Transport`]
+/// 的 `send/recv` 形状。绑定地址由调用方决定（agent 侧 `0.0.0.0:0`）。
+pub struct UdpTransport {
+    socket: std::net::UdpSocket,
+    local: SocketAddr,
+}
+
+impl UdpTransport {
+    /// 绑定监听地址（通常 `"0.0.0.0:0"`），设非阻塞 + 50ms 读超时上限。
+    pub fn bind(addr: &str) -> Result<Self, std::io::Error> {
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?; // recv 无包用 WouldBlock 表示
+        socket.set_read_timeout(Some(std::time::Duration::from_millis(50)))?;
+        let local = socket.local_addr()?;
+        Ok(Self { socket, local })
+    }
+
+    /// 实际绑定地址（生产场景为 `0.0.0.0:port`；测试可回环）。
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// 实际绑定的端口（`local.port()` 简写，agent 建 host candidate 用）。
+    pub fn local_port(&self) -> u16 {
+        self.local.port()
+    }
+}
+
+impl Transport for UdpTransport {
+    fn send(&mut self, dest: SocketAddr, data: &[u8]) {
+        let _ = self.socket.send_to(data, dest);
+    }
+    fn recv(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
+        let mut buf = [0u8; 65536];
+        match self.socket.recv_from(&mut buf) {
+            Ok((n, src)) => Some((src, buf[..n].to_vec())),
+            Err(_) => None, // WouldBlock / 超时 / 无数据 → 无包
+        }
+    }
 }
 
 /// 本模块错误。
@@ -249,16 +294,54 @@ impl WebRtcPeer {
     }
 }
 
+/// P2P 信令应答载荷（`desktop:p2p-answer`）：本地 SDP answer JSON + host
+/// candidate 列表（`desktop:p2p-candidate` 同源导出）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P2pAnswerPayload {
+    pub sdp: String,
+    pub candidates: Vec<String>,
+}
+
+/// Answerer 侧纯函数：接受一条 `desktop:p2p-offer`（sdp + candidates 数组），
+/// 产出 `(peer, P2pAnswerPayload)`。传输注入（测试内存转发 / 生产 UDP socket），
+/// 不依赖 agent 消息循环，是可单测的"处理一条 offer 消息"单元。
+///
+/// `local_addr` 是 host candidate 与 ICE `Receive::new` 用的本地地址：生产
+/// 场景传"对外广播 IP + 实际绑定端口"（`is` crate 用 `Receive.destination`
+/// 匹配本地候选，二者必须一致，见 `task-2-context`）。
+pub fn begin_answer(
+    local_addr: SocketAddr,
+    transport: Box<dyn Transport>,
+    offer_sdp: &str,
+    offer_candidates: &[String],
+) -> Result<(WebRtcPeer, P2pAnswerPayload), WebrtcError> {
+    let mut peer = WebRtcPeer::with_transport(local_addr, transport);
+    // Task 3 的 fMP4 下行占位：DataChannel 收到远端二进制先记日志。
+    peer.on_data(Box::new(|d| tracing::debug!("p2p datachannel rx {} bytes", d.len())));
+    let sdp = peer.answer_offer(offer_sdp)?;
+    for c in offer_candidates {
+        match Candidate::from_sdp_string(c) {
+            Ok(cand) => peer.add_remote_candidate(cand),
+            Err(e) => tracing::warn!("desktop:p2p-offer bad remote candidate dropped ({e}): {c}"),
+        }
+    }
+    let answer = P2pAnswerPayload {
+        sdp,
+        candidates: peer.local_candidates(),
+    };
+    Ok((peer, answer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     /// 内存传输核心：两个 peer 各自持有一个核的句柄，测试侧也保留句柄做转发。
+    /// Arc<Mutex<>>（而非 Rc<RefCell>）：`Transport: Send`，内存传输也必须
+    /// Send（P2P 驱动任务在 tokio::spawn 里持有 peer）。
     #[derive(Default)]
     struct MemState {
         /// (source, dest, data)
@@ -267,29 +350,31 @@ mod tests {
         inbox: VecDeque<(SocketAddr, Vec<u8>)>,
     }
 
+    #[derive(Clone)]
     struct MemTransport {
-        state: Rc<RefCell<MemState>>,
+        state: Arc<Mutex<MemState>>,
         local: SocketAddr,
     }
 
     impl Transport for MemTransport {
         fn send(&mut self, dest: SocketAddr, data: &[u8]) {
             self.state
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .outbox
                 .push_back((self.local, dest, data.to_vec()));
         }
         fn recv(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
-            self.state.borrow_mut().inbox.pop_front()
+            self.state.lock().unwrap().inbox.pop_front()
         }
     }
 
     /// 把所有未发报文搬到对端 inbox；返回是否搬动了东西。
-    fn move_packets(sa: &Rc<RefCell<MemState>>, sb: &Rc<RefCell<MemState>>) -> bool {
+    fn move_packets(sa: &Arc<Mutex<MemState>>, sb: &Arc<Mutex<MemState>>) -> bool {
         let mut moved = false;
         {
-            let mut a = sa.borrow_mut();
-            let mut b = sb.borrow_mut();
+            let mut a = sa.lock().unwrap();
+            let mut b = sb.lock().unwrap();
             while let Some((src, _dst, data)) = a.outbox.pop_front() {
                 b.inbox.push_back((src, data));
                 moved = true;
@@ -306,8 +391,8 @@ mod tests {
     fn pump(
         a: &mut WebRtcPeer,
         b: &mut WebRtcPeer,
-        sa: &Rc<RefCell<MemState>>,
-        sb: &Rc<RefCell<MemState>>,
+        sa: &Arc<Mutex<MemState>>,
+        sb: &Arc<Mutex<MemState>>,
     ) {
         let now = Instant::now();
         a.drive(now);
@@ -322,7 +407,7 @@ mod tests {
         }
     }
 
-    fn test_peer(ip: u8, port: u16, state: &Rc<RefCell<MemState>>) -> WebRtcPeer {
+    fn test_peer(ip: u8, port: u16, state: &Arc<Mutex<MemState>>) -> WebRtcPeer {
         let addr: SocketAddr = format!("147.147.147.{ip}:{port}").parse().unwrap();
         let t = MemTransport {
             state: state.clone(),
@@ -336,8 +421,8 @@ mod tests {
     /// 与计划断言 `state() == Connecting` 一致，不改意图。
     #[test]
     fn peer_creates_offer_and_parses_answer() {
-        let sa = Rc::new(RefCell::new(MemState::default()));
-        let sb = Rc::new(RefCell::new(MemState::default()));
+        let sa = Arc::new(Mutex::new(MemState::default()));
+        let sb = Arc::new(Mutex::new(MemState::default()));
         let mut a = test_peer(1, 50000, &sa);
         let mut b = test_peer(2, 50001, &sb);
 
@@ -357,8 +442,8 @@ mod tests {
     /// 双 peer 内存互通：无 socket，握手连上后 DataChannel 双向收发字节。
     #[test]
     fn two_peers_connect_and_exchange_data() {
-        let sa = Rc::new(RefCell::new(MemState::default()));
-        let sb = Rc::new(RefCell::new(MemState::default()));
+        let sa = Arc::new(Mutex::new(MemState::default()));
+        let sb = Arc::new(Mutex::new(MemState::default()));
         let mut a = test_peer(1, 50000, &sa);
         let mut b = test_peer(2, 50001, &sb);
 
@@ -422,5 +507,162 @@ mod tests {
             &[9u8, 8, 7],
             "B should receive A's bytes"
         );
+    }
+
+    // ── Task 2：P2P 信令通道（agent 应答侧）─────────────────────
+    // TDD RED→GREEN：先有这些断言，再实现 `begin_answer`（纯函数）。
+
+    /// agent 收到 `desktop:p2p-offer {sdp, candidates[]}` → 产出
+    /// `desktop:p2p-answer {sdp, candidates[]}`（含本地 host candidate）。
+    #[test]
+    fn p2p_agent_answers_offer_with_sdp_and_candidates() {
+        // 浏览器侧 offerer peer（Task 3 形态）：真实 str0m make_offer。
+        let sb = Arc::new(Mutex::new(MemState::default()));
+        let mut browser = test_peer(1, 53000, &sb);
+        let offer = browser.make_offer().unwrap();
+
+        // agent 侧：经纯函数 `begin_answer` 应答（注入内存传输，无 socket）。
+        let sa = Arc::new(Mutex::new(MemState::default()));
+        let agent_addr: SocketAddr = "147.147.147.2:53001".parse().unwrap();
+        let t = MemTransport {
+            state: sa.clone(),
+            local: agent_addr,
+        };
+        let (mut agent, answer) = begin_answer(agent_addr, Box::new(t), &offer, &[]).unwrap();
+
+        assert!(
+            !answer.sdp.is_empty(),
+            "answer sdp must not be empty"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&answer.sdp).is_ok(),
+            "answer sdp must be serializable JSON"
+        );
+        assert_eq!(
+            answer.candidates.len(),
+            1,
+            "agent must advertise exactly one host candidate"
+        );
+        assert!(
+            answer.candidates[0].starts_with("candidate:"),
+            "candidate must be a standard candidate:... string, got {:?}",
+            answer.candidates
+        );
+        // 接 answer 后处于建连中（未失败），远端候选可注入。
+        assert_eq!(agent.state(), WebRtcState::Connecting);
+        let browser_cands = browser.local_candidates();
+        for c in &browser_cands {
+            let cand = Candidate::from_sdp_string(c).expect("browser candidate must parse");
+            agent.add_remote_candidate(cand);
+        }
+        assert_eq!(agent.state(), WebRtcState::Connecting);
+    }
+
+    /// offer 内嵌候选注入不炸：坏候选被跳过不影响应答。
+    #[test]
+    fn p2p_offer_with_bad_candidates_still_answers() {
+        let sb = Arc::new(Mutex::new(MemState::default()));
+        let mut browser = test_peer(1, 53100, &sb);
+        let offer = browser.make_offer().unwrap();
+
+        let sa = Arc::new(Mutex::new(MemState::default()));
+        let agent_addr: SocketAddr = "147.147.147.2:53101".parse().unwrap();
+        let t = MemTransport {
+            state: sa.clone(),
+            local: agent_addr,
+        };
+        let bad = vec!["this is not a candidate".to_string()];
+        let (_agent, answer) = begin_answer(agent_addr, Box::new(t), &offer, &bad).unwrap();
+        assert!(!answer.sdp.is_empty(), "answer sdp must not be empty");
+    }
+
+    /// 纯函数产出的 answer 可被浏览器式 peer 接受，并全流程握手至 Connected
+    /// （agent 侧 peer 由 begin_answer 创建，走真实信令路径）。
+    #[test]
+    fn p2p_full_handshake_via_begin_answer() {
+        let sa = Arc::new(Mutex::new(MemState::default()));
+        let sb = Arc::new(Mutex::new(MemState::default()));
+        let mut browser = test_peer(1, 53200, &sb);
+        let offer = browser.make_offer().unwrap();
+
+        let agent_addr: SocketAddr = "147.147.147.2:53201".parse().unwrap();
+        let t = MemTransport {
+            state: sa.clone(),
+            local: agent_addr,
+        };
+        let (mut agent, answer) = begin_answer(agent_addr, Box::new(t), &offer, &[]).unwrap();
+
+        // 浏览器接受 answer + agent 的 host candidate。
+        browser.handle_answer(&answer.sdp).unwrap();
+        for c in &answer.candidates {
+            browser.add_remote_candidate(Candidate::from_sdp_string(c).unwrap());
+        }
+        // agent 侧浏览器候选：offer sdp 内联候选由 accept_offer 解析，这里
+        // 再按信令协议显式补喂（浏览器 local_candidates 与 sdp 内联一致）。
+        let browser_cands = browser.local_candidates();
+        for c in &browser_cands {
+            agent.add_remote_candidate(Candidate::from_sdp_string(c).unwrap());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump(&mut agent, &mut browser, &sa, &sb);
+            if agent.state() == WebRtcState::Connected && browser.state() == WebRtcState::Connected {
+                break;
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            agent.state(),
+            WebRtcState::Connected,
+            "agent peer must reach Connected via begin_answer flow"
+        );
+        assert_eq!(
+            browser.state(),
+            WebRtcState::Connected,
+            "browser peer must reach Connected"
+        );
+    }
+
+    /// 生产 UDP 传输：本地绑一个 0.0.0.0:0 socket 可收发（回环自聊）。
+    #[test]
+    fn p2p_udp_transport_binds_and_loops() {
+        let mut a = UdpTransport::bind("0.0.0.0:0").expect("bind");
+        let mut b = UdpTransport::bind("0.0.0.0:0").expect("bind");
+        let a_addr = a.local_addr();
+        let b_addr = b.local_addr();
+        assert_ne!(a_addr.port(), 0, "must get a real ephemeral port");
+        assert_ne!(a_addr.port(), b_addr.port(), "two binds must differ");
+
+        a.send(b_addr, b"ping");
+        b.send(a_addr, b"pong");
+        // recv 是非阻塞轮询：先发后收，回环最迟几 ms 内到达。源 IP 由内核按
+        // 路由挑（0.0.0.0 绑定发包的实际源 IP），只校验端口与载荷。
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some((src, data)) = b.recv() {
+                assert_eq!(src.port(), a_addr.port(), "source port must be a's port");
+                assert_eq!(data, b"ping");
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("udp loopback recv timed out");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        loop {
+            if let Some((src, data)) = a.recv() {
+                assert_eq!(src.port(), b_addr.port(), "source port must be b's port");
+                assert_eq!(data, b"pong");
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("udp loopback recv timed out");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }

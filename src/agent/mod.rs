@@ -4,6 +4,7 @@ pub mod desktop;
 pub mod encoding;
 pub mod exec_sessions;
 pub mod fs;
+pub mod p2p;
 pub mod shell;
 pub mod upgrade;
 
@@ -50,6 +51,7 @@ struct UploadReassembly {
 /// Outbound message handle. The main loop never blocks on HTTP: terminal
 /// output is pushed to a bounded, coalesced channel; control/result messages
 /// are pushed to a bounded channel drained with priority by a background task.
+#[derive(Clone)]
 struct Out {
     control_tx: tokio::sync::mpsc::Sender<String>,
     output_tx: tokio::sync::mpsc::Sender<(String, Vec<u8>)>,
@@ -769,6 +771,9 @@ async fn run_session(
     // (concurrent sends could reorder fragments and break playback).
     // 先建 DesktopManager，心跳扩展（R5#150）需要它的 KPI 快照。
     let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(desktop_cfg.clone()));
+    // Task 2 P2P 信令会话槽：None = 无活动协商；offer 到达时宿主 peer +
+    // 驱动任务，desktop:stop / 二次 offer / 会话结束 时回收。
+    let p2p_state = crate::agent::p2p::P2pState::default();
     tokio::spawn(sender_loop(
         client.http_client().clone(),
         client.send_url().to_string(),
@@ -1663,7 +1668,59 @@ async fn run_session(
 
                                 "desktop:stop" => {
                                     tracing::info!("desktop:stop requested");
+                                    // 桌面上层流停止；P2P 信令会话一并回收（驱动
+                                    // 任务 abort，浏览器回退 relay 路径，Task 3/6）。
+                                    crate::agent::p2p::shutdown(&p2p_state).await;
                                     desktop.stop(post_fn.clone()).await;
+                                }
+
+                                "desktop:p2p-offer" => {
+                                    // 浏览器作为 offerer 发起的 WebRTC 协商（Task 3
+                                    // createOffer 产物）。agent 应答 → desktop:p2p-answer
+                                    // {sdp, candidates[]}；建连/失败由驱动任务广播
+                                    // desktop:p2p-state。窗口内二次 offer = last-wins。
+                                    let sdp = msg
+                                        .payload
+                                        .get("sdp")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let candidates: Vec<String> = msg
+                                        .payload
+                                        .get("candidates")
+                                        .and_then(|v| v.as_array())
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    tracing::info!(
+                                        sdp_bytes = sdp.len(),
+                                        cands = candidates.len(),
+                                        "desktop:p2p-offer received"
+                                    );
+                                    let ctrl = task_control_tx.clone();
+                                    crate::agent::p2p::handle_offer(
+                                        &p2p_state,
+                                        client.session_id.clone(),
+                                        ctrl,
+                                        &sdp,
+                                        &candidates,
+                                    )
+                                    .await;
+                                }
+
+                                "desktop:p2p-candidate" => {
+                                    // trickle ICE：浏览器把候选中途到达的 remote
+                                    // candidate 喂给正在握手的共享 peer。
+                                    if let Some(c) = msg
+                                        .payload
+                                        .get("candidate")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        crate::agent::p2p::handle_candidate(&p2p_state, c).await;
+                                    }
                                 }
 
                                 "desktop:codec" => {
@@ -2037,12 +2094,14 @@ async fn run_session(
     // R5#11 会话退出：记录桌面是否在跑（供重连恢复），并停止当前流——
     // run_desktop_loop 是 tokio::spawn 的孤儿 task（desktop drop 不停它），
     // 不显式 stop 会继续向已失效的 relay 连接发帧（浪费 CPU + 重连后与
-    // 新流双发冲突）。
+    // 新流双发冲突）。P2P 驱动任务同是孤儿 task：先回收再断连，防其继续
+    // 向失效连接广播 desktop:p2p-state。
     *desktop_want_running = desktop.is_running();
     if desktop.is_running() {
         tracing::warn!("session ending with desktop running — stopping stream for reconnect recovery");
         desktop.stop(post_fn.clone()).await;
     }
+    crate::agent::p2p::shutdown(&p2p_state).await;
 
     // Tokens were already cached into `cached_tokens` right after registration,
     // so `start` can replay them on reconnect — nothing to return here.

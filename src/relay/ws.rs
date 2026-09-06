@@ -310,6 +310,14 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "desktop:cmd-ack",
             "desktop:cursor",
             "test-delay-ack",
+            // Task 2 P2P 信令（agent→浏览器）：answer/candidate/state 属
+            // 控制消息（non-lossy），与 desktop:started 同路径广播。offer 是
+            // 浏览器→agent 方向，不进这里。约定：p2p-offer/answer/candidate
+            // 已在 proto requires_write 的 read_only_types（浏览器只读观看者
+            // 也能参与协商）。
+            "desktop:p2p-answer",
+            "desktop:p2p-candidate",
+            "desktop:p2p-state",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {
             // fs:result is browser-facing (file manager reads + downloads).
@@ -2060,6 +2068,41 @@ mod tests {
             .expect("browser must receive desktop:started")
             .unwrap();
         assert!(got.contains("desktop:started") && got.contains("h264"), "got: {got}");
+    }
+
+    #[tokio::test]
+    async fn test_desktop_p2p_signaling_broadcasts_to_browsers() {
+        // Task 2 P2P 信令：agent→浏览器 的 desktop:p2p-answer/candidate/state
+        // 必须走 broadcast_types 广播（non-lossy 控制消息）；且不触发
+        // desktop:video / desktop:started 的特殊路径（不建桌面 fan-out 流）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        insert_channel_map(&state, &sid).await;
+        let mut sse_rx = add_browser(&state, &sid, "brow1").await;
+
+        for ty in ["desktop:p2p-answer", "desktop:p2p-candidate", "desktop:p2p-state"] {
+            let payload = match ty {
+                "desktop:p2p-state" => serde_json::json!({ "state": "connected" }),
+                "desktop:p2p-candidate" => serde_json::json!({ "candidate": "candidate:1 1 udp" }),
+                _ => serde_json::json!({ "sdp": "{}", "candidates": [] }),
+            };
+            let msg = serde_json::json!({
+                "type": ty,
+                "session_id": sid,
+                "payload": payload
+            });
+            route_agent_message(&state, &sid, &msg.to_string()).await;
+            let got = tokio::time::timeout(std::time::Duration::from_millis(2000), sse_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("browser must receive {ty}"))
+                .unwrap();
+            assert!(got.contains(ty), "got: {got}");
+        }
+        assert!(
+            state.desktop_streams.read().await.is_empty(),
+            "p2p 消息不应建桌面 fan-out 流（与 desktop:video/started 路径隔离）"
+        );
     }
 
     async fn add_browser(
