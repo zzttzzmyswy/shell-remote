@@ -106,6 +106,8 @@
     }
 
     // 编码方案切换：发送 desktop:codec，agent 重建桌面流。
+    // R5#2 控制命令 ack：命令带递增 seq，agent 处理后回 desktop:cmd-ack，
+    // 浏览器 toast 反馈操作结果（弱网/高负载下操作是否生效可见）。
     const codecSelect = document.getElementById('desktop-codec-select');
     if (codecSelect) {
         codecSelect.addEventListener('change', function() {
@@ -114,7 +116,7 @@
             // 切换中标志：agent stop→start 重建流期间, desktop:stopped 不
             // 触发退出桌面视图, 等 desktop:started 到来后自动重连新流。
             window.__codecSwitchPending = true;
-            window.shellRemote.send('desktop:codec', { codec: codec });
+            window.shellRemote.send('desktop:codec', { codec: codec, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast('切换编码为 ' + codec.toUpperCase() + '…', '');
         });
     }
@@ -135,7 +137,7 @@
             }
             if (!desktopEnabled || !window.shellRemote) return;
             window.__codecSwitchPending = true;
-            window.shellRemote.send('desktop:quality', { quality: quality, bitrate_kbps: custom });
+            window.shellRemote.send('desktop:quality', { quality: quality, bitrate_kbps: custom, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast('切换码率档…', '');
         });
     }
@@ -146,10 +148,22 @@
     if (grayToggle) {
         grayToggle.addEventListener('change', function() {
             if (!desktopEnabled || !window.shellRemote) return;
-            window.shellRemote.send('desktop:gray', { enabled: this.checked });
+            window.shellRemote.send('desktop:gray', { enabled: this.checked, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast(this.checked ? '已开启灰度模式（省带宽）' : '已关闭灰度模式', '');
         });
     }
+
+    // R5#2 控制命令 ack：agent 回执——操作生效 ok / 失败 error → toast 反馈。
+    window.shellRemote.on('desktop:cmd-ack', function(msg) {
+        const p = msg.payload || {};
+        if (typeof p.ok === 'boolean') {
+            if (p.ok) {
+                showToast('指令已生效', 'success');
+            } else {
+                showToast('指令失败: ' + (p.error || '未知错误'), 'error');
+            }
+        }
+    });
 
     toggleDesktopBtn.addEventListener('click', function() {
         if (!desktopEnabled) return;

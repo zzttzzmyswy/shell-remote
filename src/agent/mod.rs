@@ -1528,24 +1528,30 @@ async fn run_session(
                                 "desktop:codec" => {
                                     // 热切换编码方案（web 页编码器下拉）：
                                     // av1/vp9/h264，切换后自动重建桌面流。
+                                    // R5#2 控制命令 ack：回 cmd-ack {seq, ok} 供
+                                    // 浏览器确认操作结果（弱网/高负载下可见反馈）。
                                     let codec = msg
                                         .payload
                                         .get("codec")
                                         .and_then(|c| c.as_str())
                                         .unwrap_or("")
                                         .to_string();
+                                    let seq = msg
+                                        .payload
+                                        .get("seq")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
                                     tracing::info!(codec = %codec, "desktop:codec requested");
-                                    if let Err(e) = desktop.set_codec(&codec, post_fn.clone()).await {
-                                        let err = Message {
-                                            msg_type: "error".to_string(),
-                                            session_id: client.session_id.clone(),
-                                            payload: serde_json::json!({
-                                                "code": "DESKTOP_BAD_CODEC",
-                                                "message": e
-                                            }),
-                                        };
-                                        out.control(err).await;
-                                    }
+                                    let result = desktop.set_codec(&codec, post_fn.clone()).await;
+                                    let ack = Message {
+                                        msg_type: "desktop:cmd-ack".to_string(),
+                                        session_id: client.session_id.clone(),
+                                        payload: match &result {
+                                            Ok(()) => serde_json::json!({ "seq": seq, "ok": true }),
+                                            Err(e) => serde_json::json!({ "seq": seq, "ok": false, "error": e }),
+                                        },
+                                    };
+                                    out.control(ack).await;
                                 }
 
                                 "desktop:qos" => {
@@ -1636,7 +1642,7 @@ async fn run_session(
 
                                 "desktop:quality" => {
                                     // 码率档切换（web 码率下拉）：speed/balanced/best
-                                    // + 自定义 kbps。改档后重建桌面流。
+                                    // + 自定义 kbps。改档后重建桌面流。R5#2 命令 ack。
                                     let quality = msg
                                         .payload
                                         .get("quality")
@@ -1648,32 +1654,47 @@ async fn run_session(
                                         .get("bitrate_kbps")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0);
+                                    let seq = msg
+                                        .payload
+                                        .get("seq")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
                                     tracing::info!(quality = %quality, custom_kbps, "desktop:quality requested");
-                                    if let Err(e) = desktop
+                                    let result = desktop
                                         .set_quality(&quality, custom_kbps, post_fn.clone())
-                                        .await
-                                    {
-                                        let err = Message {
-                                            msg_type: "error".to_string(),
-                                            session_id: client.session_id.clone(),
-                                            payload: serde_json::json!({
-                                                "code": "DESKTOP_BAD_QUALITY",
-                                                "message": e
-                                            }),
-                                        };
-                                        out.control(err).await;
-                                    }
+                                        .await;
+                                    let ack = Message {
+                                        msg_type: "desktop:cmd-ack".to_string(),
+                                        session_id: client.session_id.clone(),
+                                        payload: match &result {
+                                            Ok(()) => serde_json::json!({ "seq": seq, "ok": true }),
+                                            Err(e) => serde_json::json!({ "seq": seq, "ok": false, "error": e }),
+                                        },
+                                    };
+                                    out.control(ack).await;
                                 }
 
                                 "desktop:gray" => {
                                     // 灰度模式开关（web 桌面控制栏，弱网省带宽）：
                                     // 只翻编码前降色度 flag，即时生效不重建流。
+                                    // R5#2 命令 ack（即时生效，无失败路径 → ok）。
                                     let enabled = msg
                                         .payload
                                         .get("enabled")
                                         .and_then(|v| v.as_bool())
                                         .unwrap_or(false);
                                     desktop.set_gray(enabled);
+                                    let seq = msg
+                                        .payload
+                                        .get("seq")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let ack = Message {
+                                        msg_type: "desktop:cmd-ack".to_string(),
+                                        session_id: client.session_id.clone(),
+                                        payload: serde_json::json!({ "seq": seq, "ok": true }),
+                                    };
+                                    out.control(ack).await;
                                 }
 
                                 "desktop:mouse" => {

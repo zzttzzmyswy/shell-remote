@@ -202,6 +202,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "desktop:uplink",
             "desktop:clipboard",
             "desktop:qos-ack",
+            "desktop:cmd-ack",
             "desktop:cursor",
             "test-delay-ack",
         ];
@@ -393,6 +394,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 "desktop:uplink",
                 "desktop:clipboard",
                 "desktop:qos-ack",
+                "desktop:cmd-ack",
                 "desktop:cursor",
                 "test-delay-ack",
                 "mcp:result",
