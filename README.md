@@ -125,7 +125,7 @@ session: a1b2c3d4
 - 码率：按用户需求 **最高 800kbps、最低 200kbps** 自适应动态调整（`--desktop-max-bitrate` / `--desktop-min-bitrate`，单位 kbps，默认 800/200）。
 - 编码：软件编码（openh264，BSD 许可）兜底；`--desktop-codec h264`。**硬件编码（VAAPI / Windows Media Foundation）按"软编兜底、尽可能硬编"的需求预留为后续扩展**，当前版本为纯软编。
 - 下行通道（P2P 直连，阶段1/2）：默认探测顺序 **LAN → WebRTC DataChannel → relay**，全部自动、用户无感：
-  - **LAN**：agent 带 `--desktop-lan-port` 时，浏览器与 agent 同网段直接 `http://agent-ip:port/agent/desktop/stream` 拉流（CORS 限定 relay 同源）；
+  - **LAN**：agent 带 `--desktop-lan-port` 时，浏览器与 agent 同网段直接 `http://agent-ip:port/agent/desktop/stream` 拉流（CORS 限定 relay 同源）；**部署限制**：该 LAN 拉流为 `http://` 混合内容——relay/会话页以 **HTTPS** 提供时浏览器会直接拦截此 fetch，Stage-2 LAN 直连不可用（无挂起、快速回退 P2P/relay），LAN 通道仅在 relay/会话页走纯 HTTP 时生效；WebRTC P2P 与 relay 回退不受影响；
   - **WebRTC**：协商经 relay 信令（`desktop:p2p-*`）完成，DataChannel 承载 fMP4 字节（不可靠模式、丢旧保新）；
   - **relay**：前两者失败/打洞不通时自动回退既有 `/agent/desktop/stream` 转发，功能不劣于旧版。
   - 指标面板"下行通道"行显示当前路径（`lan` / `p2p` / `relay`）。已知限制：P2P 高动态持续帧率受 str0m SCTP cwnd 慢启动限制（LAN/relay 无此问题）；P2P 会话为单活跃 viewer（并发 viewer 自动走 relay）。
