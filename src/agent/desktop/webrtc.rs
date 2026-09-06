@@ -99,6 +99,13 @@ pub enum WebrtcError {
     Backpressure,
 }
 
+/// SDP 载体形态：str0m JSON（工具链/测试）或 RFC 4566 文本（真实浏览器）。
+#[derive(Clone, Copy)]
+enum SdpFormat {
+    Json,
+    Rfc,
+}
+
 /// 默认空传输（`new()` 构造用，生产由 `with_transport` 注入真实 socket 传输）。
 struct NoopTransport;
 
@@ -165,16 +172,37 @@ impl WebRtcPeer {
         Ok(serde_json::to_string(&offer)?)
     }
 
-    /// 应答方向：接受远端 offer，产 SDP answer（JSON 字符串）。
-    pub fn answer_offer(&mut self, offer_json: &str) -> Result<String, WebrtcError> {
-        let offer: SdpOffer = serde_json::from_str(offer_json)?;
+    /// 应答方向：接受远端 offer，产 SDP answer。兼容两种 SDP 形态：
+    /// - str0m JSON（Task 1/2 的 `make_offer` 产物，工具链/测试自洽）；
+    /// - RFC 4566 文本（真实浏览器 `pc.createOffer` 产物，Task 3 主线）。
+    /// 应答格式跟随请求格式：浏览器收 RFC 文本才 `setRemoteDescription` 可解。
+    pub fn answer_offer(&mut self, offer_sdp: &str) -> Result<String, WebrtcError> {
+        let (offer, fmt) = match serde_json::from_str::<SdpOffer>(offer_sdp) {
+            Ok(o) => (o, SdpFormat::Json),
+            Err(_) => (
+                SdpOffer::from_sdp_string(offer_sdp).map_err(|e| {
+                    tracing::warn!("RFC SDP offer parse failed: {e}");
+                    WebrtcError::Sdp
+                })?,
+                SdpFormat::Rfc,
+            ),
+        };
         let answer = self.rtc.sdp_api().accept_offer(offer)?;
-        Ok(serde_json::to_string(&answer)?)
+        match fmt {
+            SdpFormat::Json => Ok(serde_json::to_string(&answer)?),
+            SdpFormat::Rfc => Ok(answer.to_sdp_string()),
+        }
     }
 
-    /// 发起方：接受 SDP answer。
-    pub fn handle_answer(&mut self, answer_json: &str) -> Result<(), WebrtcError> {
-        let answer: SdpAnswer = serde_json::from_str(answer_json)?;
+    /// 发起方：接受 SDP answer（同样兼容 JSON 与 RFC 文本，见 [`Self::answer_offer`]）。
+    pub fn handle_answer(&mut self, answer_sdp: &str) -> Result<(), WebrtcError> {
+        let answer = match serde_json::from_str::<SdpAnswer>(answer_sdp) {
+            Ok(a) => a,
+            Err(_) => SdpAnswer::from_sdp_string(answer_sdp).map_err(|e| {
+                tracing::warn!("RFC SDP answer parse failed: {e}");
+                WebrtcError::Sdp
+            })?,
+        };
         let pending = self
             .pending_offer
             .take()
@@ -223,7 +251,18 @@ impl WebRtcPeer {
     /// 任务里周期调用；测试用其推进内存转发握手。
     pub fn drive(&mut self, now: Instant) -> Option<Instant> {
         // 1. 喂入待处理的外部报文。
+        // 单次 drive 限批喂入：底层 dimpl DTLS 的接收队列上限（max_queue_rx=30
+        // 条记录），且**只在 poll_output 排空时才消费**。若把一次 recv 积累的
+        // 整个 socket 背压（数十条 SCTP SACK/DTLS 记录）一次性塞入，会在本轮
+        // 排空前就撞满上限 → ReceiveQueueFull → 整个 peer 判定 Failed。限批 +
+        // 每次 drive 后的 poll_output 天然形成「插一批→排一批」的节奏。
+        const MAX_FEED_PER_DRIVE: usize = 8;
+        let mut fed = 0usize;
         while let Some((source, data)) = self.transport.recv() {
+            if fed >= MAX_FEED_PER_DRIVE {
+                break; // 余量留在 socket buffer，下次 drive 再喂（≤5ms）
+            }
+            fed += 1;
             if let Ok(recv) = Receive::new(Protocol::Udp, source, self.local_addr, &data) {
                 let input = Input::Receive(now, recv);
                 if self.rtc.accepts(&input) {
@@ -333,27 +372,30 @@ pub fn begin_answer(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+pub(crate) mod testutil {
+    //! 内存传输测试设施：双 peer 无 socket 握手/收发（`agent/p2p.rs` 的
+    //! 镜像投递测试也复用）。Arc<Mutex<>>（而非 Rc<RefCell>）：`Transport: Send`，
+    //! 内存传输也必须 Send（P2P 驱动任务在 tokio::spawn 里持有 peer）。
 
-    /// 内存传输核心：两个 peer 各自持有一个核的句柄，测试侧也保留句柄做转发。
-    /// Arc<Mutex<>>（而非 Rc<RefCell>）：`Transport: Send`，内存传输也必须
-    /// Send（P2P 驱动任务在 tokio::spawn 里持有 peer）。
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use super::{Transport, WebRtcPeer};
+
     #[derive(Default)]
-    struct MemState {
+    pub(crate) struct MemState {
         /// (source, dest, data)
-        outbox: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>,
+        pub(crate) outbox: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>,
         /// (source, data)
-        inbox: VecDeque<(SocketAddr, Vec<u8>)>,
+        pub(crate) inbox: VecDeque<(SocketAddr, Vec<u8>)>,
     }
 
     #[derive(Clone)]
-    struct MemTransport {
-        state: Arc<Mutex<MemState>>,
-        local: SocketAddr,
+    pub(crate) struct MemTransport {
+        pub(crate) state: Arc<Mutex<MemState>>,
+        pub(crate) local: SocketAddr,
     }
 
     impl Transport for MemTransport {
@@ -370,7 +412,7 @@ mod tests {
     }
 
     /// 把所有未发报文搬到对端 inbox；返回是否搬动了东西。
-    fn move_packets(sa: &Arc<Mutex<MemState>>, sb: &Arc<Mutex<MemState>>) -> bool {
+    pub(crate) fn move_packets(sa: &Arc<Mutex<MemState>>, sb: &Arc<Mutex<MemState>>) -> bool {
         let mut moved = false;
         {
             let mut a = sa.lock().unwrap();
@@ -388,7 +430,7 @@ mod tests {
     }
 
     /// 推进双 peer 一步：驱动引擎并把产生的报文转发到对端 inbox。
-    fn pump(
+    pub(crate) fn pump(
         a: &mut WebRtcPeer,
         b: &mut WebRtcPeer,
         sa: &Arc<Mutex<MemState>>,
@@ -407,7 +449,7 @@ mod tests {
         }
     }
 
-    fn test_peer(ip: u8, port: u16, state: &Arc<Mutex<MemState>>) -> WebRtcPeer {
+    pub(crate) fn test_peer(ip: u8, port: u16, state: &Arc<Mutex<MemState>>) -> WebRtcPeer {
         let addr: SocketAddr = format!("147.147.147.{ip}:{port}").parse().unwrap();
         let t = MemTransport {
             state: state.clone(),
@@ -415,6 +457,14 @@ mod tests {
         };
         WebRtcPeer::with_transport(addr, Box::new(t))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::testutil::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// 计划 Step 2 原测试：offer/answer JSON 往返 + 状态机存活。
     /// 0.23 下接 answer 后未 pump 前 ICE 停在 New（映射为 Connecting），
@@ -556,6 +606,53 @@ mod tests {
             agent.add_remote_candidate(cand);
         }
         assert_eq!(agent.state(), WebRtcState::Connecting);
+    }
+
+    // ── Task 3：真实浏览器 RFC SDP 互操作 ──────────────────────
+    // RED→GREEN：浏览器 `pc.createOffer()` 产 RFC 4566 文本（非 str0m JSON），
+    // agent 必须能解析并以同格式应答（JSON-only 会让真实浏览器协商失败）。
+
+    /// 浏览器式 RFC offer → begin_answer → RFC 文本 answer（浏览器
+    /// setRemoteDescription 可直接解），且状态机进入建连中。
+    #[test]
+    fn p2p_rfc_browser_offer_is_answered_in_rfc_format() {
+        let sb = Arc::new(Mutex::new(MemState::default()));
+        let mut browser = test_peer(1, 53300, &sb);
+        let offer_json = browser.make_offer().unwrap();
+        // 浏览器不会发出 str0m JSON——把 JSON 转成 RFC 文本再走应答侧。
+        let offer_obj: SdpOffer = serde_json::from_str(&offer_json).unwrap();
+        let offer_rfc = offer_obj.to_sdp_string();
+        assert!(offer_rfc.starts_with("v=0"), "RFC offer must be plain SDP text");
+
+        let sa = Arc::new(Mutex::new(MemState::default()));
+        let agent_addr: SocketAddr = "147.147.147.2:53301".parse().unwrap();
+        let t = MemTransport { state: sa.clone(), local: agent_addr };
+        let (mut agent, answer) = begin_answer(agent_addr, Box::new(t), &offer_rfc, &[]).unwrap();
+
+        assert!(
+            answer.sdp.starts_with("v=0"),
+            "answer to a browser RFC offer must be RFC text, got {}",
+            &answer.sdp[..answer.sdp.len().min(40)]
+        );
+        assert_eq!(answer.candidates.len(), 1, "host candidate still advertised");
+        assert_eq!(agent.state(), WebRtcState::Connecting);
+
+        // 浏览器侧可接受该 RFC answer（handle_answer 走 RFC 解析）。
+        browser.handle_answer(&answer.sdp).unwrap();
+        assert_eq!(browser.state(), WebRtcState::Connecting);
+    }
+
+    /// Offer 生产侧：str0m JSON 产物转出 RFC 文本应可再解析（保证测试夹具
+    /// 与真实浏览器形态的转录不破）。
+    #[test]
+    fn p2p_sdp_json_roundtrips_to_rfc_text() {
+        let sb = Arc::new(Mutex::new(MemState::default()));
+        let mut browser = test_peer(1, 53350, &sb);
+        let offer_json = browser.make_offer().unwrap();
+        let offer: SdpOffer = serde_json::from_str(&offer_json).unwrap();
+        let rfc = offer.to_sdp_string();
+        let reparsed = SdpOffer::from_sdp_string(&rfc);
+        assert!(reparsed.is_ok(), "RFC text must round-trip through the parser");
     }
 
     /// offer 内嵌候选注入不炸：坏候选被跳过不影响应答。

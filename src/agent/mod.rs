@@ -1129,8 +1129,34 @@ async fn run_session(
             });
         }
     }
+    // Task 3：P2P 已建连时把 desktop:video 的 fMP4 字节镜像一份进 DataChannel
+    //（relay POST 行为/编码/QoS 零改动，仅加一条镜像投递）。闭包外 clone，
+    // Arc 引用计数使闭包与消息循环共享同一个投递口。
+    let video_tx = p2p_state.video_tx.clone();
+    let last_init = p2p_state.last_init.clone();
     let post_fn: crate::agent::desktop::PostFn = Arc::new(move |msg| {
         let t = msg["type"].as_str().unwrap_or("?").to_string();
+        // fMP4 镜像投递：解析 desktop:video 的 base64 data（init=ftyp+moov /
+        // frag=moof+mdat，不带 JSON 包裹），投给 P2P 消费循环写 DataChannel。
+        // init 单独缓存一份（建连时补推，见 p2p 驱动任务 Connected 分支）。
+        // 通道未建/未开时静默丢弃（丢旧保新，浏览器 reqkey/重连兜底）。p2p 侧
+        // UnboundedSender::send 不阻塞，std RwLock 读不跨 await。
+        if t == "desktop:video" {
+            let kind = msg["payload"]["kind"].as_str();
+            let data_b64 = msg["payload"]["data"].as_str();
+            if let Some(data_b64) = data_b64 {
+                if let Some(bytes) = crate::agent::fs::decode_b64(data_b64) {
+                    if kind == Some("init") {
+                        *last_init.write().unwrap() = Some(bytes.clone());
+                    }
+                    if let Ok(guard) = video_tx.read() {
+                        if let Some(tx) = guard.as_ref() {
+                            let _ = tx.send(bytes);
+                        }
+                    }
+                }
+            }
+        }
         let _ = post_tx.send(msg); // unbounded: 不会失败, 由 consumer 批内丢旧
         tracing::trace!("post_fn queued {t}");
     });
