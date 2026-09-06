@@ -36,6 +36,22 @@ use std::time::Duration;
 
 use crate::agent::desktop::encoder::next_lower_codec;
 
+/// R5#32 剪贴板大文本防护：超过该字节数截断（完整文本走文件传输为远期方向，
+/// 先防超大控制消息阻塞上行 / 远端剪贴板写入卡顿）。512KB 覆盖正常剪贴板
+/// 内容（代码/文档/日志），只有异常大复制才会触发。
+pub const CLIPBOARD_MAX_CHARS: usize = 512 * 1024;
+
+/// 安全截断到最近 UTF-8 字符边界（`floor_char_boundary`，Rust 1.73+）：避免
+/// 在字节中间切出非法字符/半个码点。超过 `max` 时返回前缀，否则原样。
+/// 纯函数（截断提示由调用方记日志）。
+pub fn clipboard_truncate(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        text
+    } else {
+        &text[..text.floor_char_boundary(max)]
+    }
+}
+
 /// Post a JSON message to the relay on the agent's own HTTP transport.
 pub type PostFn = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 
@@ -426,6 +442,7 @@ impl DesktopManager {
     /// text to the remote machine.
     pub async fn handle_clipboard_set(&self, payload: &serde_json::Value) {
         let Some(text) = payload.get("text").and_then(|v| v.as_str()) else { return };
+        let text = clipboard_truncate(text, CLIPBOARD_MAX_CHARS);
         let mut g = self.clipboard.lock().await;
         let clip = g.get_or_insert_with(clipboard::ClipboardSync::start);
         clip.set(text.to_string());
@@ -439,6 +456,7 @@ impl DesktopManager {
             let clip = g.get_or_insert_with(clipboard::ClipboardSync::start);
             clip.get().unwrap_or_default()
         };
+        let text = clipboard_truncate(&text, CLIPBOARD_MAX_CHARS);
         post(serde_json::json!({
             "type": "desktop:clipboard",
             "payload": { "text": text }
@@ -2225,6 +2243,29 @@ mod tests {
         assert_eq!(i420[..w * h].iter().min().copied().unwrap(), 90, "Y untouched");
         assert_eq!(i420[w * h..].iter().max().copied().unwrap(), 128, "UV neutralized");
         assert_eq!(i420[w * h..].iter().min().copied().unwrap(), 128, "UV neutralized");
+    }
+
+    /// R5#32 剪贴板大文本截断：未超限原样；超限截断到最近 UTF-8 字符边界
+    /// （中英文混排不切出非法字符/半个码点）。
+    #[test]
+    fn test_clipboard_truncate_boundary() {
+        // 未超限：原样返回。
+        assert_eq!(clipboard_truncate("hello", 100), "hello");
+        // 英文超限：截断长度恰为 max。
+        let long = "a".repeat(600_000);
+        assert_eq!(clipboard_truncate(&long, 1000).len(), 1000);
+        // 中文（UTF-8 每字 3 字节）+ floor_char_boundary：max 落在字符中间
+        // 时前移到完整字符边界，绝不切半个字。
+        let cjk: String = "中".repeat(1_000); // 3000 字节
+        let t = clipboard_truncate(&cjk, 1_001);
+        let n = t.len();
+        assert!(n <= 1_001, "截断不得超过 max：{n}");
+        assert!(n % 3 == 0, "不得切半个中文字符：{n}");
+        // 混排尾部尽量贴近 max。
+        let mixed = format!("{}abc{}", "中".repeat(333), "x".repeat(700));
+        let tm = clipboard_truncate(&mixed, 1_400);
+        assert!(std::str::from_utf8(tm.as_bytes()).is_ok(), "截断必须合法 UTF-8");
+        assert!(tm.len() <= 1_400);
     }
 
     #[test]
