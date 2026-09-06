@@ -208,6 +208,42 @@
         });
     }
 
+    // 批次7 多显示器选屏（rustdesk 对齐）：agent started 上报的显示器拓扑
+    // 填充下拉；选择后发送 desktop:select-display，agent 重建桌面流切到
+    // 该显示器。"" = 恢复启动默认显示器。
+    const displaySelect = document.getElementById('desktop-display-select');
+    const displayLabel = document.getElementById('desktop-display-label');
+    function populateDisplaySelect(displays) {
+        if (!displaySelect || !displayLabel) return;
+        const current = displaySelect.value;
+        displaySelect.innerHTML = '';
+        const def = document.createElement('option');
+        def.value = '';
+        def.textContent = '默认';
+        displaySelect.appendChild(def);
+        (displays || []).forEach(function(d) {
+            const o = document.createElement('option');
+            o.value = d.name || '';
+            const geo = (d.width && d.height) ? (' · ' + d.width + 'x' + d.height) : '';
+            o.textContent = (d.name || '?') + geo;
+            displaySelect.appendChild(o);
+        });
+        // 单屏/无拓扑时隐藏下拉（选屏无意义），多屏才显示。
+        const n = (displays || []).length;
+        displayLabel.style.display = (n > 1) ? '' : 'none';
+        if (current) displaySelect.value = current;
+    }
+    if (displaySelect) {
+        displaySelect.addEventListener('change', function() {
+            if (!desktopEnabled || !window.shellRemote) return;
+            const display = this.value || '';
+            // 重建流期间 desktop:stopped 不退出桌面视图，等 started 后重连。
+            window.__codecSwitchPending = true;
+            window.shellRemote.send('desktop:select-display', { display: display, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
+            showToast(display ? ('切换显示器 ' + display) : '恢复默认显示器…', '');
+        });
+    }
+
     // R5#2 控制命令 ack：agent 回执——操作生效 ok / 失败 error → toast 反馈。
     window.shellRemote.on('desktop:cmd-ack', function(msg) {
         const p = msg.payload || {};
@@ -404,6 +440,20 @@
         window._srDesktopInfo.displays = (msg.payload && msg.payload.displays) || [];
         if (desktopView && desktopView._captureBackend !== undefined) {
             desktopView._captureBackend = window._srDesktopInfo.backend;
+        }
+        // 批次7 选屏：刷新下拉选项；多屏才显示。agent 生效中的显示器
+        // （display 字段，"" = 默认）同步到选中值。
+        if (typeof populateDisplaySelect === 'function') {
+            populateDisplaySelect(window._srDesktopInfo.displays);
+            const ds = document.getElementById('desktop-display-select');
+            if (ds) {
+                const cur = (msg.payload && msg.payload.display) || '';
+                if (cur && Array.from(ds.options).some(function(o) { return o.value === cur; })) {
+                    ds.value = cur;
+                } else {
+                    ds.value = '';
+                }
+            }
         }
         // 实际生效的编码方案（可能因 fallback 与 select 默认值不同）同步 UI。
         if (msg.payload && msg.payload.codec) {

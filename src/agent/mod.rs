@@ -1625,6 +1625,35 @@ async fn run_session(
                                     out.control(ack).await;
                                 }
 
+                                "desktop:select-display" => {
+                                    // 批次7 多显示器选屏（rustdesk 对齐）：切换
+                                    // X11 捕获显示器。payload.display 为空 → 恢复
+                                    // 启动默认（--desktop-display 或平台默认屏）。
+                                    // 重建桌面流使新屏生效，回 cmd-ack {seq, ok}。
+                                    let sel_disp = msg
+                                        .payload
+                                        .get("display")
+                                        .and_then(|c| c.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let seq = msg
+                                        .payload
+                                        .get("seq")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    tracing::info!(sel_display = %sel_disp, "desktop:select-display requested");
+                                    let result = desktop.select_display(&sel_disp, post_fn.clone()).await;
+                                    let ack = Message {
+                                        msg_type: "desktop:cmd-ack".to_string(),
+                                        session_id: client.session_id.clone(),
+                                        payload: match &result {
+                                            Ok(()) => serde_json::json!({ "seq": seq, "ok": true }),
+                                            Err(e) => serde_json::json!({ "seq": seq, "ok": false, "error": e }),
+                                        },
+                                    };
+                                    out.control(ack).await;
+                                }
+
                                 "desktop:qos" => {
                                     // 端到端延时 + 解码背压反馈 → QoS（内容驱动
                                     // fps：静态1fps/动态满帧/解码背压才降帧；码率由

@@ -129,6 +129,12 @@ impl DesktopConfig {
     }
 }
 
+/// 解析 start 用的捕获显示器：运行时选屏覆盖（web 下拉可改）优先，
+/// 否则回落启动配置的 --desktop-display（再否则 None = 平台默认屏）。
+fn resolved_display(runtime: &Option<String>, config: &Option<String>) -> Option<String> {
+    runtime.clone().or_else(|| config.clone())
+}
+
 /// Controls the desktop capture+encode task.
 /// 心跳扩展 KPI 快照（R5#150）：agent 心跳携带的最小桌面运行态。
 /// 供 relay/admin 侧可观测（不依赖浏览器面板），字段无锁原子读。
@@ -179,6 +185,10 @@ pub struct DesktopManager {
     /// 运行时质量档倍率（web 码率下拉可改：speed/balanced/best）。初始 =
     /// config.quality；改动后重建桌面流应用（set_codec 同机制）。
     quality: std::sync::RwLock<f32>,
+    /// 运行时选屏覆盖（web 显示器下拉可改）：None = 用启动配置的
+    /// --desktop-display（未指定则 X11 默认屏）；Some(name) = 切换捕获源。
+    /// 初始 = config.display；改动后重建桌面流应用（set_codec 同机制）。
+    display: std::sync::RwLock<Option<String>>,
     /// 运行时用户码率硬顶（web 自定义码率）。0 = auto（base×quality）。
     max_bps: std::sync::RwLock<u64>,
     /// QoS 码率缩放（千分比，1000 = 100%）。弱网（高端到端延时）时下调
@@ -220,6 +230,7 @@ impl DesktopManager {
         let fps0 = config.fps.clamp(1.0, 60.0) as u32;
         let quality0 = config.quality;
         let max_bps0 = config.max_bps;
+        let display0 = config.display.clone();
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
@@ -231,6 +242,7 @@ impl DesktopManager {
             codec: std::sync::RwLock::new(codec),
             fps: Arc::new(std::sync::atomic::AtomicU32::new(fps0)),
             quality: std::sync::RwLock::new(quality0),
+            display: std::sync::RwLock::new(display0),
             max_bps: std::sync::RwLock::new(max_bps0),
             qos_scale: Arc::new(std::sync::atomic::AtomicU32::new(1000)),
             qos: tokio::sync::Mutex::new(QosAdaptive::new(quality0)),
@@ -445,6 +457,35 @@ impl DesktopManager {
         self.codec.read().map(|c| c.clone()).unwrap_or_default()
     }
 
+    /// 运行时选屏值：None = 启动默认（--desktop-display 或 X11 默认屏）。
+    pub fn display(&self) -> Option<String> {
+        self.display.read().map(|d| d.clone()).unwrap_or(None)
+    }
+
+    /// 运行时热切换捕获显示器（rustdesk 对齐的选屏能力）。`""` / 缺失 →
+    /// 恢复启动默认显示器；否则切到同名显示器（X11 RANDR name）。仅当
+    /// 桌面正在运行时重建桌面流（stop 旧流 → start 新流，start 用新 display
+    /// 打开捕获源）。display 不变时是 no-op。
+    pub async fn select_display(&self, display: &str, post: PostFn) -> Result<(), String> {
+        let next: Option<String> = if display.trim().is_empty() {
+            None
+        } else {
+            Some(display.trim().to_string())
+        };
+        {
+            let mut cur = self.display.write().map_err(|_| "display lock poisoned".to_string())?;
+            if *cur == next {
+                return Ok(());
+            }
+            *cur = next;
+        }
+        if self.is_running() {
+            self.stop(post.clone()).await;
+            self.start(post).await;
+        }
+        Ok(())
+    }
+
     /// 注入 relay 时钟偏移（relay_epoch - 本地_epoch，ms）。agent 在会话
     /// 建立后对 relay /api/clock 采样得到；srtc 打点会加上这个偏移，
     /// 把采集时刻换算到 relay 时基（不依赖 agent 系统时间）。
@@ -547,6 +588,9 @@ impl DesktopManager {
         cfg.codec = codec;
         // 运行时档位（web 码率/质量下拉可改）覆盖启动默认值。
         cfg.quality = self.quality.read().map(|q| *q).unwrap_or(cfg.quality);
+        // 运行时选屏（web 显示器下拉可改）覆盖启动 --desktop-display。
+        let disp = self.display.read().map(|d| d.clone()).unwrap_or(None);
+        cfg.display = resolved_display(&disp, &cfg.display);
         let mb = self.max_bps.read().map(|b| *b).unwrap_or(0);
         if mb > 0 {
             cfg.max_bps = mb;
@@ -890,6 +934,7 @@ async fn run_desktop_pipeline(
             "codec": cfg.codec, "width": w0, "height": h0, "fps": cfg.fps,
             "min_kbps": cfg.min_bps / 1000, "max_kbps": cfg.max_bps / 1000,
             "backend": backend,
+            "display": cfg.display,
             "displays": monitors.iter().map(|m| {
                 serde_json::json!({
                     "name": m.name, "width": m.width, "height": m.height,
@@ -1964,6 +2009,48 @@ mod tests {
         dm.bump_backpressure();
         dm.bump_backpressure();
         assert_eq!(dm.backpressure_count(), 2);
+    }
+
+    #[test]
+    fn test_resolved_display_precedence() {
+        // 批次7 选屏：运行时覆盖（web 下拉）优先于启动配置 --desktop-display。
+        assert_eq!(resolved_display(&Some(":1".into()), &None), Some(":1".into()));
+        assert_eq!(resolved_display(&Some(":2".into()), &Some(":0".into())), Some(":2".into()));
+        // 无运行时覆盖 → 回落启动配置。
+        assert_eq!(resolved_display(&None, &Some(":0".into())), Some(":0".into()));
+        // 均无 → None（平台默认屏）。
+        assert_eq!(resolved_display(&None, &None), None);
+    }
+
+    #[test]
+    fn test_select_display_updates_runtime_override() {
+        // 未运行时 select_display 只更新覆盖值（不重建），后续 start 生效。
+        let dm = DesktopManager::new(DesktopConfig::default());
+        assert_eq!(dm.display(), None, "默认无运行时覆盖");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let post: PostFn = Arc::new(|_| {});
+            dm.select_display(":1", post).await.unwrap();
+            // 空字符串 → 恢复默认（None）。
+            let post2: PostFn = Arc::new(|_| {});
+            dm.select_display("", post2).await.unwrap();
+            // 同值 no-op（不报错、不重建——running=false 时本就不重建）。
+            let post3: PostFn = Arc::new(|_| {});
+            dm.select_display("", post3).await.unwrap();
+        });
+        assert_eq!(dm.display(), None);
+    }
+
+    #[test]
+    fn test_select_display_trim() {
+        // 带空白/前后空格的名字会被 trim；纯空白等价空（恢复默认）。
+        let dm = DesktopManager::new(DesktopConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let post: PostFn = Arc::new(|_| {});
+            dm.select_display("  :3  ", post).await.unwrap();
+        });
+        assert_eq!(dm.display(), Some(":3".into()));
     }
 
     #[test]
