@@ -108,7 +108,7 @@
 | 45 | moof 复用（tfhd 缓存） | ✔ | Mp4Muxer 缓存 tfhd 模板、每帧只重建变化部分（mp4.rs，测试逐字节一致） |
 | 46 | init 最小化 | ✔ | stbl 只留 stsd、去 stts/stsc/stsz/stco 空表（mp4.rs，ffmpeg frag_keyframe 一致，浏览器实测出画） |
 | 47 | WebCodecs keyframe 判定一致 | ✔ | test_keyframe_flag_matches_browser_detection 断言 agent flags 与浏览器判定逐字一致 |
-| 48 | 控制消息轻通道 | ◐ | qos/reqkey 走 SSE；qos 250ms 已含 lseq（≈4/s ack 密度，agent 只消费它）；独立 100ms ack 批未做——agent 无独立消费端，造无消费者消息不划算，待限产机制落地时补 |
+| 48 | 控制消息轻通道 | ◐ | qos/reqkey 走 SSE；qos 250ms 已含 lseq（≈4/s ack 密度，agent 只消费它）；第 43 轮确认决策关闭：**独立 100ms ack 批不做**（agent 无独立消费端，造无消费者消息不划算）——限产机制落地时再评估 |
 | 49-53 | 队列 24/2/停滞 500ms/接入 1.5s/解码错误分级 | ✔ | desktop.js 全链路 + reqkey |
 | 54 | demux 损坏 3 次重发 init | ✔ | 连续3次非法box→reqkey reinit 3s限频（desktop.js:_parseNextBox） |
 | 55 | 帧超龄 >2s 丢弃 | ✔ | e2e>2000ms 丢+reqkey（desktop.js:_onDecoded，面板超龄计数） |
@@ -116,7 +116,7 @@
 | 57-59 | 面板补行（目标帧率/quality/弱网） | ✔ | 本轮：gofps/reqkey/weaknet/TTFV 行（desktop.js+session.html） |
 | 60 | e2e 与解码排队分流 | ✔ | 解码队列行加时延估算 dq/dfps×1000ms（desktop.js，e2e 归因分流） |
 | 61-64 | 内存曲线/rAF 暂停/光标通道 | ◐ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；**光标独立通道已做**（第 18 轮：agent XQueryPointer 100ms 节流 → desktop:cursor → 浏览器 overlay，X11 GetImage 不含光标层是真实缺口） |
-| 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect） |
+| 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect）；第 43 轮核实：能力探测缓存已做（`sessionStorage` 保存解码模式 webcodecs/mse，重连/切页复用） |
 | 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ◐ | MSE 回退有（`_webcodecsAvailable ? webcodecs : mse`）；**解码器释放已实现**（disconnect 完整清理：MSE disconnect + `_dec.close()` + frames close + reader cancel，第 25 轮核实）；弱网降级提示/重连降质部分 |
 | 71 | 帧到达 jitter 面板 | ✔ | metric-jitter（v0.42） |
 | 72 | qos 250ms + ack 100ms 批 | ◐ | qos 250ms 独立上报已做（desktop.js，dfps×4 折算保 agent 语义，实测 3/s）；ack 100ms 批未做 |
@@ -146,7 +146,7 @@
 
 ### 批次 5 · 测试与遥测（147-167）
 
-◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）；**crash.log 崩溃日志已增强**（第 24 轮：`main.rs` panic hook 补时间戳/pid/backtrace/`SR_LOG_DIR` 路径/append 多次崩溃保留——基础 hook 前已有，本轮补齐字段与保留策略）。统一时间线/告警未做。
+◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）；**crash.log 崩溃日志已增强**（第 24 轮：`main.rs` panic hook 补时间戳/pid/backtrace/`SR_LOG_DIR` 路径/append 多次崩溃保留——基础 hook 前已有，本轮补齐字段与保留策略）。统一时间线/告警未做。第 43 轮：心跳扩展 KPI 补 **active（内容活跃/静止）+ bp_count（relay 拥塞累计）** 字段（`DesktopKpi` + `kpi_snapshot` + sender_loop 心跳 JSON，测试断言扩展）——admin KPI 曲线可观测静止/活跃与传输段拥塞时间线。
 
 ### 批次 6 · 风险与回滚（168-177）
 
@@ -235,4 +235,7 @@
 - **第 42 轮新增合入**：
   1. 控制消息优先级腾位窗口（R5#29）：relay 广播段 non-lossy 控制消息在浏览器 SSE channel 满时 `timeout(100ms, tx.send().await)` 等腾位（lossy 数据维持 try_send 静默丢）——弱网/瞬间积压下控制消息不被数据挤掉，仍满才告警丢。测试 `test_control_message_gets_drain_window_when_full`（满 channel：lossy 立即返回 / 控制消息 ≥80ms 腾位窗口）。全量 `cargo test` **390 通过**（+1）。
   2. 核实标注（#127-128）：捕获内存池/行拷贝 SIMD——当前架构 Frame 拥有 Vec + allocator 缓存 + LLVM 自动向量化已覆盖常见场景；专项 frame-ring 内存池需框架级改造（编码侧归还 buffer）收益不确定，如实标注远期。
+- **第 43 轮新增合入**：
+  1. 心跳 KPI 扩展补字段（R5#150 增强）：`DesktopKpi` 加 `active`（内容活跃 ≤1.5s，R5#25）+ `bp_count`（relay 拥塞累计，R5#16），`kpi_snapshot` 与 sender_loop 心跳 JSON 同步携带——admin KPI 曲线可观测**静止/活跃**与**传输段拥塞**时间线；测试 `test_sender_loop_heartbeat_carries_desktop_kpi` 断言扩展。全量 `cargo test` **390 通过**。
+  2. 核实收口：65-66 能力探测缓存已做（sessionStorage 复用解码模式）；#48 轻通道决策关闭（独立 100ms ack 批无消费者端，限产机制落地再评估）；#14/#41-44 线协议整块、#36-38 KCP、#123-124/#129 GDI/DXGI Windows、#132-134 Wayland、#136-146 功耗画像、#127-128 SIMD、丙统一时间线、153 grader——均为远期/环境限制/架构决策，如实标注。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
