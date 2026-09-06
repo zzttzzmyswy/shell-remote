@@ -160,7 +160,7 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 62 轮合计实（IPv6 子集核实闭环，R5 99% 保持）。
+- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 63 轮合计实（综合回归 review：全量验收矩阵重验全绿，弱网矩阵依赖浏览器如实不可重验）。
 - **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
@@ -266,6 +266,8 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 63 轮综合 review**：
+  1. 全量验收矩阵重验当前 master（55-62 轮合入后回归确认，用户铁律交叉验证）：① **全量 `cargo test`** **406 通过**（0 失败）；② **重连矩阵**（`tools/reconnect_matrix.sh 2`）3 场景全过——agent kill-重启续接 / relay 重启退避重连 / 连续 flap 幂等；③ **4-top 动态基准**（`tools/bench_top4_verify.sh`）PASS——fps 中值 30.0 满帧、bitrate 670kbps（**动态内容不降帧**铁律成立）；④ **长稳短跑**（`tools/stability_verify.sh 60`）PASS——4 样本无重连、RSS 末两点 +0%（无泄漏）、fps 30.0；⑤ **IPv6 全链路**（`tools/ipv6_verify.sh`）PASS——fps 30.0 / bitrate 670kbps。**弱网矩阵（`weaknet_kpi_matrix.sh` / `weaknet_matrix.sh`）不可重验（如实记录）**：两脚本均依赖 playwright 浏览器采样（e2e/QoS 上报来自浏览器端），用户已明确不用浏览器验证 + 当前环境无浏览器会话；QoS 快照日志同样由浏览器 250ms 上报触发（无浏览器则 agent 无 `qos_state=` 快照行，`qos_attribution.py` 无可分析输入）。弱网 QoS/降级决策路径在 55-62 轮**未改动**（60/61 轮改动在 agent 桌面选屏重建/色彩转换 SIMD，不涉 QoS），此前第 20 轮弱网矩阵实测通过——不构成回归。
 - **第 62 轮新增合入**：
   1. IPv6 全链路核实闭环（R5 #38 KCP/白名单/IPv6 的 IPv6 子集）：**验证型合入**——确认 relay/agent 的 IPv6 支持由 tokio 天然提供（`TcpListener::bind(&"[::1]:port")` 直接监听 IPv6、agent `--relay-url http://[::1]:port` 直连），无代码缺陷。**交付验收脚本 `tools/ipv6_verify.sh`**（`bash -n` + 本机 IPv6 loopback 前置检查 + relay bind [::1] HTTP 200 + agent IPv6 注册会话 + 模拟浏览器 desktop:start + KPI 采样断言 fps≥15 且 bitrate>0）。**实测**：relay 监听 `[::1]`、agent 注册成功、桌面流经 IPv6 启动、fps 中值 30.0 满帧 / bitrate 670kbps——动态不降帧铁律在 IPv6 通道同样成立。KCP（UDP 拥塞控制替换 WS/TCP）与白名单本体仍远期（白名单部分受 #22 WS/HTTP 限流等价覆盖）。
 - **第 61 轮新增合入**：
