@@ -76,6 +76,8 @@
       this._staleDropped = 0;
       // 时钟慢校准定时器（R3 丙135：连接后每 15min 重校一次，对抗长会话漂移）
       this._clockRecheckTimer = null;
+      // JS 内存峰值（R2 丁131 / R5#61）：面板内存行显示当前 + 会话峰值。
+      this._jsMemPeak = 0;
       // demux 损坏重同步计数（R3 丁150）：连续 3 次非法 box → 重发 init。
       this._demuxCorrupt = 0;
       // 解码器黑名单（R2 己155/R3 丁155）：连续解码错误触发（这里是解码器
@@ -961,6 +963,19 @@
           if (uplink) uplink.textContent = self._uplinkMode || '-';
           if (decoder) decoder.textContent = self._decoderLabel();
           if (encoder) encoder.textContent = self._encoderLabel();
+          // JS 内存曲线（R2 丁131 / R5#61）：长会话泄漏观测——Chrome 暴露
+          // performance.memory（非标准但实际可用），used 显示当前 + 峰值。
+          // 持续上升不回落 = 泄漏信号。
+          const jsmem = document.getElementById('metric-jsmem');
+          if (jsmem) {
+            if (performance.memory && performance.memory.usedJSHeapSize) {
+              const used = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024);
+              if (used > (self._jsMemPeak || 0)) self._jsMemPeak = used;
+              jsmem.textContent = used + ' MB' + (self._jsMemPeak ? ' / 峰值 ' + self._jsMemPeak + ' MB' : '');
+            } else {
+              jsmem.textContent = '不支持';
+            }
+          }
           // 目标帧率 vs 内容活动：agent 回传的目标 fps（desktop:qos-ack），
           // 与本地实际渲染对比。fps=1 → 静态；≥15 → 动态满帧；中间为解码
           // 背压阶梯。diff 代表 agent 目标与本地实际的安全余量（对齐
