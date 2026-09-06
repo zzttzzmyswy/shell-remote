@@ -2,24 +2,44 @@
 //!
 //! Screen captures arrive as packed 32-bit BGRA pixels (X11 ShmImage /
 //! Windows GDI BitBlt both produce B, G, R, A byte order on little-endian
-//! hosts). OpenH264 consumes planar I420. The conversion is scalar BT.601-ish
-//! with studio-swing clamps; correctness is unit-tested directly so the rest
-//! of the pipeline can trust its layout.
+//! hosts). OpenH264 consumes planar I420. The conversion is scalar
+//! BT.601/BT.709 with studio-swing clamps; correctness is unit-tested
+//! directly so the rest of the pipeline can trust its layout.
 
-/// Convert a packed BGRA buffer (4 bytes/pixel: B, G, R, A) into planar I420.
+/// 色彩矩阵（R5#136-146 色彩矩阵最小可验证子集）：H.264 标准默认 BT.601，
+/// WebM/HD 常选 BT.709（同一像素两种矩阵 Y/U/V 系数不同）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorMatrix {
+    Bt601,
+    Bt709,
+}
+
+/// 矩阵系数（整数定点，>>8 缩放）：`(yr, yg, yb, ur, ug, ub, vr, vg, vb)`。
+/// BT.601: Y=0.299/0.587/0.114；U=-0.169/-0.331/0.500；V=0.500/-0.419/-0.081
+/// BT.709: Y=0.2126/0.7152/0.0722；U=-0.1146/-0.3854/0.500；V=0.5/-0.4541/-0.0459
+fn matrix_coeffs(m: ColorMatrix) -> (i32, i32, i32, i32, i32, i32, i32, i32, i32) {
+    match m {
+        ColorMatrix::Bt601 => (66, 129, 25, -38, -74, 112, 112, -94, -18),
+        ColorMatrix::Bt709 => (54, 183, 18, -29, -99, 128, 128, -116, -12),
+    }
+}
+
+/// Convert a packed BGRA buffer (4 bytes/pixel: B, G, R, A) into planar I420
+/// using the given color matrix.
 ///
 /// Returns `w*h + w*h/2` bytes: full-resolution Y plane, then quarter-size
 /// U and V planes in that order. `stride` is the source row stride in bytes
 /// (typically `w*4`, but X11 images may add padding).
-///
-/// # Panics
-///
-/// Panics if `w` or `h` is odd (4:2:0 requires even dimensions), if `bgra` is
-/// shorter than `h*stride`, or if the internal OOB access would read past the
-/// buffer (guarded by an explicit len check).
-pub fn bgra_to_i420(bgra: &[u8], w: usize, h: usize, stride: usize) -> Vec<u8> {
+pub fn bgra_to_i420_with_matrix(
+    bgra: &[u8],
+    w: usize,
+    h: usize,
+    stride: usize,
+    matrix: ColorMatrix,
+) -> Vec<u8> {
     assert!(w % 2 == 0 && h % 2 == 0, "size must be even for 4:2:0");
     assert!(bgra.len() >= h * stride, "source buffer too small");
+    let (kyr, kyg, kyb, kur, kug, kub, kvr, kvg, kvb) = matrix_coeffs(matrix);
     let y_len = w * h;
     let uv_len = y_len / 4;
     let mut yuv = vec![0u8; y_len + 2 * uv_len];
@@ -32,17 +52,23 @@ pub fn bgra_to_i420(bgra: &[u8], w: usize, h: usize, stride: usize) -> Vec<u8> {
             let b = bgra[src] as i32;
             let g = bgra[src + 1] as i32;
             let r = bgra[src + 2] as i32;
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            let y = ((kyr * r + kyg * g + kyb * b + 128) >> 8) + 16;
             y_part[row * w + col] = y.clamp(16, 235) as u8;
             if col % 2 == 0 && row % 2 == 0 {
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let u = ((kur * r + kug * g + kub * b + 128) >> 8) + 128;
+                let v = ((kvr * r + kvg * g + kvb * b + 128) >> 8) + 128;
                 u_part[(row / 2) * sw + col / 2] = u.clamp(16, 240) as u8;
                 v_part[(row / 2) * sw + col / 2] = v.clamp(16, 240) as u8;
             }
         }
     }
     yuv
+}
+
+/// Convert a packed BGRA buffer into planar I420 using the default BT.601
+/// matrix (H.264 / OpenH264 标准色域)。
+pub fn bgra_to_i420(bgra: &[u8], w: usize, h: usize, stride: usize) -> Vec<u8> {
+    bgra_to_i420_with_matrix(bgra, w, h, stride, ColorMatrix::Bt601)
 }
 
 /// Box-filter downscale of a BGRA frame straight into I420 at a smaller size.
@@ -111,6 +137,25 @@ mod tests {
         let bgra = vec![0u8; 320 * 240 * 4];
         let yuv = bgra_to_i420(&bgra, 320, 240, 320 * 4);
         assert_eq!(yuv.len(), 320 * 240 + 2 * (320 / 2) * (240 / 2));
+    }
+
+    #[test]
+    fn test_color_matrix_bt709_differs_from_bt601() {
+        // R5#136-146 色彩矩阵最小子集：同一彩色像素（蓝红各半 + 绿）两种
+        // 矩阵的 Y/U/V 输出应不同（BT.709 与 BT.601 系数不同）。
+        let mut bgra = vec![0u8; 4 * 4 * 4];
+        for px in 0..16 {
+            let o = px * 4;
+            bgra[o] = 200;     // B
+            bgra[o + 1] = 100; // G
+            bgra[o + 2] = 60;  // R
+            bgra[o + 3] = 255; // A
+        }
+        let y601 = bgra_to_i420_with_matrix(&bgra, 4, 4, 16, ColorMatrix::Bt601);
+        let y709 = bgra_to_i420_with_matrix(&bgra, 4, 4, 16, ColorMatrix::Bt709);
+        assert_ne!(y601, y709, "BT.601 与 BT.709 输出必须不同");
+        // 默认入口 = BT.601（H.264 标准色域，回归保护）。
+        assert_eq!(bgra_to_i420(&bgra, 4, 4, 16), y601);
     }
 
     #[test]
