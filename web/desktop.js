@@ -453,7 +453,10 @@
         return;
       }
       // DataChannel：agent 端把 desktop:video 的 fMP4 字节镜像投进来。
-      this._p2pDc = this._p2pPc.createDataChannel('desktop');
+      // 不可靠 + 无序（Task 6，与 agent str0m make_offer 侧同步）：丢包不重传、
+      // 不阻塞后续消息——fMP4 丢旧保新、帧时效优先，避免可靠有序通道在弱网下
+      // 的 head-of-line 卡顿拖住整条下行。
+      this._p2pDc = this._p2pPc.createDataChannel('desktop', { ordered: false, maxRetransmits: 0 });
       this._p2pDc.binaryType = 'arraybuffer';
       this._p2pDc.onmessage = function(ev) {
         if (typeof ev.data === 'string') return; // 控制帧忽略
@@ -558,7 +561,10 @@
           this.connected = false;
         }
       } else {
-        // 协商/建连中途失败：一次性回退现有 WS 链路。
+        // 协商/建连中途失败：一次性回退现有 WS 链路。这里与 _onP2pFailed 同置
+        // _p2pFallbackDone，防止本路径 _startWs 之后，pending 的 setLocalDescription
+        // / handleAnswer 拒绝再触发 _onP2pFailed → 第二次 _startWs（双开 WS）。
+        this._p2pFallbackDone = true;
         this._startWs();
       }
     }
@@ -615,7 +621,10 @@
     }
 
     // ── 拉流：WS 优先（relay WS 下行），失败回退 HTTP fetch ──────
+    // 幂等守卫：已有 WS 在途（_startWs 在 new WebSocket 后立即置位）则不二次
+    // 打开——防止 P2P 双回退路径（_onP2pLost/_onP2pFailed 叠加）双开 WS 风暴。
     _startWs() {
+      if (this._ws) return;
       const token = sessionStorage.getItem('shell-remote-token');
       if (!token || typeof WebSocket === 'undefined') {
         this._startFetch();
@@ -1141,6 +1150,9 @@
       }
       if (this.controller) { this.controller.abort(); this.controller = null; }
       if (this.reader) { this.reader.cancel().catch(function() {}); this.reader = null; }
+      // relay WS 兜底同闭：断连即关（否则残留 WS 继续 feed 已断开的视图，且
+      // 重连 _startWs 的 `if (this._ws) return` 会误认为已有连接在途）。
+      if (this._ws) { try { this._ws.onclose = null; this._ws.close(); } catch (e) {} this._ws = null; }
       // LAN 探测/拉流在途时被显式断开：_startLan 的 fallback 连锁据此停住。
       this._lanCancelled = true;
       // P2P 会话清理（Task 3）：关 pc/dc、清协商超时、解除 __p2pTransport。

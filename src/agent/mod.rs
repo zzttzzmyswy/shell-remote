@@ -742,10 +742,14 @@ async fn run_session(
     // 必须在 register 与 DesktopManager::new 之前：绑定端口/出口 IP 只有 spawn
     // 后才知道，注册消息的 lan_addr 与 desktop:capabilities.lan_addrs 都要它。
     let lan_desktop = if desktop_cfg.lan_port != 0 {
-        match crate::agent::lan::LanDesktop::spawn(desktop_cfg.lan_port).await {
+        // Task 6 CORS 收窄：LAN 无认证端点只放行 relay 同源页面读流。relay_url
+        // 解析失败 → LanDesktop 内部回退 "*"（记 tradeoff，见 lan.rs）。
+        let relay_origin = crate::agent::lan::relay_origin(relay_url);
+        match crate::agent::lan::LanDesktop::spawn(desktop_cfg.lan_port, relay_origin).await {
             Ok(lan) => {
                 tracing::info!(
                     addr = %lan.addr_report(),
+                    cors_origin = %lan.cors_origin(),
                     "LAN desktop stream server up (--desktop-lan-port)"
                 );
                 Some(lan)

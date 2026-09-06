@@ -330,6 +330,15 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "desktop:p2p-state",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {
+            // 复盘日志（Task 6 轻量）：P2P 状态切换（connecting/connected/failed）
+            // 广播给全体浏览器——浏览器据此知道传输层选中 p2p 还是回退 relay。
+            if proto_msg.msg_type == "desktop:p2p-state" {
+                tracing::info!(
+                    session = %session_id,
+                    p2p_state = %proto_msg.payload.get("state").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "transport: desktop:p2p-state broadcast"
+                );
+            }
             // fs:result is browser-facing (file manager reads + downloads).
             // A browser download reuses `_mcp_request_id` as its correlation
             // id, so it must still be broadcast — treating it as an MCP RPC
@@ -1708,6 +1717,16 @@ pub async fn browser_send_handler(
         "payload": body["payload"]
     })
     .to_string();
+
+    // 复盘日志（Task 6 轻量）：浏览器发起的 P2P 信令（offer/candidate）转发
+    // 给 agent —— 下行传输层协商路径的可观测点。
+    if msg_type.starts_with("desktop:p2p") {
+        tracing::info!(
+            session = %session_id,
+            msg = msg_type,
+            "transport: browser p2p signaling -> agent"
+        );
+    }
 
     {
         let broadcast = state.agent_broadcast.read().await;
