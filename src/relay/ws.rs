@@ -431,6 +431,12 @@ pub async fn agent_ws_send_handler(
     Query(params): Query<HashMap<String, String>>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
+    // R5#22 WS/HTTP 限流等价：WS uplink 与 HTTP `/agent/events` 共享 per-IP
+    // 连接频率配额（ev: 30/min）——agent 无法切通道绕过限流。长连接建立
+    // 时检查一次即可（agent 正常不断连，30/min 裕量充足）。
+    if !agent_conn_rate_ok(&state, &headers).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "WS uplink rate limited").into_response();
+    }
     let session_id = match params.get("session") {
         Some(s) if !s.is_empty() => s.clone(),
         _ => return (StatusCode::BAD_REQUEST, "missing ?session=").into_response(),
@@ -976,21 +982,27 @@ pub async fn upgrade_blob_handler(
 
 // ── Agent SSE handler (GET, for HTTP-mode agent receive) ─────────────
 
-pub async fn agent_events_handler(
-    State(state): State<Arc<SharedState>>,
-    headers: axum::http::HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+/// agent 上行通道（HTTP SSE `/agent/events` 与 WS uplink）共享的连接频率
+/// 限流（R5#22 WS/HTTP 等价）：per-IP `ev:` 配额 30/min。返回 false = 超限
+/// （调用方回 429）。**同一 key 让 WS 与 HTTP 共用配额**——agent 无法通过
+/// 切换通道绕过连接频率限制（防恶意快速重连耗尽资源）。
+async fn agent_conn_rate_ok(state: &Arc<SharedState>, headers: &axum::http::HeaderMap) -> bool {
     let client_ip = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
-    {
-        let mut rl = state.rate_limiter.write().await;
-        if !rl.check(&format!("ev:{client_ip}"), 30, std::time::Duration::from_secs(60)) {
-            return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
-        }
+    let mut rl = state.rate_limiter.write().await;
+    rl.check(&format!("ev:{client_ip}"), 30, std::time::Duration::from_secs(60))
+}
+
+pub async fn agent_events_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !agent_conn_rate_ok(&state, &headers).await {
+        return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
     let session_id = match params.get("session") {
@@ -1817,6 +1829,30 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), 429, "窗口内超额注册应被限流");
+    }
+
+    /// R5#22 WS/HTTP 限流等价：`agent_conn_rate_ok` 用同一 `ev:` key——WS
+    /// uplink 与 HTTP `/agent/events` 共享 per-IP 30/min 配额，切通道无法
+    /// 绕过连接频率限制。
+    #[tokio::test]
+    async fn test_agent_conn_rate_shared_ws_http() {
+        let state = make_state("");
+        let mk = |ip: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::HeaderName::from_static("x-forwarded-for"),
+                ip.parse().unwrap(),
+            );
+            h
+        };
+        let headers = mk("10.0.0.9");
+        for _ in 0..30 {
+            assert!(agent_conn_rate_ok(&state, &headers).await, "窗口内 30 次应放行");
+        }
+        assert!(!agent_conn_rate_ok(&state, &headers).await, "第 31 次应超限（HTTP/WS 同配额）");
+        // 不同 IP 独立配额，不受影响。
+        let other = mk("10.0.0.10");
+        assert!(agent_conn_rate_ok(&state, &other).await, "不同 IP 独立配额");
     }
 
     #[tokio::test]

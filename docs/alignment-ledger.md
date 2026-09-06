@@ -79,13 +79,13 @@
 | 19 | 桌面开启竞态幂等 | ◐ | |
 | 20 | 半开连接心跳兜底 | ◐ | |
 | 21 | 未知消息白名单丢弃 | ✔ | relay route_agent_message 白名单外丢弃+日志（ws.rs KNOWN 常量） |
-| 22 | WS/HTTP 限流等价 | ⬜ | |
+| 22 | WS/HTTP 限流等价 | ✔ | agent_conn_rate_ok 共享 ev: 30/min 配额（agent_events_handler + agent_ws_send_handler，测试 test_agent_conn_rate_shared_ws_http） |
 | 23 | 崩溃重启会话 key 续接 | ⬜ | |
 | 24 | 桌面流 map 生命周期追踪 | ✔ | created/removed 带原因日志（ws.rs desktop:started/stopped/agent断线，实测三路径） |
 | 25 | 空闲回收可见性 | ⬜ | |
 | 26 | token 过期快速重鉴权 | ⬜ | |
 | 27 | viewer 移除水位化（满即删→告警） | ✔ | 本轮：满时丢旧保新，超 MAX_CONSECUTIVE_DROPS=60 才移除（relay/desktop.rs） |
-| 28 | 20s WS ping | ◐ | |
+| 28 | 20s WS ping | ✔ | handle_agent_ws_uplink 每 20s server-side ping（agent 死链 ~35s 检出），台账此前误标 ◐，第 17 轮代码级核实修正 |
 | 29 | 控制消息优先级 | ⬜ | |
 | 30 | 时钟校准 15min 慢校准 | ✔ | 连接期每 15min 重校（desktop.js:_startMetrics） |
 | 31 | 注册风暴防御 | ✔ | 120/min+冷却（agent/mod.rs） |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **55%**（甲 帧率/IDR/RTT分带/TestDelay探针、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 25%。
-- **R5 落地清单（200 点）**：✔ 类约 **61%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 9 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项）；⬜ 26%。
+- **R5 落地清单（200 点）**：✔ 类约 **63%**（可靠通道 11 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 9 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项）；⬜ 24%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -171,4 +171,7 @@
   2. 台账修正：**#89 CBR 纪律此前已做**（`aom.rs:111 AOM_CBR` + `vpx.rs:91 VPX_CBR` + undershoot/overshoot 50% + KF_DISABLED 外部 force_idr）——上轮台账误标未做，本轮代码级核实后标 ✔。
 - **第 16 轮新增合入**：
   1. admin KPI 曲线（R5 丙111/140 部分）：relay 用宽松 JSON 拦截 agent 心跳 `ping`（真实心跳缺 payload 字段，严格 ProtoMessage 解析会失败——此为采样触发前的关键前提）→ 采样心跳 KPI 进 `SharedState.kpi_history`（15s×120 FIFO）→ admin `/api/session/kpi/:sid` 返回时间序列 → admin 面板 Sessions 表 📈 按钮展开行内 canvas 折线（fps 蓝 / bitrate 绿）。测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`。**浏览器实测**：桌面开启后 KPI API 13 样本、6 个 running=true、bitrate>0；admin 📈 点击展开 canvas 曲线已绘制。
+- **第 17 轮新增合入**：
+  1. WS/HTTP 限流等价（`relay/ws.rs agent_conn_rate_ok`）：agent WS uplink 与 HTTP `/agent/events` 共享 per-IP `ev:` 30/min 连接配额（同一 key 无法切通道绕过），events handler 改复用辅助；测试 `test_agent_conn_rate_shared_ws_http`（30 放行/31 超限/异 IP 独立）→ R5#22。
+  2. 台账修正：**#28 20s WS ping 已做**（`handle_agent_ws_uplink` 每 20s server-side ping，agent 死链 ~35s 检出），此前误标 ◐，代码级核实后标 ✔。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、光标独立通道、独立 100ms ack 批、AV1 测速门槛、质量 250ms 反馈等——在台账对应 ⬜/◐ 行，未宣称完成。
