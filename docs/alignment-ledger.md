@@ -142,7 +142,7 @@
 | 131 | 分辨率事件驱动 | ✔ | XRANDR ScreenChangeNotify 注册+poll_for_event（capture.rs，Xvfb 实测注册，替代 30 帧轮询） |
 | 132-134 | Wayland/首帧/缩放 | ⬜ | 远期 |
 | 135 | `--desktop-capture-fps` 抓帧独立上限 | ✔ | CLI 参数 + ThreadedFrameSource::spawn_with_max_fps（动态节流、静态退避不变，测试 `test_threaded_source_max_fps_throttles`） |
-| 136-146 | 功耗/内存画像/多显示器/色彩矩阵 | ⬜ | 远期 |
+| 136-146 | 功耗/内存画像/多显示器/色彩矩阵 | ⬜ | **内存画像最小子集已做**（第 45 轮：agent 心跳 KPI 带 `rss_kb`（`/proc/self/statm` resident×4KB，`self_rss_kb` + 单测）→ relay `AgentKpiSample.rss_kb` → admin KPI 曲线可见 agent 内存时间线，长稳验收 RSS 判据的旁证）；功耗采样/多显示器/色彩矩阵仍远期 |
 
 ### 批次 5 · 测试与遥测（147-167）
 
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **91%**（可靠通道 30 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 13 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **92%**（可靠通道 30 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 14 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -240,4 +240,6 @@
   2. 核实收口：65-66 能力探测缓存已做（sessionStorage 复用解码模式）；#48 轻通道决策关闭（独立 100ms ack 批无消费者端，限产机制落地再评估）；#14/#41-44 线协议整块、#36-38 KCP、#123-124/#129 GDI/DXGI Windows、#132-134 Wayland、#136-146 功耗画像、#127-128 SIMD、丙统一时间线、153 grader——均为远期/环境限制/架构决策，如实标注。
 - **第 44 轮新增合入**：
   1. KPI 采样补齐 active/bp_count + 告警雏形（批次5 遥测测试）：`AgentKpiSample` 加 `active`/`bp_count`（第 43 轮 agent 心跳已带但 relay 采样未解析——admin KPI API 实际取不到，本轮补上）；新增 `kpi_anomalous(active, fps)` 告警判据（内容活跃但 fps<10 = 动态异常降帧，用户铁律动态不降帧）→ `tracing::warn`（≥30s/会话限频），静止（active=false）不误报。测试：`test_kpi_anomalous_threshold`（动态 fps5/9 告警、10/30 不告警、静止不告警）+ 采样测试断言 active/bp_count 落库。全量 `cargo test` **391 通过**（+1）。
+- **第 45 轮新增合入**：
+  1. 内存画像最小子集（R5#136-146 部分）：agent 心跳 KPI 加 `rss_kb`（`self_rss_kb` 读 `/proc/self/statm` resident×4KB，非 Linux 回退 0）+ 单测 `test_self_rss_kb_reports_positive`；relay `AgentKpiSample.rss_kb` 解析 → admin `/api/session/kpi` 可见 **agent 内存时间线**（长稳验收 RSS 判据的旁证，运维可发现内存泄漏趋势）。测试：采样测试断言 rss_kb 落库。全量 `cargo test` **392 通过**（+1）。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
