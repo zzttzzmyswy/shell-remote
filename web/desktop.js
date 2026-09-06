@@ -78,6 +78,8 @@
       // 还是解码跟不上"（对齐 rustdesk TestDelay/target fps，MYS-886）。
       this._ackFps = null;
       this._ackScale = null;
+      // QoS 五态质量状态（agent qos-ack 回传；面板"QoS 状态"行 + 颜色）。
+      this._qosState = null;
       // 首帧时间 TTFV 打点（R2 乙60：接入 → 首帧渲染毫秒），面板"链路状态"
       // 前放置；弱网模式判定也在此（e2e 连续命中阈值 → 弱网标记）。
       this._ttfvStart = 0;
@@ -897,6 +899,8 @@
       if (typeof ack.qos_scale === 'number' || typeof ack.qos_scale === 'string') {
         this._ackScale = Number(ack.qos_scale);
       }
+      // QoS 五态质量状态（R4 甲A0/A2，agent qos-ack 回传）→ 面板状态行。
+      if (ack.qos_state) this._qosState = String(ack.qos_state);
     }
     // TestDelay 探针回包：agent 原样 echo t0，本地单调时钟算纯网络 RTT。
     receiveTestDelayAck(ack) {
@@ -1076,6 +1080,19 @@
           // 而 e2e 高 → 延迟在管线/解码侧而非网络。
           const probeEl = document.getElementById('metric-probe');
           if (probeEl) probeEl.textContent = self._probeRttMs ? self._probeRttMs + ' ms' : '-';
+          // QoS 五态状态行（R4 甲A0/A2）：agent qos-ack 回传，颜色分级。
+          const qosStateEl = document.getElementById('metric-qos-state');
+          if (qosStateEl) {
+            const s = self._qosState;
+            if (s) {
+              qosStateEl.textContent = s;
+              const colors = { Good: '#3fbf6f', Medium: '#d9b13f', Degraded: '#e08a2e', Critical: '#e04f4f', Unknown: '#999' };
+              qosStateEl.style.color = colors[s] || '#999';
+            } else {
+              qosStateEl.textContent = '-';
+              qosStateEl.style.color = '';
+            }
+          }
           br.textContent = self._avgKbps ? self._avgKbps + ' kbps' : '-';
           if (backend) backend.textContent = self._captureBackend || '-';
           if (uplink) uplink.textContent = self._uplinkMode || '-';

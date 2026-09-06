@@ -259,7 +259,7 @@ impl DesktopManager {
         decode_fps: u32,
         decode_queue: u32,
         ack_seq: u64,
-    ) -> (u32, u32, u64) {
+    ) -> (u32, u32, u64, QosQualityState) {
         use std::sync::atomic::Ordering as O;
         let cap = (self.config.fps as u32).clamp(1, 60);
         // 距上次采样的墙钟与帧数差
@@ -299,6 +299,12 @@ impl DesktopManager {
             encoder::target_bitrate(1920, 1080, 0, self.config.quality).max(self.config.min_bps)
         };
         let bitrate_kbps = base_bps * (permille as u64) / 1000 / 1000;
+        // QoS 五态质量状态（R4 甲A0/A2）：on_delay 已更新，读取供日志与
+        // qos-ack 回传浏览器（面板"QoS 状态"行）。
+        let state = {
+            let q = self.qos.lock().await;
+            q.quality_state()
+        };
         // QoS 快照（R5#149）：结构化单行，含状态、目标 fps、质量缩放、
         // 码率、解码背压（dfps/dq）与 ack 进度。admin/复盘按行解析即可
         // 还原每 1s 的 QoS 决策轨迹（对齐 rustdesk QoS 可观测性）。
@@ -307,6 +313,7 @@ impl DesktopManager {
             probe_ms,
             fps,
             qos_scale = permille,
+            qos_state = ?state,
             bitrate_kbps,
             cap,
             decode_fps = decode_fps,
@@ -314,7 +321,7 @@ impl DesktopManager {
             ack_seq,
             "desktop QoS: adaptive adjusted"
         );
-        (fps, permille, bitrate_kbps)
+        (fps, permille, bitrate_kbps, state)
     }
 
     /// QoS 动态调整目标帧率（内容驱动：静态 1fps/动态满帧/解码背压才降帧，下限
@@ -1257,6 +1264,11 @@ pub struct QosAdaptive {
     ratio: f32,
     /// 当前质量档 ratio（bound 到 0.5..=1.5）。
     quality_ratio: f32,
+    /// QoS 质量状态（R4 甲 A0 五态 / A2 质量反馈状态机）：由网络层 probe
+    /// 中值与拥塞增量 over 推导的显式状态，供日志/面板/复盘观测。**不影响
+    /// 决策**——fps/ratio 仍由内容驱动 + over 判据决定，本状态只是可观测
+    /// 快照（rustdesk QualityStatus 同构）。
+    quality_state: QosQualityState,
     /// 最近一次浏览器上报的端到端延时（ms）。
     last_delay: u32,
     /// 延期历史（HISTORY_DELAY_LEN=2）。
@@ -1298,6 +1310,22 @@ pub const QOS_DELAY_THRESHOLD_150MS: u32 = 150;
 pub const QOS_BR_SPEED: f32 = 0.5;
 pub const QOS_BR_BALANCED: f32 = 0.67;
 pub const QOS_BR_BEST: f32 = 1.5;
+
+/// QoS 质量状态（R4 甲 A0 五态 / A2 质量反馈状态机）。由网络层 probe 中值
+/// 与拥塞增量 over 推导，供日志/面板/复盘观测；fps/ratio 决策不受其影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum QosQualityState {
+    /// 首样本前（未建立基线）。
+    Unknown,
+    /// 网络健康（probe<100 且 over 低于阈值）。
+    Good,
+    /// 轻度劣化（probe 100-300 或 over 达阈值）。
+    Medium,
+    /// 明显劣化（probe 300-800 或 over 较大）。
+    Degraded,
+    /// 严重劣化（probe≥800 或 over 极大）。
+    Critical,
+}
 /// BR_MIN（scrap）：ratio 绝对下限。
 pub const QOS_BR_MIN: f32 = 0.2;
 /// BR_MIN_HIGH_RESOLUTION（scrap）：高分屏 ratio 下限。
@@ -1344,6 +1372,7 @@ impl QosAdaptive {
             fps: QOS_FPS,
             ratio: quality_ratio,
             quality_ratio,
+            quality_state: QosQualityState::Unknown,
             last_delay: 0,
             delay_history: std::collections::VecDeque::new(),
             median_window: std::collections::VecDeque::new(),
@@ -1388,6 +1417,42 @@ impl QosAdaptive {
         let mut v: Vec<u32> = self.probe_window.iter().copied().collect();
         v.sort_unstable();
         v[v.len() / 2]
+    }
+
+    /// QoS 质量状态更新（R4 甲 A0 五态 / A2 质量反馈状态机）：由网络层
+    /// probe 中值与拥塞增量 over 推导显式状态。状态**只作可观测快照**，
+    /// 不驱动决策（fps/ratio 仍由内容活动 + over 判据决定）。迁移记日志，
+    /// 供面板/复盘还原每 1s 的 QoS 走势。
+    pub fn update_quality_state(&mut self) {
+        let probe = self.probe_median_delay();
+        let med = self.median_delay();
+        let over = med.saturating_sub(self.baseline_delay.max(10));
+        let band = self.rtt_band();
+        let threshold = if band >= 2 { 60 } else { 100 };
+        let next = if probe >= 800 || over >= threshold + 300 {
+            QosQualityState::Critical
+        } else if probe >= 300 || over >= threshold + 150 {
+            QosQualityState::Degraded
+        } else if probe >= 100 || over >= threshold {
+            QosQualityState::Medium
+        } else {
+            QosQualityState::Good
+        };
+        if next != self.quality_state {
+            tracing::info!(
+                from = ?self.quality_state,
+                to = ?next,
+                probe_ms = probe,
+                over,
+                "desktop QoS state transition"
+            );
+            self.quality_state = next;
+        }
+    }
+
+    /// 当前 QoS 质量状态（日志/面板观测用）。
+    pub fn quality_state(&self) -> QosQualityState {
+        self.quality_state
     }
 
     /// RTT 分带（R4 丁142 / R5#111）：按中值延时返回弱网档位，
@@ -1530,6 +1595,9 @@ impl QosAdaptive {
         } else if first {
             self.adjust_ratio(false);
         }
+
+        // QoS 质量状态（A0 五态 / A2）：每次采样后更新可观测快照 + 迁移日志。
+        self.update_quality_state();
 
         (self.fps, self.ratio_permille())
     }
@@ -2055,6 +2123,68 @@ mod tests {
     fn test_qos_probe_absent_returns_zero() {
         let q = QosAdaptive::new(QOS_BR_BALANCED);
         assert_eq!(q.probe_median_delay(), 0, "未上报时 probe 中值应为 0（兼容）");
+    }
+
+    /// R4 甲A0 五态 / A2 质量反馈状态机：网络层 probe 健康 → Good；probe
+    /// 抬升 → Medium/Degraded/Critical；状态是纯观测快照，不影响 fps/ratio
+    /// 决策（决策测试仍全绿）。
+    #[test]
+    fn test_qos_quality_state_transitions() {
+        // 初始 Unknown（首样本前）。
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        assert_eq!(q.quality_state(), QosQualityState::Unknown);
+
+        // 健康：probe 20ms 恒定 → Good。
+        let mut now = 3_000_000u64;
+        for _ in 0..9 {
+            now += 300_000;
+            q.on_delay(40, 20, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        assert_eq!(q.quality_state(), QosQualityState::Good, "网络健康应 Good");
+
+        // probe 抬到 500ms（e2e 保持低 → over≈0，状态由网络层单独驱动）
+        // → Degraded（300-800 带）。
+        for _ in 0..6 {
+            now += 300_000;
+            q.on_delay(40, 500, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        assert_eq!(q.quality_state(), QosQualityState::Degraded, "probe 500 → Degraded");
+
+        // probe 抬到 900ms → Critical（≥800 带）。
+        for _ in 0..6 {
+            now += 300_000;
+            q.on_delay(40, 900, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        assert_eq!(q.quality_state(), QosQualityState::Critical, "probe 900 → Critical");
+
+        // probe 回落 30ms → 恢复 Good（中值窗口排出尖峰后）。
+        for _ in 0..8 {
+            now += 300_000;
+            q.on_delay(40, 30, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        assert_eq!(q.quality_state(), QosQualityState::Good, "网络恢复 → Good");
+    }
+
+    /// 无探针（probe=0）时状态由 e2e 拥塞增量 over 驱动（保持兼容）。
+    #[test]
+    fn test_qos_quality_state_without_probe() {
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        let mut now = 3_000_000u64;
+        // 健康期 e2e 40ms，baseline 学到 40。
+        for _ in 0..9 {
+            now += 300_000;
+            q.on_delay(40, 0, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        // 持续高 e2e（无探针）→ over 大 → 至少 Medium。
+        for _ in 0..12 {
+            now += 300_000;
+            q.on_delay(800, 0, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        assert!(
+            matches!(q.quality_state(), QosQualityState::Medium | QosQualityState::Degraded | QosQualityState::Critical),
+            "无探针持续高 e2e → 状态劣化，实际 {:?}",
+            q.quality_state()
+        );
     }
 
     #[test]

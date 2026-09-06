@@ -1564,12 +1564,12 @@ async fn run_session(
                                         .get("lseq")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0);
-                                    let (fps, qos_scale, bitrate_kbps) = desktop
+                                    let (fps, qos_scale, bitrate_kbps, qos_state) = desktop
                                         .on_qos_delay(delay_ms, probe_ms, decode_fps, decode_queue, ack_seq)
                                         .await;
                                     // 回传当前生效的 QoS 状态（对齐 rustdesk TestDelay
                                     // 携带 target_bitrate，MYS-886 #153）：浏览器可展示
-                                    // 实际码率/帧率。
+                                    // 实际码率/帧率 + 质量状态（R4 甲A0 五态）。
                                     let qos_ack = Message {
                                         msg_type: "desktop:qos-ack".to_string(),
                                         session_id: client.session_id.clone(),
@@ -1577,6 +1577,7 @@ async fn run_session(
                                             "fps": fps,
                                             "qos_scale": qos_scale,
                                             "bitrate_kbps": bitrate_kbps,
+                                            "qos_state": format!("{:?}", qos_state),
                                         }),
                                     };
                                     out.control(qos_ack).await;
