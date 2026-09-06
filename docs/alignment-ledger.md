@@ -71,7 +71,7 @@
 | 11 | relay 重启后重发 init 状态机 | ✔ | 第 21 轮：agent 会话级 `desktop_want_running` 跨重连传递——断线退出时记录桌面状态并显式 stop（防 orphan task 向失效连接发帧），重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init）。实测两轮 relay 重启均 `auto-restoring desktop stream` + `capture started 1280x720` |
 | 12 | SSE 重建补 desktop:state | ✔ | 第 32 轮：relay 缓存每会话最近桌面运行状态（`SharedState.desktop_states`，started→true / stopped→false）→ SSE 首次连接/断线重建握手时**先**补发 `desktop:state {running}` 快照（`agent_events_handler` + `desktop_state_snapshot`，未入缓冲每次现读现发）→ 浏览器 `desktop:state` 监听按 running 恢复视图（true→进入桌面拉流，false→退回终端，编码热切换保护）。此前浏览器仅靠 `desktop:capabilities {running}` 恰好仍在事件缓冲中才能恢复视图；测试 `test_desktop_state_snapshot_reflects_latest` |
 | 13 | 多 agent 同 IP 白名单 | ✔ | `registration_rate_limit_per_min` 默认 120/min（--registration-rate-limit 可调）——同一出口 IP 多 agent 注册/重连不误拒；第 26 轮代码级核实修正 |
-| 14 | 混合通道二进制分辨 | ⬜ | 线协议整块（批次 2 #41）未做 |
+| 14 | 混合通道二进制分辨 | ⬜ | 第 57 轮核实：架构上混合通道**已分离**——agent 控制（`control_tx` 64 有界）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道分离（#15/#29）；浏览器 SSE 控制 text vs 桌面 WS binary 也分离。JSON 阶段 base64 由 `kind`（init/frag）分辨；**二进制帧分辨协议在 #41 binary 化时落地**（依赖架构重构，远期） |
 | 15 | agent 控制消息独立有界 channel | ✔ | 已分离：`control_tx`（bounded 64，控制消息）+ `post_tx`（unbounded，媒体帧，批内丢旧）+ `shell_tx`（终端输出）；第 26 轮代码级核实修正 |
 | 16 | relay→agent 背压回传 | ✔ | 第 36 轮：relay fan-out 丢旧保新（viewer 缓冲满）时限频（≥5s）向 agent 回传 `desktop:congested {dropped}`（`push_frag` 返回被跳过 viewer 数 → `route_agent_message` desktop:video 分支经 `SharedState.last_congest_notify` 限频 → agent `desktop:congested` 分支记录"传输段拥塞"日志，不直接改 QoS 决策——码率收敛仍由浏览器段 e2e/dq 主导，relay drop 作补充证据）。viewer 缓冲 16 帧此前已降。测试 `test_push_frag_reports_congested_drops` + `test_desktop_congested_backpressure_to_agent` |
 | 17 | 12s 超时统一 ≤5s | ✔ | join ack 看门狗 8s → **5s**（session.js，对齐 rustdesk 5s 超时语义——弱网更快失败恢复）；SSE 重连退避 1→10s 上限已核实；无残留 12s 单一超时 |
@@ -262,6 +262,8 @@
 - **第 56 轮新增合入**：
   1. admin overview 展示协议统计（R5#43 观测子集闭环）：每会话 `desktop_proto` 字段含 `encoded_bytes`/`decoded_bytes`/`dropped_frames`——JSON 协议膨胀率与 agent→relay 段丢帧对运维可见（admin 决策 binary 化 ROI 的直接证据面）。全量 `cargo test` **399 通过**（无新增测试数，admin 字段纯展示）。
   2. R4/5 统计核实更新：甲-戊各段经历轮合入实质闭合（30s 判死/能力回退链/重连降质/告警/统一时间线工具/验收脚本化全闭环等），58% → **78%**（⬜ 12% 线协议/KCP/Windows/Wayland/i444/SIMD 架构平台级、◐ 10% 依赖远期）；R5 落地清单 99% 保持。
+- **第 57 轮核实收口**：
+  1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 54 轮综合 review**：
   1. 全量验收矩阵重验当前 master（用户铁律交叉验证）：① **重连矩阵**（`tools/reconnect_matrix.sh`）8 场景全过（agent 崩溃重启续接 / relay 重启退避重连 / 连续 flap 幂等）；② **4-top 动态基准**（`tools/bench_top4_verify.sh`）PASS——fps 中值 30.0 满帧、bitrate 670kbps（**动态内容不降帧**铁律实测成立）；③ **长稳短跑**（`tools/stability_verify.sh 60`）PASS——4 样本无重连、RSS 末两点 +0%（无泄漏）、fps 30.0（**降质不降帧** + 稳定）。全量 `cargo test` 398 已在此前通过。R5 ✔ 类 99% 保持（可合入项闭合，剩余 ⬜ 架构/平台级远期）。
 - **第 53 轮新增合入**：
