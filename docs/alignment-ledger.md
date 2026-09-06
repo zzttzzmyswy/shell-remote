@@ -59,7 +59,7 @@
 | # | 点 | 状态 | 证据 |
 |---|---|---|---|
 | 1 | reqkey 全链路 | ✔ | desktop.js:_requestKey → agent/mod.rs:1559 → request_idr |
-| 2 | 控制消息序号+确认 | ⬜ | 未做 |
+| 2 | 控制消息序号+确认 | ✔ | 第 22 轮：控制命令（quality/codec/gray）带递增 seq → agent 处理后回 `desktop:cmd-ack {seq,ok,error}` → 浏览器 toast 反馈操作结果（弱网/高负载可见反馈）；relay broadcast_types/KNOWN 白名单；实测 quality(best) ack `{ok:true,seq:100}` |
 | 3 | SSE 重连补控制事件 | ⬜ | 未做 |
 | 4 | 会话/升级生命周期清理 | ✔ | ws.rs remove desktop_streams+agent_upgrades；legacy 2min 未做 |
 | 5 | 单条消息 8MB 上限 | ✔ | ws.rs browser_send_handler → 413 + 单测 |
@@ -67,7 +67,7 @@
 | 7 | 心跳 15s | ✔ | agent/mod.rs Duration::from_secs(15) |
 | 8 | SSE 空闲超时对齐心跳 | ◐ | |
 | 9 | 重连退避 60s 上限 | ◐ | 浏览器 10 次退避已有；agent 控制优先待补 |
-| 10 | agent 重连幂等替换 | ⬜ | |
+| 10 | agent 重连幂等替换 | ✔ | relay `SessionRegistry::register_existing`（session.rs:153）——agent 断线重连 replay cached_tokens 走 register_existing 替换旧 session（第 21 轮 #11 恢复依赖它）；代码级核实修正 |
 | 11 | relay 重启后重发 init 状态机 | ✔ | 第 21 轮：agent 会话级 `desktop_want_running` 跨重连传递——断线退出时记录桌面状态并显式 stop（防 orphan task 向失效连接发帧），重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init）。实测两轮 relay 重启均 `auto-restoring desktop stream` + `capture started 1280x720` |
 | 12 | SSE 重建补 desktop:state | ⬜ | |
 | 13 | 多 agent 同 IP 白名单 | ⬜ | |
@@ -80,13 +80,13 @@
 | 20 | 半开连接心跳兜底 | ◐ | |
 | 21 | 未知消息白名单丢弃 | ✔ | relay route_agent_message 白名单外丢弃+日志（ws.rs KNOWN 常量） |
 | 22 | WS/HTTP 限流等价 | ✔ | agent_conn_rate_ok 共享 ev: 30/min 配额（agent_events_handler + agent_ws_send_handler，测试 test_agent_conn_rate_shared_ws_http） |
-| 23 | 崩溃重启会话 key 续接 | ⬜ | |
+| 23 | 崩溃重启会话 key 续接 | ✔ | agent 崩溃重启后 cached_tokens replay → relay `register_existing` 续接同一 session（client.rs 缓存 token + connect_with_retry 重放）；与 #10 同机制，代码级核实修正 |
 | 24 | 桌面流 map 生命周期追踪 | ✔ | created/removed 带原因日志（ws.rs desktop:started/stopped/agent断线，实测三路径） |
 | 25 | 空闲回收可见性 | ⬜ | |
 | 26 | token 过期快速重鉴权 | ⬜ | |
 | 27 | viewer 移除水位化（满即删→告警） | ✔ | 本轮：满时丢旧保新，超 MAX_CONSECUTIVE_DROPS=60 才移除（relay/desktop.rs） |
 | 28 | 20s WS ping | ✔ | handle_agent_ws_uplink 每 20s server-side ping（agent 死链 ~35s 检出），台账此前误标 ◐，第 17 轮代码级核实修正 |
-| 29 | 控制消息优先级 | ⬜ | |
+| 29 | 控制消息优先级 | ◐ | 部分：`is_lossy_msg_type` 区分数据（terminal:output 静默丢）/控制（non-lossy 满时告警丢）已有，基本优先级语义成立；channel 满时控制仍可能丢（无腾位机制），第 22 轮核实 |
 | 30 | 时钟校准 15min 慢校准 | ✔ | 连接期每 15min 重校（desktop.js:_startMetrics） |
 | 31 | 注册风暴防御 | ✔ | 120/min+冷却（agent/mod.rs） |
 | 32 | 剪贴板大文本走文件传输 | ⬜ | |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **57%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 23%。
-- **R5 落地清单（200 点）**：✔ 类约 **70%**（可靠通道 13 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 10 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 20%。
+- **R5 落地清单（200 点）**：✔ 类约 **72%**（可靠通道 16 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 10 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 19%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -185,4 +185,7 @@
   1. relay 重启后桌面流自动恢复（`agent/mod.rs run_session` 加 `desktop_want_running` 会话级标志）：断线退出时记录桌面 running 并显式 stop（修掉孤儿 task——run_desktop_loop 是 tokio::spawn detach，desktop drop 不停它，会继续向失效 relay 发帧浪费 CPU + 重连双发冲突）；重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init 给新 DesktopStream）。**实测**：两轮 relay 重启均显 `reconnected with desktop previously running — auto-restoring desktop stream` + `capture started 1280x720`（agent 日志证据）；用户手动关闭桌面（pagehide stop）后 running=false → 重连不自动开（符合预期）→ R5#11。
   2. 台账修正：**#19 桌面开启竞态幂等已实现**（`DesktopManager::start` 首行 `is_running` 守卫，检查→置 running 无 await 并发安全），此前误标 ◐。
   3. 诊断结论：#20 记录的连续会话按钮 disabled 现象，在干净复现下**不存在**（会话2 按钮正常 enabled + caps 正常）——疑 playwright 连续实例会话残留，非产品 bug；#12（SSE 重建补 desktop:state）实际已工作（桌面保持运行时新 join 收 caps 正常）。
+- **第 22 轮新增合入**：
+  1. 控制命令 ack（`agent/mod.rs` quality/codec/gray handler + `web/session.js`）：命令带递增 `seq` → agent 处理后回 `desktop:cmd-ack {seq,ok,error?}` → 浏览器 toast 反馈操作结果（quality/codec/gray 成功或失败可见）；relay broadcast_types/KNOWN 白名单加 cmd-ack。**浏览器实测**：quality(best) 命令 ack `{ok:true,seq:100}` 到达。TCP 可靠（命令不丢），本确认价值 = **操作结果反馈**（弱网/高负载下用户可见操作生效）+ 为弱网重发预留 seq 机制 → R5#2。
+  2. 台账修正：#10 agent 重连幂等替换（`register_existing` 替换旧 session）与 #23 崩溃重启 key 续接（cached_tokens replay）经代码级核实**均已实现**；#29 控制消息优先级核实为 ◐（is_lossy 数据/控制区分已成立，channel 满时控制仍可能丢）。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
