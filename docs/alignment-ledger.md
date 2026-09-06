@@ -60,7 +60,7 @@
 |---|---|---|---|
 | 1 | reqkey 全链路 | ✔ | desktop.js:_requestKey → agent/mod.rs:1559 → request_idr |
 | 2 | 控制消息序号+确认 | ✔ | 第 22 轮：控制命令（quality/codec/gray）带递增 seq → agent 处理后回 `desktop:cmd-ack {seq,ok,error}` → 浏览器 toast 反馈操作结果（弱网/高负载可见反馈）；relay broadcast_types/KNOWN 白名单；实测 quality(best) ack `{ok:true,seq:100}` |
-| 3 | SSE 重连补控制事件 | ⬜ | 未做 |
+| 3 | SSE 重连补控制事件 | ✔ | relay `agent_events_handler` + `EventBuffer::replay_from(last_id)`——浏览器 SSE 重连带 last-event-id 时补发断线期间控制事件（ws.rs:1003-1047）；第 24 轮代码级核实修正 |
 | 4 | 会话/升级生命周期清理 | ✔ | ws.rs remove desktop_streams+agent_upgrades；legacy 2min 未做 |
 | 5 | 单条消息 8MB 上限 | ✔ | ws.rs browser_send_handler → 413 + 单测 |
 | 6 | /agent/send 首次绑定校验 | ⬜ | |
@@ -146,7 +146,7 @@
 
 ### 批次 5 · 测试与遥测（147-167）
 
-◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）。统一时间线/13s 决策树/crash.log 上报/告警未做。
+◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）；**crash.log 崩溃日志已增强**（第 24 轮：`main.rs` panic hook 补时间戳/pid/backtrace/`SR_LOG_DIR` 路径/append 多次崩溃保留——基础 hook 前已有，本轮补齐字段与保留策略）。统一时间线/告警未做。
 
 ### 批次 6 · 风险与回滚（168-177）
 
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **74%**（可靠通道 18 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 11 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 18%。
+- **R5 落地清单（200 点）**：✔ 类约 **75%**（可靠通道 19 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 17%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -191,4 +191,7 @@
 - **第 23 轮新增合入**：
   1. QoS 13s 归因决策树（`tools/qos_attribution.py`）：解析 agent 日志 `desktop QoS` 结构化行 → 逐采样归因 **network / decode / encode / static / good**（probe_ms≥300 或 probe 中+降码率 → network；网络健康+dq>12+dfps<20 → decode 积压；动态 fps≤15 且降码率 → encode）→ 归因占比 + 中位 e2e/RTT/fps 建议。**验证**：真实日志 95% static（静态桌面正常）+ 5% good + 中位 e2e=40ms/RTT=4ms；分支逻辑单测（network×2/ decode/ static/ good 全对）→ R4 丙 13s 归因决策树。
   2. 台账修正：#18 发送失败即重连（会话断线 → connect_with_retry 退避重连，与 #11 同路径）与 #20 半开连接心跳兜底（20s ping + 15s 心跳双方探测）经代码级核实均已实现。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛、crash.log 上报等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **第 24 轮新增合入**：
+  1. crash.log 崩溃日志增强（`main.rs` panic hook）：补时间戳（unix_ms）/pid/`Backtrace::force_capture()` 栈/`SR_LOG_DIR` 路径对齐（未设回退当前目录）/append 多次崩溃保留（此前 fs::write 覆盖只留最后一次，多闪退丢现场）→ 批次5 crash.log 上报（基础 hook 前已有，本轮补齐字段与保留策略）。
+  2. 台账修正：#3 SSE 重连补控制事件经代码级核实**已实现**（`agent_events_handler` + `EventBuffer::replay_from(last_id)` 补发断线期间控制事件）。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
