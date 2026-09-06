@@ -21,6 +21,28 @@
   var reconnectTimer = null;
   var reconnectDelay = 1000;      // grows on failure, resets on success
   var lastSessionError = null;    // dedup identical consecutive error toasts
+  // R5#8 SSE 空闲看门狗：agent 下行 SSE 心跳 15s、relay 半开超时 60s。浏览器
+  // 侧显式空闲计数（对齐 #8）：30s 无任何 SSE 事件即判死主动重连（relay 60s
+  // 兜底的一半），弱网事件稀疏时更快检出半开连接。
+  var lastSseAt = 0;              // 最近一次收到 SSE 块的墙钟；0 = 当前流未就绪
+  var sseIdleTimer = null;        // setInterval id（惰性创建，连接成功后启动）
+  var SSE_IDLE_MS = 30000;
+  var SSE_IDLE_CHECK_MS = 5000;
+
+  function checkSseIdle() {
+    if (lastSseAt === 0 || intentionalClose) return;
+    var idle = Date.now() - lastSseAt;
+    if (idle > SSE_IDLE_MS) {
+      console.warn('SSE idle ' + idle + 'ms（半开检测 #8），主动重连');
+      lastSseAt = 0;
+      if (controller) {
+        intentionalClose = true;
+        controller.abort();
+        intentionalClose = false;
+      }
+      scheduleReconnect();
+    }
+  }
 
   function emit(type, obj) {
     var hs = handlers[type];
@@ -75,6 +97,7 @@
 
   // Parse one SSE block (lines separated by \n) and dispatch to handlers.
   function handleBlock(block) {
+    lastSseAt = Date.now(); // 任何块到达 = 流活着（R5#8 空闲看门狗刷新）
     var eventName = 'message';
     var dataLines = [];
     var lines = block.split('\n');
@@ -170,6 +193,11 @@
       lastSessionError = null;
       var reader = resp.body.getReader();
       var decoder = new TextDecoder();
+      // R5#8：SSE 流建立即启动空闲看门狗（惰性，仅一次）——30s 无任何
+      // 块判定半开（relay 60s 兜底的一半），主动 abort + 重连。
+      if (!sseIdleTimer) {
+        sseIdleTimer = setInterval(checkSseIdle, SSE_IDLE_CHECK_MS);
+      }
 
       function pump() {
         return reader.read().then(function(result) {
