@@ -103,7 +103,7 @@
 |---|---|---|---|
 | 41 | 逐帧 binary+头{len,seq,flags} | ⬜ | **帧头字段显式化已做**（第 52 轮：desktop:video frag 带消息级 `seq`（递增帧号，与 fMP4 moof seqn 同步）+ `flags`（key/delta）——逐帧 binary 头的 JSON 等价子集，未来 binary 化可同构迁移；`pipeline_static` 测试断言）；**binary 传输 + len 头仍远期**（架构级重构） |
 | 42 | seq 真实丢帧 | ✔ | desktop.js:_handleMoof seqn gap |
-| 43 | relay 二进制直转 | ⬜ | |
+| 43 | relay 二进制直转 | ⬜ | **协议开销观测子集已做**（第 53 轮：relay `SharedState.desktop_proto` 累计 desktop:video base64 编码/解码字节（`test_desktop_protocol_overhead_stats` 断言 "AQID"=4字符→3字节）——量化 JSON 传输膨胀 ≈33%，为二进制直转决策提供 ROI 数据）；**二进制直转仍远期**（依赖 #41 线协议整块） |
 | 44 | 老版本兼容/capability | ⬜ | **capability 协商最小子集已做**（第 51 轮：agent 注册消息带 `capabilities` 数组（codec/后端/桌面功能声明）→ relay `SessionInfo.capabilities` + `update_capabilities`/`get_capabilities` → admin overview 展示——老版本 agent 不带保持空，浏览器可据此协商；测试 `test_register_capabilities_roundtrip`）；**老版本二进制兼容仍远期**（依赖 #41 线协议整块） |
 | 45 | moof 复用（tfhd 缓存） | ✔ | Mp4Muxer 缓存 tfhd 模板、每帧只重建变化部分（mp4.rs，测试逐字节一致） |
 | 46 | init 最小化 | ✔ | stbl 只留 stsd、去 stts/stsc/stsz/stco 空表（mp4.rs，ffmpeg frag_keyframe 一致，浏览器实测出画） |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 31 项 / 前端 22 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 17 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 31 项 / 前端 22 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -256,4 +256,6 @@
   1. capability 协商最小子集（R5#44 老版本兼容/capability）：agent 注册消息带 **`capabilities`** 数组（`codec:av1/vp9/h264`、`backend:x11/wayland/gdi/dxgi`、`desktop:gray/quality/clipboard/cursor/test-delay` 声明）→ relay `SessionInfo.capabilities` + `update_capabilities`/`get_capabilities`（会话不存在静默）→ admin overview 每会话显示 `capabilities`——老版本 agent 不带保持空，浏览器可据此能力协商。测试 `test_register_capabilities_roundtrip`（未声明空 / update-get 往返一致）。全量 `cargo test` **397 通过**（+1）。
 - **第 52 轮新增合入**：
   1. 逐帧 binary 头 JSON 子集（R5#41 部分）：desktop:video frag 消息带 **消息级 `seq`**（递增帧号，与 fMP4 moof 内 seqn 同步）+ **`flags`**（key/delta）——"逐帧 binary+头{len,seq,flags}"的 JSON 等价（len 由消息长度隐含），未来 binary 化时可同构迁移；浏览器按需解析、向后兼容。测试：`pipeline_static_desktop_spaces_out_keyframes` 增断言（frag 携带 seq 数字 + flags="key"）。全量 `cargo test` **397 通过**（无新增测试数，既有 pipeline 测试断言扩展）。
+- **第 53 轮新增合入**：
+  1. relay 二进制直转观察性子集（R5#43）：relay `SharedState.desktop_proto` 每会话累计 desktop:video base64 编码字节 / 解码字节——量化 JSON 协议膨胀（base64 ≈33%），为二进制直转（binary 化）决策提供 ROI 数据。测试 `test_desktop_protocol_overhead_stats`（"AQID"=4 字符编码 → 3 字节解码 × 2）。全量 `cargo test` **398 通过**（+1）。收口核实：R5 剩余 ⬜ 全为架构级/平台级远期（#41 binary 传输 / #43 直转 / #14 混合通道 / #36-38 KCP / Windows DXGI/GDI / Wayland / SIMD / 批次7），可合入项闭合。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
