@@ -26,7 +26,8 @@ use crate::relay::desktop::{DesktopStream, ViewerGuard};
 struct LanState {
     stream: DesktopStream,
     /// LAN 流响应 `Access-Control-Allow-Origin` 值（Task 6 复审收窄：relay
-    /// 同源 `scheme://host[:port]`；relay_url 无法解析时为 `"*"`——见 `relay_origin`）。
+    /// 同源 `scheme://host[:port]`；relay_url 解析失败时拒绝启动，见
+    /// [`LanDesktop::spawn`]——fail-closed，不放行 `*`）。
     cors_origin: Arc<String>,
 }
 
@@ -46,7 +47,8 @@ pub struct LanDesktop {
     /// 与 relay fan-out 的 viewer 缓冲同一语义）。
     feed_tx: tokio::sync::mpsc::Sender<(bool, bool, Vec<u8>)>,
     /// LAN 流响应的 CORS `Access-Control-Allow-Origin` 值（Task 6 收窄；见
-    /// [`LanState`]。`"*"` = relay_url 解析失败回退，未收窄）。
+    /// [`LanState`]。恒为具体 relay 同源，**不可能**是 `"*"`——origin 解析
+    /// 失败时 [`Self::spawn`] 直接拒绝启动，fail-closed）。
     allowed_origin: String,
     /// server 任务句柄：drop 时 abort，释放端口供重连重新 bind。
     _server: tokio::task::JoinHandle<()>,
@@ -60,16 +62,25 @@ impl LanDesktop {
     ///
     /// `relay_origin` 是 relay 的 `scheme://host[:port]`（LAN 页面从该源加载，
     /// 浏览器到 agent LAN 端点是跨源 fetch，CORS 须放行此源才能读流）。为
-    /// `None` 时（relay_url 解析失败）回退 `"*"`——无法收窄，记录 tradeoff。
+    /// `None` 时（relay_url 解析失败）**拒绝启动**（fail-closed，final-review
+    /// #4）：LAN server 属显式 opt-in，relay_url 解析失败时 serve `*` 是把
+    /// 无认证的桌面流端点开放给任意网页的唯一泄漏面，宁可不启。生产 relay_url
+    /// 恒为 `http(s)://host[:port]`，本路径常温冷。
     pub async fn spawn(port: u16, relay_origin: Option<String>) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
         let local_port = listener.local_addr()?.port();
 
+        let Some(cors_origin) = relay_origin else {
+            drop(listener);
+            tracing::error!(
+                "LAN CORS fail-closed: relay_url 无法解析出可靠 origin，拒绝启动 LAN 桌面流服务（不放行 Access-Control-Allow-Origin: *）"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "lan desktop server refused: no relay origin (fail-closed)",
+            ));
+        };
         let stream = DesktopStream::new();
-        let cors_origin = relay_origin.unwrap_or_else(|| {
-            tracing::warn!("LAN CORS: relay_url 无法解析出可靠 origin，回退 Access-Control-Allow-Origin: *（未收窄）");
-            "*".to_string()
-        });
         let state = LanState {
             stream: stream.clone(),
             cors_origin: Arc::new(cors_origin.clone()),
@@ -117,7 +128,7 @@ impl LanDesktop {
     }
 
     /// 当前 LAN 流 CORS `Access-Control-Allow-Origin` 值（日志/复审观测用；
-    /// `"*"` 表示 relay_url 解析失败未收窄）。
+    /// 恒为具体 relay 同源，绝不可能是 `"*"`——fail-closed）。
     pub(crate) fn cors_origin(&self) -> &str {
         &self.allowed_origin
     }
@@ -144,7 +155,7 @@ impl LanDesktop {
 
 /// 从 relay_url（如 `http://127.0.0.1:3130`、`https://sshx.zztweb.top`）提取
 /// CORS 允许来源 `scheme://host[:port]`（浏览器 Origin 的形态）。无 `://` 或
-/// host 为空 → `None`（调用方回退通配并记录 tradeoff）。
+/// host 为空 → `None`（调用方 [`LanDesktop::spawn`] 拒绝启动——fail-closed）。
 pub(crate) fn relay_origin(relay_url: &str) -> Option<String> {
     let trimmed = relay_url.trim();
     let (scheme, rest) = trimmed.split_once("://")?;
@@ -207,10 +218,13 @@ async fn lan_stream_handler(State(st): State<LanState>) -> Response {
         .header("x-accel-buffering", "no")
         // CORS（Task 6 复审收窄）：浏览器页面由 relay 站点加载（如
         // http://127.0.0.1:3120），LAN 直连指向 agent 本地 http://<lan-ip>:port
-        // 是跨源 fetch——必须放行 relay 同源才能读到流 body。**不再放行任意源**：
-        // 无认证的 LAN 端点只允许 relay 同源的页面读流；陌生来源页面被浏览器
+        // 是跨源 fetch——必须放行 relay 同源才能读到流 body。**只放行 relay 同源**
+        // （origin 解析失败时服务根本不启动，fail-closed），陌生来源页面被浏览器
         // CORS 拦截（ACAO 不匹配），降低"任意网页嗅探内网桌面流"的风险面。
+        // `Vary: Origin`（final-review MINOR）：ACAO 随请求 Origin 变（缓存是按
+        // Origin 分桶的），显式声明避免中间缓存把某来源的响应复用得给别家。
         .header("Access-Control-Allow-Origin", st.cors_origin.as_str())
+        .header("Vary", "Origin")
         .body(body)
         .unwrap()
 }
@@ -222,6 +236,7 @@ async fn cors_preflight(State(st): State<LanState>) -> Response {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header("Access-Control-Allow-Origin", st.cors_origin.as_str())
+        .header("Vary", "Origin")
         .header("Access-Control-Allow-Methods", "GET, OPTIONS")
         .header("Access-Control-Allow-Headers", "*")
         .header("Access-Control-Max-Age", "86400")
@@ -253,7 +268,8 @@ mod tests {
     }
 
     /// CORS 收窄：spawn 传入 relay 同源 → GET 响应与 OPTIONS 预检的
-    /// `Access-Control-Allow-Origin` 都等于该源（不再是 `*`）。
+    /// `Access-Control-Allow-Origin` 都等于该源（不再是 `*`），且带
+    /// `Vary: Origin`。
     #[tokio::test]
     async fn lan_cors_narrowed_to_relay_origin() {
         let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".to_string()))
@@ -273,24 +289,30 @@ mod tests {
             !head.contains("*"),
             "wildcard ACAO must not appear, got: {head}"
         );
-    }
-
-    /// CORS 兜底：origin 解析失败 → 回退通配（收窄不可行的 tradeoff）。
-    #[tokio::test]
-    async fn lan_cors_falls_back_to_wildcard_when_no_origin() {
-        let lan = LanDesktop::spawn(0, None).await.unwrap();
-        lan.feed(true, true, b"ftyp-cors-wild".to_vec());
-        tokio::time::sleep(Duration::from_millis(120)).await;
-
-        let body = http_get_until(&lan, b"ftyp-cors-wild").await;
-        let head = String::from_utf8_lossy(&body);
         assert!(
-            head.contains("access-control-allow-origin: *"),
-            "fallback must be wildcard, got: {head}"
+            head.to_ascii_lowercase().contains("vary: origin"),
+            "Vary: Origin must be present when ACAO is a fixed origin, got: {head}"
         );
     }
 
-    /// OPTIONS 预检回同样的收窄 ACAO。
+    /// CORS **失败关闭**（final-review #4）：relay origin 解析失败 → spawn 拒绝
+    /// 启动（返回 Err），绝不 serve `Access-Control-Allow-Origin: *`。
+    #[tokio::test]
+    async fn lan_cors_fails_closed_when_no_origin() {
+        let err = match LanDesktop::spawn(0, None).await {
+            Ok(_) => panic!(
+                "spawn(relay_origin=None) must refuse to start the LAN server (fail-closed)"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "refusal must be a clean InvalidInput error, got {err:?}"
+        );
+    }
+
+    /// OPTIONS 预检回同样的收窄 ACAO + `Vary: Origin`。
     #[tokio::test]
     async fn lan_cors_preflight_echoes_relay_origin() {
         let lan = LanDesktop::spawn(0, Some("https://relay.example.com".to_string()))
@@ -314,6 +336,10 @@ mod tests {
             head.contains("access-control-allow-origin: https://relay.example.com"),
             "OPTIONS must echo the narrowed origin, got: {head}"
         );
+        assert!(
+            head.to_ascii_lowercase().contains("vary: origin"),
+            "OPTIONS must also carry Vary: Origin, got: {head}"
+        );
     }
 
     /// in-process fan-out：spawn(0) → feed init（缓存）→ HTTP viewer 加入
@@ -322,7 +348,9 @@ mod tests {
     /// 迟到 viewer 只回放 init——与 relay fan-out 语义一致）。
     #[tokio::test]
     async fn lan_fanout_init_then_frags_to_viewer() {
-        let lan = LanDesktop::spawn(0, None).await.unwrap();
+        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".to_string()))
+            .await
+            .unwrap();
         lan.feed(true, true, b"ftyp-moov-init-seg".to_vec());
         tokio::time::sleep(Duration::from_millis(120)).await;
 
@@ -359,7 +387,9 @@ mod tests {
     /// 之后加入的 viewer 仍拿到缓存 init。
     #[tokio::test]
     async fn lan_feed_with_no_viewer_does_not_panic() {
-        let lan = LanDesktop::spawn(0, None).await.unwrap();
+        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".to_string()))
+            .await
+            .unwrap();
         lan.feed(true, true, b"init-no-viewer".to_vec());
         lan.feed(false, true, b"key".to_vec());
         lan.feed(false, false, b"delta".to_vec());
@@ -378,7 +408,9 @@ mod tests {
     /// 最小 HTTP GET，响应必含缓存的 init 字节（fMP4 首段）。
     #[tokio::test]
     async fn http_get_stream_returns_init_bytes() {
-        let lan = LanDesktop::spawn(0, None).await.unwrap();
+        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".to_string()))
+            .await
+            .unwrap();
         lan.feed(true, true, b"ftypmdat-lan-init".to_vec());
         tokio::time::sleep(Duration::from_millis(120)).await;
 
