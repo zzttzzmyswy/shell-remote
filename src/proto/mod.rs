@@ -243,6 +243,50 @@ pub fn is_valid_custom_session_id(s: &str) -> bool {
     (5..=20).contains(&len) && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+// ── desktop:video 二进制帧格式（R5 #41 线协议的最小可验证子集）──
+//
+// 目标格式（对齐 rustdesk 逐帧 binary+头{len,seq,flags}）：
+//   [flags:u8][seq:u32 LE][len:u32 LE][payload len 字节]
+// - WS binary 帧边界自带长度，`len` 再显式携带做**双重校验**（截断/损坏
+//   帧拒绝，不吞错）。
+// - flags 位 0：1 = key frame（IDR），0 = delta。
+// - payload = 原始 fMP4 init/frag 字节（与浏览器桌面 WS 下行同构，未来
+//   binary 化 agent→relay 段时直接字节直转，消除 base64 ≈33% 膨胀）。
+//
+// **当前状态**：格式规格 + 双向编解码已落地并单测（agent/relay 可复用）；
+// 实时传输仍走 JSON+base64（第 52 轮帧头字段显式化 seq/flags 的 JSON 等价
+// 已就绪，relay 第 53/55 轮观测/丢帧检测已就绪）——agent→relay 段真正
+// binary 化（agent 发 binary WS 帧 + relay Binary 分支直转）为架构级远期，
+// 本格式是其同构迁移目标。
+pub const BIN_FRAME_FLAG_KEY: u8 = 0x01;
+/// 帧头长度：[flags(1) + seq(4) + len(4)]。
+pub const BIN_FRAME_HEADER_LEN: usize = 9;
+
+/// 编码 desktop:video 二进制帧。
+pub fn encode_bin_frame(flags: u8, seq: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(BIN_FRAME_HEADER_LEN + payload.len());
+    out.push(flags);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 解码 desktop:video 二进制帧；帧头非法 / `len` 与剩余字节不符 → None
+/// （不 panic，relay 对损坏帧直接丢弃）。
+pub fn decode_bin_frame(bytes: &[u8]) -> Option<(u8, u32, &[u8])> {
+    if bytes.len() < BIN_FRAME_HEADER_LEN {
+        return None;
+    }
+    let flags = bytes[0];
+    let seq = u32::from_le_bytes(bytes[1..5].try_into().ok()?);
+    let len = u32::from_le_bytes(bytes[5..9].try_into().ok()?) as usize;
+    if bytes.len() != BIN_FRAME_HEADER_LEN + len {
+        return None;
+    }
+    Some((flags, seq, &bytes[BIN_FRAME_HEADER_LEN..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +394,54 @@ mod tests {
         assert!(requires_write("desktop:clipboard:set"));
         assert!(requires_write("desktop:quality"));
         assert!(requires_write("unknown:whatever")); // unknown → fail-closed
+    }
+
+    #[test]
+    fn test_bin_frame_roundtrip() {
+        // R5 #41 格式规格：key/delta 帧 roundtrip，seq 边界与空 payload。
+        for flags in [0u8, BIN_FRAME_FLAG_KEY] {
+            let payload = vec![1u8, 2, 3, 4];
+            let bytes = encode_bin_frame(flags, 42, &payload);
+            assert_eq!(bytes.len(), BIN_FRAME_HEADER_LEN + 4);
+            let (f, s, p) = decode_bin_frame(&bytes).unwrap();
+            assert_eq!(f, flags);
+            assert_eq!(s, 42);
+            assert_eq!(p, payload.as_slice());
+        }
+        // seq 边界：0 与 u32::MAX。
+        let b = encode_bin_frame(0, 0, &[]);
+        let (_, s, p) = decode_bin_frame(&b).unwrap();
+        assert_eq!(s, 0);
+        assert!(p.is_empty());
+        let b = encode_bin_frame(0, u32::MAX, b"x");
+        let (_, s, p) = decode_bin_frame(&b).unwrap();
+        assert_eq!(s, u32::MAX);
+        assert_eq!(p, b"x");
+    }
+
+    #[test]
+    fn test_bin_frame_rejects_malformed() {
+        // 拒绝：<9 字节（头不全）、len 与剩余不符（截断/多出）、
+        // len 声称超大但字节不足。
+        assert!(decode_bin_frame(&[]).is_none());
+        assert!(decode_bin_frame(&[0]).is_none());
+        assert!(decode_bin_frame(&[0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        // len=4 但只有 2 个 payload 字节 → 长度不符拒绝。
+        let mut short = encode_bin_frame(0, 1, b"abcd");
+        short.pop();
+        short.pop();
+        assert!(decode_bin_frame(&short).is_none());
+        // len=4 但 payload 多出 1 字节 → 拒绝。
+        let mut extra = encode_bin_frame(0, 1, b"abcd");
+        extra.push(0xff);
+        assert!(decode_bin_frame(&extra).is_none());
+        // 头内 len 被篡改为超大值 → 拒绝（不 panic）。
+        let mut tampered = encode_bin_frame(0, 1, b"ab");
+        tampered[5] = 0xff;
+        tampered[6] = 0xff;
+        tampered[7] = 0xff;
+        tampered[8] = 0x7f;
+        assert!(decode_bin_frame(&tampered).is_none());
     }
 
     #[test]
