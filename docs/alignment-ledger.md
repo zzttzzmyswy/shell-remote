@@ -48,7 +48,7 @@
 
 ### 戊 发布门槛（171-200）
 
-◐ 发布纪律已立（5 轮内不发布，本台账即是）。验收脚本化：4-top 基准（bench_top4.sh 雏形）/弱网矩阵（weaknet_matrix.sh）/长稳 1h ——待补；**重连矩阵已完成**（第 34 轮 `tools/reconnect_matrix.sh` 进程级全过）。
+◐ 发布纪律已立（5 轮内不发布，本台账即是）。验收脚本化：**4-top 基准已完成**（第 38 轮 `tools/bench_top4_verify.sh`——动态画面用 `tools/bench_draw_quad.c` 四象限字符块（本环境 Xvfb 无 misc 字体，xterm/top 起不来），agent X11 捕获 + admin KPI 断言：实测 fps 中值 30.0（动态满帧，铁律"动态不降帧"）+ bitrate 670kbps PASS）；弱网矩阵已有（`weaknet_matrix.sh`）；**重连矩阵已完成**（第 34 轮）；长稳 1h 待补。
 
 ---
 
@@ -223,4 +223,6 @@
   1. relay→agent 背压回传（R5#16）：`DesktopStream::push_frag` 返回本拍被跳过（丢旧）viewer 数；`route_agent_message` desktop:video 分支检测到 drop 并经 `SharedState.last_congest_notify` 限频（≥5s）向 agent 回传 `desktop:congested {dropped}`（仅回 agent，不进 broadcast_types/EventBuffer）；agent `desktop:congested` 分支记录传输段拥塞日志（relay drop 与浏览器段 e2e/dq 互补，不直接改 QoS 决策）。测试 `test_push_frag_reports_congested_drops`（满缓冲报 drop / 腾位恢复）+ `test_desktop_congested_backpressure_to_agent`（20 帧填满 16 缓冲后回传命中），全量 `cargo test` **388 通过**（+2）。顺带核实修正 R4/5 表：丙 crash.log 上报已做（第 24 轮）、丁 TestDelay 探针已做（第 14 轮），统一时间线/重连窗口降质量为仅剩待补。
 - **第 37 轮新增合入**：
   1. 浏览器 30s 判死兜底（R4 乙101-110 错误与恢复）：desktop.js 播放器新增 `_lastDataAt` 看门狗——`_feed(chunk)` 每次视频数据（init/moof/mdat）到达刷新；曾连上（`_gotFirstFrame`）但 30s 无任何数据到达（WS/SSE 半开黑洞、relay 静默卡死）→ 判定连接死亡并 `window.shellRemote.reconnect()`。静止安全：agent 静止时每 4s 一个 IDR 心跳 moof 仍到达，不误判；判死置位防重复，重连失败由 SSE 退避/join 看门狗兜底。**验证**：`node --check` 通过 + `_lastDataAt` 三处引用（初始化/刷新/判死）+ reconnect 入口存在。顺带核实修正 R4/5 A4：agent 侧"丢帧追新"已由 `try_latest`（每拍取最新帧、跳过中间帧）+ 批内丢旧实现，台账过时标"未做"。
+- **第 38 轮新增合入**：
+  1. 4-top 动态基准验收脚本化（R4 戊172 发布门槛）：`tools/bench_top4_verify.sh`——动态画面用 `tools/bench_draw_quad.c`（无字体依赖四象限高速字符块；本环境 Xvfb 无 misc 字体，`bench_top4.sh` 的 xterm/top 起不来）→ relay + agent（X11 捕获，模拟浏览器 `POST /agent/session/send` 发 `desktop:start`，桌面由浏览器命令驱动）→ admin KPI 采样断言。**实测 PASS：fps 中值 30.0（动态满帧，用户铁律"动态内容不降帧"）+ bitrate 670kbps（编码器实际输出）**。附 bench_top4.sh（有字体环境的 xterm 版）保留。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
