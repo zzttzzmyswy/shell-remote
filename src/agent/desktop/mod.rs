@@ -922,10 +922,18 @@ async fn run_desktop_pipeline(
     // desktop:started 上报（浏览器/运维可见远端多屏；X11 实现返回 RANDR
     // 输出，其它后端空）。
     let monitors = src.list_monitors();
+    // R5 #127 内存池：编码循环帧 buffer 池（capture 借出 + 主循环归还环形）。
+    let frame_pool = std::sync::Arc::new(FramePool::new(4));
     // 截图线程化（rustdesk capture 线程对齐）：capture 挪到独立线程持续
     // 抓帧，编码循环 try_latest 非阻塞取最新帧——抓帧（X11/DXGI）不再拖慢
     // 编码，慢抓帧时跳帧追最新。src 被 move 进抓帧线程。
-    let threaded = match capture::ThreadedFrameSource::spawn_with_max_fps(src, cfg.capture_fps) {
+    // R5 #127 第三块：池注入 capture 线程（next_frame 借出 bgra，主循环归还，
+    // 帧 buffer 环形复用）。
+    let threaded = match capture::ThreadedFrameSource::spawn_with_max_fps(
+        src,
+        cfg.capture_fps,
+        Some(frame_pool.clone()),
+    ) {
         Ok(t) => t,
         Err(e) => {
             (post)(serde_json::json!({
@@ -936,10 +944,7 @@ async fn run_desktop_pipeline(
         }
     };
     let (mut w0, mut h0) = threaded.resolution();
-    // R5 #127 内存池第二块：编码循环帧 buffer 池。预分配 2 个 cfg 尺寸
-    // buffer；合成帧（静态 IDR/reqkey）从池借出拷贝、动态帧处理完归还
-    // ——避开高频路径每帧堆分配（capture 侧预分配为后续框架级闭环）。
-    let frame_pool = FramePool::new(4);
+    // R5 #127 启动摊分：预分配 cfg 尺寸 buffer（后续借出复用）。
     frame_pool.prealloc(2, w0 as usize * h0 as usize * 4);
     if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
         (post)(serde_json::json!({

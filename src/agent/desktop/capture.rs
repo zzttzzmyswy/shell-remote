@@ -14,6 +14,7 @@
 //! tries wayland (when a portal is reachable) then X11.
 
 use std::sync::Arc;
+use crate::agent::desktop::FramePool;
 
 /// One captured frame: packed BGRA (little-endian byte order B,G,R,A).
 pub struct Frame {
@@ -48,6 +49,9 @@ pub trait FrameSource: Send {
     fn list_monitors(&self) -> Vec<MonitorInfo> {
         Vec::new()
     }
+    /// R5 #127 捕获侧内存池第三块：注入预分配 buffer 池（next_frame 从池
+    /// 借出 bgra，主循环处理完归还——帧 buffer 环形复用）。默认 no-op。
+    fn attach_pool(&mut self, _pool: std::sync::Arc<FramePool>) {}
 }
 
 /// Open a capture source. `kind` is one of `auto`, `x11`, `wayland`,
@@ -169,7 +173,7 @@ pub struct ThreadedFrameSource {
 impl ThreadedFrameSource {
     /// 启动抓帧线程，不限速（等价 `spawn_with_max_fps(inner, 0)`）。
     pub fn spawn(mut inner: Box<dyn FrameSource>) -> Result<Self, String> {
-        Self::spawn_with_max_fps(inner, 0.0)
+        Self::spawn_with_max_fps(inner, 0.0, None)
     }
 
     /// 启动抓帧线程。`inner` 被 move 进线程（不再可从外部访问）。
@@ -178,9 +182,14 @@ impl ThreadedFrameSource {
     pub fn spawn_with_max_fps(
         mut inner: Box<dyn FrameSource>,
         max_fps: f64,
+        pool: Option<std::sync::Arc<FramePool>>,
     ) -> Result<Self, String> {
         use std::sync::atomic::Ordering as O;
         let (width, height) = inner.resolution();
+        // R5 #127 捕获侧池：注入线程内 capture（next_frame 从池借出）。
+        if let Some(p) = &pool {
+            inner.attach_pool(p.clone());
+        }
         let latest = Arc::new(std::sync::Mutex::new(None));
         let err_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let last_err = Arc::new(std::sync::Mutex::new(None));
@@ -337,6 +346,8 @@ pub struct X11Source {
     /// 每 N 帧重查一次 root geometry（display 分辨率运行时变更检测，
     /// rustdesk `Rect`/HotPlug 对齐）。X setup 缓存不反映 xrandr 变更。
     recheck: u32,
+    /// R5 #127 捕获侧内存池：bgra 借出池（next_frame 复用归还 buffer）。
+    pool: Option<std::sync::Arc<FramePool>>,
     /// 是否已注册 XRANDR ScreenChangeNotify（R5#131 分辨率事件驱动）。
     /// 注册后 `next_frame` 用 `poll_for_event` 读事件——只有真变更才触发
     /// 重建，替代固定 30 帧一次的 `get_geometry` 轮询往返。
@@ -403,6 +414,7 @@ impl X11Source {
             composite: None,
             shm: None,
             shm_failed: false,
+            pool: None,
             recheck: 0,
             randr_registered: false,
             cursor_cb: None,
@@ -602,7 +614,7 @@ impl X11Source {
             .reply()
             .map_err(|e| format!("get_image reply: {e}"))?;
         let depth = if reply.depth > 0 { reply.depth } else { self.depth };
-        Self::bgra_from_pixels(&reply.data, depth, self.width as usize, self.height as usize, &self.conn)
+        Self::bgra_from_pixels(&reply.data, depth, self.width as usize, self.height as usize, &self.conn, self.pool.as_ref())
     }
 
     /// `ShmGetImage` on the *current root* — the server writes the pixels
@@ -629,7 +641,7 @@ impl X11Source {
         // mapped until `teardown_shm`/`Drop`; the `ShmGetImage` reply above
         // guarantees the server has finished writing `size` bytes.
         let data = unsafe { std::slice::from_raw_parts(s.ptr, s.size) };
-        Self::bgra_from_pixels(data, self.depth, self.width as usize, self.height as usize, &self.conn)
+        Self::bgra_from_pixels(data, self.depth, self.width as usize, self.height as usize, &self.conn, self.pool.as_ref())
     }
 
     /// Normalize a raw X11 pixel buffer (depth 24/32, server byte order) into
@@ -645,6 +657,7 @@ impl X11Source {
         w: usize,
         h: usize,
         conn: &x11rb::rust_connection::RustConnection,
+        pool: Option<&Arc<FramePool>>,
     ) -> Result<Vec<u8>, String> {
         use x11rb::connection::Connection as _;
         use x11rb::image::{BitsPerPixel, Image, ImageOrder, ScanlinePad};
@@ -685,7 +698,11 @@ impl X11Source {
             _ => (w as usize) * 4,
         };
         let data = native.data();
-        let mut bgra = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        // R5 #127 捕获侧池：有池则借出复用 buffer（主循环归还），否则自分配。
+        let mut bgra = match pool {
+            Some(p) => p.acquire((w as usize) * (h as usize) * 4),
+            None => Vec::with_capacity((w as usize) * (h as usize) * 4),
+        };
         for row in 0..h as usize {
             let start = row * stride;
             let end = (start + w as usize * 4).min(data.len());
@@ -709,6 +726,9 @@ impl X11Source {
 
 #[cfg(not(windows))]
 impl FrameSource for X11Source {
+    fn attach_pool(&mut self, pool: std::sync::Arc<FramePool>) {
+        self.pool = Some(pool);
+    }
     fn resolution(&self) -> (usize, usize) {
         (self.width as usize, self.height as usize)
     }
@@ -1333,7 +1353,7 @@ mod tests {
     fn test_threaded_source_max_fps_throttles() {
         let src: Box<dyn FrameSource> = Box::new(CounterSource { w: 8, h: 8, t: 0 });
         // max_fps=20 → 50ms 间隔；1s 窗口应 ~20 帧（远小于全速数百）。
-        let ts = ThreadedFrameSource::spawn_with_max_fps(src, 20.0).unwrap();
+        let ts = ThreadedFrameSource::spawn_with_max_fps(src, 20.0, None).unwrap();
         // 等首帧（拿到后首帧即被消费，不计入限速统计）。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut first = None;
