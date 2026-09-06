@@ -40,7 +40,7 @@
 
 ### 丙 遥测（111-140）
 
-⬜ 全部未做。统一时间线／13s 归因决策树／QoS 快照／admin KPI 曲线／带宽记账／评分卡汇总 等，均在后台批次 5（见 R5 清单）。
+◐ 部分。QoS 快照结构化日志（R5#149）、心跳扩展 KPI（#150）、relay 带宽记账（#152）、评分卡脚本（#155）已有；**admin KPI 曲线已做**（第 16 轮：relay 采样 agent 心跳 KPI——15s×120 点 FIFO，`/api/session/kpi/:sid` 时间序列 + admin 面板 📈 canvas 折线 fps/bitrate）。统一时间线／13s 归因决策树／crash.log 上报 未做。
 
 ### 丁 弱网纵深（141-170）
 
@@ -146,7 +146,7 @@
 
 ### 批次 5 · 测试与遥测（147-167）
 
-◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做。统一时间线/13s 决策树/admin KPI 曲线/crash.log 上报/告警未做。
+◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做；**admin KPI 曲线已做**（第 16 轮：`route_agent_message` 宽松 JSON 拦截 ping 心跳（真实 ping 缺 payload 字段，严格 ProtoMessage 解析失败）→ 采样 KPI 进 `SharedState.kpi_history` 15s×120 FIFO → `/api/session/kpi/:sid` 时间序列 → admin 面板 📈 canvas 折线，测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`）。统一时间线/13s 决策树/crash.log 上报/告警未做。
 
 ### 批次 6 · 风险与回滚（168-177）
 
@@ -160,8 +160,8 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **54%**（甲 帧率/IDR/RTT分带/TestDelay探针、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 21%（丙遥测剩余、戊发布门槛）；◐ 25%。
-- **R5 落地清单（200 点）**：✔ 类约 **59%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 8 项 / TestDelay 探针 1 项）；⬜ 27%。
+- **R4/5（200 点）**：✔ 类约 **55%**（甲 帧率/IDR/RTT分带/TestDelay探针、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 25%。
+- **R5 落地清单（200 点）**：✔ 类约 **61%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 9 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项）；⬜ 26%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -169,4 +169,6 @@
 - **第 15 轮新增合入**：
   1. 编码器故障热备（`mod.rs next_degrade_codec` + `rebuild_encoder_degrade`）：统一 #84 慢帧 / #85 encode-Err 降级出口——encode 连续 5 帧返回 Err（编码器故障/崩溃，区别于 #84 慢帧）自动重建为 fallback 链下一档（av1→vp9→h264），mp4_cfg 置 None + force_idr 重发 init；测试 `test_next_degrade_codec_trigger`（阈值/降档/一次性/末档 7 断言）→ R2 乙77 / R5#85。
   2. 台账修正：**#89 CBR 纪律此前已做**（`aom.rs:111 AOM_CBR` + `vpx.rs:91 VPX_CBR` + undershoot/overshoot 50% + KF_DISABLED 外部 force_idr）——上轮台账误标未做，本轮代码级核实后标 ✔。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、admin KPI 曲线、光标独立通道、独立 100ms ack 批、AV1 测速门槛、质量 250ms 反馈等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **第 16 轮新增合入**：
+  1. admin KPI 曲线（R5 丙111/140 部分）：relay 用宽松 JSON 拦截 agent 心跳 `ping`（真实心跳缺 payload 字段，严格 ProtoMessage 解析会失败——此为采样触发前的关键前提）→ 采样心跳 KPI 进 `SharedState.kpi_history`（15s×120 FIFO）→ admin `/api/session/kpi/:sid` 返回时间序列 → admin 面板 Sessions 表 📈 按钮展开行内 canvas 折线（fps 蓝 / bitrate 绿）。测试 `test_route_agent_message_samples_ping_kpi`/`test_kpi_history_caps_and_drops_oldest`。**浏览器实测**：桌面开启后 KPI API 13 样本、6 个 running=true、bitrate>0；admin 📈 点击展开 canvas 曲线已绘制。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、光标独立通道、独立 100ms ack 批、AV1 测速门槛、质量 250ms 反馈等——在台账对应 ⬜/◐ 行，未宣称完成。
