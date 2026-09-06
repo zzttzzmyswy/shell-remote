@@ -256,6 +256,8 @@
   1. capability 协商最小子集（R5#44 老版本兼容/capability）：agent 注册消息带 **`capabilities`** 数组（`codec:av1/vp9/h264`、`backend:x11/wayland/gdi/dxgi`、`desktop:gray/quality/clipboard/cursor/test-delay` 声明）→ relay `SessionInfo.capabilities` + `update_capabilities`/`get_capabilities`（会话不存在静默）→ admin overview 每会话显示 `capabilities`——老版本 agent 不带保持空，浏览器可据此能力协商。测试 `test_register_capabilities_roundtrip`（未声明空 / update-get 往返一致）。全量 `cargo test` **397 通过**（+1）。
 - **第 52 轮新增合入**：
   1. 逐帧 binary 头 JSON 子集（R5#41 部分）：desktop:video frag 消息带 **消息级 `seq`**（递增帧号，与 fMP4 moof 内 seqn 同步）+ **`flags`**（key/delta）——"逐帧 binary+头{len,seq,flags}"的 JSON 等价（len 由消息长度隐含），未来 binary 化时可同构迁移；浏览器按需解析、向后兼容。测试：`pipeline_static_desktop_spaces_out_keyframes` 增断言（frag 携带 seq 数字 + flags="key"）。全量 `cargo test` **397 通过**（无新增测试数，既有 pipeline 测试断言扩展）。
+- **第 54 轮综合 review**：
+  1. 全量验收矩阵重验当前 master（用户铁律交叉验证）：① **重连矩阵**（`tools/reconnect_matrix.sh`）8 场景全过（agent 崩溃重启续接 / relay 重启退避重连 / 连续 flap 幂等）；② **4-top 动态基准**（`tools/bench_top4_verify.sh`）PASS——fps 中值 30.0 满帧、bitrate 670kbps（**动态内容不降帧**铁律实测成立）；③ **长稳短跑**（`tools/stability_verify.sh 60`）PASS——4 样本无重连、RSS 末两点 +0%（无泄漏）、fps 30.0（**降质不降帧** + 稳定）。全量 `cargo test` 398 已在此前通过。R5 ✔ 类 99% 保持（可合入项闭合，剩余 ⬜ 架构/平台级远期）。
 - **第 53 轮新增合入**：
   1. relay 二进制直转观察性子集（R5#43）：relay `SharedState.desktop_proto` 每会话累计 desktop:video base64 编码字节 / 解码字节——量化 JSON 协议膨胀（base64 ≈33%），为二进制直转（binary 化）决策提供 ROI 数据。测试 `test_desktop_protocol_overhead_stats`（"AQID"=4 字符编码 → 3 字节解码 × 2）。全量 `cargo test` **398 通过**（+1）。收口核实：R5 剩余 ⬜ 全为架构级/平台级远期（#41 binary 传输 / #43 直转 / #14 混合通道 / #36-38 KCP / Windows DXGI/GDI / Wayland / SIMD / 批次7），可合入项闭合。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
