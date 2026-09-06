@@ -123,6 +123,7 @@ async fn sender_loop(
                         "encode_ms": k.encode_ms,
                         "active": k.active,
                         "bp_count": k.bp_count,
+                        "rss_kb": self_rss_kb(),
                     });
                 }
                 let ping = ping.to_string();
@@ -131,6 +132,17 @@ async fn sender_loop(
         }
     }
     flush_output(&client, &send_url, &session_id, &mut pending).await;
+}
+
+/// 当前进程 RSS（KB）。读 `/proc/self/statm` 第 2 字段（resident pages）
+/// × 4KB 页。非 Linux 回退 0（心跳 rss_kb 缺省）。用于 admin KPI 的
+/// "agent 内存画像"时间线（R5#136-146 内存画像最小子集）。
+fn self_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        .map(|pages| pages * 4)
+        .unwrap_or(0)
 }
 
 async fn flush_output(
@@ -1986,6 +1998,14 @@ async fn execute_command(cmd: &str, timeout_ms: u64, shell: &str) -> (String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_self_rss_kb_reports_positive() {
+        // R5#136-146 内存画像最小子集：Linux 下 /proc/self/statm 必然给出
+        // 非零 RSS（本测试进程占内存）。
+        let rss = self_rss_kb();
+        assert!(rss > 0, "self_rss_kb must be >0 on Linux, got {rss}");
+    }
 
     #[test]
     fn test_download_chunk_payload_is_last_flag() {

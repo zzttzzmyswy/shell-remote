@@ -127,6 +127,9 @@ pub struct AgentKpiSample {
     /// relay→浏览器 fan-out 拥塞累计次数（agent 心跳快照，R5#16）：admin KPI
     /// 可观测传输段拥塞时间线。
     pub bp_count: u32,
+    /// agent 进程 RSS（KB，`/proc/self/statm`）。admin KPI 可观测 agent 内存
+    /// 画像时间线（R5#136-146 内存画像最小子集，长稳验收的 RSS 判据旁证）。
+    pub rss_kb: u64,
 }
 
 /// KPI 历史窗口长度：agent 心跳 15s × 120 = 30min。
