@@ -49,6 +49,9 @@ pub struct DesktopConfig {
     pub codec: String,
     /// Nominal encode frame rate.
     pub fps: f64,
+    /// 抓帧独立上限（fps，R3 乙83 / R5#135）。0 = 不限制（默认，动态时
+    /// 全速抓帧由编码 min_gap 跳帧）。设值则动态桌面抓帧也按此节流。
+    pub capture_fps: f64,
     /// Adaptive bitrate bounds in bps (user request: 800 / 200 → kbps).
     pub min_bps: u64,
     pub max_bps: u64,
@@ -69,6 +72,7 @@ impl Default for DesktopConfig {
             // 30fps 减一半编码负载，时延显著优于 60fps，流畅度损失小。
             // 需要更高帧率用 --desktop-fps 显式指定。
             fps: 30.0,
+            capture_fps: 0.0, // 0 = 抓帧不限速（编码 min_gap 跳帧兜底）
             // 静态桌面 ~80k 足够 (openh264 实测 84k 满帧); 动态由 ABR 拉回
             min_bps: 80_000,
             // 0 = 自动按 rustdesk 模型（base_bitrate × quality，1080p balanced
@@ -646,7 +650,7 @@ async fn run_desktop_pipeline(
     // 截图线程化（rustdesk capture 线程对齐）：capture 挪到独立线程持续
     // 抓帧，编码循环 try_latest 非阻塞取最新帧——抓帧（X11/DXGI）不再拖慢
     // 编码，慢抓帧时跳帧追最新。src 被 move 进抓帧线程。
-    let threaded = match capture::ThreadedFrameSource::spawn(src) {
+    let threaded = match capture::ThreadedFrameSource::spawn_with_max_fps(src, cfg.capture_fps) {
         Ok(t) => t,
         Err(e) => {
             (post)(serde_json::json!({
@@ -801,9 +805,33 @@ async fn run_desktop_pipeline(
                 if ec > 0 {
                     // 持续性捕获失败（例如 XWayland 下 root GetImage 抛 BadMatch、
                     // Windows 屏幕 DC 失效）。无限重试只会刷屏且永远黑屏。
-                    // 连续失败 MAX_CAPTURE_ERRORS 次后终止, 并把原因回传
-                    // 给浏览器展示。
-                    if ec >= MAX_CAPTURE_ERRORS {
+                    //
+                    // #130 对齐 rustdesk"黑屏 ≤2s 即报错"语义：
+                    // - 首帧前失败（frame_idx==0）：没有可回退的画面，重试无意义，
+                    //   立即终止并回传（浏览器秒级看到原因，而不是黑屏 150 次）；
+                    // - 首帧后失败：首次失败即发 desktop:error 通知（浏览器即时
+                    //   看到"捕获异常重试中"），但保留重试窗口（150 次 ≈ 10s，
+                    //   Windows GDI 锁屏/安全桌面 DC 失效需重建上下文自愈）——
+                    //   这是瞬时失效与持续失效的区分：通知即时、终止延后。
+                    if frame_idx == 0 {
+                        tracing::error!("desktop capture failed before first frame — giving up immediately");
+                        let e = threaded.last_err().unwrap_or_else(|| "capture failed".to_string());
+                        (post)(serde_json::json!({
+                            "type": "desktop:error",
+                            "payload": { "error": format!("capture failed before first frame: {e}") }
+                        }));
+                        break;
+                    }
+                    if ec == 1 {
+                        // 首帧已出：首次失败立即通知浏览器（黑屏可见化），
+                        // 不干等 150 次重试才报错。
+                        let e = threaded.last_err().unwrap_or_else(|| "capture failed".to_string());
+                        tracing::warn!("desktop capture error (retrying): {e}");
+                        (post)(serde_json::json!({
+                            "type": "desktop:error",
+                            "payload": { "error": format!("capture error, retrying: {e}") }
+                        }));
+                    } else if ec >= MAX_CAPTURE_ERRORS {
                         tracing::error!("desktop capture failed {ec} frames in a row — giving up");
                         let e = threaded.last_err().unwrap_or_else(|| "capture failed".to_string());
                         (post)(serde_json::json!({

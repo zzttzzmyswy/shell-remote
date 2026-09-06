@@ -141,6 +141,13 @@ enum Command {
         #[arg(long, default_value_t = 30.0)]
         desktop_fps: f64,
 
+        /// 抓帧独立上限（fps，R3 乙83 / R5#135）：限制 capture 线程产帧率，
+        /// 与编码 fps 解耦。0 = 不限制（默认，动态时全速抓帧由编码 min_gap
+        /// 跳帧）。设值则动态桌面抓帧也按此节流（省 X/DXGI 往返，低配 CPU
+        /// 友好）。静止桌面仍走 would-block 退避，不受此参数影响。
+        #[arg(long, default_value_t = 0.0)]
+        desktop_capture_fps: f64,
+
         /// Maximum encode bitrate in kbps. 0 = 自动按 rustdesk 模型
         /// （base_bitrate(分辨率) × 质量档，1080p balanced ≈1388kbps）。
         /// 显式设值则作为硬顶（向 rustdesk 配置靠拢, MYS-886）。
@@ -254,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
             desktop_capture,
             desktop_codec,
             desktop_fps,
+            desktop_capture_fps,
             desktop_max_bitrate,
             desktop_quality,
             desktop_min_bitrate,
@@ -274,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
                 capture: desktop_capture,
                 codec: desktop_codec,
                 fps: desktop_fps,
+                capture_fps: desktop_capture_fps,
                 min_bps: desktop_min_bitrate * 1000,
                 max_bps: desktop_max_bitrate * 1000,
                 quality: match desktop_quality.as_str() {

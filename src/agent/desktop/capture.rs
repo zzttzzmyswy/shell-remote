@@ -144,8 +144,18 @@ pub struct ThreadedFrameSource {
 }
 
 impl ThreadedFrameSource {
-    /// 启动抓帧线程。`inner` 被 move 进线程（不再可从外部访问）。
+    /// 启动抓帧线程，不限速（等价 `spawn_with_max_fps(inner, 0)`）。
     pub fn spawn(mut inner: Box<dyn FrameSource>) -> Result<Self, String> {
+        Self::spawn_with_max_fps(inner, 0.0)
+    }
+
+    /// 启动抓帧线程。`inner` 被 move 进线程（不再可从外部访问）。
+    /// `max_fps` > 0 时限制**动态**产帧率（静态仍走 would-block 退避；
+    /// R5#135 抓帧独立上限，与编码 fps 解耦）。
+    pub fn spawn_with_max_fps(
+        mut inner: Box<dyn FrameSource>,
+        max_fps: f64,
+    ) -> Result<Self, String> {
         use std::sync::atomic::Ordering as O;
         let (width, height) = inner.resolution();
         let latest = Arc::new(std::sync::Mutex::new(None));
@@ -199,6 +209,11 @@ impl ThreadedFrameSource {
                     //   （waiting-on-change 抓帧语义，R3 乙57/82）。
                     if same {
                         std::thread::sleep(std::time::Duration::from_millis(100));
+                    } else if max_fps > 0.0 {
+                        // 抓帧独立上限（R5#135）：动态也按 max_fps 节流，
+                        // 省 X/DXGI 往返（低配 CPU 友好）。1/0 防除零。
+                        let interval = (1000.0 / max_fps).max(1.0) as u64;
+                        std::thread::sleep(std::time::Duration::from_millis(interval));
                     } else {
                         std::thread::yield_now();
                     }
@@ -1168,6 +1183,42 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(got >= 3, "must keep yielding frames, got {got}");
+    }
+
+    /// #135 抓帧独立上限：动态源 + max_fps 应把产帧率压到 ~max_fps，
+    /// 而不是全速（对齐 R3 乙83）。验证限速真实生效（1s 窗口产帧数
+    /// 显著小于全速，且大致 ≈ max_fps × 1s）。
+    #[test]
+    fn test_threaded_source_max_fps_throttles() {
+        let src: Box<dyn FrameSource> = Box::new(CounterSource { w: 8, h: 8, t: 0 });
+        // max_fps=20 → 50ms 间隔；1s 窗口应 ~20 帧（远小于全速数百）。
+        let ts = ThreadedFrameSource::spawn_with_max_fps(src, 20.0).unwrap();
+        // 等首帧（拿到后首帧即被消费，不计入限速统计）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut first = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(f) = ts.try_latest() {
+                first = Some(f);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(first.is_some(), "throttled source must still produce");
+        // 统计 1.1s 内的可取帧数。
+        let mut got = 0u32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1100);
+        while std::time::Instant::now() < deadline {
+            if ts.try_latest().is_some() {
+                got += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // 20fps × 1.1s ≈ 22 帧；允许 ±调度抖动（15..40）。
+        assert!(
+            (15..=45).contains(&got),
+            "max_fps=20 must throttle capture to ~20fps, got {got} frames in 1.1s"
+        );
+        drop(ts);
     }
 
     /// 静止退避（R3 乙57/82 对齐）：画面恒定的源 → 抓帧线程应退避 sleep 控制
