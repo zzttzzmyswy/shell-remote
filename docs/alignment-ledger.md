@@ -21,9 +21,9 @@
 
 | # | 点 | 状态 | 证据 |
 |---|---|---|---|
-| 1-5 | A0 五态定义 | ◐ | 内容驱动 fps 已实现（静态/动态/背压），无完整五态对象；见 mod.rs:1058-1082 |
+| 1-5 | A0 五态定义 | ◐ | 内容驱动 fps 已实现（静态/动态/背压）；**五态对象已做**（第 19 轮：`QosQualityState` Unknown/Good/Medium/Degraded/Critical，probe 中值+over 推导、迁移日志、qos-ack 回传、面板状态行，实测 Unknown→Good）；决策仍由内容活动+over 判据驱动，状态为观测快照 |
 | 6-15 | A1 输入信号 | ◐ | 熵/上行队列/解码背压/时钟均已进 on_delay；**TestDelay 探针已做**（第 14 轮：浏览器 1s 单调时钟探测包 → agent 即时 echo → 纯网络层 RTT，probe_ms 随 qos 上报并作拥塞证实——网络健康而 e2e 高判定为管线积压不降码率） |
-| 16-30 | A2 质量控制器 | ◐ | 码率档三档+灰度+quality 连续在 QosAdaptive；250ms 质量反馈状态机未做 |
+| 16-30 | A2 质量控制器 | ◐ | 码率档三档+灰度+quality 连续在 QosAdaptive；**250ms 质量反馈状态机已做**（第 19 轮：五态由 250ms qos 上报驱动、迁移日志、面板状态行） |
 | 31-45 | A3 帧率控制器 | ✔ | 内容驱动（静态 1fps/动态满帧/背压 24→15）mod.rs:1058-1082 + QoS 单测 8 项 |
 | 46-55 | A4 丢帧控制器 | ◐ | 浏览器丢旧+seq gap 统计已实现（desktop.js）；agent 侧"质量到底丢帧追新"未做 |
 | 56-60 | A5 IDR 控制器 | ✔ | 活跃 6s/静止 4s/reqkey 即时/首帧强制已有（mod.rs:535 等），QP 保护未单测 |
@@ -160,8 +160,8 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **56%**（甲 帧率/IDR/RTT分带/TestDelay探针、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 24%。
-- **R5 落地清单（200 点）**：✔ 类约 **65%**（可靠通道 11 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 9 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项）；⬜ 23%。
+- **R4/5（200 点）**：✔ 类约 **57%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 23%。
+- **R5 落地清单（200 点）**：✔ 类约 **67%**（可靠通道 11 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 9 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 22%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -176,4 +176,6 @@
   2. 台账修正：**#28 20s WS ping 已做**（`handle_agent_ws_uplink` 每 20s server-side ping，agent 死链 ~35s 检出），此前误标 ◐，代码级核实后标 ✔。
 - **第 18 轮新增合入**：
   1. 光标独立通道（`capture.rs poll_cursor` + `FrameSource::set_cursor_cb` + `desktop:cursor` + `web/desktop.js updateCursor`）：**X11 `GetImage`/`ShmGetImage` 不含光标层——远程用户看不到鼠标指针是真实缺口**。agent 捕获线程 `next_frame` 内 100ms 节流 `XQueryPointer` → 位置经 `cursor_cb` → `desktop:cursor {x,y,shown}` 轻量消息（光标移动不触发整帧重编码）→ relay broadcast_types/KNOWN 白名单 → 浏览器 `.sr-cursor-overlay`（内联 SVG 箭头 + 捕获分辨率→显示尺寸映射）。**浏览器实测**：overlay 出现在屏幕中心（638,342≈640,360）、注入鼠标移动到 (300,200)/(600,450) 后 overlay 跟随到 (299,190)/(598,428)。另确认 enigo 注入需 DISPLAY 环境（测试环境未设导致注入失败，非代码 bug）→ R4 乙81-90 / R5#64。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、独立 100ms ack 批、AV1 测速门槛、质量 250ms 反馈等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **第 19 轮新增合入**：
+  1. QoS 五态质量状态机（`mod.rs QosQualityState` Unknown/Good/Medium/Degraded/Critical + `QosAdaptive::update_quality_state`）：由网络层 probe 中值 + 拥塞增量 over 推导的**显式状态对象**（rustdesk QualityStatus 同构），每次 250ms qos 采样更新；迁移记日志（实测 `from=Unknown to=Good probe_ms=20 over=0`）；`qos-ack` 回传 `qos_state` → 浏览器面板"QoS 状态"行（Good 绿/Medium 黄/Degraded 橙/Critical 红）。测试 `test_qos_quality_state_transitions`（五态迁移 + 恢复）、`test_qos_quality_state_without_probe`（无探针靠 over）。**浏览器实测**：面板显示 Good + 绿色、agent 日志快照含 `qos_state=Good`。状态为观测快照、不影响 fps/ratio 决策（决策测试全绿）→ R4 甲 A0 / A2。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
