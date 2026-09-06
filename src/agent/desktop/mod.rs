@@ -760,6 +760,9 @@ async fn run_desktop_pipeline(
     let mut encode_degraded = false;
     const SLOW_ENCODE_MS: f64 = 66.0;
     const SLOW_ENCODE_TRIGGER: u32 = 10;
+    // moof 复用 muxer（R5#45）：tfhd 模板缓存，每帧只重建变化部分，
+    // 减少高频路径的 moof 构建分配。
+    let muxer = mp4::Mp4Muxer::new();
 
     while running.load(Ordering::SeqCst) {
         let cur_fps = fps_ctl.load(Ordering::SeqCst).clamp(1, 60);
@@ -1051,7 +1054,7 @@ async fn run_desktop_pipeline(
         };
         // capture_ms 已在捕获后、编码前取（见上方赋值处）——srtc 携带的是
         // 含编码全程的起点。
-        let frag = mp4::mp4_fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq, capture_ms);
+        let frag = muxer.fragment(cfg_mp4, &sample, pts_ms, encoded.is_idr, seq, capture_ms);
         seq += 1;
         pts_ms += frame_ms; // 只有真实 POST 的帧推进 fMP4 时间线
         post(serde_json::json!({
