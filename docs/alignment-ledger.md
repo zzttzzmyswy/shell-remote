@@ -93,7 +93,7 @@
 | 33 | 输入 10ms 合并节流 | ✔ | mousemove 10ms 合并最后坐标（desktop.js:_onPointerMove，与 #34 叠加） |
 | 34 | 弱网输入降采样 | ✔ | e2e>300ms 2:1 / >800ms 4:1（desktop.js:_onPointerMove） |
 | 35 | 弱网控制消息直通 | ✔ | 已由组合覆盖：#29 控制消息非 lossy 优先 + #15 独立有界控制 channel + #2 命令 ack（seq+确认）+ #33/#34 输入节流/降采样——弱网下控制消息不被数据挤掉且可确认；第 29 轮核实修正 |
-| 36-38 | KCP/白名单/IPv6 | ⬜ | 远期 |
+| 36-38 | KCP/白名单/IPv6 | ◐ | **IPv6 子集已核实闭环**（第 62 轮：relay `--bind "[::1]:port"`（`TcpListener::bind` 直传 tokio 天然支持 IPv6）→ agent `--relay-url http://[::1]:port` 注册会话 → 模拟浏览器 desktop:start → 桌面视频数据经 IPv6 回流 KPI（fps 中值 30.0 满帧、bitrate 670kbps——动态不降帧铁律在 IPv6 通道同样成立）；验收脚本 `tools/ipv6_verify.sh`（`bash -n` + 本机 IPv6 loopback 前置检查 + 全链路断言）PASS 固化。**KCP（UDP 拥塞控制替换 WS/TCP）与白名单仍远期**（大架构改动）；白名单部分受 #22 WS/HTTP 限流等价（第 17 轮）覆盖 |
 | 39 | 多会话隔离压测 | ✔ | 第 31 轮：`tools/multi_session_isolation.sh`——同 relay 并行 N 个独立 agent（各自 `--key`+`--session-id`，`--desktop-capture none`），验证注册/共存/隔离（会话数+在线数+心跳互不干扰）；实测 3 agent 3/3 注册、overview 3 会话 3 在线 PASS |
 | 40 | 批次验收：重连矩阵 | ✔ | 第 34 轮：`tools/reconnect_matrix.sh`（进程级重连矩阵，不依赖浏览器）——三破坏源：agent 崩溃重启（kill -9 → 同 key/session 重启 → register_existing 续接）、relay 重启（agent 退避 60s 上限自动重连）、连续 flap（幂等替换）；验证点 = admin overview `agent_online` + agent 日志 session established。实测 **8/8 场景全过**（relay 重启恢复、agent 重启续接、flap 稳定） |
 
@@ -160,7 +160,7 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 61 轮合计实（像素转换 SIMD 子集已做，R5 99% 保持）。
+- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 62 轮合计实（IPv6 子集核实闭环，R5 99% 保持）。
 - **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
@@ -266,6 +266,8 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 62 轮新增合入**：
+  1. IPv6 全链路核实闭环（R5 #38 KCP/白名单/IPv6 的 IPv6 子集）：**验证型合入**——确认 relay/agent 的 IPv6 支持由 tokio 天然提供（`TcpListener::bind(&"[::1]:port")` 直接监听 IPv6、agent `--relay-url http://[::1]:port` 直连），无代码缺陷。**交付验收脚本 `tools/ipv6_verify.sh`**（`bash -n` + 本机 IPv6 loopback 前置检查 + relay bind [::1] HTTP 200 + agent IPv6 注册会话 + 模拟浏览器 desktop:start + KPI 采样断言 fps≥15 且 bitrate>0）。**实测**：relay 监听 `[::1]`、agent 注册成功、桌面流经 IPv6 启动、fps 中值 30.0 满帧 / bitrate 670kbps——动态不降帧铁律在 IPv6 通道同样成立。KCP（UDP 拥塞控制替换 WS/TCP）与白名单本体仍远期（白名单部分受 #22 WS/HTTP 限流等价覆盖）。
 - **第 61 轮新增合入**：
   1. 像素转换 SIMD 最小可验证子集（R5 #127-128 行拷贝/像素转换 SIMD 部分）：`color.rs` BGRA→I420 重构为 Y 平面标量/SSSE3-SSE4.1 内核 + U/V 标量。SIMD 内核每拍 4 像素——`_mm_shuffle_epi8` 按 BGRA 布局提取 B/G/R 通道（小端 i32 视图即 [c0,c1,c2,c3]）、`_mm_mullo_epi32` + 加法合 Y 分子、`+128 >> 8 + 16`、`_mm_min/max_epi32` clamp、`_mm_packus_epi32`/`_mm_packus_epi16` 两次饱和打包、`write_unaligned` 非对齐写（行起始可能非 4 对齐）；行尾 <4 像素保持标量补齐。`bgra_to_i420_with_matrix` 运行时 `is_x86_feature_detected!("sse4.1")` dispatch，非 x86/无特性回退标量。**验证**：新增 4 单测强制 SIMD 与标量参考逐字节一致（BT.601/BT.709、padding stride、w=10/14 非 4 倍数尾部、全白/全黑/全 A=0 极端）；全量 `cargo test` **406 通过**（+4）；`simd_bench_1080p`（`#[ignore]` 手动）1080p 转换 **4.30ms vs 标量 8.03ms = 1.9x**；端到端 `tools/bench_top4_verify.sh` PASS（fps 中值 30.0 满帧、bitrate 670kbps——SIMD 转换在真实编码管线输出正常，动态不降帧铁律保持）。
 - **第 60 轮新增合入**：
