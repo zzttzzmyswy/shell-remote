@@ -595,6 +595,9 @@ pub async fn start(
     // Tokens obtained on the first successful registration; replayed on every
     // reconnect so the relay reuses them instead of minting new random ones.
     let mut cached_tokens: Option<Vec<(String, String)>> = None;
+    // R5#11 会话级桌面状态：relay 重启/断线后自动恢复桌面流（跨 run_session
+    // 重连传递"上次桌面是否在跑"）。
+    let mut desktop_want_running = false;
 
     loop {
         match run_session(
@@ -607,6 +610,7 @@ pub async fn start(
             &mut cached_tokens,
             &desktop_cfg,
             insecure_tls,
+            &mut desktop_want_running,
         )
         .await
         {
@@ -632,6 +636,10 @@ async fn run_session(
     cached_tokens: &mut Option<Vec<(String, String)>>,
     desktop_cfg: &crate::agent::desktop::DesktopConfig,
     insecure_tls: bool,
+    // R5#11 会话级桌面状态：进入时若为 true（上次断线前桌面在跑）→ 自动
+    // 恢复桌面流；退出时回写当前状态并停掉旧流（防孤儿 task 继续向已失效
+    // 的 relay 连接发帧）。
+    desktop_want_running: &mut bool,
 ) -> anyhow::Result<()> {
     // Validate the root directory BEFORE registering with the relay. A bad
     // root must fail fast without minting a session — otherwise the relay
@@ -980,6 +988,14 @@ async fn run_session(
         let _ = post_tx.send(msg); // unbounded: 不会失败, 由 consumer 批内丢旧
         tracing::trace!("post_fn queued {t}");
     });
+
+    // R5#11 会话恢复：上次断线前桌面在跑 → 重连后自动恢复桌面流（新
+    // send_url 的 post_fn；start 的首帧强制 IDR 会重发 init 给 relay 新建的
+    // DesktopStream——否则 relay 重启后 viewer 拿不到参数集黑屏）。
+    if *desktop_want_running && desktop_cfg.enabled() {
+        tracing::warn!("reconnected with desktop previously running — auto-restoring desktop stream");
+        desktop.start(post_fn.clone()).await;
+    }
 
     let exec_sessions = crate::agent::exec_sessions::ExecSessionManager::new();
 
@@ -1800,6 +1816,16 @@ async fn run_session(
 
     exec_sessions.shutdown_all().await;
     tabs.clear(); // Drop all tabs - shells kill child processes via Drop
+
+    // R5#11 会话退出：记录桌面是否在跑（供重连恢复），并停止当前流——
+    // run_desktop_loop 是 tokio::spawn 的孤儿 task（desktop drop 不停它），
+    // 不显式 stop 会继续向已失效的 relay 连接发帧（浪费 CPU + 重连后与
+    // 新流双发冲突）。
+    *desktop_want_running = desktop.is_running();
+    if desktop.is_running() {
+        tracing::warn!("session ending with desktop running — stopping stream for reconnect recovery");
+        desktop.stop(post_fn.clone()).await;
+    }
 
     // Tokens were already cached into `cached_tokens` right after registration,
     // so `start` can replay them on reconnect — nothing to return here.
