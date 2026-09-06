@@ -345,22 +345,6 @@ fn stsd(cfg: &Mp4Config) -> Vec<u8> {
     full_box(b"stsd", 0, [0, 0, 0], &p)
 }
 
-/// Empty `stts`/`stsc`/`stco` sample table: version/flags + entry_count=0.
-fn empty_count_box(name: &[u8; 4]) -> Vec<u8> {
-    let mut p = Vec::new();
-    p.extend_from_slice(&u32b(0)); // entry_count
-    full_box(name, 0, [0, 0, 0], &p)
-}
-
-/// Empty `stsz`: sample_size=0 + sample_count=0 (fragmented files carry no
-/// sample sizes in the moov; sizes travel in each trun).
-fn empty_stsz() -> Vec<u8> {
-    let mut p = Vec::new();
-    p.extend_from_slice(&u32b(0)); // sample_size
-    p.extend_from_slice(&u32b(0)); // sample_count
-    full_box(b"stsz", 0, [0, 0, 0], &p)
-}
-
 /// Build the init segment: `ftyp` + `moov` with a single H.264 video track.
 pub fn mp4_init_segment(cfg: &Mp4Config) -> Vec<u8> {
     let mut ftyp_payload = Vec::new();
@@ -370,13 +354,11 @@ pub fn mp4_init_segment(cfg: &Mp4Config) -> Vec<u8> {
     let ftyp = box_of(b"ftyp", &ftyp_payload);
 
     let stbl = {
-        let mut inner = Vec::new();
-        inner.extend_from_slice(&stsd(cfg));
-        inner.extend_from_slice(&empty_count_box(b"stts"));
-        inner.extend_from_slice(&empty_count_box(b"stsc"));
-        inner.extend_from_slice(&empty_stsz());
-        inner.extend_from_slice(&empty_count_box(b"stco"));
-        box_of(b"stbl", &inner)
+        // fMP4 最小化（R3 甲22 / R5#46）：stsd 之外的空表（stts/stsc/stsz/
+        // stco）只服务于 non-fragmented 文件；碎片化流的 sample 时间/大小
+        // 全部在每帧 trun 里，mvex/trex 声明了默认参数。去掉它们缩小区段，
+        // 与 ffmpeg/MP4Box 的 `frag_keyframe` init 一致（stbl 只需 stsd）。
+        box_of(b"stbl", &stsd(cfg))
     };
     let minf = {
         let mut inner = Vec::new();
@@ -768,6 +750,12 @@ mod tests {
         assert!(init.windows(4).any(|w| w == b"mvex"));
         assert!(init.windows(4).any(|w| w == b"trex"));
         assert_eq!(init.len() as u32, box_total(&init, 0));
+        // #46 init 最小化：fMP4 的 sample 时间/大小在每帧 trun 里，stbl 只需
+        // stsd；stts/stsc/stsz/stco 空表必须移除（与 ffmpeg frag_keyframe 一致）。
+        assert!(!init.windows(4).any(|w| w == b"stts"), "fMP4 init must not carry empty stts");
+        assert!(!init.windows(4).any(|w| w == b"stsc"), "fMP4 init must not carry empty stsc");
+        assert!(!init.windows(4).any(|w| w == b"stsz"), "fMP4 init must not carry empty stsz");
+        assert!(!init.windows(4).any(|w| w == b"stco"), "fMP4 init must not carry empty stco");
     }
 
     #[test]
