@@ -40,11 +40,11 @@
 
 ### 丙 遥测（111-140）
 
-◐ 部分。QoS 快照结构化日志（R5#149）、心跳扩展 KPI（#150）、relay 带宽记账（#152）、评分卡脚本（#155）已有；**admin KPI 曲线已做**（第 16 轮：relay 采样 agent 心跳 KPI——15s×120 点 FIFO，`/api/session/kpi/:sid` 时间序列 + admin 面板 📈 canvas 折线 fps/bitrate）；**13s 归因决策树已做**（第 23 轮：`tools/qos_attribution.py` 解析 QoS 快照按 probe/qos_state/dq/dfps 归因 network/decode/encode/static/good + 中位延迟建议，分支单测 + 真实日志验证）。统一时间线／crash.log 上报 未做。
+◐ 部分。QoS 快照结构化日志（R5#149）、心跳扩展 KPI（#150）、relay 带宽记账（#152）、评分卡脚本（#155）已有；**admin KPI 曲线已做**（第 16 轮：relay 采样 agent 心跳 KPI——15s×120 点 FIFO，`/api/session/kpi/:sid` 时间序列 + admin 面板 📈 canvas 折线 fps/bitrate）；**13s 归因决策树已做**（第 23 轮：`tools/qos_attribution.py` 解析 QoS 快照按 probe/qos_state/dq/dfps 归因 network/decode/encode/static/good + 中位延迟建议，分支单测 + 真实日志验证）。统一时间线未做；**crash.log 上报已做**（第 24 轮：`main.rs` panic hook 带时间戳/pid/backtrace/append，崩溃留痕）。第 36 轮核实修正。
 
 ### 丁 弱网纵深（141-170）
 
-◐ 部分。弱网模式 UI 标记（本轮）、reqkey 恢复、IDR 带宽占比、注册风暴保护、RTT 分带（中值滤波+4 档判定，mod.rs rat_band）、输入降采样已有；重连窗口降质量/TestDelay 探针未做。
+◐ 部分。弱网模式 UI 标记（本轮）、reqkey 恢复、IDR 带宽占比、注册风暴保护、RTT 分带（中值滤波+4 档判定，mod.rs rat_band）、输入降采样已有；重连窗口降质量未做；**TestDelay 探针已做**（第 14 轮：浏览器 1s 单调时钟探测包 → agent 即时 echo → 纯网络层 RTT，probe_ms 随 qos 上报参与拥塞归因）。第 36 轮核实修正。
 
 ### 戊 发布门槛（171-200）
 
@@ -73,7 +73,7 @@
 | 13 | 多 agent 同 IP 白名单 | ✔ | `registration_rate_limit_per_min` 默认 120/min（--registration-rate-limit 可调）——同一出口 IP 多 agent 注册/重连不误拒；第 26 轮代码级核实修正 |
 | 14 | 混合通道二进制分辨 | ⬜ | 线协议整块（批次 2 #41）未做 |
 | 15 | agent 控制消息独立有界 channel | ✔ | 已分离：`control_tx`（bounded 64，控制消息）+ `post_tx`（unbounded，媒体帧，批内丢旧）+ `shell_tx`（终端输出）；第 26 轮代码级核实修正 |
-| 16 | relay→agent 背压回传 | ◐ | relay viewer 缓冲水位已降 16；回传拥塞信号未做 |
+| 16 | relay→agent 背压回传 | ✔ | 第 36 轮：relay fan-out 丢旧保新（viewer 缓冲满）时限频（≥5s）向 agent 回传 `desktop:congested {dropped}`（`push_frag` 返回被跳过 viewer 数 → `route_agent_message` desktop:video 分支经 `SharedState.last_congest_notify` 限频 → agent `desktop:congested` 分支记录"传输段拥塞"日志，不直接改 QoS 决策——码率收敛仍由浏览器段 e2e/dq 主导，relay drop 作补充证据）。viewer 缓冲 16 帧此前已降。测试 `test_push_frag_reports_congested_drops` + `test_desktop_congested_backpressure_to_agent` |
 | 17 | 12s 超时统一 ≤5s | ✔ | join ack 看门狗 8s → **5s**（session.js，对齐 rustdesk 5s 超时语义——弱网更快失败恢复）；SSE 重连退避 1→10s 上限已核实；无残留 12s 单一超时 |
 | 18 | 发送失败即重连 | ✔ | 会话断线（send/recv 失败）→ run_session 返回 → connect_with_retry 指数退避重连（client.rs，含 429 固定延迟）；与 #11 断线恢复同路径，第 23 轮核实修正 |
 | 19 | 桌面开启竞态幂等 | ✔ | `DesktopManager::start` 首行 `if self.is_running() { return; }`（检查→置 running 间无 await，并发安全）；第 21 轮代码级核实修正 |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **88%**（可靠通道 28 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **89%**（可靠通道 29 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -219,4 +219,6 @@
   1. 重连矩阵验收脚本（R5#40 批次验收 / R3 戊165）：`tools/reconnect_matrix.sh` 由旧 playwright 雏形**重写为进程级**（不依赖浏览器，符合验证环境约束）——自带 relay+agent 生命周期，三破坏源：① agent 崩溃重启（kill -9 → 同 `--key/--session-id` 重启 → register_existing 按 key 续接）；② relay 重启（agent 指数退避 60s 上限自动重连）；③ 连续 kill-重启 flap（幂等替换 + 退避不崩）。验证点：admin overview `agent_online` + agent 日志 session established。**实测 8/8 全过**（baseline + agent×2 + relay×2 + flap×3）。修复：SID 默认值去掉非法连字符、overview 解析用 `agent_online` 顶层字段。
 - **第 35 轮新增合入**：
   1. 空闲回收可见性（R5#25）：agent 编码循环每收到真实新帧刷新 `DesktopManager.last_active_at`（unix ms，`AtomicI64`，参数链 start→run_desktop_loop→run_desktop_pipeline）；qos-ack 回传 `active`（`DesktopManager::is_active` = 距最近新帧 ≤1.5s）；浏览器 `receiveQosAck` 存 `_ackActive`，面板"目标帧率/活动"行显示 **静止/活跃**（agent 实测优先，未回传回退 ack≥15 推断）。纯判定函数 `active_at` + 单测（800ms 活跃 / 1499 边界活跃 / 1500 起静止 / 时钟回退不 panic）。**验证**：全量 `cargo test` **386 通过**（+1）——跑批时 Xvfb :98 段错误致 4 个 X11 测试失败，查明环境问题（GLX 扩展段错误）后以 `-extension GLX` 重启 Xvfb，4 测试恢复全绿，代码无涉。顺带核实修正 R4/5 表：JS 内存曲线（第 22 轮）与离开 stop（session.js pagehide/beforeunload → disconnect）均已做。
+- **第 36 轮新增合入**：
+  1. relay→agent 背压回传（R5#16）：`DesktopStream::push_frag` 返回本拍被跳过（丢旧）viewer 数；`route_agent_message` desktop:video 分支检测到 drop 并经 `SharedState.last_congest_notify` 限频（≥5s）向 agent 回传 `desktop:congested {dropped}`（仅回 agent，不进 broadcast_types/EventBuffer）；agent `desktop:congested` 分支记录传输段拥塞日志（relay drop 与浏览器段 e2e/dq 互补，不直接改 QoS 决策）。测试 `test_push_frag_reports_congested_drops`（满缓冲报 drop / 腾位恢复）+ `test_desktop_congested_backpressure_to_agent`（20 帧填满 16 缓冲后回传命中），全量 `cargo test` **388 通过**（+2）。顺带核实修正 R4/5 表：丙 crash.log 上报已做（第 24 轮）、丁 TestDelay 探针已做（第 14 轮），统一时间线/重连窗口降质量为仅剩待补。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
