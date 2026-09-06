@@ -48,7 +48,7 @@
 
 ### 戊 发布门槛（171-200）
 
-◐ 发布纪律已立（5 轮内不发布，本台账即是）。4-top 基准/弱网矩阵/长稳 1h/重连矩阵 的**验收脚本化**待补（bench_top4.sh 已有雏形）。
+◐ 发布纪律已立（5 轮内不发布，本台账即是）。验收脚本化：4-top 基准（bench_top4.sh 雏形）/弱网矩阵（weaknet_matrix.sh）/长稳 1h ——待补；**重连矩阵已完成**（第 34 轮 `tools/reconnect_matrix.sh` 进程级全过）。
 
 ---
 
@@ -95,7 +95,7 @@
 | 35 | 弱网控制消息直通 | ✔ | 已由组合覆盖：#29 控制消息非 lossy 优先 + #15 独立有界控制 channel + #2 命令 ack（seq+确认）+ #33/#34 输入节流/降采样——弱网下控制消息不被数据挤掉且可确认；第 29 轮核实修正 |
 | 36-38 | KCP/白名单/IPv6 | ⬜ | 远期 |
 | 39 | 多会话隔离压测 | ✔ | 第 31 轮：`tools/multi_session_isolation.sh`——同 relay 并行 N 个独立 agent（各自 `--key`+`--session-id`，`--desktop-capture none`），验证注册/共存/隔离（会话数+在线数+心跳互不干扰）；实测 3 agent 3/3 注册、overview 3 会话 3 在线 PASS |
-| 40 | 批次验收：重连矩阵 | ⬜ | |
+| 40 | 批次验收：重连矩阵 | ✔ | 第 34 轮：`tools/reconnect_matrix.sh`（进程级重连矩阵，不依赖浏览器）——三破坏源：agent 崩溃重启（kill -9 → 同 key/session 重启 → register_existing 续接）、relay 重启（agent 退避 60s 上限自动重连）、连续 flap（幂等替换）；验证点 = admin overview `agent_online` + agent 日志 session established。实测 **8/8 场景全过**（relay 重启恢复、agent 重启续接、flap 稳定） |
 
 ### 批次 2 · 打包与前端（41-80）
 
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **86%**（可靠通道 28 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **87%**（可靠通道 28 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -215,4 +215,6 @@
   1. SSE 重建补桌面状态（R5#12）：relay 新增 `SharedState.desktop_states`（每会话最近 `desktop:started`→true / `desktop:stopped`→false 缓存）；`agent_events_handler` SSE 首次连接/断线重建握手时经 `desktop_state_snapshot` **先补发** `desktop:state {running}` 快照（现读现发、不入 EventBuffer——不依赖历史事件仍在缓冲里）；浏览器 `session.js` 新增 `desktop:state` 监听：running=true 且本机未在看 → 进桌面视图拉流（与 `desktop:capabilities` 的 running 逻辑一致），false 且非编码热切换 → 退回终端。测试 `test_desktop_state_snapshot_reflects_latest`（无历史不发 / started 后 running=true / stopped 后 false），全量 `cargo test` **385 通过**。
 - **第 33 轮新增合入**：
   1. agent 重连退避上限对齐 rustdesk 60s（R5#9）：`connect_with_retry` max_delay 300s → **60s**——指数退避 1→2→4→8→16→32→60 封顶，429 固定 15s 不变；断线/弱网 agent 最坏 1min 内恢复（原 5min 封顶恢复太慢）；单测更新 `test_next_retry_delay_exponential_with_cap`（32→60 / 300→60 封顶断言）+ 429 用例。全量 `cargo test` **385 通过**。顺带核实 #8：agent SSE idle 60s = 心跳 15s × 4 裕量（已实现），浏览器显式空闲计数未独立实现，如实标注 ◐。
+- **第 34 轮新增合入**：
+  1. 重连矩阵验收脚本（R5#40 批次验收 / R3 戊165）：`tools/reconnect_matrix.sh` 由旧 playwright 雏形**重写为进程级**（不依赖浏览器，符合验证环境约束）——自带 relay+agent 生命周期，三破坏源：① agent 崩溃重启（kill -9 → 同 `--key/--session-id` 重启 → register_existing 按 key 续接）；② relay 重启（agent 指数退避 60s 上限自动重连）；③ 连续 kill-重启 flap（幂等替换 + 退避不崩）。验证点：admin overview `agent_online` + agent 日志 session established。**实测 8/8 全过**（baseline + agent×2 + relay×2 + flap×3）。修复：SID 默认值去掉非法连字符、overview 解析用 `agent_online` 顶层字段。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
