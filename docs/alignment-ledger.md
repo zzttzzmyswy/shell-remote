@@ -142,7 +142,7 @@
 | 131 | 分辨率事件驱动 | ✔ | XRANDR ScreenChangeNotify 注册+poll_for_event（capture.rs，Xvfb 实测注册，替代 30 帧轮询） |
 | 132-134 | Wayland/首帧/缩放 | ⬜ | 远期 |
 | 135 | `--desktop-capture-fps` 抓帧独立上限 | ✔ | CLI 参数 + ThreadedFrameSource::spawn_with_max_fps（动态节流、静态退避不变，测试 `test_threaded_source_max_fps_throttles`） |
-| 136-146 | 功耗/内存画像/多显示器/色彩矩阵 | ⬜ | **内存画像最小子集已做**（第 45 轮：agent 心跳 KPI 带 `rss_kb`（`/proc/self/statm` resident×4KB，`self_rss_kb` + 单测）→ relay `AgentKpiSample.rss_kb` → admin KPI 曲线可见 agent 内存时间线，长稳验收 RSS 判据的旁证）；**功耗采样最小子集已做**（第 46 轮：agent 心跳 KPI 带 `cpu_ms`（`/proc/self/stat` utime+stime×tick，`cpu_ms_from_stat` 纯函数 + 构造数据单测）→ relay `AgentKpiSample.cpu_ms` → 两次采样差 = 区间 CPU 使用率，admin KPI 可见功耗画像）；**功耗硬采样最小子集已做**（第 50 轮：agent 心跳 KPI 带 `cpu_temp`（`self_cpu_temp` 扫 `/sys/class/hwmon/*/temp*_input` 取首个非零毫度→℃，无传感器回退 0；测试 `test_self_cpu_temp_safe_or_positive`）→ relay `AgentKpiSample.cpu_temp` → admin KPI 可见温度趋势，过热告警基础数据）；**多显示器最小子集已做**（第 48 轮：`FrameSource::list_monitors` 枚举 X11 RANDR 输出（名称/分辨率/偏移），`desktop:started` 带 `displays` 数组——远端多屏拓扑对浏览器/运维可见；测试 `test_x11_list_monitors_returns_at_least_one`）；**多显示器 UI 面已做**（第 58 轮：浏览器面板"远端显示器"行显示数量 + 各分辨率摘要，session.js 存 `_srDesktopInfo.displays` + desktop.js 渲染——多屏选屏的前置观察面）；**色彩矩阵最小子集已做**（第 49 轮：`color.rs bgra_to_i420_with_matrix` 支持 BT.601/BT.709 系数选择，默认 601 不变（H.264 标准色域）；测试 `test_color_matrix_bt709_differs_from_bt601` + 默认回归；CLI 配置项为后续方向） |
+| 136-146 | 功耗/内存画像/多显示器/色彩矩阵 | ⬜ | **内存画像最小子集已做**（第 45 轮：agent 心跳 KPI 带 `rss_kb`（`/proc/self/statm` resident×4KB，`self_rss_kb` + 单测）→ relay `AgentKpiSample.rss_kb` → admin KPI 曲线可见 agent 内存时间线，长稳验收 RSS 判据的旁证）；**功耗采样最小子集已做**（第 46 轮：agent 心跳 KPI 带 `cpu_ms`（`/proc/self/stat` utime+stime×tick，`cpu_ms_from_stat` 纯函数 + 构造数据单测）→ relay `AgentKpiSample.cpu_ms` → 两次采样差 = 区间 CPU 使用率，admin KPI 可见功耗画像）；**功耗硬采样最小子集已做**（第 50 轮：agent 心跳 KPI 带 `cpu_temp`（`self_cpu_temp` 扫 `/sys/class/hwmon/*/temp*_input` 取首个非零毫度→℃，无传感器回退 0；测试 `test_self_cpu_temp_safe_or_positive`）→ relay `AgentKpiSample.cpu_temp` → admin KPI 可见温度趋势，过热告警基础数据）；**多显示器最小子集已做**（第 48 轮：`FrameSource::list_monitors` 枚举 X11 RANDR 输出（名称/分辨率/偏移），`desktop:started` 带 `displays` 数组——远端多屏拓扑对浏览器/运维可见；测试 `test_x11_list_monitors_returns_at_least_one`）；**多显示器 UI 面已做**（第 58 轮：浏览器面板"远端显示器"行显示数量 + 各分辨率摘要，session.js 存 `_srDesktopInfo.displays` + desktop.js 渲染——多屏选屏的前置观察面）；**多显示器选屏闭环已做**（第 60 轮：agent 运行时选屏覆盖 `display: RwLock` + `select_display` stop→start 重建（`set_codec` 同机制）、`desktop:started` 带 `display` 字段、agent `desktop:select-display` 命令回 cmd-ack、浏览器"显示器"下拉多屏显示/change 发送/started 同步；单测 `test_resolved_display_precedence` 等 3 项，全量 402 通过）；**色彩矩阵最小子集已做**（第 49 轮：`color.rs bgra_to_i420_with_matrix` 支持 BT.601/BT.709 系数选择，默认 601 不变（H.264 标准色域）；测试 `test_color_matrix_bt709_differs_from_bt601` + 默认回归；CLI 配置项为后续方向） |
 
 ### 批次 5 · 测试与遥测（147-167）
 
@@ -154,13 +154,13 @@
 
 ### 批次 7 · 远期（178-200）
 
-⬜ 全部远期（i444/HW 编码/portal 直通/P2P/多显示器选屏/多流等）——**授权细化子集已做**（第 59 轮：`requires_write` read_only_types 补 `desktop:reqkey`/`desktop:test-delay`/`desktop:clipboard:get`——ro 只读观看会话可 reqkey 弱网恢复/TestDelay 测量/剪贴板读取，控制类（mouse/key/clipboard:set/quality/codec/gray）仍要求写权限；测试 `test_requires_write` 断言扩展）。
+⬜ 全部远期（i444/HW 编码/portal 直通/P2P/**多流同帧率协调**等）——**授权细化子集已做**（第 59 轮：`requires_write` read_only_types 补 `desktop:reqkey`/`desktop:test-delay`/`desktop:clipboard:get`——ro 只读观看会话可 reqkey 弱网恢复/TestDelay 测量/剪贴板读取，控制类（mouse/key/clipboard:set/quality/codec/gray）仍要求写权限；测试 `test_requires_write` 断言扩展）；**多显示器选屏子集已做**（第 60 轮：选屏闭环见 136-146 行，枚举+UI 面+运行时切换已闭合，多流同帧率协调为剩余远期）。
 
 ---
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD）；◐ 10%（部分依赖架构远期）。第 56 轮合计实。
+- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD）；◐ 10%（部分依赖架构远期）。第 60 轮合计实（多显示器选屏闭环子集已做，R5 99% 保持）。
 - **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
@@ -266,6 +266,8 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 60 轮新增合入**：
+  1. 多显示器选屏闭环（批次7 多流/多显示器部分，rustdesk 对齐）：agent `DesktopManager` 新增运行时选屏覆盖 `display: RwLock<Option<String>>`（初始 = 启动 `--desktop-display`）+ `select_display(&str, post)`——更新覆盖值（`""`/空白 → 恢复启动默认）、运行中 stop→start 重建桌面流（`set_codec` 同机制）；`start()` 用 `resolved_display(runtime, config)` 解析实际捕获屏；`desktop:started` payload 新增 `display` 字段（前端同步选中值）。agent 新增 `desktop:select-display` 命令（回 `desktop:cmd-ack {seq, ok}`，复用白名单）。浏览器工具栏新增"显示器"下拉——多屏拓扑才显示（`populateDisplaySelect` 按 `_srDesktopInfo.displays` 重建选项：默认 + 各 name·宽x高）、change 发送 `desktop:select-display`、started 事件同步当前屏。**验证**：`node --check`（session.js + desktop.js）通过；新增单测 `test_resolved_display_precedence`（运行时覆盖优先于启动配置）/`test_select_display_updates_runtime_override`（未运行更新字段、空串恢复默认、同值 no-op）/`test_select_display_trim`（trim + 纯空白=恢复），全量 `cargo test` **402 通过**（+3）。收口：批次7 多流/多显示器部分（枚举+UI 面+选屏闭环）已闭合，剩余 ⬜ 全为架构级/平台级远期（binary 传输 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD、多流同帧率协调）。
 - **第 59 轮新增合入**：
   1. 授权细化最小子集（批次7 授权细化）：`requires_write` read_only_types 补 `desktop:reqkey` / `desktop:test-delay` / `desktop:clipboard:get`——**ro 只读观看会话可 reqkey 弱网恢复 / TestDelay 网络测量 / 剪贴板读取**，控制类（mouse/key/clipboard:set/quality/codec/gray）仍要求写权限（403 拒绝）——只读观看体验与安全性兼顾。测试 `test_requires_write` 断言扩展（3 只读允许 + 4 控制拒绝）。全量 `cargo test` **399 通过**。
 - **第 54 轮综合 review**：
