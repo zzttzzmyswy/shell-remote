@@ -32,11 +32,11 @@
 
 | # | 点 | 状态 | 证据 |
 |---|---|---|---|
-| 61-70 | 连接与能力 | ◐ | 时钟校准 7 次剔除>500ms（desktop.js:_calibrateClock）、WS 优先回退 HTTP、TTFV 已打点（本轮）；能力探测缓存/MSE 能力协商等未做 |
+| 61-70 | 连接与能力 | ◐ | 时钟校准 7 次剔除>500ms（desktop.js:_calibrateClock）、WS 优先回退 HTTP、TTFV 已打点（本轮）；**MSE/WebCodecs 能力协商已做**（desktop.js：`_webcodecsAvailable` 安全上下文+VideoDecoder 检测 → 模式选择 webcodecs/mse/none → sessionStorage 缓存复用，重连/切页直接取）、**能力探测缓存已做**（sessionStorage，desktop.js:287）、解码方案面板行已渲染（metric-decoder）；第 40 轮核实修正 |
 | 71-80 | 拉流与解复用 | ◐ | seqn 解析+真实丢帧（desktop.js:_handleMoof）、demux 重同步已有；逐帧 binary 帧头协议未做（仍在 JSON 批） |
 | 81-90 | 解码与渲染 | ◐ | 解码即渲染、队列 24/2、停滞 500ms reqkey 均有；**光标叠加层已做**（第 18 轮：X11 GetImage 不含光标层——agent `poll_cursor` 100ms 节流 XQueryPointer → `desktop:cursor` 轻量消息 → 浏览器 `.sr-cursor-overlay` 叠加渲染，实测光标跟随鼠标）；超龄丢弃 2s 已做 |
 | 91-100 | 指标与面板 | ◐ | jitter/丢帧(seq)/e2e/目标帧率/TTFV/弱网标记（本轮补齐）；JS 内存曲线**已做**（第 22 轮批次2 #61：当前+峰值行）、离开 stop **已做**（session.js pagehide/beforeunload → notifyDesktopLeave → desktopView.disconnect 停流）；第 35 轮核实修正 |
-| 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；**30s 判死已做**（第 37 轮：浏览器播放器 `_lastDataAt` 看门狗——曾连上但 30s 无任何视频数据 → 判死重连，静止安全因 4s IDR 心跳仍到达）；重连降质/能力回退链待补 |
+| 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；**30s 判死已做**（第 37 轮：浏览器播放器 `_lastDataAt` 看门狗——曾连上但 30s 无任何视频数据 → 判死重连，静止安全因 4s IDR 心跳仍到达）；**能力回退链已做**（`_onDecodeError` 黑名单切 codec → `desktop:codec` 请求 agent 降档 + `_scheduleDecodeRecover` 1500ms 防抖重建流兜底）；重连降质待补 |
 
 ### 丙 遥测（111-140）
 
@@ -227,4 +227,7 @@
   1. 4-top 动态基准验收脚本化（R4 戊172 发布门槛）：`tools/bench_top4_verify.sh`——动态画面用 `tools/bench_draw_quad.c`（无字体依赖四象限高速字符块；本环境 Xvfb 无 misc 字体，`bench_top4.sh` 的 xterm/top 起不来）→ relay + agent（X11 捕获，模拟浏览器 `POST /agent/session/send` 发 `desktop:start`，桌面由浏览器命令驱动）→ admin KPI 采样断言。**实测 PASS：fps 中值 30.0（动态满帧，用户铁律"动态内容不降帧"）+ bitrate 670kbps（编码器实际输出）**。附 bench_top4.sh（有字体环境的 xterm 版）保留。
 - **第 39 轮新增合入**：
   1. 长稳验收脚本化（R4 戊172 发布门槛·长稳 1h）：`tools/stability_verify.sh`——动态画面（bench_draw_quad）下长稳运行：每 15s 采样 admin KPI（fps/bitrate）+ agent RSS + 重连计数，断言无断线重连 / fps 中值 ≥15 / RSS 后段稳定（末两点增长 <5% 即编码器初始化摊分后不再增长，非泄漏）。**冒烟 90s 实测 PASS：6 样本无重连、fps 中值 30.0、bitrate 峰值 670kbps、RSS 末两点 +0%**。正式 1h：`STABILITY_SECONDS=3600 tools/stability_verify.sh`。戊列验收脚本化（4-top/弱网/重连/长稳）全闭环。
+- **第 40 轮新增合入**：
+  1. R5#16 背压可观测闭环：agent `DesktopManager` 加 `backpressure` 计数（收到 `desktop:congested` 递增，`bump_backpressure`/`backpressure_count` + 单测 `test_backpressure_counter_accumulates`）；qos-ack 回传 `bp_count`；浏览器面板新增"relay 拥塞"行（metric-bp，agent 回传 >0 显示次数）——传输段拥塞对用户/调试可见。全量 `cargo test` **389 通过**（+1）。
+  2. 核实修正（R4/5 表）：61-70 连接与能力——MSE/WebCodecs 能力协商（`_webcodecsAvailable` 安全上下文+VideoDecoder 检测 → webcodecs/mse/none + sessionStorage 缓存复用）与能力探测缓存均已做；101-110 能力回退链——`_onDecodeError` 黑名单切 codec + `_scheduleDecodeRecover` 重建流兜底均已做；台账过时标"未做"。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
