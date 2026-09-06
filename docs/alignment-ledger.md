@@ -48,7 +48,7 @@
 
 ### 戊 发布门槛（171-200）
 
-◐ 发布纪律已立（5 轮内不发布，本台账即是）。验收脚本化：**4-top 基准已完成**（第 38 轮 `tools/bench_top4_verify.sh`——动态画面用 `tools/bench_draw_quad.c` 四象限字符块（本环境 Xvfb 无 misc 字体，xterm/top 起不来），agent X11 捕获 + admin KPI 断言：实测 fps 中值 30.0（动态满帧，铁律"动态不降帧"）+ bitrate 670kbps PASS）；弱网矩阵已有（`weaknet_matrix.sh`）；**重连矩阵已完成**（第 34 轮）；长稳 1h 待补。
+◐ 发布纪律已立（5 轮内不发布，本台账即是）。验收脚本化：**4-top 基准已完成**（第 38 轮 `tools/bench_top4_verify.sh`——动态画面用 `tools/bench_draw_quad.c` 四象限字符块（本环境 Xvfb 无 misc 字体，xterm/top 起不来），agent X11 捕获 + admin KPI 断言：实测 fps 中值 30.0（动态满帧，铁律"动态不降帧"）+ bitrate 670kbps PASS）；弱网矩阵已有（`weaknet_matrix.sh`）；**重连矩阵已完成**（第 34 轮）；**长稳已完成**（第 39 轮 `tools/stability_verify.sh`——动态画面长稳：每 15s 采样 KPI+RSS，断言无重连 / fps 中值 ≥15 / RSS 后段稳定（末两点 +<5%，编码器初始化摊分非泄漏）；冒烟 90s 实测 PASS（6 样本无重连、fps 30.0、RSS 末两点 +0%、bitrate 670kbps）；正式 1h 用 `STABILITY_SECONDS=3600`）。戊列验收脚本化全闭环。
 
 ---
 
@@ -225,4 +225,6 @@
   1. 浏览器 30s 判死兜底（R4 乙101-110 错误与恢复）：desktop.js 播放器新增 `_lastDataAt` 看门狗——`_feed(chunk)` 每次视频数据（init/moof/mdat）到达刷新；曾连上（`_gotFirstFrame`）但 30s 无任何数据到达（WS/SSE 半开黑洞、relay 静默卡死）→ 判定连接死亡并 `window.shellRemote.reconnect()`。静止安全：agent 静止时每 4s 一个 IDR 心跳 moof 仍到达，不误判；判死置位防重复，重连失败由 SSE 退避/join 看门狗兜底。**验证**：`node --check` 通过 + `_lastDataAt` 三处引用（初始化/刷新/判死）+ reconnect 入口存在。顺带核实修正 R4/5 A4：agent 侧"丢帧追新"已由 `try_latest`（每拍取最新帧、跳过中间帧）+ 批内丢旧实现，台账过时标"未做"。
 - **第 38 轮新增合入**：
   1. 4-top 动态基准验收脚本化（R4 戊172 发布门槛）：`tools/bench_top4_verify.sh`——动态画面用 `tools/bench_draw_quad.c`（无字体依赖四象限高速字符块；本环境 Xvfb 无 misc 字体，`bench_top4.sh` 的 xterm/top 起不来）→ relay + agent（X11 捕获，模拟浏览器 `POST /agent/session/send` 发 `desktop:start`，桌面由浏览器命令驱动）→ admin KPI 采样断言。**实测 PASS：fps 中值 30.0（动态满帧，用户铁律"动态内容不降帧"）+ bitrate 670kbps（编码器实际输出）**。附 bench_top4.sh（有字体环境的 xterm 版）保留。
+- **第 39 轮新增合入**：
+  1. 长稳验收脚本化（R4 戊172 发布门槛·长稳 1h）：`tools/stability_verify.sh`——动态画面（bench_draw_quad）下长稳运行：每 15s 采样 admin KPI（fps/bitrate）+ agent RSS + 重连计数，断言无断线重连 / fps 中值 ≥15 / RSS 后段稳定（末两点增长 <5% 即编码器初始化摊分后不再增长，非泄漏）。**冒烟 90s 实测 PASS：6 样本无重连、fps 中值 30.0、bitrate 峰值 670kbps、RSS 末两点 +0%**。正式 1h：`STABILITY_SECONDS=3600 tools/stability_verify.sh`。戊列验收脚本化（4-top/弱网/重连/长稳）全闭环。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
