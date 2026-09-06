@@ -117,11 +117,11 @@
 | 60 | e2e 与解码排队分流 | ✔ | 解码队列行加时延估算 dq/dfps×1000ms（desktop.js，e2e 归因分流） |
 | 61-64 | 内存曲线/rAF 暂停/光标通道 | ◐ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；**光标独立通道已做**（第 18 轮：agent XQueryPointer 100ms 节流 → desktop:cursor → 浏览器 overlay，X11 GetImage 不含光标层是真实缺口） |
 | 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect） |
-| 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ◐ | MSE 回退有 |
+| 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ◐ | MSE 回退有（`_webcodecsAvailable ? webcodecs : mse`）；**解码器释放已实现**（disconnect 完整清理：MSE disconnect + `_dec.close()` + frames close + reader cancel，第 25 轮核实）；弱网降级提示/重连降质部分 |
 | 71 | 帧到达 jitter 面板 | ✔ | metric-jitter（v0.42） |
 | 72 | qos 250ms + ack 100ms 批 | ◐ | qos 250ms 独立上报已做（desktop.js，dfps×4 折算保 agent 语义，实测 3/s）；ack 100ms 批未做 |
 | 73 | 首帧 TTFV<500ms 打点 | ✔ | 本轮：_ttfvMs 面板展示（desktop.js） |
-| 74-78 | 解码器黑名单/reqkey 计数/崩溃日志/离开停抓/白闪 | ◐ | 黑名单切 codec（desktop.js:_onDecodeError）+ reqkey 计数 + 离页停抓（session.js pagehide）；崩溃日志/白闪缺 |
+| 74-78 | 解码器黑名单/reqkey 计数/崩溃日志/离开停抓/白闪 | ◐ | 黑名单切 codec（desktop.js:_onDecodeError）+ reqkey 计数 + **崩溃日志**（main.rs crash.log，第 24 轮增强）+ 离页停抓（session.js pagehide）+ **光标 overlay 断开清理**（第 25 轮：disconnect 移除 `.sr-cursor-overlay`，补 R5#64 遗漏）；白闪缺 |
 | 79-80 | 打包单测/前端验收 | ⬜ | |
 
 ### 批次 3 · 编码器与 QoS 深化（81-120）
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **75%**（可靠通道 19 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 17%。
+- **R5 落地清单（200 点）**：✔ 类约 **76%**（可靠通道 19 项 / 前端 21 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 16%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -194,4 +194,7 @@
 - **第 24 轮新增合入**：
   1. crash.log 崩溃日志增强（`main.rs` panic hook）：补时间戳（unix_ms）/pid/`Backtrace::force_capture()` 栈/`SR_LOG_DIR` 路径对齐（未设回退当前目录）/append 多次崩溃保留（此前 fs::write 覆盖只留最后一次，多闪退丢现场）→ 批次5 crash.log 上报（基础 hook 前已有，本轮补齐字段与保留策略）。
   2. 台账修正：#3 SSE 重连补控制事件经代码级核实**已实现**（`agent_events_handler` + `EventBuffer::replay_from(last_id)` 补发断线期间控制事件）。
+- **第 25 轮新增合入**：
+  1. 光标 overlay 断开清理补漏（`web/desktop.js` disconnect 移除 `.sr-cursor-overlay`——第 18 轮 R5#64 遗漏的 DOM 残留清理，断开后元素/样式不再残留）。**浏览器实测**：overlay 随 xdotool 移动出现 → disconnect 后从 DOM 清除 ✓、桌面出画 1280x720 正常。
+  2. 台账核实修正：#67-70 **解码器释放已实现**（disconnect 完整清理：MSE disconnect + `_dec.close()` + frames close + reader cancel）；#76 崩溃日志（main.rs crash.log 第 24 轮）；#77 离开停抓（pagehide）均已实现。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
