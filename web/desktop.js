@@ -844,6 +844,8 @@
       this._weakNet = false;
       this._staleDropped = 0;
       this._throttleCounter = 0;
+      if (this._moveTimer) { clearTimeout(this._moveTimer); this._moveTimer = null; }
+      this._movePending = null;
       this._unbindInput();
       this._stopMetrics();
       const panel = document.getElementById('desktop-metrics');
@@ -1067,9 +1069,16 @@
       // 卡顿更优（rustdesk 弱网输入节流语义）。点击/滚轮/按键是离散动作，
       // 不做采样（一次点击漏发会错意），只节流连续 move。
       this._throttleCounter = 0;
+      // 10ms 输入合并（R3 己188 / R5#33）：浏览器 mousemove 可达 ~120Hz，
+      // 远超 agent 注入/远端消费速率。合并到 10ms 窗口发**最后一个坐标**
+      // （追新语义），把上行控制频率压到 ~100Hz 且不丢移动轨迹——与弱网
+      // 降采样（按 e2e 进一步减）叠加。
+      this._movePending = null;   // {x, y}
+      this._moveTimer = null;
       this._onPointerMove = function(e) {
         const p = self._toDesktopXY(e);
         if (!p) return;
+        // 弱网降采样：e2e 高时跳过部分事件（离散点按计数取）。
         const e2e = self._e2eMs;
         if (e2e !== undefined) {
           self._throttleCounter += 1;
@@ -1081,7 +1090,16 @@
             }
           }
         }
-        send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
+        // 10ms 合并：缓存最后坐标，定时器到点只发最新一个。
+        self._movePending = p;
+        if (!self._moveTimer) {
+          self._moveTimer = setTimeout(function() {
+            self._moveTimer = null;
+            const last = self._movePending;
+            self._movePending = null;
+            if (last) send('desktop:mouse', { type: 'move', x: last.x, y: last.y });
+          }, 10);
+        }
       };
       this._onPointerDown = function(e) {
         const p = self._toDesktopXY(e);
