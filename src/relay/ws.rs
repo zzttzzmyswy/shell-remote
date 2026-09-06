@@ -277,7 +277,29 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                     for (uid, sse_sid) in &channel_map.browser_sessions {
                         if target_user.is_none_or(|t| t == uid.as_str()) {
                             if let Some(tx) = sse_sessions.get(sse_sid) {
-                                deliver(tx, &proto_msg.msg_type, text_str.to_string());
+                                // R5#29 控制消息优先级（腾位窗口）：lossy 数据
+                                // （terminal:output 等）维持 try_send 静默丢；
+                                // non-lossy 控制消息在 channel 满时给 100ms
+                                // 腾位窗口（浏览器消费端正在排空）——弱网/瞬间
+                                // 积压下控制消息不被数据挤掉；仍满才告警丢。
+                                if is_lossy_msg_type(&proto_msg.msg_type) {
+                                    deliver(tx, &proto_msg.msg_type, text_str.to_string());
+                                } else {
+                                    let tx_clone = tx.clone();
+                                    let msg = text_str.to_string();
+                                    if tokio::time::timeout(
+                                        std::time::Duration::from_millis(100),
+                                        tx_clone.send(msg),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        tracing::warn!(
+                                            "SSE control channel still full after 100ms; dropping non-lossy {} for a stuck browser",
+                                            proto_msg.msg_type
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1608,6 +1630,48 @@ mod tests {
             }
         }
         assert!(saw_congested, "viewer 拥塞应回传 desktop:congested 给 agent");
+    }
+
+    #[tokio::test]
+    async fn test_control_message_gets_drain_window_when_full() {
+        // R5#29 控制消息优先级：channel 满时 non-lossy 控制消息给 100ms 腾位
+        // 窗口（等待浏览器消费端排空）而 lossy 数据立即 try_send 静默丢。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let bsid = "bs_prio_test".to_string();
+        let (tx, _rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        state.sse_sessions.write().await.insert(bsid.clone(), tx);
+        let mut cm = ChannelMap::new();
+        cm.browser_sessions.insert("uid1".to_string(), bsid.clone());
+        state.agent_broadcast.write().await.insert(sid.clone(), cm);
+
+        // lossy 数据填满 channel（terminal:output 在 broadcast_types 中）：
+        // 第 1..=CAP 条进队列，之后 try_send 满 → 静默丢，调用立即返回。
+        let t0 = std::time::Instant::now();
+        for _ in 0..(SSE_CHANNEL_CAPACITY + 8) {
+            let out = serde_json::json!({
+                "type": "terminal:output", "session_id": sid, "payload": { "text": "x" }
+            });
+            route_agent_message(&state, &sid, &out.to_string()).await;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(80),
+            "lossy 满时不应阻塞（立即 try_send 丢旧）"
+        );
+
+        // 控制消息（desktop:started，non-lossy）：channel 满 → 阻塞 ~100ms
+        // 等腾位（浏览器未消费则超时丢，但语义上获得优先递送窗口）。
+        let started = serde_json::json!({
+            "type": "desktop:started", "session_id": sid, "payload": {}
+        });
+        let t1 = std::time::Instant::now();
+        route_agent_message(&state, &sid, &started.to_string()).await;
+        assert!(
+            t1.elapsed() >= std::time::Duration::from_millis(80),
+            "控制消息满时应等待腾位窗口（≥80ms），实际 {:?}",
+            t1.elapsed()
+        );
     }
 
     #[tokio::test]
