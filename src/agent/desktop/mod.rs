@@ -1264,7 +1264,15 @@ async fn run_desktop_pipeline(
         pts_ms += frame_ms; // 只有真实 POST 的帧推进 fMP4 时间线
         post(serde_json::json!({
             "type": "desktop:video",
-            "payload": { "kind": "frag", "key": encoded.is_idr, "data": base64(&frag) }
+            "payload": {
+                "kind": "frag", "key": encoded.is_idr, "data": base64(&frag),
+                // R5#41 帧头字段显式化（JSON 阶段子集）：消息级 seq（递增帧
+                // 号，与 fMP4 moof 内 seqn 同步）+ flags（key/delta）——协议
+                // 层帧序号/标记，未来 binary 化时同构迁移；浏览器按需解析，
+                // 向后兼容。
+                "seq": seq,
+                "flags": if encoded.is_idr { "key" } else { "delta" },
+            }
         }));
 
         // Adaptive bitrate + 降级决策: 每 10 个编码帧评估一次。
@@ -2847,6 +2855,13 @@ mod tests {
             "static desktop must space out keyframes, got {} (old 500ms heartbeat would be ~16)",
             keys.len()
         );
+        // R5#41 帧头字段显式化：frag 必须带消息级 seq（递增帧号）与 flags。
+        let f0 = keys[0];
+        assert!(
+            f0["payload"]["seq"].is_u64() || f0["payload"]["seq"].is_number(),
+            "frag must carry message-level seq, got {f0:?}"
+        );
+        assert_eq!(f0["payload"]["flags"], "key", "keyframe frag flags must be 'key'");
     }
 
     /// 最坏情况回归：纯噪声内容即便无法流畅编码，也必须持续产出关键帧
