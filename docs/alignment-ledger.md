@@ -25,7 +25,7 @@
 | 6-15 | A1 输入信号 | ◐ | 熵/上行队列/解码背压/时钟均已进 on_delay；**TestDelay 探针已做**（第 14 轮：浏览器 1s 单调时钟探测包 → agent 即时 echo → 纯网络层 RTT，probe_ms 随 qos 上报并作拥塞证实——网络健康而 e2e 高判定为管线积压不降码率） |
 | 16-30 | A2 质量控制器 | ◐ | 码率档三档+灰度+quality 连续在 QosAdaptive；**250ms 质量反馈状态机已做**（第 19 轮：五态由 250ms qos 上报驱动、迁移日志、面板状态行） |
 | 31-45 | A3 帧率控制器 | ✔ | 内容驱动（静态 1fps/动态满帧/背压 24→15）mod.rs:1058-1082 + QoS 单测 8 项 |
-| 46-55 | A4 丢帧控制器 | ◐ | 浏览器丢旧+seq gap 统计已实现（desktop.js）；agent 侧"质量到底丢帧追新"未做 |
+| 46-55 | A4 丢帧控制器 | ◐ | 浏览器丢旧+seq gap 统计（desktop.js）+ agent 侧追新**已做**（capture.rs `try_latest` 非阻塞取最新帧——编码循环每拍取最新、跳过中间帧，慢抓帧跳帧追最新；静态 IDR 用 last_static 重编）；"按质量阈值主动跳帧"（QoS Critical 主动丢 P 帧）未做——弱网由码率/分辨率降级代替，第 37 轮核实修正 |
 | 56-60 | A5 IDR 控制器 | ✔ | 活跃 6s/静止 4s/reqkey 即时/首帧强制已有（mod.rs:535 等），QP 保护未单测 |
 
 ### 乙 Player 浏览器端（61-110）
@@ -36,7 +36,7 @@
 | 71-80 | 拉流与解复用 | ◐ | seqn 解析+真实丢帧（desktop.js:_handleMoof）、demux 重同步已有；逐帧 binary 帧头协议未做（仍在 JSON 批） |
 | 81-90 | 解码与渲染 | ◐ | 解码即渲染、队列 24/2、停滞 500ms reqkey 均有；**光标叠加层已做**（第 18 轮：X11 GetImage 不含光标层——agent `poll_cursor` 100ms 节流 XQueryPointer → `desktop:cursor` 轻量消息 → 浏览器 `.sr-cursor-overlay` 叠加渲染，实测光标跟随鼠标）；超龄丢弃 2s 已做 |
 | 91-100 | 指标与面板 | ◐ | jitter/丢帧(seq)/e2e/目标帧率/TTFV/弱网标记（本轮补齐）；JS 内存曲线**已做**（第 22 轮批次2 #61：当前+峰值行）、离开 stop **已做**（session.js pagehide/beforeunload → notifyDesktopLeave → desktopView.disconnect 停流）；第 35 轮核实修正 |
-| 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；30s 判死/重连降质/能力回退链待补 |
+| 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；**30s 判死已做**（第 37 轮：浏览器播放器 `_lastDataAt` 看门狗——曾连上但 30s 无任何视频数据 → 判死重连，静止安全因 4s IDR 心跳仍到达）；重连降质/能力回退链待补 |
 
 ### 丙 遥测（111-140）
 
@@ -221,4 +221,6 @@
   1. 空闲回收可见性（R5#25）：agent 编码循环每收到真实新帧刷新 `DesktopManager.last_active_at`（unix ms，`AtomicI64`，参数链 start→run_desktop_loop→run_desktop_pipeline）；qos-ack 回传 `active`（`DesktopManager::is_active` = 距最近新帧 ≤1.5s）；浏览器 `receiveQosAck` 存 `_ackActive`，面板"目标帧率/活动"行显示 **静止/活跃**（agent 实测优先，未回传回退 ack≥15 推断）。纯判定函数 `active_at` + 单测（800ms 活跃 / 1499 边界活跃 / 1500 起静止 / 时钟回退不 panic）。**验证**：全量 `cargo test` **386 通过**（+1）——跑批时 Xvfb :98 段错误致 4 个 X11 测试失败，查明环境问题（GLX 扩展段错误）后以 `-extension GLX` 重启 Xvfb，4 测试恢复全绿，代码无涉。顺带核实修正 R4/5 表：JS 内存曲线（第 22 轮）与离开 stop（session.js pagehide/beforeunload → disconnect）均已做。
 - **第 36 轮新增合入**：
   1. relay→agent 背压回传（R5#16）：`DesktopStream::push_frag` 返回本拍被跳过（丢旧）viewer 数；`route_agent_message` desktop:video 分支检测到 drop 并经 `SharedState.last_congest_notify` 限频（≥5s）向 agent 回传 `desktop:congested {dropped}`（仅回 agent，不进 broadcast_types/EventBuffer）；agent `desktop:congested` 分支记录传输段拥塞日志（relay drop 与浏览器段 e2e/dq 互补，不直接改 QoS 决策）。测试 `test_push_frag_reports_congested_drops`（满缓冲报 drop / 腾位恢复）+ `test_desktop_congested_backpressure_to_agent`（20 帧填满 16 缓冲后回传命中），全量 `cargo test` **388 通过**（+2）。顺带核实修正 R4/5 表：丙 crash.log 上报已做（第 24 轮）、丁 TestDelay 探针已做（第 14 轮），统一时间线/重连窗口降质量为仅剩待补。
+- **第 37 轮新增合入**：
+  1. 浏览器 30s 判死兜底（R4 乙101-110 错误与恢复）：desktop.js 播放器新增 `_lastDataAt` 看门狗——`_feed(chunk)` 每次视频数据（init/moof/mdat）到达刷新；曾连上（`_gotFirstFrame`）但 30s 无任何数据到达（WS/SSE 半开黑洞、relay 静默卡死）→ 判定连接死亡并 `window.shellRemote.reconnect()`。静止安全：agent 静止时每 4s 一个 IDR 心跳 moof 仍到达，不误判；判死置位防重复，重连失败由 SSE 退避/join 看门狗兜底。**验证**：`node --check` 通过 + `_lastDataAt` 三处引用（初始化/刷新/判死）+ reconnect 入口存在。顺带核实修正 R4/5 A4：agent 侧"丢帧追新"已由 `try_latest`（每拍取最新帧、跳过中间帧）+ 批内丢旧实现，台账过时标"未做"。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
