@@ -484,13 +484,21 @@
             window.__p2pTransport.handleState(msg);
         }
     });
-    // P2P 发送辅助：将信令消息发到 agent。实际调用点由 Task 3 决定
-    // （desktop:started 后、RTCPeerConnection 就绪时）——本 task 不在
-    // started 处理器里触发协商，避免引入 Task 3 前不存在的调用链。
-    function sendDesktopP2p(message) {
-        window.shellRemote.send('desktop:p2p-offer', message);
-        window.shellRemote.send('desktop:p2p-candidate', message);
+    // P2P 发送辅助（Task 3 收口 schema）：按 payload 形态分派到对应消息类型。
+    //   {sdp, candidates[]}  → desktop:p2p-offer（协商发起）
+    //   {candidate}          → desktop:p2p-candidate（trickle ICE）
+    // Task 2 把同一载荷同时发到两个消息（reviewer Minor）：已修正为本分发。
+    // 暴露到 window 供 desktop.js（独立 IIFE，先于 session.js 加载）的
+    // _startP2p 调用——会话打开时两脚本都已执行，调用点无先后问题。
+    function sendDesktopP2p(payload) {
+        if (!payload || !window.shellRemote || !window.shellRemote.send) return;
+        if (typeof payload.sdp === 'string') {
+            window.shellRemote.send('desktop:p2p-offer', payload);
+        } else if (typeof payload.candidate === 'string') {
+            window.shellRemote.send('desktop:p2p-candidate', payload);
+        }
     }
+    window.sendDesktopP2p = sendDesktopP2p;
 
     // agent 上行链路方式（ws | http）变化时上报，指标面板展示。
     window.shellRemote.on('desktop:uplink', function(msg) {
