@@ -15,6 +15,7 @@
 - **Agent 原子自升级** — 后台"设备"面板逐台一键触发 agent 自升级：agent 从 relay 下载新二进制 → SHA-256 校验 → 可执行性冒烟测试 → 同目录原子替换 → 以原参数重启；全程进度实时显示在设备行上，任何一步失败都会保留原二进制并给出明确错误
 - **连接自愈** — 设备已注册但 agent 链路未建立或断开时不再僵死在空白终端：终端页提示"设备连接中断，正在自动重连"并自动重连，agent 恢复后终端自动回放续上；若 join 因 agent 通道失效（重连/顶替窗口）无法送达，relay 会通知浏览器重连；浏览器侧另有 join 应答看门狗，8s 无应答即自动重连——任何链路静默丢失都不会留下永久的空白终端
 - **桌面共享** — agent 捕获 X11/Windows 桌面，H.264（openh264 软编）实时编码，动态码率 800–200kbps 自适应，浏览器 MSE 播放；会话页可在"终端/桌面"间任意切换（桌面默认关闭，点击按钮开流）
+- **P2P 直连（阶段1/2）** — 桌面流下行优先直连：同网段浏览器经 `--desktop-lan-port` 直连 agent 本地端点（LAN），否则 WebRTC DataChannel（WebRTC），均失败自动回退 relay 转发。三种路径用户无感切换，任何时刻不劣于纯 relay
 - **SSE+POST 协议** — 全链路使用 HTTP SSE 推送 + POST 发送，兼容性好，不依赖 WebSocket
 - **单二进制** — 所有 Web 资源通过 `rust-embed` 编译嵌入，零外部文件依赖
 - **Token 鉴权** — 随机临时 Token 或固定密钥；支持读写和只读两种权限
@@ -99,6 +100,7 @@ cargo build --release
 | `--desktop-max-bitrate` | `800` | 最大编码码率（kbps，用户需求原数值 800） |
 | `--desktop-min-bitrate` | `200` | 最小编码码率（kbps，用户需求原数值 200） |
 | `--desktop-display` | `$DISPLAY` | 指定 X11 显示（如 `:1`），默认取 `$DISPLAY` |
+| `--desktop-lan-port` | `0` | LAN 直连桌面流监听端口（阶段2）。`0` = 不启用；非 0 时同网段浏览器直接 `http://agent-ip:port/agent/desktop/stream` 拉流，绕开 relay |
 
 输出示例：
 
@@ -122,6 +124,11 @@ session: a1b2c3d4
 - 权限：开流/关流需 rw Token（`requires_write`）；观看桌面画面 rw/ro 均可。
 - 码率：按用户需求 **最高 800kbps、最低 200kbps** 自适应动态调整（`--desktop-max-bitrate` / `--desktop-min-bitrate`，单位 kbps，默认 800/200）。
 - 编码：软件编码（openh264，BSD 许可）兜底；`--desktop-codec h264`。**硬件编码（VAAPI / Windows Media Foundation）按"软编兜底、尽可能硬编"的需求预留为后续扩展**，当前版本为纯软编。
+- 下行通道（P2P 直连，阶段1/2）：默认探测顺序 **LAN → WebRTC DataChannel → relay**，全部自动、用户无感：
+  - **LAN**：agent 带 `--desktop-lan-port` 时，浏览器与 agent 同网段直接 `http://agent-ip:port/agent/desktop/stream` 拉流（CORS 限定 relay 同源）；
+  - **WebRTC**：协商经 relay 信令（`desktop:p2p-*`）完成，DataChannel 承载 fMP4 字节（不可靠模式、丢旧保新）；
+  - **relay**：前两者失败/打洞不通时自动回退既有 `/agent/desktop/stream` 转发，功能不劣于旧版。
+  - 指标面板"下行通道"行显示当前路径（`lan` / `p2p` / `relay`）。已知限制：P2P 高动态持续帧率受 str0m SCTP cwnd 慢启动限制（LAN/relay 无此问题）；P2P 会话为单活跃 viewer（并发 viewer 自动走 relay）。
 - 捕获：X11（含 XWayland）与 Windows GDI 已实现；Wayland 原生捕获需 xdg-desktop-portal + PipeWire 运行时，本版本未内置（agent 会给出明确错误提示，可用 XWayland 走 X11 后端）。
 - 传输：fMP4（fragmented MP4）流式推给浏览器 MSE，新加入的观者从最近一个关键帧（IDR）开始接收，无需等待下一个 GOP。
 - 其它编码格式（VP8/VP9/HEVC）：考虑二进制体积与许可（x265/libvpx 体积大且 HEVC 浏览器兼容面窄），当前仅内置 H.264——它对全浏览器 MSE 兼容性最好，符合"编码器过大则只选压缩效率足够且浏览器可解"的要求。

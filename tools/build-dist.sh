@@ -18,10 +18,27 @@ mkdir -p "$CACHE"
 STUB_SRC="$ROOT/tools/glibc-cxx-stubs.c"
 
 # target | cc | cxx | ar | dist name
+#
+# aarch64/armv7 用 musl.cc 真 musl 工具链（str0m 引入后其 aws-lc-sys C 代码
+# 用 glibc cross-gcc 编译会泄入 __isoc23_* glibc 符号、musl 链接失败，见
+# MYS-931 gate；经典 glibc-gcc + libstdc++ stub 方案在 vpx/aom/openh264
+# 纯 C/C++ 时代够用，str0m 加入后必须换）。工具链解压到
+# $HOME/.cache/muslcc-<arch>（musl.cc 发布，GCC 11.2.1 + musl 1.2.3）。
+# x86_64 用系统 musl-gcc（默认 cc + crt-static 亦等价）；Windows 用 mingw。
+MUSLCC_AARCH64="${MUSLCC_AARCH64:-$HOME/.cache/muslcc-aarch64/bin/aarch64-linux-musl-}"
+MUSLCC_ARMV7="${MUSLCC_ARMV7:-$HOME/.cache/muslcc-armv7/bin/arm-linux-musleabihf-}"
+if [ ! -x "${MUSLCC_AARCH64}gcc" ] || [ ! -x "${MUSLCC_ARMV7}gcc" ]; then
+  echo "ERROR: str0m 引入后 aarch64/armv7 需 musl.cc 工具链（aws-lc-sys C 代码
+用 glibc cross-gcc 会泄入 glibc 符号致 musl 链接失败）。请下载并解压到
+\$HOME/.cache/muslcc-{aarch64,armv7}（https://musl.cc/aarch64-linux-musl-cross.tgz 与
+arm-linux-musleabihf-cross.tgz），或设 MUSLCC_AARCH64 / MUSLCC_ARMV7 指向
+<prefix>（需含 gcc/g++/ar）。" >&2
+  exit 2
+fi
 PLATFORMS=(
   "x86_64-unknown-linux-musl|musl-gcc|g++|ar|shell-remote-x86_64"
-  "aarch64-unknown-linux-musl|aarch64-linux-gnu-gcc|aarch64-linux-gnu-g++|aarch64-linux-gnu-ar|shell-remote-aarch64"
-  "armv7-unknown-linux-musleabihf|arm-linux-gnueabihf-gcc|arm-linux-gnueabihf-g++|arm-linux-gnueabihf-ar|shell-remote-armv7"
+  "aarch64-unknown-linux-musl|${MUSLCC_AARCH64}gcc|${MUSLCC_AARCH64}g++|${MUSLCC_AARCH64}ar|shell-remote-aarch64"
+  "armv7-unknown-linux-musleabihf|${MUSLCC_ARMV7}gcc|${MUSLCC_ARMV7}g++|${MUSLCC_ARMV7}ar|shell-remote-armv7"
   "x86_64-pc-windows-gnu|x86_64-w64-mingw32-gcc|x86_64-w64-mingw32-g++|x86_64-w64-mingw32-ar|shell-remote-x86_64.exe"
 )
 
@@ -31,11 +48,15 @@ for entry in "${PLATFORMS[@]}"; do
   dir="$CACHE/${dist_name%.exe}"
   mkdir -p "$dir/x"
   rm -f "$dir/stub.o" "$dir/libstdc++.a"
-  "$cc" -O2 -c "$STUB_SRC" -o "$dir/stub.o"
   stdlib=$("$cxx" -print-file-name=libstdc++.a)
-  echo "glibc libstdc++: $stdlib"
-  ( cd "$dir/x" && rm -f ./*.o 2>/dev/null; ar x "$stdlib" )
-  ar rc "$dir/libstdc++.a" "$dir"/x/*.o "$dir/stub.o"
+  echo "libstdc++: $stdlib ($cc)"
+  # glibc stub 需合并进所有目标的 libstdc++.a：x86_64-musl 的 distro g++ /
+  # mingw 的 libstdc++ 引用 glibc-only 符号（__*_chk、fopen64…）；musl.cc
+  # 工具链的 libstdc++ 虽为 musl 构建，但 CACHE 里的 libvpx/libaom 静态库是
+  # 旧 glibc 工具链预编译的，同样引用 fopen64 等 glibc 符号 → stub 也要合入。
+  "$cc" -O2 -c "$STUB_SRC" -o "$dir/stub.o"
+  ( cd "$dir/x" && rm -f ./*.o 2>/dev/null; "$ar" x "$stdlib" )
+  "$ar" rc "$dir/libstdc++.a" "$dir"/x/*.o "$dir/stub.o"
 
   # VP9 (libvpx): prefer a prebuilt static libvpx for this target (built by
   # tools/build-libvpx.sh → $CACHE/libvpx-<target>/). Fall back to the default
@@ -59,8 +80,13 @@ for entry in "${PLATFORMS[@]}"; do
     LIBXAOM_FLAGS=()
   fi
 
+  # musl libstdc++ 的 guard 引用 __sync_synchronize，已在 glibc-cxx-stubs.c
+  # 中为 arm/aarch64 提供了内联 dmb 屏障实现（stub.o 已合入 libstdc++.a）。
+  # 不链 -lgcc：musl libgcc 的 linux-atomic.o 与 rust compiler_builtins 在
+  # arm 下存在 __sync_fetch_and_add_* 重复符号定义。
+  RUSTFLAGS="-C link-arg=-L$dir"
   env CC="$cc" CXX="$cxx" AR="$ar" "${LIBVPX_FLAGS[@]}" "${LIBXAOM_FLAGS[@]}" \
-      RUSTFLAGS="-C link-arg=-L$dir" \
+      RUSTFLAGS="$RUSTFLAGS" \
       cargo build --release --target "$target" --manifest-path "$ROOT/Cargo.toml"
 done
 
