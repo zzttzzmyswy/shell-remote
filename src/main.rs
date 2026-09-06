@@ -180,12 +180,32 @@ async fn main() -> anyhow::Result<()> {
     }));
     // 关闭 ANSI 颜色控制符: 在不支持色彩的终端(重定向/日志文件/Windows 旧终端)
     // 里会产生大量转义序列垃圾。用户要求无法检测时直接关闭。
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    // 日志轮转（R3 己191 / R5#153）：设 `SR_LOG_DIR=<目录>` 时额外写入
+    // 滚动文件（每小时一个滚动文件，non-blocking，不阻塞业务线程）。
+    // 默认不设 = 只输出 stderr，行为与旧版完全一致。
+    // `_log_guard` 必须活到 main 末尾（drop 会关闭 non-blocking writer）。
+    let _log_guard = match std::env::var("SR_LOG_DIR") {
+        Ok(dir) if !dir.is_empty() => {
+            let file_appender = tracing_appender::rolling::hourly(&dir, "shell-remote.log");
+            let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(file_writer)
+                .with_env_filter(filter)
+                .init();
+            tracing::info!(dir = %dir, "log rotation enabled (hourly rolling file)");
+            Some(guard)
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter(filter)
+                .init();
+            None
+        }
+    };
 
     let cli = Cli::parse();
 
