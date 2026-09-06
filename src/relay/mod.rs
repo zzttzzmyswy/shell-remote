@@ -97,10 +97,11 @@ pub struct SharedState {
     /// （动态内容异常降帧，用户铁律动态不降帧）→ 告警日志，≥30s / 次避免
     /// 刷屏。keyed by session id。
     pub last_kpi_alert: RwLock<HashMap<String, std::time::Instant>>,
-    /// 桌面流协议开销统计（R5#43 二进制直转观察性子集）：每会话累计
-    /// `(base64 编码字节, 解码后字节)`——量化 JSON 协议膨胀（base64 ≈33%），
-    /// 为 binary 化直转决策提供 ROI 数据。
-    pub desktop_proto: RwLock<HashMap<String, (u64, u64)>>,
+    /// 桌面流协议统计（R5#43 二进制直转观察 + #41 seq 丢帧检测）：每会话
+    /// `(base64 编码字节, 解码后字节, 上次帧 seq, 检测到丢帧数)`——量化 JSON
+    /// 协议膨胀（base64 ≈33%）供 binary 化 ROI 决策；消息级 seq 跳变检测
+    /// agent→relay 段丢帧（与浏览器段 moof seqn 互补）。
+    pub desktop_proto: RwLock<HashMap<String, (u64, u64, u64, u64)>>,
     /// Last `agent:upgrade_progress` payload per session (drives the admin
     /// device panel's upgrade status cell). Keyed by session id.
     pub agent_upgrades: RwLock<HashMap<String, serde_json::Value>>,

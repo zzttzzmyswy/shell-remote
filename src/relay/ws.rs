@@ -167,14 +167,25 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             let kind = proto_msg.payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let data_b64 = proto_msg.payload.get("data").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(bytes) = crate::agent::fs::decode_b64(data_b64) {
-                // R5#43 协议开销观测：累计 base64 编码/解码字节——量化 JSON
-                // 传输膨胀（base64 ≈33%），为二进制直转（binary 化）决策提供
-                // ROI 数据（admin/决策用，登录见 desktop:stopped 未做周期刷盘）。
+                // R5#43 协议开销观测 + R5#41 seq 丢帧检测：累计 base64
+                // 编码/解码字节（量化 JSON 膨胀 ≈33%）；消息级 seq 跳变检测
+                // agent→relay 段丢帧（浏览器段 moof seqn 互补）。
+                let msg_seq = proto_msg
+                    .payload
+                    .get("seq")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 {
                     let mut proto = state.desktop_proto.write().await;
-                    let ent = proto.entry(session_id.to_string()).or_insert((0, 0));
+                    let ent = proto.entry(session_id.to_string()).or_insert((0, 0, 0, 0));
                     ent.0 += data_b64.len() as u64;
                     ent.1 += bytes.len() as u64;
+                    if msg_seq > 0 && ent.2 > 0 && msg_seq > ent.2 + 1 {
+                        ent.3 += msg_seq - ent.2 - 1;
+                    }
+                    if msg_seq > 0 {
+                        ent.2 = msg_seq;
+                    }
                 }
                 let ds = {
                     let mut streams = state.desktop_streams.write().await;
@@ -1770,9 +1781,32 @@ mod tests {
             route_agent_message(&state, &sid, &frag.to_string()).await;
         }
         let proto = state.desktop_proto.read().await;
-        let (enc, dec) = proto.get(&sid).expect("desktop:video must be counted");
+        let (enc, dec, last_seq, dropped) = proto.get(&sid).expect("desktop:video must be counted");
         assert_eq!(*enc, 8, "AQID=4 字符 × 2");
         assert_eq!(*dec, 6, "3 字节 × 2");
+        assert_eq!(*last_seq, 0, "无 seq 字段不推进 last_seq");
+        assert_eq!(*dropped, 0, "无 seq 无丢帧检测");
+    }
+
+    #[tokio::test]
+    async fn test_desktop_seq_gap_detects_dropped_frames() {
+        // R5#41 seq 丢帧检测：消息级 seq 1→3 跳变 → 检测到 1 帧丢失
+        // （agent→relay 段；浏览器段 moof seqn 互补）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        for seq in [1u64, 3u64] {
+            let frag = serde_json::json!({
+                "type": "desktop:video",
+                "session_id": sid,
+                "payload": { "kind": "frag", "data": "AQID", "key": true, "seq": seq }
+            });
+            route_agent_message(&state, &sid, &frag.to_string()).await;
+        }
+        let proto = state.desktop_proto.read().await;
+        let (_, _, last_seq, dropped) = proto.get(&sid).expect("desktop:video must be counted");
+        assert_eq!(*last_seq, 3, "last_seq 应推进到 3");
+        assert_eq!(*dropped, 1, "seq 1→3 跳变应检测 1 帧丢失");
     }
 
     #[tokio::test]
