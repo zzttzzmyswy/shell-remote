@@ -16,6 +16,10 @@ pub struct SessionInfo {
     /// Agent binary version reported at registration (`CARGO_PKG_VERSION`).
     /// `None` for older agents that predate version reporting.
     pub agent_version: Option<String>,
+    /// Agent 能力声明（R5#44 capability 协商最小子集）：注册时携带的
+    /// 能力字符串列表（`codec:av1` / `backend:x11` / `desktop:gray` 等）。
+    /// 老版本 agent 不报 → 空。admin overview 展示，浏览器可据此协商。
+    pub capabilities: Vec<String>,
 }
 
 pub struct SessionRegistry {
@@ -121,6 +125,7 @@ impl SessionRegistry {
                     is_temporary,
                     device: None,
                     agent_version: None,
+                    capabilities: Vec::new(),
                 },
             );
         }
@@ -194,6 +199,7 @@ impl SessionRegistry {
                     is_temporary: true,
                     device: None,
                     agent_version: None,
+                    capabilities: Vec::new(),
                 },
             );
         }
@@ -209,6 +215,26 @@ impl SessionRegistry {
             tokens,
             evicted,
         })
+    }
+
+    /// R5#44 capability 协商最小子集：注册后更新会话能力声明（agent 注册
+    /// 消息带 `capabilities` 数组，如 `codec:av1` / `backend:x11` /
+    /// `desktop:gray`）。会话不存在时静默。admin overview 展示，浏览器可
+    /// 据此协商能力。
+    pub async fn update_capabilities(&self, session_id: &str, capabilities: Vec<String>) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(info) = sessions.get_mut(session_id) {
+            info.capabilities = capabilities;
+        }
+    }
+
+    /// 读会话能力声明（无会话/未声明 → 空）。
+    pub async fn get_capabilities(&self, session_id: &str) -> Vec<String> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|i| i.capabilities.clone())
+            .unwrap_or_default()
     }
 
     pub async fn remove(&self, session_id: &str) {

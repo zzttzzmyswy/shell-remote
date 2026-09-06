@@ -165,6 +165,14 @@ impl RelayClient {
             register_msg["session_id"] = json!(sid);
         }
         register_msg["agent_version"] = json!(env!("CARGO_PKG_VERSION"));
+        // R5#44 capability 协商最小子集：注册时声明能力集（codec/后端/
+        // 桌面功能），relay 存储并在 admin overview 展示，浏览器可据此协商。
+        register_msg["capabilities"] = json!([
+            "codec:av1", "codec:vp9", "codec:h264",
+            "backend:x11", "backend:wayland", "backend:gdi", "backend:dxgi",
+            "desktop:gray", "desktop:quality", "desktop:clipboard",
+            "desktop:cursor", "desktop:test-delay",
+        ]);
 
         let resp = http_client
             .post(&send_url)

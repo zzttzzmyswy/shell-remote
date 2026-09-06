@@ -170,6 +170,7 @@ pub async fn overview_handler(
             "fixed_key": info.fixed_key,
             "device": info.device,
             "agent_version": info.agent_version,
+            "capabilities": info.capabilities,
             "upgrade": upgrades.get(sid),
             "browser_count": browser_count,
             "last_active_seconds": last_active_seconds,

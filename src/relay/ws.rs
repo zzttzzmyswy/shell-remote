@@ -780,6 +780,22 @@ pub async fn agent_send_handler(
             }
         };
 
+        // R5#44 capability 协商最小子集：注册消息可带 capabilities 数组
+        // （agent 声明 codec/后端/功能），存入会话供 admin overview 展示与
+        // 浏览器协商。老版本 agent 不带 → 保持空。
+        if let Some(caps) = body["capabilities"].as_array() {
+            let caps: Vec<String> = caps
+                .iter()
+                .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                .collect();
+            if !caps.is_empty() {
+                state
+                    .sessions
+                    .update_capabilities(&session_id, caps)
+                    .await;
+            }
+        }
+
         let tokens_json: Vec<Value> = tokens
             .iter()
             .map(|(token, perm)| {
@@ -1707,6 +1723,26 @@ mod tests {
             "控制消息满时应等待腾位窗口（≥80ms），实际 {:?}",
             t1.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn test_register_capabilities_roundtrip() {
+        // R5#44 capability 协商：注册后 update/get capabilities 往返一致，
+        // 老版本（不带 capabilities）保持空。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        assert!(
+            state.sessions.get_capabilities(&sid).await.is_empty(),
+            "未声明能力应为空"
+        );
+        let caps = vec![
+            "codec:av1".to_string(),
+            "backend:x11".to_string(),
+            "desktop:gray".to_string(),
+        ];
+        state.sessions.update_capabilities(&sid, caps.clone()).await;
+        assert_eq!(state.sessions.get_capabilities(&sid).await, caps);
     }
 
     #[tokio::test]
