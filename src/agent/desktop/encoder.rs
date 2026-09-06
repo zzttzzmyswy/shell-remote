@@ -201,6 +201,19 @@ pub fn create_encoder_fallback(
     }
     Err(format!("all encoders failed — {last_err}"))
 }
+
+/// 返回编码复杂度顺序中的下一档更低 codec（`av1 → vp9 → vp8 → h264`）。
+/// 用于编码耗时预算降级（R5#84）：当前 codec 软编跑不动时换更廉价的档。
+/// 已是 h264（末档）返回 `None`。
+pub fn next_lower_codec(codec: &str) -> Option<String> {
+    let order = ["av1", "vp9", "vp8", "h264"];
+    let idx = order.iter().position(|c| *c == codec)?;
+    if idx + 1 < order.len() {
+        Some(order[idx + 1].to_string())
+    } else {
+        None
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +245,16 @@ mod tests {
         assert!(q_min < q_max && q_min <= 36 && q_max >= 37);
         let (q_min_s, q_max_s) = calc_q_values(QUALITY_SPEED);
         assert!(q_min_s >= q_min && q_max_s >= q_max, "speed 应比 best 更松");
+    }
+
+    #[test]
+    fn test_next_lower_codec_chain() {
+        // 编码复杂度降级链 av1→vp9→vp8→h264；末档为 None（不再降）。
+        assert_eq!(next_lower_codec("av1").as_deref(), Some("vp9"));
+        assert_eq!(next_lower_codec("vp9").as_deref(), Some("vp8"));
+        assert_eq!(next_lower_codec("vp8").as_deref(), Some("h264"));
+        assert_eq!(next_lower_codec("h264"), None);
+        // 未知 codec：不猜测降级（保持原样，防把未知串错降）。
+        assert_eq!(next_lower_codec("wegotno"), None);
     }
 }

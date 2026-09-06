@@ -34,6 +34,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::agent::desktop::encoder::next_lower_codec;
+
 /// Post a JSON message to the relay on the agent's own HTTP transport.
 pub type PostFn = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 
@@ -704,6 +706,14 @@ async fn run_desktop_pipeline(
     // 更新一次）限制拷贝开销；静态 IDR 只需要"最近画面"。
     let mut last_static: Option<(usize, usize, Vec<u8>)> = None;
     let mut last_static_at = std::time::Instant::now();
+    // 编码耗时预算（R2 甲19/20 / R5#84）：连续 ≥10 帧单帧编码 >66ms 判定
+    // 当前 codec 在软编上不堪重负，降级到更低复杂度的 codec（av1→vp9→h264，
+    // 复用 fallback 链）。避免"持续超帧预算 → e2e 堆积 → QoS 误判拥塞"的
+    // 假阳性路径；降级一次性，成功后重置计数。
+    let mut slow_encode_streak: u32 = 0;
+    let mut encode_degraded = false;
+    const SLOW_ENCODE_MS: f64 = 66.0;
+    const SLOW_ENCODE_TRIGGER: u32 = 10;
 
     while running.load(Ordering::SeqCst) {
         let cur_fps = fps_ctl.load(Ordering::SeqCst).clamp(1, 60);
@@ -866,6 +876,7 @@ async fn run_desktop_pipeline(
         if gray.load(std::sync::atomic::Ordering::Relaxed) {
             apply_gray(&mut i420);
         }
+        let encode_t0 = std::time::Instant::now();
         let encoded = match enc.encode(&i420) {
             Ok(e) => e,
             Err(e) => {
@@ -873,6 +884,65 @@ async fn run_desktop_pipeline(
                 continue;
             }
         };
+        let encode_ms = encode_t0.elapsed().as_secs_f64() * 1000.0;
+        // 编码耗时预算（R5#84）：软编单帧 >66ms 且连续 10 帧 → 当前 codec
+        // 在 CPU 上跑不动，降级到 fallback 链的下一档（av1→vp9→h264）。
+        // 触发前先看是否有更低档可降（h264 是末档，不再降——此时保持现状
+        // 只是丢帧追新，比反复重建更稳）。
+        if !encode_degraded {
+            if encode_ms > SLOW_ENCODE_MS {
+                slow_encode_streak += 1;
+            } else {
+                slow_encode_streak = 0;
+            }
+            if slow_encode_streak >= SLOW_ENCODE_TRIGGER {
+                let next = next_lower_codec(&cfg.codec);
+                if let Some(lower) = next {
+                    tracing::warn!(
+                        codec = %cfg.codec,
+                        next = %lower,
+                        ms = format!("{encode_ms:.0}"),
+                        "encode budget exceeded ({SLOW_ENCODE_TRIGGER} frames > {SLOW_ENCODE_MS}ms) — degrading codec"
+                    );
+                    match encoder::create_encoder_fallback(
+                        &lower,
+                        enc_w as u32,
+                        enc_h as u32,
+                        cfg.max_bps,
+                        cfg.fps,
+                        cfg.quality,
+                    ) {
+                        Ok((new_enc, actual)) => {
+                            tracing::warn!(
+                                codec = %cfg.codec,
+                                next = %actual,
+                                "encode degraded to {actual} (soft-encode budget)"
+                            );
+                            enc = new_enc;
+                            cfg.codec = actual;
+                            if mp4_cfg.is_some() {
+                                mp4_cfg = None; // 参数集变了：下个 IDR 重发 init
+                                seq = 1;
+                            }
+                            enc.force_idr();
+                            encode_degraded = true; // 一次性，成功后不再反复触发
+                        }
+                        Err(e) => {
+                            tracing::warn!("encode degrade to {lower} failed: {e}");
+                            encode_degraded = true; // 失败也停止重试，防重建风暴
+                        }
+                    }
+                } else {
+                    // 已到最廉 codec（h264）：不再降，仅记录——丢帧追新兜底。
+                    encode_degraded = true;
+                    tracing::warn!(
+                        ms = format!("{encode_ms:.0}"),
+                        "encode budget exceeded but codec is already lowest ({}) — keeping",
+                        cfg.codec
+                    );
+                }
+            }
+        }
         frame_idx += 1;
 
         // 防御：RC 仍可能输出空帧（极少数情况）——空帧不 POST，记录为跳帧。
