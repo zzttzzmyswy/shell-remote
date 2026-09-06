@@ -96,6 +96,23 @@ impl DesktopConfig {
 }
 
 /// Controls the desktop capture+encode task.
+/// 心跳扩展 KPI 快照（R5#150）：agent 心跳携带的最小桌面运行态。
+/// 供 relay/admin 侧可观测（不依赖浏览器面板），字段无锁原子读。
+pub struct DesktopKpi {
+    /// 桌面流是否在跑（agent 心跳时刻）。
+    pub running: bool,
+    /// 当前编码方案（`av1` / `vp9` / `h264`）。
+    pub codec: String,
+    /// 当前目标帧率（内容驱动：静态 1 / 动态满帧 / 背压降档）。
+    pub fps: u32,
+    /// QoS 码率缩放（千分比，1000 = 100%）。
+    pub quality_permille: u32,
+    /// 编码器当前目标码率（kbps）。
+    pub bitrate_kbps: u32,
+    /// 最近单帧编码耗时（ms）。暂缺（未做跨线程累计），0 = 不可得。
+    pub encode_ms: u32,
+}
+
 pub struct DesktopManager {
     config: DesktopConfig,
     running: Arc<AtomicBool>,
@@ -277,7 +294,20 @@ impl DesktopManager {
             encoder::target_bitrate(1920, 1080, 0, self.config.quality).max(self.config.min_bps)
         };
         let bitrate_kbps = base_bps * (permille as u64) / 1000 / 1000;
-        tracing::info!(delay_ms, fps, qos_scale = permille, cap, ack_seq, "desktop QoS: adaptive adjusted");
+        // QoS 快照（R5#149）：结构化单行，含状态、目标 fps、质量缩放、
+        // 码率、解码背压（dfps/dq）与 ack 进度。admin/复盘按行解析即可
+        // 还原每 1s 的 QoS 决策轨迹（对齐 rustdesk QoS 可观测性）。
+        tracing::info!(
+            delay_ms,
+            fps,
+            qos_scale = permille,
+            bitrate_kbps,
+            cap,
+            decode_fps = decode_fps,
+            decode_queue = decode_queue,
+            ack_seq,
+            "desktop QoS: adaptive adjusted"
+        );
         (fps, permille, bitrate_kbps)
     }
 
@@ -345,6 +375,22 @@ impl DesktopManager {
     pub fn set_bandwidth_bps(&self, bps: u64) {
         use std::sync::atomic::Ordering as O;
         self.bandwidth.store(bps.max(1), O::Relaxed);
+    }
+
+    /// 心跳扩展 KPI 快照（R3 丙140 / R5#150）：agent 心跳里附带当前桌面
+    /// 运行态，relay/admin 侧可观测不依赖浏览器面板。字段全部读自原子，
+    /// 无锁；`encode_ms` 暂缺（编码耗时未做跨线程累计，见 #84 预算降级），
+    /// 为 0 表示不可得——admin 曲线只画有值的行。
+    pub fn kpi_snapshot(&self) -> DesktopKpi {
+        use std::sync::atomic::Ordering as O;
+        DesktopKpi {
+            running: self.running.load(O::Relaxed),
+            codec: self.codec(),
+            fps: self.fps.load(O::Relaxed),
+            quality_permille: self.qos_scale.load(O::Relaxed),
+            bitrate_kbps: (self.qos_bitrate.load(O::Relaxed) / 1000) as u32,
+            encode_ms: 0,
+        }
     }
 
     /// Handle one `desktop:mouse` payload from a browser (inject locally).

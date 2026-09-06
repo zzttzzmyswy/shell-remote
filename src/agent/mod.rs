@@ -84,6 +84,7 @@ async fn sender_loop(
     mut control_rx: tokio::sync::mpsc::Receiver<String>,
     mut output_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
     heartbeat: Duration,
+    desktop: Option<std::sync::Arc<crate::agent::desktop::DesktopManager>>,
 ) {
     let mut pending: HashMap<String, Vec<u8>> = HashMap::new();
     let mut timer = tokio::time::interval(Duration::from_millis(16));
@@ -108,7 +109,21 @@ async fn sender_loop(
                 flush_output(&client, &send_url, &session_id, &mut pending).await;
             }
             _ = heartbeat_tick.tick() => {
-                let ping = serde_json::json!({"type": "ping", "session_id": &session_id}).to_string();
+                // 心跳扩展（R5#150）：桌面启用时附带运行态 KPI，relay/admin
+                // 可观测不依赖浏览器面板。字段少、低频（15s），开销可忽略。
+                let mut ping = serde_json::json!({"type": "ping", "session_id": &session_id});
+                if let Some(dm) = &desktop {
+                    let k = dm.kpi_snapshot();
+                    ping["kpi"] = serde_json::json!({
+                        "running": k.running,
+                        "codec": k.codec,
+                        "fps": k.fps,
+                        "quality_permille": k.quality_permille,
+                        "bitrate_kbps": k.bitrate_kbps,
+                        "encode_ms": k.encode_ms,
+                    });
+                }
+                let ping = ping.to_string();
                 post_raw(&client, &send_url, &ping).await;
             }
         }
@@ -662,6 +677,11 @@ async fn run_session(
         control_tx: control_tx.clone(),
         output_tx,
     };
+    // Desktop video sharing: control + frame messages are posted through a
+    // single-task FIFO so the byte stream reaches the relay in order
+    // (concurrent sends could reorder fragments and break playback).
+    // 先建 DesktopManager，心跳扩展（R5#150）需要它的 KPI 快照。
+    let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(desktop_cfg.clone()));
     tokio::spawn(sender_loop(
         client.http_client().clone(),
         client.send_url().to_string(),
@@ -669,14 +689,11 @@ async fn run_session(
         control_rx,
         output_rx,
         Duration::from_secs(15),
+        Some(desktop.clone()),
     ));
     // Keep a control sender for spawned long-running tasks (e.g. mcp:exec).
     let task_control_tx = control_tx;
 
-    // Desktop video sharing: control + frame messages are posted through a
-    // single-task FIFO so the byte stream reaches the relay in order
-    // (concurrent sends could reorder fragments and break playback).
-    let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(desktop_cfg.clone()));
     // 时钟校准：采样 relay /api/clock 求 (relay_epoch - 本地_epoch) 偏移，
     // 注入 DesktopManager，srtc 打点落在 relay 时基 —— e2e 延时从此不再
     // 依赖 agent/浏览器两机系统时钟同步（MYS-886 指标失真根因）。
@@ -2218,6 +2235,7 @@ mod tests {
             control_rx,
             output_rx,
             std::time::Duration::from_millis(50),
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         drop(control_tx);
@@ -2231,6 +2249,67 @@ mod tests {
                 .any(|b| b["type"] == "ping" && b["session_id"] == "sess1"),
             "sender_loop must send a periodic ping heartbeat, got {:?}",
             *calls
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sender_loop_heartbeat_carries_desktop_kpi() {
+        // R5#150：桌面启用时心跳必须附带 KPI（fps/codec/bitrate 等），
+        // relay/admin 侧可观测不依赖浏览器面板。
+        use std::sync::{Arc as StdArc, Mutex};
+        let calls: StdArc<Mutex<Vec<serde_json::Value>>> = StdArc::new(Mutex::new(Vec::new()));
+        let app = {
+            let calls = calls.clone();
+            axum::Router::new().route(
+                "/agent/send",
+                axum::routing::post(
+                    move |axum::Json(b): axum::Json<serde_json::Value>| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.lock().unwrap().push(b);
+                            axum::http::StatusCode::OK
+                        }
+                    },
+                ),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let client = reqwest::Client::new();
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(64);
+        let url = format!("http://127.0.0.1:{}/agent/send", port);
+        let dm = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(
+            crate::agent::desktop::DesktopConfig::default(),
+        ));
+        let task = tokio::spawn(sender_loop(
+            client,
+            url,
+            "sess1".to_string(),
+            control_rx,
+            output_rx,
+            std::time::Duration::from_millis(50),
+            Some(dm.clone()),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        drop(control_tx);
+        drop(output_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+
+        let calls = calls.lock().unwrap();
+        let ping = calls
+            .iter()
+            .find(|b| b["type"] == "ping")
+            .expect("heartbeat ping");
+        assert!(
+            ping["kpi"].is_object(),
+            "heartbeat must carry desktop KPI, got {ping:?}"
+        );
+        assert!(
+            ping["kpi"]["fps"].is_u64() && ping["kpi"]["codec"].is_string(),
+            "KPI must include fps + codec, got {ping:?}"
         );
     }
 }
