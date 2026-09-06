@@ -46,6 +46,7 @@
       this._lastCaptureMs = 0;    // 最新解码帧的采集时间（e2e 延时）
       this._lastE2eMs = undefined; // 最近一次解码时测得的即时管线延时（不含帧陈旧度）
       this._lastNewFrameAt = 0;   // 最近一次解码帧到达的本地时刻（静止判定）
+      this._lastDataAt = 0;     // 最近一次视频数据(init/moof/mdat)到达时刻（R4 30s 判死看门狗）
       this._e2eMs = undefined;
       this._gotFirstFrame = false; // 是否已渲染过首帧（接入 reqkey 快路径）
       // MSE 模式首帧监听句柄（WebCodecs 走 _onDecoded；MSE 用 video
@@ -442,6 +443,10 @@
     // ── fMP4 demux ─────────────────────────────────────────
     // 字节流 → (init 的 avcC) + 逐 moof 的 {ptsUs, isKey, captureMs, avcc}
     _feed(chunk) {
+      // R4 乙30s 判死：任何视频数据到达（init/moof/mdat 都在此进入）都刷新
+      // 到达时刻——网络存活证据。静止安全：agent 静止时每 4s 一个 IDR 心跳
+      // 仍会到达 moof，不会误判；30s 完全无任何数据才是连接黑洞。
+      if (chunk && chunk.byteLength > 0) this._lastDataAt = Date.now();
       // 追加到缓冲
       const merged = new Uint8Array(this._buf.length + chunk.byteLength);
       merged.set(this._buf, 0);
@@ -1037,6 +1042,17 @@
           if (self.connected && self._gotFirstFrame && self._lastNewFrameAt &&
             (Date.now() - self._lastNewFrameAt) > 500) {
             self._requestKey();
+          }
+          // R4 乙30s 判死：曾连上（收到过首帧）但 30s 无任何视频数据到达
+          // （WS/SSE 半开黑洞、relay 静默卡死）→ 判定连接死亡，触发重连。
+          // 与静止区分：静止有 4s IDR 心跳数据；"_lastDataAt" 超 30s 未刷新
+          // 才是真黑洞。触发后置位防重复（重连失败由 SSE 退避/join 看门狗兜底）。
+          if (self.connected && self._gotFirstFrame && self._lastDataAt &&
+            (Date.now() - self._lastDataAt) > 30000) {
+            self._lastDataAt = Date.now();
+            if (window.shellRemote && window.shellRemote.reconnect) {
+              window.shellRemote.reconnect();
+            }
           }
         }, 250);
       }
