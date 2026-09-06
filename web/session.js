@@ -54,7 +54,7 @@
         joinAckTimer = setTimeout(() => {
             joinAckTimer = null;
             showToast('设备无响应，正在自动重连…', 'error');
-            window.shellRemote.reconnect();
+            requestReconnect();
         }, JOIN_ACK_TIMEOUT);
     }
     function clearJoinWatchdog() {
@@ -63,6 +63,58 @@
             joinAckTimer = null;
         }
     }
+
+    // ── 重连窗口降质量（R4 乙101-110 重连降质）────────────────────
+    // 弱网下反复重连（join 看门狗/SSE 断线/30s 判死）时，带宽被重建风暴
+    // 吃满反而更难恢复。对齐 rustdesk：30s 内 ≥2 次重连判定重连风暴 →
+    // 标记降质，下次 join 成功后立即请求 speed 低码率档（带宽压力骤减，
+    // 更易稳定），稳定 15s 无重连后自动恢复 best。
+    const reconnectTimes = [];
+    let qualityDegraded = false;
+    let qualityRestoreTimer = null;
+    function requestReconnect() {
+        const now = Date.now();
+        reconnectTimes.push(now);
+        // 只保留 30s 窗口内的重连记录（数组很小，就地 filter 无碍）
+        for (let i = reconnectTimes.length - 1; i >= 0; i--) {
+            if (now - reconnectTimes[i] > 30000) reconnectTimes.splice(i, 1);
+        }
+        if (reconnectTimes.length >= 2 && !qualityDegraded) {
+            qualityDegraded = true;
+            // 不在此处直接发 desktop:quality：重连窗口内 agent 可能已断，
+            // 消息会丢。改为 join 成功后 applyQualityOnJoin 再发（必达）。
+            showToast('网络不稳定，将自动降低码率档恢复…', 'warning');
+        }
+        if (window.shellRemote && window.shellRemote.reconnect) {
+            window.shellRemote.reconnect();
+        }
+    }
+    // join 成功后应用降质（若已标记）；并调度 15s 无重连后恢复 best。
+    function applyQualityOnJoin() {
+        if (!qualityDegraded || !window.shellRemote) return;
+        window.shellRemote.send('desktop:quality', {
+            quality: 'speed', bitrate_kbps: 0,
+            seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1)
+        });
+        showToast('已降为速度档（重连恢复中）', 'warning');
+        if (qualityRestoreTimer) clearTimeout(qualityRestoreTimer);
+        qualityRestoreTimer = setTimeout(function() {
+            qualityRestoreTimer = null;
+            qualityDegraded = false;
+            const now2 = Date.now();
+            const recent = reconnectTimes.filter(function(t) { return now2 - t < 30000; });
+            if (recent.length < 2 && window.shellRemote) {
+                window.shellRemote.send('desktop:quality', {
+                    quality: 'best', bitrate_kbps: 0,
+                    seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1)
+                });
+                showToast('连接已稳定，恢复最佳质量', 'success');
+            }
+        }, 15000);
+    }
+    // 供桌面播放器（desktop.js 30s 判死等）走同一降质通道。
+    window.__requestReconnect = requestReconnect;
+    window.__applyQualityOnJoin = applyQualityOnJoin;
 
     function updateOnlineCount() {
         onlineCountEl.textContent = onlineUsers + ' online';
@@ -282,6 +334,8 @@
         clearJoinWatchdog();
         onlineUsers = msg.payload.count || 0;
         updateOnlineCount();
+        // 重连成功（join 已应答）：若此前标记了重连降质 → 应用低码率档。
+        if (window.__applyQualityOnJoin) window.__applyQualityOnJoin();
     });
 
     window.shellRemote.on('desktop:capabilities', function(msg) {

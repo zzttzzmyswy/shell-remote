@@ -1052,7 +1052,10 @@
           if (self.connected && self._gotFirstFrame && self._lastDataAt &&
             (Date.now() - self._lastDataAt) > 30000) {
             self._lastDataAt = Date.now();
-            if (window.shellRemote && window.shellRemote.reconnect) {
+            // 走统一重连通道（R4 乙重连降质）：触发重连并参与降质检测。
+            if (window.__requestReconnect) {
+              window.__requestReconnect();
+            } else if (window.shellRemote && window.shellRemote.reconnect) {
               window.shellRemote.reconnect();
             }
           }
