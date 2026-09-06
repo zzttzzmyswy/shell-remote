@@ -167,11 +167,19 @@ fn cpu_ms_from_stat(stat: &str, hz: u64) -> u64 {
 /// 采样差 = 区间 CPU 使用率——admin KPI 可见 agent 功耗画像
 /// （R5#136-146 功耗采样最小子集）。
 fn self_cpu_ms() -> u64 {
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-    std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .map(|s| cpu_ms_from_stat(&s, hz))
-        .unwrap_or(0)
+    #[cfg(target_os = "linux")]
+    {
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .map(|s| cpu_ms_from_stat(&s, hz))
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Windows/macOS 无 /proc/self/stat 与 sysconf，功耗画像回退 0。
+        0
+    }
 }
 
 /// 当前 CPU/主板温度（℃，hwmon 传感器毫度 /1000；找不到回退 0.0）。

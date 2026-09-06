@@ -64,7 +64,10 @@ pub fn open_source(
 ) -> Result<(Box<dyn FrameSource>, String), String> {
     match kind {
         "none" => Err("desktop capture disabled".to_string()),
+        #[cfg(not(windows))]
         "x11" => ok_backend(X11Source::open(display), "x11"),
+        #[cfg(windows)]
+        "x11" => Err("X11 capture is Linux-only".to_string()),
         #[cfg(all(target_os = "linux", feature = "wayland"))]
         "wayland" => ok_backend(crate::agent::desktop::wayland::WaylandSource::open(), "wayland"),
         #[cfg(not(all(target_os = "linux", feature = "wayland")))]
@@ -315,6 +318,7 @@ impl Drop for ThreadedFrameSource {
 /// avoiding a full-frame round-trip through the X protocol on every capture.
 /// Falls back to plain `GetImage` if SHM init fails (no extension / server
 /// refuses the attach).
+#[cfg(not(windows))]
 pub struct X11Source {
     conn: x11rb::rust_connection::RustConnection,
     screen_num: usize,
@@ -368,6 +372,7 @@ struct ShmState {
 // struct Send within this single-threaded `ThreadedFrameSource` usage.
 unsafe impl Send for ShmState {}
 
+#[cfg(not(windows))]
 impl X11Source {
     pub fn open(display: Option<&str>) -> Result<Self, String> {
         use x11rb::connection::Connection;
@@ -702,6 +707,7 @@ impl X11Source {
     }
 }
 
+#[cfg(not(windows))]
 impl FrameSource for X11Source {
     fn resolution(&self) -> (usize, usize) {
         (self.width as usize, self.height as usize)
@@ -822,6 +828,7 @@ impl FrameSource for X11Source {
     }
 }
 
+#[cfg(not(windows))]
 impl X11Source {
     /// 光标位置查询（R5#64 光标独立通道）：X11 捕获画面不含光标层，远程
     /// 用户看不到鼠标指针。每 100ms 节流查询 root 指针位置并经 `cursor_cb`
@@ -850,12 +857,14 @@ impl X11Source {
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for X11Source {
     fn drop(&mut self) {
         self.teardown_shm();
     }
 }
 
+#[cfg(not(windows))]
 impl X11Source {
     /// Compose the composite-fallback error (shared by the shm-fallback path).
     fn err_composite(&mut self, shm_err: String, root_err: String) -> Result<Frame, String> {
