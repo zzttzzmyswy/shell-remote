@@ -90,6 +90,13 @@ pub struct RelayClient {
 /// 429（relay 对每 IP `agent:register` 限流，见 relay/ws.rs）时用固定
 /// 15s 退避：不在限流窗口内立即重试撞墙、也不指数放大（等待窗口自然
 /// 恢复）；其余错误按指数退避并封顶 `max`。
+/// R5#26 快速重鉴权判定：注册失败错误消息是否为"旧 token 失效"（HTTP 401
+/// token 无效 / 409 session 已被占用——relay 重启或 token 轮换后旧缓存
+/// 失效）。命中则清缓存回退固定 key 全新注册，避免用失效 token 无限重试卡死。
+fn token_stale_registration(err: &str) -> bool {
+    err.contains("HTTP 401") || err.contains("HTTP 409")
+}
+
 fn next_retry_delay(is_rate_limited: bool, prev: Duration, max: Duration) -> Duration {
     if is_rate_limited {
         Duration::from_secs(15)
@@ -291,13 +298,15 @@ impl RelayClient {
         fixed_key: Option<String>,
         token_type: &str,
         desired_session_id: Option<&str>,
-        cached_tokens: Option<&[(String, String)]>,
+        // `&mut`：R5#26 快速重鉴权——旧 token 注册被拒时清空缓存回退全新注册。
+        cached_tokens: &mut Option<Vec<(String, String)>>,
         max_retries: u32,
         insecure_tls: bool,
     ) -> anyhow::Result<Self> {
         let relay_url = relay_url.trim_end_matches('/');
         let mut delay = tokio::time::Duration::from_secs(1);
         let max_delay = tokio::time::Duration::from_secs(300);
+        let mut use_tokens = cached_tokens.as_deref();
 
         for attempt in 0..=max_retries {
             match Self::connect_http(
@@ -305,7 +314,7 @@ impl RelayClient {
                 fixed_key.clone(),
                 token_type,
                 desired_session_id,
-                cached_tokens,
+                use_tokens,
                 insecure_tls,
             )
             .await
@@ -315,12 +324,24 @@ impl RelayClient {
                     if attempt == max_retries {
                         return Err(e);
                     }
-                    let is_429 = e.to_string().contains("HTTP 429");
+                    let msg = format!("{e:#}");
+                    let is_429 = msg.contains("HTTP 429");
+                    // R5#26 token 过期快速重鉴权：旧 token 注册被拒（HTTP
+                    // 401 token 无效 / 409 session 已被占用——relay 重启或
+                    // token 轮换后旧缓存失效）→ 清缓存，下一次尝试用固定 key
+                    // 全新注册。否则永远用失效 token 重试 → 注册卡死无法恢复。
+                    if use_tokens.is_some() && token_stale_registration(&msg) {
+                        tracing::warn!(
+                            "cached token registration rejected (stale?) — clearing and re-registering fresh"
+                        );
+                        *cached_tokens = None;
+                        use_tokens = None;
+                    }
                     delay = next_retry_delay(is_429, delay, max_delay);
                     tracing::warn!(
                         "Connection attempt {} failed: {}. Retrying in {:?}...",
                         attempt + 1,
-                        format!("{e:#}"),
+                        msg,
                         delay
                     );
                     tokio::time::sleep(delay).await;
@@ -466,6 +487,17 @@ mod tests {
         let max = Duration::from_secs(300);
         assert_eq!(next_retry_delay(true, Duration::from_secs(1), max), Duration::from_secs(15));
         assert_eq!(next_retry_delay(true, Duration::from_secs(120), max), Duration::from_secs(15));
+    }
+
+    /// R5#26 token 过期快速重鉴权判定：401/409 命中（清缓存回退全新注册），
+    /// 限流(429)与网络错误不命中（保持退避重试）。
+    #[test]
+    fn test_token_stale_registration_detection() {
+        assert!(token_stale_registration("Registration failed (HTTP 401): Unauthorized"));
+        assert!(token_stale_registration("Registration failed (HTTP 409): session_id already in use"));
+        assert!(!token_stale_registration("Registration failed (HTTP 429): too many requests"));
+        assert!(!token_stale_registration("tcp connect error: Connection refused"));
+        assert!(!token_stale_registration("Failed to parse register response"));
     }
 
     #[test]

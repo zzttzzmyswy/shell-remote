@@ -658,7 +658,7 @@ async fn run_session(
         key.clone(),
         token_type,
         session_id,
-        cached_tokens.as_deref(),
+        cached_tokens,
         10,
         insecure_tls,
     )
