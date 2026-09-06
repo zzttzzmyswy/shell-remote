@@ -144,7 +144,7 @@
 
 ### 批次 5 · 测试与遥测（147-167）
 
-⬜ 统一时间线/13s 决策树/QoS 快照/心跳扩展/admin KPI/带宽记账/log 轮转/crash.log 上报/评分卡机制/弱网矩阵脚本/告警，全部待做。
+◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）已入仓。统一时间线/13s 决策树/admin KPI 曲线/带宽记账/log 轮转/crash.log 上报/评分卡聚合/告警未做。
 
 ### 批次 6 · 风险与回滚（168-177）
 
@@ -158,13 +158,11 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **33%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复、丁 弱网可见性+输入节流）；⬜ 40%（丙遥测、戊发布门槛）；◐ 27%。
-- **R5 落地清单（200 点）**：✔ 类约 **30%**（可靠通道 7 项 / 前端 17 项 / 抓帧 3 项 / 编码器 2 项）；⬜ 52%。
-- **第 3 轮新增合入**：
-  1. demux 损坏 3 次重发 init（`desktop.js:_parseNextBox`，连续非法 box→reqkey reinit，3s 限频）→ R3 丁150 / R5#54；
-  2. WebCodecs 能力探测缓存 sessionStorage（`desktop.js:connect`，`sr-capability-v1`，1h 过期重探）→ R3 己195 / R5#65；
-  3. 解码器黑名单切 codec（`desktop.js:_onDecodeError`，30s 窗口 ≥3 次解码 error→av1→vp9→h264 切档）→ R2 己155 / R5#74；
-  4. 离页停抓（`session.js` pagehide/beforeunload → desktop:stop + disconnect，省 agent 资源）→ R3 己100 / R5#77；
-  5. 面板三组分组（`session.html` 流畅度/质量/传输 三段标题 + `style.css` 分组样式）→ R3 己197 / R5#56；
-  6. 编码耗时预算降级（`mod.rs` 单帧 >66ms×10 → `encoder::next_lower_codec` 降 av1→vp9→h264，一次性防重建风暴，`test_next_lower_codec_chain`）→ R2 甲19/20 / R5#84。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **R4/5（200 点）**：✔ 类约 **36%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复、丁 弱网可见性+输入节流、丙 遥测基线）；⬜ 38%（丙遥测剩余、戊发布门槛）；◐ 26%。
+- **R5 落地清单（200 点）**：✔ 类约 **34%**（可靠通道 7 项 / 前端 17 项 / 抓帧 3 项 / 编码器 2 项 / 遥测测试 4 项）；⬜ 48%。
+- **第 4 轮新增合入**：
+  1. QoS 快照结构化（`mod.rs` desktop QoS 日志带 decode_fps/decode_queue/bitrate_kbps）→ R5#149；
+  2. 心跳扩展 KPI（`agent/mod.rs sender_loop` 心跳带 running/codec/fps/quality_permille/bitrate_kbps，`test_sender_loop_heartbeat_carries_desktop_kpi`）→ R3 丙140 / R5#150；
+  3. 弱网矩阵脚本（`tools/weaknet_matrix.sh`：netem 6 组 RTT×丢包 + 浏览器采样评分卡）→ R5#156；
+  4. 重连矩阵脚本（`tools/reconnect_matrix.sh`：agent/relay/browser 三源 ×5 恢复检测）→ R3 戊165 / R5#164。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批、log 轮转等——在台账对应 ⬜/◐ 行，未宣称完成。
