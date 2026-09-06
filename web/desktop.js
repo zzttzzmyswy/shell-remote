@@ -84,6 +84,10 @@
       this._ackScale = null;
       // QoS 五态质量状态（agent qos-ack 回传；面板"QoS 状态"行 + 颜色）。
       this._qosState = null;
+      // R5#67-70 弱网降级提示：QoS 进入 Degraded/Critical（或码率被 QoS
+      // 压降）时状态条提示降质保帧，恢复后清除（仅清自己设置的文本）。
+      this._qosDegradedShown = false;
+      this._qosDegradeText = null;
       // 首帧时间 TTFV 打点（R2 乙60：接入 → 首帧渲染毫秒），面板"链路状态"
       // 前放置；弱网模式判定也在此（e2e 连续命中阈值 → 弱网标记）。
       this._ttfvStart = 0;
@@ -941,6 +945,25 @@
       }
       // QoS 五态质量状态（R4 甲A0/A2，agent qos-ack 回传）→ 面板状态行。
       if (ack.qos_state) this._qosState = String(ack.qos_state);
+      // R5#67-70 弱网降级提示：Degraded/Critical 或码率被 QoS 压降
+      // （qos_scale<800‰）→ 状态条提示"降质保帧"（弱网可见性主动提示，
+      // 非仅面板小字）；恢复后清除。限频：状态跃迁才更新。
+      const qs = this._qosState;
+      const scaleLow = typeof this._ackScale === 'number' && this._ackScale > 0 && this._ackScale < 800;
+      const degradeNow = qs === 'Degraded' || qs === 'Critical' || scaleLow;
+      if (degradeNow && !this._qosDegradedShown) {
+        this._qosDegradedShown = true;
+        const t = '网络较弱：已降码率/画质保帧（QoS ' + (qs || 'degraded') + '）';
+        this._qosDegradeText = t;
+        this.setStatus(t, true);
+      } else if (!degradeNow && this._qosDegradedShown) {
+        this._qosDegradedShown = false;
+        // 仅清自己设置的降级文本，不误清临时错误消息。
+        if (this.statusEl && this.statusEl.textContent === this._qosDegradeText) {
+          this.setStatus('', false);
+        }
+        this._qosDegradeText = null;
+      }
       // R5#25 空闲回收可见性：agent 回传 active（最近真实新帧 ≤1.5s）——
       // 静止时 agent 已回收编码资源，面板"目标帧率/活动"行显示"静止"。
       this._ackActive = (typeof ack.active === 'boolean') ? ack.active : undefined;
