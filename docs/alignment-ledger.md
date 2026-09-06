@@ -110,23 +110,23 @@
 | 47 | WebCodecs keyframe 判定一致 | ◐ | isKey 判定已统一；断言单测缺 |
 | 48 | 控制消息轻通道 | ◐ | qos/reqkey 走 SSE；ack 100ms 批未做 |
 | 49-53 | 队列 24/2/停滞 500ms/接入 1.5s/解码错误分级 | ✔ | desktop.js 全链路 + reqkey |
-| 54 | demux 损坏 3 次重发 init | ◐ | 重同步有；3 次重发 init 缺 |
+| 54 | demux 损坏 3 次重发 init | ✔ | 连续3次非法box→reqkey reinit 3s限频（desktop.js:_parseNextBox） |
 | 55 | 帧超龄 >2s 丢弃 | ✔ | e2e>2000ms 丢+reqkey（desktop.js:_onDecoded，面板超龄计数） |
-| 56 | 面板三组分组 | ⬜ | 单列未分组 |
+| 56 | 面板三组分组 | ✔ | session.html 流畅度/质量/传输 三段（R3 己197） |
 | 57-59 | 面板补行（目标帧率/quality/弱网） | ✔ | 本轮：gofps/reqkey/weaknet/TTFV 行（desktop.js+session.html） |
 | 60 | e2e 与解码排队分流 | ◐ | |
 | 61-64 | 内存曲线/rAF 暂停/光标通道 | ⬜ | |
-| 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缺 |
+| 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect） |
 | 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ◐ | MSE 回退有 |
 | 71 | 帧到达 jitter 面板 | ✔ | metric-jitter（v0.42） |
 | 72 | qos 250ms + ack 100ms 批 | ◐ | qos 1s 上报（desktop.js），ack 批未做 |
 | 73 | 首帧 TTFV<500ms 打点 | ✔ | 本轮：_ttfvMs 面板展示（desktop.js） |
-| 74-78 | 解码器黑名单/reqkey 计数/崩溃日志/离开停抓/白闪 | ◐ | reqkey 计数面板（本轮）；其余缺 |
+| 74-78 | 解码器黑名单/reqkey 计数/崩溃日志/离开停抓/白闪 | ◐ | 黑名单切 codec（desktop.js:_onDecodeError）+ reqkey 计数 + 离页停抓（session.js pagehide）；崩溃日志/白闪缺 |
 | 79-80 | 打包单测/前端验收 | ⬜ | |
 
 ### 批次 3 · 编码器与 QoS 深化（81-120）
 
-◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；其余（threads loadavg、AV1 测速门槛、编码耗时预算、H264 热备、质量 250ms 反馈、CBR 纪律、RTT 分带、弱网 KPI 矩阵）未做。
+◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；#84 编码耗时预算已合入（`mod.rs` 慢帧 >66ms×10 → `next_lower_codec` 降档）。其余（threads loadavg、AV1 测速门槛、H264 热备、质量 250ms 反馈、CBR 纪律、RTT 分带、弱网 KPI 矩阵）未做。
 
 ### 批次 4 · 抓帧能效（121-146）
 
@@ -158,12 +158,13 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **30%**（甲 帧率/IDR、乙 Player 主体+韧性、丁 弱网可见性+输入节流）；⬜ 42%（丙遥测、戊发布门槛）；◐ 28%。
-- **R5 落地清单（200 点）**：✔ 类约 **26%**（可靠通道 7 项 / 前端 12 项 / 抓帧 3 项 / 编码器 1 项）；⬜ 55%。
-- **第 2 轮新增合入**：
-  1. 浏览器帧超龄丢弃（`desktop.js:_onDecoded`，etend>2000ms 丢+reqkey，面板"超龄"计数）→ R4 乙88 / R5#55；
-  2. 时钟 15min 慢校准（`desktop.js:_startMetrics`，连接期重校 relay 时基抗漂移）→ R5#30；
-  3. 弱网输入降采样（`desktop.js:_onPointerMove`，e2e>300ms 2:1、>800ms 4:1，鼠标 move 节流）→ R2 丙104/109 / R5#34；
-  4. 抓帧线程静止退避（`capture.rs` 线程循环，would-block 后 sleep 100ms 而非全速可空转，`test_threaded_static_source_backs_off`）→ R5#126 / R3 乙57/82；
-  5. 编码器面积判据（`aom.rs` 抽 `av1_cpu_used`/`av1_superblock_size` 纯函数，w*h±面积而非宽高各超——超宽屏档位修正，`test_area_based_cpu_used_and_superblock`）→ R5#81。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带（输入节流已做，区分探针未做）、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **R4/5（200 点）**：✔ 类约 **33%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复、丁 弱网可见性+输入节流）；⬜ 40%（丙遥测、戊发布门槛）；◐ 27%。
+- **R5 落地清单（200 点）**：✔ 类约 **30%**（可靠通道 7 项 / 前端 17 项 / 抓帧 3 项 / 编码器 2 项）；⬜ 52%。
+- **第 3 轮新增合入**：
+  1. demux 损坏 3 次重发 init（`desktop.js:_parseNextBox`，连续非法 box→reqkey reinit，3s 限频）→ R3 丁150 / R5#54；
+  2. WebCodecs 能力探测缓存 sessionStorage（`desktop.js:connect`，`sr-capability-v1`，1h 过期重探）→ R3 己195 / R5#65；
+  3. 解码器黑名单切 codec（`desktop.js:_onDecodeError`，30s 窗口 ≥3 次解码 error→av1→vp9→h264 切档）→ R2 己155 / R5#74；
+  4. 离页停抓（`session.js` pagehide/beforeunload → desktop:stop + disconnect，省 agent 资源）→ R3 己100 / R5#77；
+  5. 面板三组分组（`session.html` 流畅度/质量/传输 三段标题 + `style.css` 分组样式）→ R3 己197 / R5#56；
+  6. 编码耗时预算降级（`mod.rs` 单帧 >66ms×10 → `encoder::next_lower_codec` 降 av1→vp9→h264，一次性防重建风暴，`test_next_lower_codec_chain`）→ R2 甲19/20 / R5#84。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、reqkey 100ms ack 批等——在台账对应 ⬜/◐ 行，未宣称完成。
