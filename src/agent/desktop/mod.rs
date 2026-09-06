@@ -202,6 +202,19 @@ impl FramePool {
     }
 }
 
+/// 从池借 buffer 构建捕获帧（R5 #127 第二块）：合成帧（静态 IDR/reqkey
+/// 重编）的 bgra 从 `FramePool` 借出并拷贝，主循环处理完 `release` 归还
+/// ——避免每次合成帧 clone 都在堆上新分配一个大 buffer。
+fn pooled_frame(pool: &FramePool, w: usize, h: usize, bgra: &[u8]) -> capture::Frame {
+    let mut buf = pool.acquire(bgra.len());
+    buf.extend_from_slice(bgra);
+    capture::Frame {
+        bgra: buf,
+        width: w,
+        height: h,
+    }
+}
+
 /// Controls the desktop capture+encode task.
 /// 心跳扩展 KPI 快照（R5#150）：agent 心跳携带的最小桌面运行态。
 /// 供 relay/admin 侧可观测（不依赖浏览器面板），字段无锁原子读。
@@ -923,6 +936,11 @@ async fn run_desktop_pipeline(
         }
     };
     let (mut w0, mut h0) = threaded.resolution();
+    // R5 #127 内存池第二块：编码循环帧 buffer 池。预分配 2 个 cfg 尺寸
+    // buffer；合成帧（静态 IDR/reqkey）从池借出拷贝、动态帧处理完归还
+    // ——避开高频路径每帧堆分配（capture 侧预分配为后续框架级闭环）。
+    let frame_pool = FramePool::new(4);
+    frame_pool.prealloc(2, w0 as usize * h0 as usize * 4);
     if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
         (post)(serde_json::json!({
             "type": "desktop:started",
@@ -1130,14 +1148,15 @@ async fn run_desktop_pipeline(
                     // 决策只读 flag；消费与 force_idr 由下方"有帧即决策"块统一处理。
                     synthetic = true;
                     let (w, h, bgra) = last_static.as_ref().unwrap();
-                    Some(capture::Frame { bgra: bgra.clone(), width: *w, height: *h })
+                    // R5 #127：合成帧 bgra 从池借出（复用），处理完归还。
+                    Some(pooled_frame(&frame_pool, *w, *h, bgra))
                 } else {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
                 }
             }
         };
-        let fr = match fr {
+        let mut fr = match fr {
             Some(f) => f,
             None => continue,
         };
@@ -1222,6 +1241,8 @@ async fn run_desktop_pipeline(
         } else {
             color::bgra_to_i420_scaled(&fr.bgra, w, h, w * 4, enc_w, enc_h)
         };
+        // R5 #127：帧 bgra 已消耗（转换完成），buffer 归还池复用（cap 保留）。
+        frame_pool.release(std::mem::take(&mut fr.bgra));
         // 灰度模式（web 端可选，弱网省带宽）：编码前把 UV 平面置中性 128，
         // 色度信息≈0，码率显著下降（亮度是弱网下的主观关键）。切换即时生效
         // （下帧起），不重建编码器。
@@ -2101,6 +2122,21 @@ mod tests {
         assert!(big.capacity() >= 1000);
         let (reused, allocated) = pool.stats();
         assert_eq!((reused, allocated), (0, 1), "不匹配尺寸 → 新分配");
+    }
+
+    #[test]
+    fn test_pooled_frame_allocates_from_pool() {
+        // R5 #127 第二块：合成帧从预分配池借 buffer（复用命中、无新分配），
+        // bgra 内容与尺寸正确。
+        let pool = FramePool::new(4);
+        pool.prealloc(1, 100);
+        let f1 = pooled_frame(&pool, 5, 5, &[7u8; 100]);
+        assert_eq!(f1.bgra, vec![7u8; 100]);
+        assert_eq!(f1.width, 5);
+        assert_eq!(f1.height, 5);
+        let (reused, allocated) = pool.stats();
+        assert_eq!(reused, 1, "预分配 buffer 命中复用");
+        assert_eq!(allocated, 0, "未触发新分配");
     }
 
     #[test]
