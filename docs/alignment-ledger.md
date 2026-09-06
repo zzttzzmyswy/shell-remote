@@ -160,7 +160,7 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 70 轮合计实（#41/#43 线协议闭环 + 综合回归全绿，R5 99% 保持）。
+- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 71 轮合计实（剩余远期项落地可行性审计收口，R5 99% 保持）。
 - **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / SSE 空闲看门狗 1 项 / **弱网降级提示 1 项（第 66 轮）**）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
@@ -266,6 +266,15 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 71 轮：剩余 ⬜ 落地可行性审计（诚实收口）**：
+  1. 逐项代码级核实剩余 ⬜（全部为架构/平台级远期，本环境 Linux X11 无可安全落地子集）：
+     - **#36-38 KCP**：代码库**无任何 UDP/KCP 通道**（纯 WS/TCP 上行 + 浏览器 WS/SSE 下行）——KCP 是全新传输层（UDP 拥塞控制替换 TCP），需 agent/relay/浏览器三端协议重构，阻塞 = 架构级。
+     - **#123-124/#129 Windows DXGI/GDI**：`backend:gdi/dxgi` 仅 Windows 编译（capture.rs cfg），本环境无 Windows 无法编译/测试——阻塞 = 平台。未来在 Windows 机器落地（DXGI fastlane / GDI 静止停抓）。
+     - **#132-134 Wayland**：`wayland` feature 默认**未启用**（需 zbus/gstreamer 依赖），本环境 Xvfb 无 Wayland compositor——阻塞 = 平台 + 依赖。未来在 Wayland 会话机器启用 feature + xdg-desktop-portal 实测。
+     - **i444**：aom.rs 硬编码 `AOM_IMG_FMT_I420`（`aom_img_alloc`）——i444 需改 img 格式 + bgra→i444 转换管线 + **解码端兼容**（WebCodecs AV1/VP9 I444 支持有限）——阻塞 = 编码器 + 解码端双端改造，收益不确定。
+     - **#127 SIMD 内存池**：frame ring buffer + 引用计数需框架级改造（编码侧归还 buffer），当前 allocator 缓存 + 像素转换 SIMD（第 61 轮）已覆盖常见热点——阻塞 = 框架级，收益不确定。
+     - **多流同帧率协调**：agent `DesktopManager` **单实例**（单桌面流设计）——多流需 agent 多桌面实例 + relay 多流路由 + 浏览器多画布，阻塞 = 框架级；同帧率协调依赖多流先落地。
+  2. 收口结论：**可合入项全部闭合**——R5 落地清单 99%（剩余 1% = #36-38/#123-124/#132-134/#127/多流/i444 架构平台项，均可复现阻塞原因）；R4/5 78%（⬜ 12% 即上述架构平台项、◐ 10% 依赖远期）。台账从第 60 轮起的"最小可验证子集"推进已完成，当前 master 全验收矩阵全绿（第 70 轮综合回归）。
 - **第 70 轮综合 review（binary 化回归确认 + #43 核实收口）**：
   1. **#43 relay 二进制直转核实闭环**：第 69 轮 #41 全链路 binary 后，relay `Message::Binary` 分支 `route_bin_desktop_frame` 对 binary 帧 payload **原样字节直转** `set_init`/`push_frag`（不重新 base64 编解码，`desktop_proto` `encoded==decoded` 0% 膨胀）——正是 #43 直转语义；观测（第 53 轮）+ admin 展示（第 56 轮）+ 直转（第 69 轮）三件套齐，#43 标 ✔。
   2. **综合回归（第 69 轮 binary 化改动大，全矩阵重验确认无回归）**：① `cargo test` **413 通过**；② 重连矩阵（`reconnect_matrix.sh 2`）全过——agent kill-重启续接 / relay 重启退避重连 / 连续 flap 幂等（binary 上行 + 重连续接兼容）；③ 长稳短跑（`stability_verify.sh 60`）PASS——4 样本无重连、RSS 末两点 +0%、fps 30.0；④ IPv6 全链路（`ipv6_verify.sh`）PASS——fps 30.0 / bitrate 670；⑤ 4-top 动态基准（`bench_top4_verify.sh`）PASS——fps 30.0 / bitrate 670（动态不降帧铁律）。**二进制路径下全验收矩阵全绿**。
