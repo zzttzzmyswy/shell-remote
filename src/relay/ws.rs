@@ -167,6 +167,15 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             let kind = proto_msg.payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let data_b64 = proto_msg.payload.get("data").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(bytes) = crate::agent::fs::decode_b64(data_b64) {
+                // R5#43 协议开销观测：累计 base64 编码/解码字节——量化 JSON
+                // 传输膨胀（base64 ≈33%），为二进制直转（binary 化）决策提供
+                // ROI 数据（admin/决策用，登录见 desktop:stopped 未做周期刷盘）。
+                {
+                    let mut proto = state.desktop_proto.write().await;
+                    let ent = proto.entry(session_id.to_string()).or_insert((0, 0));
+                    ent.0 += data_b64.len() as u64;
+                    ent.1 += bytes.len() as u64;
+                }
                 let ds = {
                     let mut streams = state.desktop_streams.write().await;
                     streams
@@ -1743,6 +1752,27 @@ mod tests {
         ];
         state.sessions.update_capabilities(&sid, caps.clone()).await;
         assert_eq!(state.sessions.get_capabilities(&sid).await, caps);
+    }
+
+    #[tokio::test]
+    async fn test_desktop_protocol_overhead_stats() {
+        // R5#43 二进制直转观察性子集：base64 编码/解码字节累计——量化 JSON
+        // 协议膨胀（"AQID"=4 字符编码 3 字节解码），binary 化 ROI 数据。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        for _ in 0..2 {
+            let frag = serde_json::json!({
+                "type": "desktop:video",
+                "session_id": sid,
+                "payload": { "kind": "frag", "data": "AQID", "key": true }
+            });
+            route_agent_message(&state, &sid, &frag.to_string()).await;
+        }
+        let proto = state.desktop_proto.read().await;
+        let (enc, dec) = proto.get(&sid).expect("desktop:video must be counted");
+        assert_eq!(*enc, 8, "AQID=4 字符 × 2");
+        assert_eq!(*dec, 6, "3 字节 × 2");
     }
 
     #[tokio::test]
