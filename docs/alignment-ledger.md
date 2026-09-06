@@ -136,7 +136,7 @@
 | 122 | X11 字节判重静止停抓 | ✔ | ThreadedFrameSource last_raw memcmp（已合入，capture.rs:167） |
 | 123-124 | DXGI fastlane/静止节流 | ⬜ | Windows 侧 |
 | 125-126 | 抓帧速率联动/静止 sleep | ✔ | 静止退避 100ms sleep（capture.rs 线程循环，`test_threaded_static_source_backs_off`） |
-| 127-128 | 捕获内存池/行拷贝 SIMD | ⬜ | 第 42 轮核实标注：当前架构 Frame 拥有 `Vec<u8>`（bgra 所有权随帧流转），每帧分配由 allocator 缓存（glibc/jemalloc 复用同尺寸块）；行拷贝/像素转换循环由 LLVM 自动向量化。专项内存池（frame ring buffer + 引用计数）需框架级改造（编码侧归还 buffer），收益不确定，列为远期 |
+| 127-128 | 捕获内存池/行拷贝 SIMD | ◐ | **像素转换 SIMD 已做**（第 61 轮：`color.rs` BGRA→I420 的 Y 平面走 SSSE3/SSE4.1 128 位内核（shuffle 提通道 + i32 乘加 + 饱和打包，4 像素/拍，行尾标量补齐），U/V 子采样网格行内不连续保持标量；`bgra_to_i420_with_matrix` 运行时 `is_x86_feature_detected!("sse4.1")` dispatch，非 x86/无特性回退标量；与标量参考**逐字节一致**（测试强制：BT.601/BT.709/padding stride/非 4 倍数行尾/全色极端 5 组）；bench：1080p 转换 4.30ms vs 标量 8.03ms = **1.9x**（手动 `cargo test --release -- --ignored simd_bench_1080p`）——行拷贝/像素转换循环不再依赖 LLVM 自动向量化，显式 SIMD 落地；`#127` 捕获内存池（frame ring buffer + 引用计数）仍需框架级改造，保持远期 |
 | 129 | GDI 静止停抓+缓存 DC | ◐ | GDI DC 缓存有；静止停抓缺 |
 | 130 | 捕获失败重试窗口 30 次 | ✔ | 首帧前失败立即终止 + 首帧后首次失败即发 desktop:error（黑屏 ≤2s 可见化），保留 150 重试窗口供 GDI 自愈（mod.rs） |
 | 131 | 分辨率事件驱动 | ✔ | XRANDR ScreenChangeNotify 注册+poll_for_event（capture.rs，Xvfb 实测注册，替代 30 帧轮询） |
@@ -160,7 +160,7 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD）；◐ 10%（部分依赖架构远期）。第 60 轮合计实（多显示器选屏闭环子集已做，R5 99% 保持）。
+- **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 61 轮合计实（像素转换 SIMD 子集已做，R5 99% 保持）。
 - **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
@@ -266,6 +266,8 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 61 轮新增合入**：
+  1. 像素转换 SIMD 最小可验证子集（R5 #127-128 行拷贝/像素转换 SIMD 部分）：`color.rs` BGRA→I420 重构为 Y 平面标量/SSSE3-SSE4.1 内核 + U/V 标量。SIMD 内核每拍 4 像素——`_mm_shuffle_epi8` 按 BGRA 布局提取 B/G/R 通道（小端 i32 视图即 [c0,c1,c2,c3]）、`_mm_mullo_epi32` + 加法合 Y 分子、`+128 >> 8 + 16`、`_mm_min/max_epi32` clamp、`_mm_packus_epi32`/`_mm_packus_epi16` 两次饱和打包、`write_unaligned` 非对齐写（行起始可能非 4 对齐）；行尾 <4 像素保持标量补齐。`bgra_to_i420_with_matrix` 运行时 `is_x86_feature_detected!("sse4.1")` dispatch，非 x86/无特性回退标量。**验证**：新增 4 单测强制 SIMD 与标量参考逐字节一致（BT.601/BT.709、padding stride、w=10/14 非 4 倍数尾部、全白/全黑/全 A=0 极端）；全量 `cargo test` **406 通过**（+4）；`simd_bench_1080p`（`#[ignore]` 手动）1080p 转换 **4.30ms vs 标量 8.03ms = 1.9x**；端到端 `tools/bench_top4_verify.sh` PASS（fps 中值 30.0 满帧、bitrate 670kbps——SIMD 转换在真实编码管线输出正常，动态不降帧铁律保持）。
 - **第 60 轮新增合入**：
   1. 多显示器选屏闭环（批次7 多流/多显示器部分，rustdesk 对齐）：agent `DesktopManager` 新增运行时选屏覆盖 `display: RwLock<Option<String>>`（初始 = 启动 `--desktop-display`）+ `select_display(&str, post)`——更新覆盖值（`""`/空白 → 恢复启动默认）、运行中 stop→start 重建桌面流（`set_codec` 同机制）；`start()` 用 `resolved_display(runtime, config)` 解析实际捕获屏；`desktop:started` payload 新增 `display` 字段（前端同步选中值）。agent 新增 `desktop:select-display` 命令（回 `desktop:cmd-ack {seq, ok}`，复用白名单）。浏览器工具栏新增"显示器"下拉——多屏拓扑才显示（`populateDisplaySelect` 按 `_srDesktopInfo.displays` 重建选项：默认 + 各 name·宽x高）、change 发送 `desktop:select-display`、started 事件同步当前屏。**验证**：`node --check`（session.js + desktop.js）通过；新增单测 `test_resolved_display_precedence`（运行时覆盖优先于启动配置）/`test_select_display_updates_runtime_override`（未运行更新字段、空串恢复默认、同值 no-op）/`test_select_display_trim`（trim + 纯空白=恢复），全量 `cargo test` **402 通过**（+3）。收口：批次7 多流/多显示器部分（枚举+UI 面+选屏闭环）已闭合，剩余 ⬜ 全为架构级/平台级远期（binary 传输 #41-44、KCP、DXGI/GDI Windows、Wayland、i444、SIMD、多流同帧率协调）。
 - **第 59 轮新增合入**：
