@@ -40,7 +40,7 @@
 
 ### 丙 遥测（111-140）
 
-◐ 部分。QoS 快照结构化日志（R5#149）、心跳扩展 KPI（#150）、relay 带宽记账（#152）、评分卡脚本（#155）已有；**admin KPI 曲线已做**（第 16 轮：relay 采样 agent 心跳 KPI——15s×120 点 FIFO，`/api/session/kpi/:sid` 时间序列 + admin 面板 📈 canvas 折线 fps/bitrate）。统一时间线／13s 归因决策树／crash.log 上报 未做。
+◐ 部分。QoS 快照结构化日志（R5#149）、心跳扩展 KPI（#150）、relay 带宽记账（#152）、评分卡脚本（#155）已有；**admin KPI 曲线已做**（第 16 轮：relay 采样 agent 心跳 KPI——15s×120 点 FIFO，`/api/session/kpi/:sid` 时间序列 + admin 面板 📈 canvas 折线 fps/bitrate）；**13s 归因决策树已做**（第 23 轮：`tools/qos_attribution.py` 解析 QoS 快照按 probe/qos_state/dq/dfps 归因 network/decode/encode/static/good + 中位延迟建议，分支单测 + 真实日志验证）。统一时间线／crash.log 上报 未做。
 
 ### 丁 弱网纵深（141-170）
 
@@ -75,9 +75,9 @@
 | 15 | agent 控制消息独立有界 channel | ⬜ | |
 | 16 | relay→agent 背压回传 | ◐ | relay viewer 缓冲水位已降 16；回传拥塞信号未做 |
 | 17 | 12s 超时统一 ≤5s | ◐ | |
-| 18 | 发送失败即重连 | ◐ | |
+| 18 | 发送失败即重连 | ✔ | 会话断线（send/recv 失败）→ run_session 返回 → connect_with_retry 指数退避重连（client.rs，含 429 固定延迟）；与 #11 断线恢复同路径，第 23 轮核实修正 |
 | 19 | 桌面开启竞态幂等 | ✔ | `DesktopManager::start` 首行 `if self.is_running() { return; }`（检查→置 running 间无 await，并发安全）；第 21 轮代码级核实修正 |
-| 20 | 半开连接心跳兜底 | ◐ | |
+| 20 | 半开连接心跳兜底 | ✔ | relay→agent 每 20s server-side ping（#28）+ agent→relay 每 15s 心跳——半开连接双方探测覆盖，第 23 轮核实修正 |
 | 21 | 未知消息白名单丢弃 | ✔ | relay route_agent_message 白名单外丢弃+日志（ws.rs KNOWN 常量） |
 | 22 | WS/HTTP 限流等价 | ✔ | agent_conn_rate_ok 共享 ev: 30/min 配额（agent_events_handler + agent_ws_send_handler，测试 test_agent_conn_rate_shared_ws_http） |
 | 23 | 崩溃重启会话 key 续接 | ✔ | agent 崩溃重启后 cached_tokens replay → relay `register_existing` 续接同一 session（client.rs 缓存 token + connect_with_retry 重放）；与 #10 同机制，代码级核实修正 |
@@ -160,8 +160,8 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **57%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 23%。
-- **R5 落地清单（200 点）**：✔ 类约 **72%**（可靠通道 16 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 10 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 19%。
+- **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
+- **R5 落地清单（200 点）**：✔ 类约 **74%**（可靠通道 18 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 11 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 18%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -188,4 +188,7 @@
 - **第 22 轮新增合入**：
   1. 控制命令 ack（`agent/mod.rs` quality/codec/gray handler + `web/session.js`）：命令带递增 `seq` → agent 处理后回 `desktop:cmd-ack {seq,ok,error?}` → 浏览器 toast 反馈操作结果（quality/codec/gray 成功或失败可见）；relay broadcast_types/KNOWN 白名单加 cmd-ack。**浏览器实测**：quality(best) 命令 ack `{ok:true,seq:100}` 到达。TCP 可靠（命令不丢），本确认价值 = **操作结果反馈**（弱网/高负载下用户可见操作生效）+ 为弱网重发预留 seq 机制 → R5#2。
   2. 台账修正：#10 agent 重连幂等替换（`register_existing` 替换旧 session）与 #23 崩溃重启 key 续接（cached_tokens replay）经代码级核实**均已实现**；#29 控制消息优先级核实为 ◐（is_lossy 数据/控制区分已成立，channel 满时控制仍可能丢）。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **第 23 轮新增合入**：
+  1. QoS 13s 归因决策树（`tools/qos_attribution.py`）：解析 agent 日志 `desktop QoS` 结构化行 → 逐采样归因 **network / decode / encode / static / good**（probe_ms≥300 或 probe 中+降码率 → network；网络健康+dq>12+dfps<20 → decode 积压；动态 fps≤15 且降码率 → encode）→ 归因占比 + 中位 e2e/RTT/fps 建议。**验证**：真实日志 95% static（静态桌面正常）+ 5% good + 中位 e2e=40ms/RTT=4ms；分支逻辑单测（network×2/ decode/ static/ good 全对）→ R4 丙 13s 归因决策树。
+  2. 台账修正：#18 发送失败即重连（会话断线 → connect_with_retry 退避重连，与 #11 同路径）与 #20 半开连接心跳兜底（20s ping + 15s 心跳双方探测）经代码级核实均已实现。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛、crash.log 上报等——在台账对应 ⬜/◐ 行，未宣称完成。
