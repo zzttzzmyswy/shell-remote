@@ -794,6 +794,10 @@ async fn run_desktop_pipeline(
             "payload": { "x": x, "y": y, "shown": shown }
         }));
     }));
+    // 多显示器最小子集（R5#136-146）：move 前枚举远端显示器拓扑，随
+    // desktop:started 上报（浏览器/运维可见远端多屏；X11 实现返回 RANDR
+    // 输出，其它后端空）。
+    let monitors = src.list_monitors();
     // 截图线程化（rustdesk capture 线程对齐）：capture 挪到独立线程持续
     // 抓帧，编码循环 try_latest 非阻塞取最新帧——抓帧（X11/DXGI）不再拖慢
     // 编码，慢抓帧时跳帧追最新。src 被 move 进抓帧线程。
@@ -886,6 +890,12 @@ async fn run_desktop_pipeline(
             "codec": cfg.codec, "width": w0, "height": h0, "fps": cfg.fps,
             "min_kbps": cfg.min_bps / 1000, "max_kbps": cfg.max_bps / 1000,
             "backend": backend,
+            "displays": monitors.iter().map(|m| {
+                serde_json::json!({
+                    "name": m.name, "width": m.width, "height": m.height,
+                    "x": m.x, "y": m.y,
+                })
+            }).collect::<Vec<_>>(),
         }
     }));
 

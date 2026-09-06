@@ -22,6 +22,16 @@ pub struct Frame {
     pub height: usize,
 }
 
+/// 一台远端显示器（X11 RANDR 输出）：名称 + 分辨率 + 偏移（桌面坐标系）。
+#[derive(Clone, Debug)]
+pub struct MonitorInfo {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
 /// Frame source abstraction over a captured desktop.
 pub trait FrameSource: Send {
     /// Capture the next frame (`bgra` length must be `width*height*4`).
@@ -32,6 +42,12 @@ pub trait FrameSource: Send {
     /// 捕获画面通常不含光标层——独立查询位置经 `desktop:cursor` 轻量消息
     /// 发给浏览器 overlay（光标移动不触发整帧重编码）。
     fn set_cursor_cb(&mut self, _cb: Box<dyn FnMut(i32, i32, bool) + Send>) {}
+    /// 远端显示器拓扑（R5#136-146 多显示器最小子集）：默认空（Wayland/GDI/
+    /// 测试桩无 X11 RANDR），X11 实现枚举输出（名称/分辨率/偏移）。随
+    /// `desktop:started` 上报，浏览器/运维可见远端多屏。
+    fn list_monitors(&self) -> Vec<MonitorInfo> {
+        Vec::new()
+    }
 }
 
 /// Open a capture source. `kind` is one of `auto`, `x11`, `wayland`,
@@ -407,6 +423,49 @@ impl X11Source {
             }
         }
         Ok(src)
+    }
+
+    /// R5#136-146 多显示器最小子集：枚举 X11 RANDR 输出（名称/分辨率/偏移）。
+    /// 失败返回空（观测缺失不致命，desktop:started 的 displays 为空数组）。
+    pub fn list_monitors(&self) -> Vec<MonitorInfo> {
+        use x11rb::protocol::randr::ConnectionExt as _;
+        let mut out = Vec::new();
+        let res = match self.conn.randr_get_screen_resources_current(self.root) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(r) => r,
+                Err(_) => return out,
+            },
+            Err(_) => return out,
+        };
+        for oid in res.outputs {
+            let info = match self.conn.randr_get_output_info(oid, 0) {
+                Ok(cookie) => match cookie.reply() {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            let name = String::from_utf8_lossy(&info.name).to_string();
+            let (w, h, x, y) = if info.crtc != 0 {
+                match self.conn.randr_get_crtc_info(info.crtc, 0) {
+                    Ok(cookie) => match cookie.reply() {
+                        Ok(c) => (c.width as u32, c.height as u32, c.x as i32, c.y as i32),
+                        Err(_) => (0, 0, 0, 0),
+                    },
+                    Err(_) => (0, 0, 0, 0),
+                }
+            } else {
+                (0, 0, 0, 0)
+            };
+            out.push(MonitorInfo {
+                name,
+                width: w,
+                height: h,
+                x,
+                y,
+            });
+        }
+        out
     }
 
     /// Try to initialise the MIT-SHM fast path. Quietly falls back to
@@ -1131,6 +1190,27 @@ mod tests {
     /// #131 分辨率事件驱动：支持 RANDR 的服务器上应成功注册
     /// ScreenChangeNotify（`randr_registered=true`）——事件驱动替代轮询。
     /// 无扩展时允许注册失败（回落轮询），但必须不破坏首帧捕获。
+    #[test]
+    fn test_x11_list_monitors_returns_at_least_one() {
+        // R5#136-146 多显示器最小子集：Xvfb（或真实 X）至少有一个 RANDR
+        // 输出；枚举应非空且名称/分辨率可读。
+        let display = std::env::var("SR_XTEST_DISPLAY").unwrap_or_else(|_| ":99".into());
+        let src = match X11Source::open(Some(&display)) {
+            Ok(s) => s,
+            Err(e) => {
+                if e.contains("connect") && std::env::var("SR_NO_XTEST").is_ok() {
+                    return;
+                }
+                panic!("x11 open failed: {e}");
+            }
+        };
+        let monitors = src.list_monitors();
+        assert!(!monitors.is_empty(), "X server must expose ≥1 RANDR output");
+        let m = &monitors[0];
+        // 接通的输出应有非零分辨率（Xvfb 默认 screen 输出）
+        assert!(m.width > 0 && m.height > 0, "monitor must have size, got {m:?}");
+    }
+
     #[test]
     fn test_x11_randr_event_driven_resolution() {
         let display = std::env::var("SR_XTEST_DISPLAY").unwrap_or_else(|_| ":99".into());
