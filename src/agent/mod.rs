@@ -1180,7 +1180,8 @@ async fn run_session(
         // frag=moof+mdat，不带 JSON 包裹），投给 P2P 消费循环写 DataChannel。
         // init 单独缓存一份（建连时补推，见 p2p 驱动任务 Connected 分支）。
         // 通道未建/未开时静默丢弃（丢旧保新，浏览器 reqkey/重连兜底）。p2p 侧
-        // UnboundedSender::send 不阻塞，std RwLock 读不跨 await。
+        // MirroredQueue::push 同步非阻塞（有界丢旧保新，满丢最旧；std RwLock
+        // 读不跨 await，见 p2p.rs）。
         if t == "desktop:video" {
             let kind = msg["payload"]["kind"].as_str();
             let data_b64 = msg["payload"]["data"].as_str();
@@ -1200,8 +1201,8 @@ async fn run_session(
                         lan.feed(is_init, is_key, bytes.clone());
                     }
                     if let Ok(guard) = video_tx.read() {
-                        if let Some(tx) = guard.as_ref() {
-                            let _ = tx.send(bytes);
+                        if let Some(q) = guard.as_ref() {
+                            q.push(bytes);
                         }
                     }
                 }

@@ -20,11 +20,11 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 /// Peer 级 WebRTC 连接状态（计划接口：Connecting | Connected | Failed）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WebRtcState {
-    /// 建连中（ICE New/Checking，或暂时断开待恢复）。
+    /// 建连中（ICE New/Checking）。
     Connecting,
     /// ICE + DTLS + SCTP 已打通。
     Connected,
-    /// 内部驱动错误（poll/handle 失败）——不可恢复。
+    /// 不可恢复：驱动错误、ICE Disconnected、DataChannel 被远端关闭。
     Failed,
 }
 
@@ -328,8 +328,16 @@ impl WebRtcPeer {
                     IceConnectionState::Connected | IceConnectionState::Completed => {
                         WebRtcState::Connected
                     }
-                    // New / Checking / Disconnected（暂且视为可恢复的建连中）。
-                    _ => WebRtcState::Connecting,
+                    // New / Checking：正常建连中，保持 Connecting。
+                    IceConnectionState::New | IceConnectionState::Checking => {
+                        WebRtcState::Connecting
+                    }
+                    // Disconnected（is-0.11 无 Failed 变体，Disconnected 即终态）：
+                    // final-review #1 复审判定必须拆链——死链若长期停在 Connecting，
+                    // 驱动循环的 15s 握手超时被 `announced_connected` 门控关掉，
+                    // 配合无界 fMP4 镜像队列会在长活 agent 上 OOM。P2P 属
+                    // best-effort，弱链路本就该回退 relay 矩阵。
+                    IceConnectionState::Disconnected => WebRtcState::Failed,
                 };
             }
             Event::ChannelOpen(cid, _label) => {
@@ -339,6 +347,12 @@ impl WebRtcPeer {
                 if let Some(cb) = &self.on_data {
                     cb(d.data);
                 }
+            }
+            // 浏览器关页/主动关闭 DataChannel：建连后通道关闭即会话终结。
+            // 此前被 `_ => {}` 吞掉，死链永不 teardown（#1 复审）。
+            Event::ChannelClose(_) => {
+                tracing::debug!("p2p datachannel closed by remote, marking failed");
+                self.mark_failed();
             }
             _ => {}
         }
@@ -909,7 +923,6 @@ mod tests {
             let (sent, recv, mbps) = socket_throughput_once(*reliable, *delay, window);
             println!("{name:<40} sent={} recv={} {mbps:.2} MB/s", sent, recv);
         }
-        assert!(true);
     }
 
     /// 真实 socket 发送语义无回归（普通测试，随套件跑）：回环上不可靠+无序
