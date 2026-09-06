@@ -305,7 +305,9 @@ impl RelayClient {
     ) -> anyhow::Result<Self> {
         let relay_url = relay_url.trim_end_matches('/');
         let mut delay = tokio::time::Duration::from_secs(1);
-        let max_delay = tokio::time::Duration::from_secs(300);
+        // R5#9 rustdesk 对齐 60s 退避上限：指数 1→2→4…见顶 60s 后固定。
+        // 原 300s 封顶意味着最坏挂 ~5min 才恢复连接，弱网场景恢复太慢。
+        let max_delay = tokio::time::Duration::from_secs(60);
         let mut use_tokens = cached_tokens.as_deref();
 
         for attempt in 0..=max_retries {
@@ -484,7 +486,7 @@ mod tests {
     #[test]
     fn test_next_retry_delay_429_is_fixed_not_exponential() {
         // 429（relay 限流）退避固定 15s：不随前置退避指数放大，等待窗口恢复。
-        let max = Duration::from_secs(300);
+        let max = Duration::from_secs(60);
         assert_eq!(next_retry_delay(true, Duration::from_secs(1), max), Duration::from_secs(15));
         assert_eq!(next_retry_delay(true, Duration::from_secs(120), max), Duration::from_secs(15));
     }
@@ -502,11 +504,12 @@ mod tests {
 
     #[test]
     fn test_next_retry_delay_exponential_with_cap() {
-        let max = Duration::from_secs(300);
+        // R5#9：退避上限 60s（rustdesk 对齐）——指数增长到 60s 后封顶固定。
+        let max = Duration::from_secs(60);
         assert_eq!(next_retry_delay(false, Duration::from_secs(1), max), Duration::from_secs(2));
         assert_eq!(next_retry_delay(false, Duration::from_secs(4), max), Duration::from_secs(8));
-        // 封顶
-        assert_eq!(next_retry_delay(false, Duration::from_secs(200), max), max);
+        assert_eq!(next_retry_delay(false, Duration::from_secs(32), max), max);
+        assert_eq!(next_retry_delay(false, Duration::from_secs(300), max), max);
         // 429 与指数互不干扰
         assert_eq!(next_retry_delay(true, Duration::from_secs(8), max), Duration::from_secs(15));
     }
