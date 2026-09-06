@@ -65,7 +65,7 @@
 | 5 | 单条消息 8MB 上限 | ✔ | ws.rs browser_send_handler → 413 + 单测 |
 | 6 | /agent/send 首次绑定校验 | ✔ | relay `agent_send_handler` 校验 session 已注册（`agent_broadcast` 含 session 才接受，否则 400/401）；与第 17 轮 #22 限流同 handler 核实 |
 | 7 | 心跳 15s | ✔ | agent/mod.rs Duration::from_secs(15) |
-| 8 | SSE 空闲超时对齐心跳 | ◐ | 第 33 轮核实：agent 下行 SSE `AGENT_SSE_IDLE_TIMEOUT=60s` = 心跳 15s × 4 裕量（半开连接 ~60s 判死重连，`pump_sse_events`）；浏览器侧靠 join 看门狗 5s + SSE 重连退避覆盖——浏览器显式空闲计数未独立实现（弱网事件稀疏时仍靠 60s 兜底） |
+| 8 | SSE 空闲超时对齐心跳 | ✔ | 第 33 轮核实 + **第 65 轮补浏览器侧显式空闲看门狗**：agent 下行 SSE `AGENT_SSE_IDLE_TIMEOUT=60s` = 心跳 15s × 4 裕量（半开连接 ~60s 判死重连，`pump_sse_events`）；**浏览器 `web/sse.js` 新增空闲看门狗**（第 65 轮）——`lastSseAt` 每次 SSE 块刷新，连接建立后惰性 `setInterval(checkSseIdle, 5s)`，**30s 无任何块判定半开**（relay 60s 兜底的一半，弱网事件稀疏时更快检出）→ abort 旧流 + 走 `scheduleReconnect` 退避重连；connected 前 `lastSseAt==0` 不判死（交 join 看门狗 5s）。阈值 30s = 心跳 15s × 2 裕量，正常连接不误杀。与桌面 30s 判死（desktop.js `_lastDataAt`）对称。验证：`node --check` 通过 + 三处引用一致（定义/检查/刷新） |
 | 9 | 重连退避 60s 上限 | ✔ | 第 33 轮：agent `connect_with_retry` 退避上限 300s → **60s**（`next_retry_delay` 指数 1→2→4…见顶 60s 封顶，429 固定 15s 不受上限影响；rustdesk 对齐——断线/弱网 agent 最坏 1min 内恢复，原 5min 封顶过久；测试 `test_next_retry_delay_exponential_with_cap`/`_429_is_fixed_not_exponential`）；浏览器 10 次指数退避已有 |
 | 10 | agent 重连幂等替换 | ✔ | relay `SessionRegistry::register_existing`（session.rs:153）——agent 断线重连 replay cached_tokens 走 register_existing 替换旧 session（第 21 轮 #11 恢复依赖它）；代码级核实修正 |
 | 11 | relay 重启后重发 init 状态机 | ✔ | 第 21 轮：agent 会话级 `desktop_want_running` 跨重连传递——断线退出时记录桌面状态并显式 stop（防 orphan task 向失效连接发帧），重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init）。实测两轮 relay 重启均 `auto-restoring desktop stream` + `capture started 1280x720` |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **78%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态/编码降级链、乙 Player 主体+韧性+30s判死+能力回退链+重连降质+内存+排队归因+光标叠加+解码器释放、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树+告警雏形+统一时间线工具、丁 弱网可见性+输入节流+RTT分带+重连窗口降质量、戊 验收脚本化全闭环）；⬜ 12%（线协议 binary 整块 #41-43、KCP、DXGI/GDI Windows、Wayland、i444、SIMD 内存池部分）；◐ 10%（部分依赖架构远期）。第 64 轮合计实（capability 声明真实性，R5 99% 保持）。
-- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **99%**（可靠通道 32 项 / 前端 23 项 / 抓帧 8 项 / 编码器 8 项 / 打包 5 项 / 遥测测试 18 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项 / **SSE 空闲看门狗 1 项（第 65 轮）**）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -266,6 +266,8 @@
   1. #14 混合通道二进制分辨核实：架构上混合通道**已分离**——agent 控制（`control_tx`）/媒体（`post_tx` 批内丢旧）/桌面字节（`desktop_streams` 独立 bytes fan-out）三通道（#15/#29），浏览器 SSE 控制 text vs 桌面 WS binary 也分离；JSON 阶段 base64 由 `kind` 分辨；二进制帧分辨协议在 #41 binary 化时落地（架构重构远期）。R5 99% / R4/5 78% 保持，剩余 ⬜ 全为架构/平台/编码器级远期，最小可验证子集逐项推进中。
 - **第 58 轮新增合入**：
   1. 多显示器 UI 面（批次7 多流/多显示器部分）：浏览器面板新增"**远端显示器**"行（metric-monitors）——`desktop:started` 的 `displays` 数组存入 `_srDesktopInfo.displays`，desktop.js 1s tick 渲染"数量 + 各分辨率摘要"（如 "2 台 · 1920x1080 + 1280x720"）——多屏选屏的前置观察面。**验证**：`node --check`（session.js + desktop.js）通过 + metric-monitors 两端引用一致。纯前端改动，无 Rust 回归面。
+- **第 65 轮新增合入**：
+  1. 浏览器 SSE 空闲看门狗（R5 #8 SSE 空闲超时对齐心跳的浏览器侧显式计数）：`web/sse.js` 新增 `lastSseAt`（每次 SSE 块刷新）+ 连接建立后惰性 `setInterval(checkSseIdle, 5s)`——**30s 无任何块判定半开**（relay `AGENT_SSE_IDLE_TIMEOUT=60s` 兜底的一半，弱网事件稀疏时更快检出半开连接）→ abort 旧流 + `scheduleReconnect` 退避重连；connected 前 `lastSseAt==0` 不判死（交 join 看门狗 5s）。阈值 30s = agent 下行心跳 15s × 2 裕量，正常连接不误杀；与桌面 30s 判死（desktop.js `_lastDataAt`）对称。**验证**：`node --check`（sse.js）通过 + 三处引用一致（`lastSseAt` 定义/checkSseIdle 检查/handleBlock 刷新、`sseIdleTimer` 定义/启动）；纯前端改动无 Rust 回归面。R5 #8 标 ✔（agent 60s 兜底 + 浏览器 30s 显式看门狗互补）。
 - **第 64 轮新增合入**：
   1. capability 声明真实性（R5 #44 capability 协商细化）：`agent/client.rs` 新增 `build_capabilities()`——codec 按编译 feature（h264 恒在 / vp9·av1 按 `cfg!(feature)`，与 `DesktopConfig::supports_codec` 对齐）、backend 按**平台 + 运行时探测**（Linux 声明 `backend:x11` + wayland 仅 `feature="wayland"` 且 `WAYLAND_DISPLAY` 可达；Windows 才声明 `backend:gdi/dxgi`）——**修复此前 Linux agent 硬编码声明 `backend:gdi`/`backend:dxgi` 不实**（浏览器/admin 被误导以为支持 Windows 后端）。桌面功能声明不变（gray/quality/clipboard/cursor/test-delay）。**验证**：`test_build_capabilities_platform_accurate`（codec 按 feature / 非 Windows 无 gdi·dxgi / 桌面功能齐全）+ `test_build_capabilities_wayland_detection`（WAYLAND_DISPLAY 设/不设双分支）；端到端 admin overview 实测 Linux capabilities=`codec:h264,codec:vp9,codec:av1,backend:x11,desktop:*`（无 gdi/dxgi）；全量 `cargo test` **408 通过**（+2）。
 - **第 63 轮综合 review**：
