@@ -126,7 +126,7 @@
 
 ### 批次 3 · 编码器与 QoS 深化（81-120）
 
-◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；#82 编码线程数 loadavg 自适应已合入（`encoder.rs codec_thread_num` 用 `(核数-loadavg)×0.5`，负载高自动减线程，测试 `test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）；#84 编码耗时预算已合入（`mod.rs` 慢帧 >66ms×10 → `next_lower_codec` 降档）；#85 编码器故障热备已合入（第 15 轮：`mod.rs next_degrade_codec` 统一 #84 慢帧/#85 encode-Err 降级出口，`rebuild_encoder_degrade` 复用重建动作，连续 5 帧 Err → av1→vp9→h264；测试 `test_next_degrade_codec_trigger`）；#89 CBR 纪律**已做**（`aom.rs:111 AOM_CBR` + `vpx.rs:91 VPX_CBR` + undershoot/overshoot 50% + 缓冲 600/600/1000 + `AOM_KF_DISABLED` 外部 force_idr，前轮已合入、本台账此前误标未做，第 15 轮修正）；#111 RTT 分带 + #113 中值滤波已合入（`mod.rs`，测试覆盖）。其余（AV1 测速门槛、质量 250ms 反馈、弱网 KPI 矩阵）未做。
+◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；#82 编码线程数 loadavg 自适应已合入（`encoder.rs codec_thread_num` 用 `(核数-loadavg)×0.5`，负载高自动减线程，测试 `test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）；#84 编码耗时预算已合入（`mod.rs` 慢帧 >66ms×10 → `next_lower_codec` 降档）；#85 编码器故障热备已合入（第 15 轮：`mod.rs next_degrade_codec` 统一 #84 慢帧/#85 encode-Err 降级出口，`rebuild_encoder_degrade` 复用重建动作，连续 5 帧 Err → av1→vp9→h264；测试 `test_next_degrade_codec_trigger`）；#89 CBR 纪律**已做**（`aom.rs:111 AOM_CBR` + `vpx.rs:91 VPX_CBR` + undershoot/overshoot 50% + 缓冲 600/600/1000 + `AOM_KF_DISABLED` 外部 force_idr，前轮已合入、本台账此前误标未做，第 15 轮修正）；#111 RTT 分带 + #113 中值滤波已合入（`mod.rs`，测试覆盖）；**弱网 KPI 矩阵已做**（第 20 轮：`tools/weaknet_kpi_matrix.sh`——netem 多档 × 浏览器采样 QoS KPI（fps/e2e/probe/qos_state/bitrate）→ KPI 汇总表 + 用户铁律断言"动态弱网不降帧"（静态 fps=1 正确跳过）；实测采样正常）。其余（AV1 测速门槛、质量 250ms 反馈）未做。
 
 ### 批次 4 · 抓帧能效（121-146）
 
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **57%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 23%。
-- **R5 落地清单（200 点）**：✔ 类约 **67%**（可靠通道 11 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 9 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 22%。
+- **R5 落地清单（200 点）**：✔ 类约 **68%**（可靠通道 11 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 10 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 21%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -178,4 +178,7 @@
   1. 光标独立通道（`capture.rs poll_cursor` + `FrameSource::set_cursor_cb` + `desktop:cursor` + `web/desktop.js updateCursor`）：**X11 `GetImage`/`ShmGetImage` 不含光标层——远程用户看不到鼠标指针是真实缺口**。agent 捕获线程 `next_frame` 内 100ms 节流 `XQueryPointer` → 位置经 `cursor_cb` → `desktop:cursor {x,y,shown}` 轻量消息（光标移动不触发整帧重编码）→ relay broadcast_types/KNOWN 白名单 → 浏览器 `.sr-cursor-overlay`（内联 SVG 箭头 + 捕获分辨率→显示尺寸映射）。**浏览器实测**：overlay 出现在屏幕中心（638,342≈640,360）、注入鼠标移动到 (300,200)/(600,450) 后 overlay 跟随到 (299,190)/(598,428)。另确认 enigo 注入需 DISPLAY 环境（测试环境未设导致注入失败，非代码 bug）→ R4 乙81-90 / R5#64。
 - **第 19 轮新增合入**：
   1. QoS 五态质量状态机（`mod.rs QosQualityState` Unknown/Good/Medium/Degraded/Critical + `QosAdaptive::update_quality_state`）：由网络层 probe 中值 + 拥塞增量 over 推导的**显式状态对象**（rustdesk QualityStatus 同构），每次 250ms qos 采样更新；迁移记日志（实测 `from=Unknown to=Good probe_ms=20 over=0`）；`qos-ack` 回传 `qos_state` → 浏览器面板"QoS 状态"行（Good 绿/Medium 黄/Degraded 橙/Critical 红）。测试 `test_qos_quality_state_transitions`（五态迁移 + 恢复）、`test_qos_quality_state_without_probe`（无探针靠 over）。**浏览器实测**：面板显示 Good + 绿色、agent 日志快照含 `qos_state=Good`。状态为观测快照、不影响 fps/ratio 决策（决策测试全绿）→ R4 甲 A0 / A2。
+- **第 20 轮新增合入**：
+  1. 弱网 KPI 矩阵（`tools/weaknet_kpi_matrix.sh`）：netem 弱网档位（RTT 50/300/800 × 丢包 0/2%）逐档浏览器采样 QoS KPI（渲染 fps / e2e / 网络 RTT / qos_state / bitrate）→ KPI 汇总表 + **用户铁律断言"动态画面弱网不降帧"**（fps≥15；静态 fps=1 正确跳过，不误报）。实测采样正常（e2e 51ms、probe 4ms、qos_state Good、静态 fps=1 INFO 分支）。无 netem 权限自动降级到正常档基线 → R5#157 / R4 丁142 弱网 KPI 矩阵。
+  2. 记录观察：连续 playwright 会话后新 join 的 `toggle-desktop-btn` 可能 disabled（疑测试会话残留，生产每次新标签页是干净 SSE 会话）——与批次1 #12（SSE 重建补 desktop:state）相关，台账 ⬜ 未闭合，如实记录。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
