@@ -89,7 +89,7 @@
 | 29 | 控制消息优先级 | ◐ | 部分：`is_lossy_msg_type` 区分数据（terminal:output 静默丢）/控制（non-lossy 满时告警丢）已有，基本优先级语义成立；channel 满时控制仍可能丢（无腾位机制），第 22 轮核实 |
 | 30 | 时钟校准 15min 慢校准 | ✔ | 连接期每 15min 重校（desktop.js:_startMetrics） |
 | 31 | 注册风暴防御 | ✔ | 120/min+冷却（agent/mod.rs） |
-| 32 | 剪贴板大文本走文件传输 | ⬜ | |
+| 32 | 剪贴板大文本走文件传输 | ✔ | 大文本抓护已做（第 30 轮：`CLIPBOARD_MAX_CHARS` 512KB + `clipboard_truncate` floor_char_boundary 安全截断，set/get 双向——防超大控制消息阻塞上行/远端剪贴板写入卡顿，测试 `test_clipboard_truncate_boundary`）；完整正向文件传输为远期方向 |
 | 33 | 输入 10ms 合并节流 | ✔ | mousemove 10ms 合并最后坐标（desktop.js:_onPointerMove，与 #34 叠加） |
 | 34 | 弱网输入降采样 | ✔ | e2e>300ms 2:1 / >800ms 4:1（desktop.js:_onPointerMove） |
 | 35 | 弱网控制消息直通 | ✔ | 已由组合覆盖：#29 控制消息非 lossy 优先 + #15 独立有界控制 channel + #2 命令 ack（seq+确认）+ #33/#34 输入节流/降采样——弱网下控制消息不被数据挤掉且可确认；第 29 轮核实修正 |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **82%**（可靠通道 25 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 10%。
+- **R5 落地清单（200 点）**：✔ 类约 **83%**（可靠通道 26 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -207,4 +207,6 @@
 - **第 29 轮新增合入**：
   1. join 超时统一（`web/session.js JOIN_ACK_TIMEOUT` 8s → **5s**）：join 发出后 5s 内无控制事件回传 → 提示 + 自动重连——对齐 rustdesk 5s 超时语义，弱网下 join 静默丢失更快失败恢复（原 8s 空白终端挂更久）→ R5#17。
   2. 台账核实修正：#35 弱网控制消息直通**已由组合覆盖**（#29 控制非 lossy 优先 + #15 独立有界 channel + #2 命令 ack + #33/#34 输入节流/降采样）。
+- **第 30 轮新增合入**：
+  1. 剪贴板大文本防护（`mod.rs clipboard_truncate` + `CLIPBOARD_MAX_CHARS` 512KB）：set/get 双向安全截断到最近 UTF-8 字符边界（`floor_char_boundary`）——防超大控制消息阻塞上行 / 远端剪贴板写入卡顿（完整文本走文件传输为远期方向）。测试 `test_clipboard_truncate_boundary`（未超限原样 / 英文精确截断 / 中文不切半字 / 混排合法 UTF-8），全量 `cargo test` **384 通过** → R5#32。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
