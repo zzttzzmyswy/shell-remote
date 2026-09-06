@@ -78,6 +78,11 @@
       this._clockRecheckTimer = null;
       // JS 内存峰值（R2 丁131 / R5#61）：面板内存行显示当前 + 会话峰值。
       this._jsMemPeak = 0;
+      // QoS 250ms 上报（R5#72）：独立定时器（与 1s 面板刷新解耦），
+      // 解码帧率 dfps 按 250ms 窗口 ×4 折算回"每秒"语义，agent 侧背压
+      // 阈值（decode_fps<20 且队列>12）不受窗口改变影响。
+      this._qosTimer = null;
+      this._qosDfps = 0; // 最近一次折算后的每秒解码帧率（面板排队时延用）
       // demux 损坏重同步计数（R3 丁150）：连续 3 次非法 box → 重发 init。
       this._demuxCorrupt = 0;
       // 解码器黑名单（R2 己155/R3 丁155）：连续解码错误触发（这里是解码器
@@ -846,6 +851,7 @@
       this._weakNet = false;
       this._staleDropped = 0;
       this._throttleCounter = 0;
+      this._qosDfps = 0;
       if (this._moveTimer) { clearTimeout(this._moveTimer); this._moveTimer = null; }
       this._movePending = null;
       this._unbindInput();
@@ -892,6 +898,31 @@
           if (!self.connected) return;
           self._calibrateClock();
         }, 15 * 60 * 1000);
+      }
+      // QoS 反馈 250ms 独立上报（R5#72）：agent 的 fps/码率决策需要比
+      // 面板刷新（1s）更密的端到端与解码背压信号——弱网变化越快响应。
+      // dfps 按窗口 ×4 折算回每秒（agent 背压阈值语义不变）。
+      if (!this._qosTimer) {
+        this._qosTimer = setInterval(function() {
+          if (!self.connected) return;
+          const dfps = self._decodeCount;
+          self._decodeCount = 0;
+          self._qosDfps = dfps * 4; // 250ms 窗口 → 每秒
+          if (self._e2eMs !== undefined && window.shellRemote && window.shellRemote.send) {
+            window.shellRemote.send('desktop:qos', {
+              delay_ms: Math.round(self._e2eMs),
+              dfps: self._qosDfps,
+              dq: self._dec ? self._dec.decodeQueueSize : 0,
+              lseq: self._lastSeq || 0
+            });
+          }
+          // 停滞检测（曾收到帧但现在 500ms 无新帧）也移到这里——比 1s
+          // 面板 tick 更早发现关键帧断裂。
+          if (self.connected && self._gotFirstFrame && self._lastNewFrameAt &&
+            (Date.now() - self._lastNewFrameAt) > 500) {
+            self._requestKey();
+          }
+        }, 250);
       }
 
       // 显式按钮开关（session.html #desktop-metrics-btn）；旧的左上角
@@ -943,7 +974,16 @@
           const actualFps = self._rafCount;
           fps.textContent = actualFps;
           self._rafCount = 0;
-          buf.textContent = self._dec ? self._dec.decodeQueueSize : '-';
+          // 解码队列帧数 + 排队时延估算（R2 己175 / R5#60：e2e 归因分流——
+          // e2e 高时查这行是"解码积压"还是"上游慢"）。dq/解码fps ≈ 秒，
+          // 画面要等多久才轮到当前帧。
+          const dq = self._dec ? self._dec.decodeQueueSize : 0;
+          if (dq > 0 && self._qosDfps > 0) {
+            const estMs = Math.round(dq / self._qosDfps * 1000);
+            buf.textContent = dq + ' 帧 (~' + estMs + 'ms)';
+          } else {
+            buf.textContent = dq;
+          }
           drop.textContent = self._droppedFrames + ' 解码 / ' + self._staleDropped + ' 超龄 / ' + self._seqDrop + ' 上行(seq)';
           // 帧到达 jitter（stddev）：稳定流应 ≪ 帧间隔（top 场景目标 <8ms）
           if (jitterEl) {
@@ -1011,24 +1051,8 @@
             weaknet.textContent = wl;
             weaknet.style.color = self._weakNet ? '#f0a020' : '';
           }
-          // QoS 反馈：端到端延时 + 解码背压（解码帧率/队列深度）上报 agent。
-          //（agent 侧：fps 由内容活动驱动——静态 1fps/动态满帧，网络只调
-          //  码率；解码背压是唯一允许降帧的信号。）
-          const dfps = self._decodeCount;
-          self._decodeCount = 0;
-          if (self._e2eMs !== undefined && window.shellRemote && window.shellRemote.send) {
-            window.shellRemote.send('desktop:qos', {
-              delay_ms: Math.round(self._e2eMs),
-              dfps: dfps,
-              dq: self._dec ? self._dec.decodeQueueSize : 0,
-              lseq: self._lastSeq || 0
-            });
-          }
-          // 停滞检测：曾收到帧但现在 500ms 无新帧 → 关键帧断裂可能，请求刷新。
-          if (self.connected && self._gotFirstFrame && self._lastNewFrameAt &&
-            (Date.now() - self._lastNewFrameAt) > 500) {
-            self._requestKey();
-          }
+          // QoS 反馈已移至 250ms 独立定时器（R5#72），此处不再重复上报。
+          // 停滞检测同理（250ms 定时器内）。
         } catch (e) { /* 面板只是展示 */ }
       }, 1000);
     }
@@ -1037,6 +1061,10 @@
       if (this._metricsTimer) {
         clearInterval(this._metricsTimer);
         this._metricsTimer = null;
+      }
+      if (this._qosTimer) {
+        clearInterval(this._qosTimer);
+        this._qosTimer = null;
       }
       if (this._clockRecheckTimer) {
         clearInterval(this._clockRecheckTimer);
