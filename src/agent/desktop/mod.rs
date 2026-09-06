@@ -52,6 +52,20 @@ pub fn clipboard_truncate(text: &str, max: usize) -> &str {
     }
 }
 
+/// 当前 unix 毫秒（i64，活跃度打点用；时钟异常回退 0）。
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 活跃度判定（R5#25 空闲回收可见性）：距最近真实新帧 ≤1500ms 视为活跃
+/// （内容活动）；超过即静止/空闲（agent 已回收编码资源，仅 4s IDR 心跳）。
+fn active_at(last_active_ms: i64, now_ms: i64) -> bool {
+    now_ms.saturating_sub(last_active_ms) < 1500
+}
+
 /// Post a JSON message to the relay on the agent's own HTTP transport.
 pub type PostFn = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 
@@ -182,6 +196,11 @@ pub struct DesktopManager {
     /// 接入/参考链断裂/解码错误时即时重同步，不再等周期 IDR（对齐 rustdesk
     /// 控制端 refresh_video 语义，MYS-886）。
     idr_request: Arc<std::sync::atomic::AtomicBool>,
+    /// 最近一次真实新帧的墙钟毫秒。编码循环每收到真实新帧（内容活动，
+    /// 非静态 IDR 心跳）即刷新；qos-ack 回传 `active = elapsed < 1500ms`
+    /// 供浏览器面板显示"静止/活跃"（R5#25 空闲回收可见性——静止时 4s IDR、
+    /// 不空转编码回收资源，用户在面板上能看到状态而非误以为卡死）。
+    last_active_at: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl DesktopManager {
@@ -210,6 +229,7 @@ impl DesktopManager {
             qos_bitrate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gray: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idr_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
         }
     }
 
@@ -249,6 +269,15 @@ impl DesktopManager {
     pub fn gray_enabled(&self) -> bool {
         use std::sync::atomic::Ordering as O;
         self.gray.load(O::Relaxed)
+    }
+
+    /// R5#25 空闲回收可见性：最近 1500ms 内是否有真实新帧（内容活动）。
+    /// 静止时 agent 已回收编码资源（仅 KF_QUIET_MS 静态 IDR），面板据此
+    /// 显示"静止"而非让用户误以为画面卡死。
+    pub fn is_active(&self) -> bool {
+        let now = unix_ms_now();
+        let last = self.last_active_at.load(std::sync::atomic::Ordering::Relaxed);
+        active_at(last, now)
     }
 
     /// 请求下一个编码帧立即出关键帧（浏览器接入/解码错误/参考链断裂时调用，
@@ -498,6 +527,7 @@ impl DesktopManager {
         }
         let bandwidth = self.bandwidth.clone();
         let clock_offset = self.clock_offset.load(std::sync::atomic::Ordering::Relaxed);
+        let last_active_at = self.last_active_at.clone();
         let fps_ctl = self.fps.clone();
         let qos_scale = self.qos_scale.clone();
         let qos_frames = self.qos_frames.clone();
@@ -505,7 +535,7 @@ impl DesktopManager {
         let gray = self.gray.clone();
         let idr_request = self.idr_request.clone();
         let task = tokio::task::spawn(async move {
-            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl, qos_scale, qos_frames, qos_bitrate, gray, idr_request).await;
+            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl, qos_scale, qos_frames, qos_bitrate, gray, idr_request, last_active_at).await;
         });
         *self.task.lock().await = Some(task);
     }
@@ -692,6 +722,7 @@ async fn run_desktop_loop(
     qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
     gray: Arc<std::sync::atomic::AtomicBool>,
     idr_request: Arc<std::sync::atomic::AtomicBool>,
+    last_active_at: Arc<std::sync::atomic::AtomicI64>,
 ) {
         let mut src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok((src, backend)) => (src, backend),
@@ -705,7 +736,7 @@ async fn run_desktop_loop(
         }
     };
     let (src, backend) = src;
-    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl, qos_scale, qos_frames, qos_bitrate, gray, idr_request).await;
+    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl, qos_scale, qos_frames, qos_bitrate, gray, idr_request, last_active_at).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -723,6 +754,7 @@ async fn run_desktop_pipeline(
     qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
     gray: Arc<std::sync::atomic::AtomicBool>,
     idr_request: Arc<std::sync::atomic::AtomicBool>,
+    last_active_at: Arc<std::sync::atomic::AtomicI64>,
 ) {
     // cfg 需可变：编码器 fallback 后回写实际 codec。
     let mut cfg = cfg;
@@ -888,6 +920,10 @@ async fn run_desktop_pipeline(
                     last_static = Some((f.width, f.height, f.bgra.clone()));
                     last_static_at = std::time::Instant::now();
                 }
+                // R5#25 空闲回收可见性：真实新帧 = 内容活动。静止（无新帧/
+                // 静态 IDR 心跳）时保持 ||last_active_at|| 旧值，qos-ack 据此
+                // 上报 active=false，浏览器面板显示"静止"。
+                last_active_at.store(unix_ms_now(), std::sync::atomic::Ordering::Relaxed);
                 Some(f)
             }
             None => {
@@ -1866,6 +1902,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_active_at_threshold() {
+        // R5#25 空闲回收可见性阈值：≤1500ms 间隔判定活跃，超过即静止。
+        assert!(active_at(1_000_000, 1_000_800), "800ms 内应活跃");
+        assert!(active_at(1_000_000, 1_001_499), "1499ms 边界仍活跃");
+        assert!(!active_at(1_000_000, 1_001_500), "1500ms 边界起静止");
+        assert!(!active_at(1_000_000, 1_005_000), "5s 静止");
+        // 时钟异常（now < last）不应 panic，视为活跃（饱和为 0）。
+        assert!(active_at(1_000_000, 999_000));
+    }
+
+    #[test]
     fn test_kf_interval_adapts_to_activity() {
         // 高熵（帧均 > 2KB）→ 活跃 1.5s
         assert_eq!(kf_interval_ms_for(10_000.0), KF_ACTIVE_MS);
@@ -2657,6 +2704,7 @@ mod tests {
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
             ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
@@ -2697,7 +2745,8 @@ mod tests {
         rt.block_on(async {
             let bw = cfg.max_bps;
             let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicBool::new(false))));
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now()))));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -2735,7 +2784,8 @@ mod tests {
         rt.block_on(async {
             let bw = cfg.max_bps;
             let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(15)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicBool::new(false))));
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now()))));
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -2774,7 +2824,8 @@ mod tests {
         rt.block_on(async {
             let bw = cfg.max_bps;
             let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicBool::new(false))));
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now()))));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;

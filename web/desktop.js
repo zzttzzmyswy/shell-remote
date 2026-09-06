@@ -936,6 +936,9 @@
       }
       // QoS 五态质量状态（R4 甲A0/A2，agent qos-ack 回传）→ 面板状态行。
       if (ack.qos_state) this._qosState = String(ack.qos_state);
+      // R5#25 空闲回收可见性：agent 回传 active（最近真实新帧 ≤1.5s）——
+      // 静止时 agent 已回收编码资源，面板"目标帧率/活动"行显示"静止"。
+      this._ackActive = (typeof ack.active === 'boolean') ? ack.active : undefined;
     }
     // TestDelay 探针回包：agent 原样 echo t0，本地单调时钟算纯网络 RTT。
     receiveTestDelayAck(ack) {
@@ -1146,14 +1149,19 @@
               jsmem.textContent = '不支持';
             }
           }
-          // 目标帧率 vs 内容活动：agent 回传的目标 fps（desktop:qos-ack），
-          // 与本地实际渲染对比。fps=1 → 静态；≥15 → 动态满帧；中间为解码
-          // 背压阶梯。diff 代表 agent 目标与本地实际的安全余量（对齐
-          // rustdesk 控制端目标/实测帧率对照，MYS-886）。
+          // 目标帧率 vs 内容活动：agent 回传的目标 fps 与活跃度标记
+          // （desktop:qos-ack），与本地实际渲染对比。fps=1 → 静态；≥15 →
+          // 动态满帧；中间为解码背压阶梯。活跃度优先用 agent 实测 active
+          // （R5#25：静止时 agent 已回收编码资源仍保持画面→显示"静止"而非
+          // 误以为卡死）；未回传时回退到 ack>=15 的档位推断。
           if (gofps) {
             const ack = self._ackFps;
             if (ack !== null && ack !== undefined) {
-              gofps.textContent = '目标 ' + ack + ' / 实际 ' + actualFps + (ack >= 15 ? ' (动态)' : ' (静态)');
+              let state;
+              if (self._ackActive === false) state = '静止';
+              else if (self._ackActive === true || ack >= 15) state = '活跃';
+              else state = '静态';
+              gofps.textContent = '目标 ' + ack + ' / 实际 ' + actualFps + ' (' + state + ')';
             } else {
               gofps.textContent = '实际 ' + actualFps;
             }

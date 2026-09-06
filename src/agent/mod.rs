@@ -1592,6 +1592,8 @@ async fn run_session(
                                     // 回传当前生效的 QoS 状态（对齐 rustdesk TestDelay
                                     // 携带 target_bitrate，MYS-886 #153）：浏览器可展示
                                     // 实际码率/帧率 + 质量状态（R4 甲A0 五态）。
+                                    // active = 最近真实新帧 ≤1.5s（R5#25 空闲回收可见
+                                    // 性：静止时 agent 已回收编码资源，面板显示"静止"）。
                                     let qos_ack = Message {
                                         msg_type: "desktop:qos-ack".to_string(),
                                         session_id: client.session_id.clone(),
@@ -1600,6 +1602,7 @@ async fn run_session(
                                             "qos_scale": qos_scale,
                                             "bitrate_kbps": bitrate_kbps,
                                             "qos_state": format!("{:?}", qos_state),
+                                            "active": desktop.is_active(),
                                         }),
                                     };
                                     out.control(qos_ack).await;
