@@ -142,7 +142,7 @@
 | 131 | 分辨率事件驱动 | ✔ | XRANDR ScreenChangeNotify 注册+poll_for_event（capture.rs，Xvfb 实测注册，替代 30 帧轮询） |
 | 132-134 | Wayland/首帧/缩放 | ⬜ | 远期 |
 | 135 | `--desktop-capture-fps` 抓帧独立上限 | ✔ | CLI 参数 + ThreadedFrameSource::spawn_with_max_fps（动态节流、静态退避不变，测试 `test_threaded_source_max_fps_throttles`） |
-| 136-146 | 功耗/内存画像/多显示器/色彩矩阵 | ⬜ | **内存画像最小子集已做**（第 45 轮：agent 心跳 KPI 带 `rss_kb`（`/proc/self/statm` resident×4KB，`self_rss_kb` + 单测）→ relay `AgentKpiSample.rss_kb` → admin KPI 曲线可见 agent 内存时间线，长稳验收 RSS 判据的旁证）；**功耗采样最小子集已做**（第 46 轮：agent 心跳 KPI 带 `cpu_ms`（`/proc/self/stat` utime+stime×tick，`cpu_ms_from_stat` 纯函数 + 构造数据单测）→ relay `AgentKpiSample.cpu_ms` → 两次采样差 = 区间 CPU 使用率，admin KPI 可见功耗画像）；**多显示器最小子集已做**（第 48 轮：`FrameSource::list_monitors` 枚举 X11 RANDR 输出（名称/分辨率/偏移），`desktop:started` 带 `displays` 数组——远端多屏拓扑对浏览器/运维可见；测试 `test_x11_list_monitors_returns_at_least_one`）；**色彩矩阵最小子集已做**（第 49 轮：`color.rs bgra_to_i420_with_matrix` 支持 BT.601/BT.709 系数选择，默认 601 不变（H.264 标准色域）；测试 `test_color_matrix_bt709_differs_from_bt601` + 默认回归；CLI 配置项为后续方向） |
+| 136-146 | 功耗/内存画像/多显示器/色彩矩阵 | ⬜ | **内存画像最小子集已做**（第 45 轮：agent 心跳 KPI 带 `rss_kb`（`/proc/self/statm` resident×4KB，`self_rss_kb` + 单测）→ relay `AgentKpiSample.rss_kb` → admin KPI 曲线可见 agent 内存时间线，长稳验收 RSS 判据的旁证）；**功耗采样最小子集已做**（第 46 轮：agent 心跳 KPI 带 `cpu_ms`（`/proc/self/stat` utime+stime×tick，`cpu_ms_from_stat` 纯函数 + 构造数据单测）→ relay `AgentKpiSample.cpu_ms` → 两次采样差 = 区间 CPU 使用率，admin KPI 可见功耗画像）；**功耗硬采样最小子集已做**（第 50 轮：agent 心跳 KPI 带 `cpu_temp`（`self_cpu_temp` 扫 `/sys/class/hwmon/*/temp*_input` 取首个非零毫度→℃，无传感器回退 0；测试 `test_self_cpu_temp_safe_or_positive`）→ relay `AgentKpiSample.cpu_temp` → admin KPI 可见温度趋势，过热告警基础数据）；**多显示器最小子集已做**（第 48 轮：`FrameSource::list_monitors` 枚举 X11 RANDR 输出（名称/分辨率/偏移），`desktop:started` 带 `displays` 数组——远端多屏拓扑对浏览器/运维可见；测试 `test_x11_list_monitors_returns_at_least_one`）；**色彩矩阵最小子集已做**（第 49 轮：`color.rs bgra_to_i420_with_matrix` 支持 BT.601/BT.709 系数选择，默认 601 不变（H.264 标准色域）；测试 `test_color_matrix_bt709_differs_from_bt601` + 默认回归；CLI 配置项为后续方向） |
 
 ### 批次 5 · 测试与遥测（147-167）
 
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **96%**（可靠通道 30 项 / 前端 22 项 / 抓帧 8 项 / 编码器 8 项 / 打包 4 项 / 遥测测试 16 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **97%**（可靠通道 30 项 / 前端 22 项 / 抓帧 8 项 / 编码器 8 项 / 打包 4 项 / 遥测测试 17 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -250,4 +250,6 @@
   1. 多显示器最小子集（R5#136-146 部分）：`FrameSource::list_monitors` 默认空 + `X11Source` 实现枚举 X11 RANDR 输出（`randr_get_screen_resources_current` → output_info（名称）+ crtc_info（分辨率/偏移））；`run_desktop_pipeline` 在 src move 前枚举，`desktop:started` payload 带 **`displays`** 数组（name/width/height/x/y）——远端多屏拓扑对浏览器/运维可见（多显示器选屏为后续方向）。测试 `test_x11_list_monitors_returns_at_least_one`（Xvfb ≥1 RANDR 输出 + 非零尺寸）。全量 `cargo test` **394 通过**（+1）。
 - **第 49 轮新增合入**：
   1. 色彩矩阵最小子集（R5#136-146 部分）：`color.rs` 重构为 `bgra_to_i420_with_matrix(bgra, w, h, stride, ColorMatrix)`——`ColorMatrix::{Bt601, Bt709}` 系数表（Y/U/V 整数定点 >>8），默认入口 `bgra_to_i420` 保持 BT.601（H.264/OpenH264 标准色域，回归保护）；BT.709 供 WebM/HD 色域后续切换。测试 `test_color_matrix_bt709_differs_from_bt601`（同像素两矩阵输出不同 + 默认=601）。全量 `cargo test` **395 通过**（+1）。
+- **第 50 轮新增合入**：
+  1. 功耗硬采样最小子集（R5#136-146 部分）：agent 心跳 KPI 加 `cpu_temp`（`self_cpu_temp` 扫描 `/sys/class/hwmon/*/temp*_input` 取首个非零毫度→℃，无传感器环境回退 0 不 panic；本机 coretemp ≈77℃实测）→ relay `AgentKpiSample.cpu_temp` 解析 → admin KPI 可见 **agent 温度趋势**（过热告警的基础数据）。测试 `test_self_cpu_temp_safe_or_positive`（合理范围 0-150℃）+ 采样测试断言 cpu_temp 落库。全量 `cargo test` **396 通过**（+1）。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
