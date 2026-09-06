@@ -120,6 +120,7 @@
       this._p2pPc = null;        // RTCPeerConnection（协商失败/断开即置 null）
       this._p2pDc = null;        // RTCDataChannel
       this._p2pTimeout = null;   // 协商 5s 超时定时器
+      this._p2pFallbackDone = false; // 本次 connect 是否已回退 relay（防双开 WS）
     }
 
     // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
@@ -330,8 +331,7 @@
     _startP2p() {
       // MSE 模式 / 浏览器不支持 RTCPeerConnection：直接走现有 WS→fetch。
       // DataChannel 仅 WebCodecs 路径可用（MSE 不接 DataChannel 字节）。
-      if (!this._webcodecsAvailable() || typeof RTCPeerConnection === 'undefined' ||
-          typeof this._p2pPc === 'undefined') {
+      if (!this._webcodecsAvailable() || typeof RTCPeerConnection === 'undefined') {
         this._startWs();
         return;
       }
@@ -384,7 +384,12 @@
       try {
         this._p2pPc.createOffer().then(function(offer) {
           if (!self._p2pPc) return;
-          self._p2pPc.setLocalDescription(offer);
+          // setLocalDescription 是异步 Promise：拒绝（如协商中途 pc 关闭）不得
+          // 变未处理 rejection——随外层链一并 log+回退（对齐 _addRemoteCandidate）。
+          self._p2pPc.setLocalDescription(offer).catch(function(e) {
+            console.warn('[p2p] setLocalDescription 失败:', e);
+            self._onP2pFailed();
+          });
           if (typeof window.sendDesktopP2p === 'function') {
             // 契约（Task 2）：{sdp, candidates[]} → desktop:p2p-offer。
             window.sendDesktopP2p({ sdp: offer.sdp, candidates: [] });
@@ -395,8 +400,12 @@
       }
     }
 
-    // 协商失败（RTCPeerConnection 不可用 / createOffer 异常 / 5s 超时未连上）：
-    // 一次性回退现有 WS→fetch。幂等：pc 已置 null（已处理过）则直接返回。
+    // 协商失败（RTCPeerConnection 构造/不可用、createOffer/setLocalDescription
+    // 异常、5s 超时未连上、agent failed 广播）→ 一次性回退现有 WS→fetch。
+    // 构造函数本身抛异常时 _p2pPc 仍是 null——所以清理与回退不放在
+    // `if (this._p2pPc)` 内，保证**任何**失败点都落到 _startWs（不黑屏）。
+    // 幂等：_p2pFallbackDone 防 5s 超时与 promise rejection 双路径同时进入
+    // 造成双开 WS/fetch。
     _onP2pFailed() {
       if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
       if (this._p2pPc) {
@@ -404,10 +413,11 @@
         this._p2pPc = null;
         this._p2pDc = null;
         if (window.__p2pTransport === this) window.__p2pTransport = null;
-        if (this._transport !== 'p2p') {
-          this._transport = 'relay';
-          this._startWs();
-        }
+      }
+      if (this._transport !== 'p2p' && !this._p2pFallbackDone) {
+        this._p2pFallbackDone = true;
+        this._transport = 'relay';
+        this._startWs();
       }
     }
 
@@ -449,8 +459,16 @@
       if (!this._p2pPc) return;
       const p = msg.payload || {};
       const sdp = p.sdp;
+      const self = this;
       if (sdp) {
-        try { this._p2pPc.setRemoteDescription({ type: 'answer', sdp: sdp }); } catch (e) {}
+        try {
+          // setRemoteDescription 异步拒绝不能留未处理 rejection：log + 回退
+          //（对齐 _addRemoteCandidate；回退由 _p2pFallbackDone 去重）。
+          this._p2pPc.setRemoteDescription({ type: 'answer', sdp: sdp }).catch(function(e) {
+            console.warn('[p2p] setRemoteDescription 失败:', e);
+            self._onP2pFailed();
+          });
+        } catch (e) {}
       }
       const cands = p.candidates || [];
       for (const c of cands) {
@@ -1052,6 +1070,7 @@
       if (this._p2pDc) { try { this._p2pDc.onmessage = null; this._p2pDc.onclose = null; } catch (e) {} this._p2pDc = null; }
       if (window.__p2pTransport === this) window.__p2pTransport = null;
       this._transport = 'relay';
+      this._p2pFallbackDone = false; // 每次 disconnect 复位，重连时才允许再次 P2P→relay 回退
       this.connected = false;
       if (resetRetries !== false) this._streamRetries = 0;
       this._bpsBytes = 0;
