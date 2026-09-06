@@ -74,7 +74,7 @@
 | 14 | 混合通道二进制分辨 | ⬜ | 线协议整块（批次 2 #41）未做 |
 | 15 | agent 控制消息独立有界 channel | ✔ | 已分离：`control_tx`（bounded 64，控制消息）+ `post_tx`（unbounded，媒体帧，批内丢旧）+ `shell_tx`（终端输出）；第 26 轮代码级核实修正 |
 | 16 | relay→agent 背压回传 | ◐ | relay viewer 缓冲水位已降 16；回传拥塞信号未做 |
-| 17 | 12s 超时统一 ≤5s | ◐ | |
+| 17 | 12s 超时统一 ≤5s | ✔ | join ack 看门狗 8s → **5s**（session.js，对齐 rustdesk 5s 超时语义——弱网更快失败恢复）；SSE 重连退避 1→10s 上限已核实；无残留 12s 单一超时 |
 | 18 | 发送失败即重连 | ✔ | 会话断线（send/recv 失败）→ run_session 返回 → connect_with_retry 指数退避重连（client.rs，含 429 固定延迟）；与 #11 断线恢复同路径，第 23 轮核实修正 |
 | 19 | 桌面开启竞态幂等 | ✔ | `DesktopManager::start` 首行 `if self.is_running() { return; }`（检查→置 running 间无 await，并发安全）；第 21 轮代码级核实修正 |
 | 20 | 半开连接心跳兜底 | ✔ | relay→agent 每 20s server-side ping（#28）+ agent→relay 每 15s 心跳——半开连接双方探测覆盖，第 23 轮核实修正 |
@@ -92,7 +92,7 @@
 | 32 | 剪贴板大文本走文件传输 | ⬜ | |
 | 33 | 输入 10ms 合并节流 | ✔ | mousemove 10ms 合并最后坐标（desktop.js:_onPointerMove，与 #34 叠加） |
 | 34 | 弱网输入降采样 | ✔ | e2e>300ms 2:1 / >800ms 4:1（desktop.js:_onPointerMove） |
-| 35 | 弱网控制消息直通 | ⬜ | |
+| 35 | 弱网控制消息直通 | ✔ | 已由组合覆盖：#29 控制消息非 lossy 优先 + #15 独立有界控制 channel + #2 命令 ack（seq+确认）+ #33/#34 输入节流/降采样——弱网下控制消息不被数据挤掉且可确认；第 29 轮核实修正 |
 | 36-38 | KCP/白名单/IPv6 | ⬜ | 远期 |
 | 39 | 多会话隔离压测 | ⬜ | |
 | 40 | 批次验收：重连矩阵 | ⬜ | |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **80%**（可靠通道 23 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 12%。
+- **R5 落地清单（200 点）**：✔ 类约 **82%**（可靠通道 25 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 10%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -204,4 +204,7 @@
   1. 白闪修复（`web/session.html` + `style.css` + `desktop.js`）：新增 `#desktop-loading` 覆盖层（半透明"正在连接桌面…"绝对定位）——连接/切流/重连时显示，首帧后隐藏（WebCodecs `_onDecoded` 首帧 + MSE `video loadeddata` 事件双路径；disconnect 隐藏 + 监听清理）。消除切流/重连时 canvas 白屏闪烁给用户的"卡死/黑屏"错觉 → 批次2 #74-78 白闪。**验证**：`node --check` 语法通过 + loading 控制逻辑完整性检查（`_showLoading`/`_hideLoading`/`_mseFirstFrame` 引用齐全）；浏览器全链实测因本轮验证环境受限（连续 playwright 会话 join 偶发不稳）未完成，如实标注。
 - **第 28 轮新增合入**：
   1. mp4 打包单测补齐（`mp4.rs` +3 项）：多帧 `seqn` 严格单调递增（序断言 1→5——浏览器 `_handleMoof` 的 seqn gap 丢帧统计依赖 seqn 严格递增）；空 sample 打包结构完整 + mdat 空（静态帧 0 字节）；大 sample（300KB 高熵帧量级）mdat size 与 payload 不截断。mp4 模块 12 测试全绿，全量 `cargo test` **383 通过** → R5#79 打包单测。
+- **第 29 轮新增合入**：
+  1. join 超时统一（`web/session.js JOIN_ACK_TIMEOUT` 8s → **5s**）：join 发出后 5s 内无控制事件回传 → 提示 + 自动重连——对齐 rustdesk 5s 超时语义，弱网下 join 静默丢失更快失败恢复（原 8s 空白终端挂更久）→ R5#17。
+  2. 台账核实修正：#35 弱网控制消息直通**已由组合覆盖**（#29 控制非 lossy 优先 + #15 独立有界 channel + #2 命令 ack + #33/#34 输入节流/降采样）。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。

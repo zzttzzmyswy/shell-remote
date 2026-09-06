@@ -45,7 +45,10 @@
     // instead of leaving a permanently blank terminal (the classic
     // "registered + token ok, but web stays empty and the agent logs nothing").
     let joinAckTimer = null;
-    const JOIN_ACK_TIMEOUT = 8000;
+    // join ack 看门狗（R5#17 超时统一 ≤5s）：join 发出后 5s 内无任何控制
+    // 事件回传 → 判定 join 静默丢失，提示并自动重连（原 8s，对齐 rustdesk
+    // 5s 超时语义——弱网下更快失败恢复，避免空白终端长期挂着）。
+    const JOIN_ACK_TIMEOUT = 5000;
     function armJoinWatchdog() {
         clearJoinWatchdog();
         joinAckTimer = setTimeout(() => {
