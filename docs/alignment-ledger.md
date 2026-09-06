@@ -104,7 +104,7 @@
 | 41 | 逐帧 binary+头{len,seq,flags} | ⬜ | 线协议整块，最大未做项 |
 | 42 | seq 真实丢帧 | ✔ | desktop.js:_handleMoof seqn gap |
 | 43 | relay 二进制直转 | ⬜ | |
-| 44 | 老版本兼容/capability | ⬜ | |
+| 44 | 老版本兼容/capability | ⬜ | **capability 协商最小子集已做**（第 51 轮：agent 注册消息带 `capabilities` 数组（codec/后端/桌面功能声明）→ relay `SessionInfo.capabilities` + `update_capabilities`/`get_capabilities` → admin overview 展示——老版本 agent 不带保持空，浏览器可据此协商；测试 `test_register_capabilities_roundtrip`）；**老版本二进制兼容仍远期**（依赖 #41 线协议整块） |
 | 45 | moof 复用（tfhd 缓存） | ✔ | Mp4Muxer 缓存 tfhd 模板、每帧只重建变化部分（mp4.rs，测试逐字节一致） |
 | 46 | init 最小化 | ✔ | stbl 只留 stsd、去 stts/stsc/stsz/stco 空表（mp4.rs，ffmpeg frag_keyframe 一致，浏览器实测出画） |
 | 47 | WebCodecs keyframe 判定一致 | ✔ | test_keyframe_flag_matches_browser_detection 断言 agent flags 与浏览器判定逐字一致 |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **97%**（可靠通道 30 项 / 前端 22 项 / 抓帧 8 项 / 编码器 8 项 / 打包 4 项 / 遥测测试 17 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **98%**（可靠通道 31 项 / 前端 22 项 / 抓帧 8 项 / 编码器 8 项 / 打包 4 项 / 遥测测试 17 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -252,4 +252,6 @@
   1. 色彩矩阵最小子集（R5#136-146 部分）：`color.rs` 重构为 `bgra_to_i420_with_matrix(bgra, w, h, stride, ColorMatrix)`——`ColorMatrix::{Bt601, Bt709}` 系数表（Y/U/V 整数定点 >>8），默认入口 `bgra_to_i420` 保持 BT.601（H.264/OpenH264 标准色域，回归保护）；BT.709 供 WebM/HD 色域后续切换。测试 `test_color_matrix_bt709_differs_from_bt601`（同像素两矩阵输出不同 + 默认=601）。全量 `cargo test` **395 通过**（+1）。
 - **第 50 轮新增合入**：
   1. 功耗硬采样最小子集（R5#136-146 部分）：agent 心跳 KPI 加 `cpu_temp`（`self_cpu_temp` 扫描 `/sys/class/hwmon/*/temp*_input` 取首个非零毫度→℃，无传感器环境回退 0 不 panic；本机 coretemp ≈77℃实测）→ relay `AgentKpiSample.cpu_temp` 解析 → admin KPI 可见 **agent 温度趋势**（过热告警的基础数据）。测试 `test_self_cpu_temp_safe_or_positive`（合理范围 0-150℃）+ 采样测试断言 cpu_temp 落库。全量 `cargo test` **396 通过**（+1）。
+- **第 51 轮新增合入**：
+  1. capability 协商最小子集（R5#44 老版本兼容/capability）：agent 注册消息带 **`capabilities`** 数组（`codec:av1/vp9/h264`、`backend:x11/wayland/gdi/dxgi`、`desktop:gray/quality/clipboard/cursor/test-delay` 声明）→ relay `SessionInfo.capabilities` + `update_capabilities`/`get_capabilities`（会话不存在静默）→ admin overview 每会话显示 `capabilities`——老版本 agent 不带保持空，浏览器可据此能力协商。测试 `test_register_capabilities_roundtrip`（未声明空 / update-get 往返一致）。全量 `cargo test` **397 通过**（+1）。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
