@@ -106,7 +106,7 @@
 | 43 | relay 二进制直转 | ⬜ | |
 | 44 | 老版本兼容/capability | ⬜ | |
 | 45 | moof 复用（tfhd 缓存） | ✔ | Mp4Muxer 缓存 tfhd 模板、每帧只重建变化部分（mp4.rs，测试逐字节一致） |
-| 46 | init 最小化 | ⬜ | |
+| 46 | init 最小化 | ✔ | stbl 只留 stsd、去 stts/stsc/stsz/stco 空表（mp4.rs，ffmpeg frag_keyframe 一致，浏览器实测出画） |
 | 47 | WebCodecs keyframe 判定一致 | ✔ | test_keyframe_flag_matches_browser_detection 断言 agent flags 与浏览器判定逐字一致 |
 | 48 | 控制消息轻通道 | ◐ | qos/reqkey 走 SSE；qos 250ms 已含 lseq（≈4/s ack 密度，agent 只消费它）；独立 100ms ack 批未做——agent 无独立消费端，造无消费者消息不划算，待限产机制落地时补 |
 | 49-53 | 队列 24/2/停滞 500ms/接入 1.5s/解码错误分级 | ✔ | desktop.js 全链路 + reqkey |
@@ -144,7 +144,7 @@
 
 ### 批次 5 · 测试与遥测（147-167）
 
-◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现。统一时间线/13s 决策树/admin KPI 曲线/带宽记账/crash.log 上报/告警未做。
+◐ QoS 快照已结构化为日志（`mod.rs:desktop QoS` 带 decode_fps/decode_queue/bitrate_kbps）、心跳扩展 KPI（`agent/mod.rs sender_loop` 带 running/codec/fps/quality_permille/bitrate_kbps，测试 `test_sender_loop_heartbeat_carries_desktop_kpi`）、弱网矩阵脚本（`tools/weaknet_matrix.sh`）、重连矩阵脚本（`tools/reconnect_matrix.sh`）、评分卡脚本（`tools/scorecard.sh`，R4 戊172 门槛）已入仓；日志轮转（`SR_LOG_DIR` 环境变量 → hourly rolling file）已实现；relay 带宽记账（`DesktopStream::stats()` 每 viewer 字节/帧，`test_bandwidth_stats_track_forwarded_bytes`）已做。统一时间线/13s 决策树/admin KPI 曲线/crash.log 上报/告警未做。
 
 ### 批次 6 · 风险与回滚（168-177）
 
@@ -158,8 +158,9 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **43%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流、丙 遥测基线+日志+分辨率事件）；⬜ 31%（丙遥测剩余、戊发布门槛）；◐ 26%。
-- **R5 落地清单（200 点）**：✔ 类约 **44%**（可靠通道 7 项 / 前端 20 项 / 抓帧 4 项 / 编码器 2 项 / 打包 2 项 / 遥测测试 7 项）；⬜ 39%。
-- **第 8 轮新增合入**：
-  1. X11 分辨率事件驱动（`capture.rs` XRANDR ScreenChangeNotify 注册 + `poll_for_event` 替代 30 帧 `get_geometry` 轮询——只有真变更才重建，消除固定轮询往返；Xvfb 实测 `RandrScreenChangeNotify` 注册成功，`test_x11_randr_event_driven_resolution`）→ R3 乙70/71 / R5#131。
+- **R4/5（200 点）**：✔ 类约 **45%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 29%（丙遥测剩余、戊发布门槛）；◐ 26%。
+- **R5 落地清单（200 点）**：✔ 类约 **47%**（可靠通道 7 项 / 前端 20 项 / 抓帧 4 项 / 编码器 2 项 / 打包 3 项 / 遥测测试 8 项）；⬜ 37%。
+- **第 9 轮新增合入**：
+  1. init 最小化（`mp4.rs` stbl 只留 stsd、去 stts/stsc/stsz/stco 空表——fMP4 sample 时间/大小在每帧 trun，空表冗余；与 ffmpeg frag_keyframe 一致；浏览器实测 AV1 解码出画 1920x1080）→ R3 甲22 / R5#46；
+  2. relay 带宽记账（`DesktopStream::stats()` 每 viewer 成功投递字节/帧，init+frag 均计入；`test_bandwidth_stats_track_forwarded_bytes`）→ R3 丙113 / R5#152。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、独立 100ms ack 批（qos 250ms 已含 lseq≈4/s，agent 无独立消费端，待限产落地再补）等——在台账对应 ⬜/◐ 行，未宣称完成。
