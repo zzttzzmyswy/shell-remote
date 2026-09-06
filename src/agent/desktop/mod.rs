@@ -145,6 +145,12 @@ pub struct DesktopKpi {
     pub bitrate_kbps: u32,
     /// 最近单帧编码耗时（ms）。暂缺（未做跨线程累计），0 = 不可得。
     pub encode_ms: u32,
+    /// 内容活跃（最近真实新帧 ≤1.5s，R5#25）——admin KPI 曲线可观测
+    /// 静止/活跃时间线。
+    pub active: bool,
+    /// relay→浏览器 fan-out 拥塞累计次数（R5#16）——admin KPI 曲线可观测
+    /// 传输段拥塞时间线。
+    pub bp_count: u32,
 }
 
 pub struct DesktopManager {
@@ -466,6 +472,8 @@ impl DesktopManager {
             quality_permille: self.qos_scale.load(O::Relaxed),
             bitrate_kbps: (self.qos_bitrate.load(O::Relaxed) / 1000) as u32,
             encode_ms: 0,
+            active: self.is_active(),
+            bp_count: self.backpressure_count(),
         }
     }
 

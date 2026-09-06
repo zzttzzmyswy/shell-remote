@@ -121,6 +121,8 @@ async fn sender_loop(
                         "quality_permille": k.quality_permille,
                         "bitrate_kbps": k.bitrate_kbps,
                         "encode_ms": k.encode_ms,
+                        "active": k.active,
+                        "bp_count": k.bp_count,
                     });
                 }
                 let ping = ping.to_string();
@@ -2421,6 +2423,10 @@ mod tests {
         assert!(
             ping["kpi"]["fps"].is_u64() && ping["kpi"]["codec"].is_string(),
             "KPI must include fps + codec, got {ping:?}"
+        );
+        assert!(
+            ping["kpi"]["active"].is_boolean() && ping["kpi"]["bp_count"].is_u64(),
+            "heartbeat KPI must carry active/bp_count (R5#25/#16 admin 可见), got {ping:?}"
         );
     }
 }
