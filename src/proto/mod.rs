@@ -259,6 +259,9 @@ pub fn is_valid_custom_session_id(s: &str) -> bool {
 // binary 化（agent 发 binary WS 帧 + relay Binary 分支直转）为架构级远期，
 // 本格式是其同构迁移目标。
 pub const BIN_FRAME_FLAG_KEY: u8 = 0x01;
+/// 位 1：init 段（fMP4 ftyp/moov）。init 帧与 delta/key 独立，relay 收到
+/// init 帧走 set_init（重放给新加入 viewer），其余走 push_frag。
+pub const BIN_FRAME_FLAG_INIT: u8 = 0x02;
 /// 帧头长度：[flags(1) + seq(4) + len(4)]。
 pub const BIN_FRAME_HEADER_LEN: usize = 9;
 
@@ -398,8 +401,8 @@ mod tests {
 
     #[test]
     fn test_bin_frame_roundtrip() {
-        // R5 #41 格式规格：key/delta 帧 roundtrip，seq 边界与空 payload。
-        for flags in [0u8, BIN_FRAME_FLAG_KEY] {
+        // R5 #41 格式规格：key/delta/init 帧 roundtrip，seq 边界与空 payload。
+        for flags in [0u8, BIN_FRAME_FLAG_KEY, BIN_FRAME_FLAG_INIT, BIN_FRAME_FLAG_KEY | BIN_FRAME_FLAG_INIT] {
             let payload = vec![1u8, 2, 3, 4];
             let bytes = encode_bin_frame(flags, 42, &payload);
             assert_eq!(bytes.len(), BIN_FRAME_HEADER_LEN + 4);

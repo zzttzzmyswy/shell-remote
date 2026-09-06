@@ -652,13 +652,101 @@ async fn handle_agent_ws_uplink(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => { /* binary frames are not part of the protocol */ }
+                    // R5 #41 binary 传输消费侧就绪：agent 上行 desktop:video
+                    // 二进制帧（格式见 proto::encode_bin_frame）→ 字节直转
+                    // desktop_streams（无 base64 膨胀）。老 agent 仍走 Text
+                    // JSON 路径；本分支为未来 agent 切换的接收端。
+                    Some(Ok(Message::Binary(bin))) => {
+                        if let Some((flags, seq, payload)) = crate::proto::decode_bin_frame(&bin) {
+                            route_bin_desktop_frame(&state, &session_id, flags, seq, payload).await;
+                        } else {
+                            tracing::warn!("agent binary frame: bad header, dropped");
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
                     Some(Err(_)) => break,
                 }
             }
         }
     }
     tracing::info!(session = %session_id, "agent WS uplink disconnected");
+}
+
+/// 处理 agent 上行的 desktop:video 二进制帧（R5 #41 binary 传输消费侧）。
+/// init 帧 → `set_init`（重放给新加入 viewer）；frag 帧 → `push_frag`（丢旧
+/// 保新 + 回传 congested）；seq 丢帧检测 + desktop_proto 开销统计与 JSON
+/// text 路径同语义（binary 无 base64，encoded==decoded==payload 长度，即
+/// 0% 协议膨胀）。老 agent 不感知：此函数仅由 Binary 分支调用。
+async fn route_bin_desktop_frame(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    flags: u8,
+    seq: u32,
+    payload: &[u8],
+) {
+    use crate::proto::{BIN_FRAME_FLAG_INIT, BIN_FRAME_FLAG_KEY};
+    let seq = seq as u64;
+    // 开销观测 + 消息级 seq 丢帧检测（desktop_proto，与 text 路径同构）。
+    {
+        let mut proto = state.desktop_proto.write().await;
+        let ent = proto.entry(session_id.to_string()).or_insert((0, 0, 0, 0));
+        ent.0 += payload.len() as u64;
+        ent.1 += payload.len() as u64;
+        if seq > 0 && ent.2 > 0 && seq > ent.2 + 1 {
+            ent.3 += seq - ent.2 - 1;
+        }
+        if seq > 0 {
+            ent.2 = seq;
+        }
+    }
+    let ds = {
+        let mut streams = state.desktop_streams.write().await;
+        streams
+            .entry(session_id.to_string())
+            .or_insert_with(crate::relay::desktop::DesktopStream::new)
+            .clone()
+    };
+    if flags & BIN_FRAME_FLAG_INIT != 0 {
+        tracing::debug!("desktop:video-bin kind=init bytes={}", payload.len());
+        ds.set_init(payload.to_vec()).await;
+        return;
+    }
+    let is_key = flags & BIN_FRAME_FLAG_KEY != 0;
+    let congested = ds.push_frag(is_key, payload.to_vec()).await;
+    if congested > 0 {
+        // R5#16 回传拥塞信号（限频 ≥5s），语义与 JSON text 路径一致。
+        let should_notify = {
+            let guard = state.last_congest_notify.read().await;
+            guard
+                .get(session_id)
+                .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(5))
+        };
+        if should_notify {
+            state
+                .last_congest_notify
+                .write()
+                .await
+                .insert(session_id.to_string(), std::time::Instant::now());
+            if let Some(tx) = state
+                .agent_broadcast
+                .read()
+                .await
+                .get(session_id)
+                .and_then(|cm| cm.agent.clone())
+            {
+                let _ = deliver(
+                    &tx,
+                    "desktop:congested",
+                    serde_json::json!({
+                        "type": "desktop:congested",
+                        "session_id": session_id,
+                        "payload": { "dropped": congested }
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    }
 }
 
 // ── Agent send handler (POST, for HTTP-mode agents) ──────────────────
@@ -1701,6 +1789,77 @@ mod tests {
             }
         }
         assert!(saw_congested, "viewer 拥塞应回传 desktop:congested 给 agent");
+    }
+
+    #[tokio::test]
+    async fn test_bin_desktop_frame_init_and_frag() {
+        // R5 #41 binary 消费侧：init 帧缓存（新 viewer 拿到），frag 帧进
+        // viewer 缓冲。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let ds = {
+            let mut streams = state.desktop_streams.write().await;
+            streams
+                .entry(sid.clone())
+                .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                .clone()
+        };
+        // init 帧 → set_init 缓存。
+        let ib = crate::proto::encode_bin_frame(crate::proto::BIN_FRAME_FLAG_INIT, 1, b"ftypmoov");
+        let (f, s, p) = crate::proto::decode_bin_frame(&ib).unwrap();
+        route_bin_desktop_frame(&state, &sid, f, s, p).await;
+        let (_vid, mut rx, init) = ds.add_viewer().await;
+        assert!(init.is_some(), "init 帧应缓存，新 viewer 加入即拿到");
+        // frag 帧 → bytes 推入 viewer 缓冲。
+        let fb = crate::proto::encode_bin_frame(crate::proto::BIN_FRAME_FLAG_KEY, 2, b"moo1");
+        let (f, s, p) = crate::proto::decode_bin_frame(&fb).unwrap();
+        route_bin_desktop_frame(&state, &sid, f, s, p).await;
+        let got = rx.try_recv().expect("frag 帧应到达 viewer");
+        assert_eq!(got, b"moo1".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_bin_desktop_frame_seq_drop_and_congested() {
+        // R5 #41 binary 消费侧：seq 跳变丢帧检测 + 缓冲满回传 congested，
+        // 开销统计 encoded==decoded（binary 无 base64 膨胀）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let (_agent_tx, mut agent_rx) = insert_channel_map(&state, &sid).await;
+        let ds = {
+            let mut streams = state.desktop_streams.write().await;
+            streams
+                .entry(sid.clone())
+                .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                .clone()
+        };
+        let (_vid, _rx, _init) = ds.add_viewer().await;
+        // seq 1..3 → 5（跳 4）：agent→relay 段丢帧检测 +1。
+        for s in [1u32, 2, 3, 5] {
+            let b = crate::proto::encode_bin_frame(0, s, b"x");
+            let (f, seq, p) = crate::proto::decode_bin_frame(&b).unwrap();
+            route_bin_desktop_frame(&state, &sid, f, seq, p).await;
+        }
+        {
+            let proto = state.desktop_proto.read().await;
+            let ent = proto.get(&sid).expect("desktop_proto 应有记录");
+            assert_eq!(ent.3, 1, "seq 跳变应检测 1 帧丢失");
+            assert_eq!(ent.0, ent.1, "binary 帧 encoded==decoded（无 base64 膨胀）");
+        }
+        // 继续 key 帧填满 16 缓冲 + 超量 → 丢旧 → 回传 congested。
+        for i in 6..40u32 {
+            let b = crate::proto::encode_bin_frame(1, i, b"y");
+            let (f, seq, p) = crate::proto::decode_bin_frame(&b).unwrap();
+            route_bin_desktop_frame(&state, &sid, f, seq, p).await;
+        }
+        let mut saw_congested = false;
+        while let Ok(msg) = agent_rx.try_recv() {
+            if msg.contains("desktop:congested") {
+                saw_congested = true;
+            }
+        }
+        assert!(saw_congested, "binary 帧触发缓冲拥塞应回传 desktop:congested");
     }
 
     #[tokio::test]
