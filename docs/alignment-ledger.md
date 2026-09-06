@@ -138,9 +138,11 @@
 | 125-126 | 抓帧速率联动/静止 sleep | ✔ | 静止退避 100ms sleep（capture.rs 线程循环，`test_threaded_static_source_backs_off`） |
 | 127-128 | 捕获内存池/行拷贝 SIMD | ⬜ | |
 | 129 | GDI 静止停抓+缓存 DC | ◐ | GDI DC 缓存有；静止停抓缺 |
-| 130 | 捕获失败重试窗口 30 次 | ⬜ | |
+| 130 | 捕获失败重试窗口 30 次 | ✔ | 首帧前失败立即终止 + 首帧后首次失败即发 desktop:error（黑屏 ≤2s 可见化），保留 150 重试窗口供 GDI 自愈（mod.rs） |
 | 131 | 分辨率事件驱动 | ✔ | XRANDR ScreenChangeNotify 注册+poll_for_event（capture.rs，Xvfb 实测注册，替代 30 帧轮询） |
-| 132-146 | Wayland/首帧/缩放/功耗/内存画像/多显示器/色彩矩阵 | ⬜ | 远期 |
+| 132-134 | Wayland/首帧/缩放 | ⬜ | 远期 |
+| 135 | `--desktop-capture-fps` 抓帧独立上限 | ✔ | CLI 参数 + ThreadedFrameSource::spawn_with_max_fps（动态节流、静态退避不变，测试 `test_threaded_source_max_fps_throttles`） |
+| 136-146 | 功耗/内存画像/多显示器/色彩矩阵 | ⬜ | 远期 |
 
 ### 批次 5 · 测试与遥测（147-167）
 
@@ -158,9 +160,9 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **45%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 29%（丙遥测剩余、戊发布门槛）；◐ 26%。
-- **R5 落地清单（200 点）**：✔ 类约 **47%**（可靠通道 7 项 / 前端 20 项 / 抓帧 4 项 / 编码器 2 项 / 打包 3 项 / 遥测测试 8 项）；⬜ 37%。
-- **第 9 轮新增合入**：
-  1. init 最小化（`mp4.rs` stbl 只留 stsd、去 stts/stsc/stsz/stco 空表——fMP4 sample 时间/大小在每帧 trun，空表冗余；与 ffmpeg frag_keyframe 一致；浏览器实测 AV1 解码出画 1920x1080）→ R3 甲22 / R5#46；
-  2. relay 带宽记账（`DesktopStream::stats()` 每 viewer 成功投递字节/帧，init+frag 均计入；`test_bandwidth_stats_track_forwarded_bytes`）→ R3 丙113 / R5#152。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、独立 100ms ack 批（qos 250ms 已含 lseq≈4/s，agent 无独立消费端，待限产落地再补）等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **R4/5（200 点）**：✔ 类约 **47%**（甲 帧率/IDR、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 27%（丙遥测剩余、戊发布门槛）；◐ 26%。
+- **R5 落地清单（200 点）**：✔ 类约 **50%**（可靠通道 7 项 / 前端 20 项 / 抓帧 6 项 / 编码器 2 项 / 打包 3 项 / 遥测测试 8 项）；⬜ 34%。
+- **第 10 轮新增合入**：
+  1. 捕获失败快速报错（`mod.rs`：首帧前失败立即终止、首帧后首次失败即发 desktop:error——黑屏 ≤2s 可见化，保留 150 重试窗口供 Windows GDI 自愈）→ R1 A27 / R3 乙77 / R5#130；
+  2. `--desktop-capture-fps` 抓帧独立上限（`main.rs` CLI + `ThreadedFrameSource::spawn_with_max_fps` 动态节流、静态退避不变，`test_threaded_source_max_fps_throttles`；浏览器实测 capture-fps=20 正常出画）→ R3 乙83 / R5#135。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、弱网 RTT 分带探针、admin KPI 曲线、光标独立通道、独立 100ms ack 批等——在台账对应 ⬜/◐ 行，未宣称完成。
