@@ -97,6 +97,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                     active: k.get("active").and_then(|v| v.as_bool()).unwrap_or(false),
                     bp_count: k.get("bp_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                     rss_kb: k.get("rss_kb").and_then(|v| v.as_u64()).unwrap_or(0),
+                    cpu_ms: k.get("cpu_ms").and_then(|v| v.as_u64()).unwrap_or(0),
                 };
                 // 批次5 告警雏形：active 且 fps<10（动态内容异常降帧）→ 告警
                 // 日志（≥30s/会话限频）。静止（active=false,fps=1）不告警。
@@ -1852,7 +1853,7 @@ mod tests {
             "session_id": "sid1",
             "kpi": { "running": true, "codec": "av1", "fps": 30,
                     "quality_permille": 1000, "bitrate_kbps": 1388, "encode_ms": 12,
-                    "active": true, "bp_count": 3, "rss_kb": 65536 }
+                    "active": true, "bp_count": 3, "rss_kb": 65536, "cpu_ms": 1234 }
         })
         .to_string();
         route_agent_message(&state, "sid1", &msg).await;
@@ -1869,6 +1870,7 @@ mod tests {
         assert!(s.active, "active must be sampled from agent heartbeat (R5#25)");
         assert_eq!(s.bp_count, 3, "bp_count must be sampled from agent heartbeat (R5#16)");
         assert_eq!(s.rss_kb, 65536, "rss_kb must be sampled (内存画像)");
+        assert_eq!(s.cpu_ms, 1234, "cpu_ms must be sampled (功耗画像)");
         assert!(s.at_unix_ms > 0);
 
         // 无 kpi 字段的 ping：不产生样本（保持 2）。

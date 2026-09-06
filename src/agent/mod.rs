@@ -124,6 +124,7 @@ async fn sender_loop(
                         "active": k.active,
                         "bp_count": k.bp_count,
                         "rss_kb": self_rss_kb(),
+                        "cpu_ms": self_cpu_ms(),
                     });
                 }
                 let ping = ping.to_string();
@@ -142,6 +143,33 @@ fn self_rss_kb() -> u64 {
         .ok()
         .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
         .map(|pages| pages * 4)
+        .unwrap_or(0)
+}
+
+/// 从 `/proc/self/stat` 文本解析累计 CPU 毫秒（utime+stime，字段 14/15；
+/// comm 可含空格/括号 → `rsplit(") ")` 取后半，utime/stime 是后半字段
+/// 11/12）。`hz` = 时钟 tick/秒（`sysconf(_SC_CLK_TCK)`）。纯函数便于单测。
+fn cpu_ms_from_stat(stat: &str, hz: u64) -> u64 {
+    let Some(tail) = stat.rsplit(") ").next() else {
+        return 0;
+    };
+    let f: Vec<&str> = tail.split_whitespace().collect();
+    if f.len() < 13 || hz == 0 {
+        return 0;
+    }
+    let utime: u64 = f[11].parse().unwrap_or(0);
+    let stime: u64 = f[12].parse().unwrap_or(0);
+    (utime + stime) * 1000 / hz
+}
+
+/// 当前进程累计 CPU 时间（ms，utime+stime）。非 Linux 回退 0。两次心跳
+/// 采样差 = 区间 CPU 使用率——admin KPI 可见 agent 功耗画像
+/// （R5#136-146 功耗采样最小子集）。
+fn self_cpu_ms() -> u64 {
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .map(|s| cpu_ms_from_stat(&s, hz))
         .unwrap_or(0)
 }
 
@@ -2005,6 +2033,17 @@ mod tests {
         // 非零 RSS（本测试进程占内存）。
         let rss = self_rss_kb();
         assert!(rss > 0, "self_rss_kb must be >0 on Linux, got {rss}");
+    }
+
+    #[test]
+    fn test_cpu_ms_from_stat_parses_ticks() {
+        // R5#136-146 功耗采样：构造 stat（comm 含空格/括号，utime 字段14=100、
+        // stime 字段15=200 ticks，hz=100）→ 应换算 3000ms。
+        let stat = "1234 (shell-remote test) R 0 0 0 0 0 0 0 0 0 0 100 200";
+        assert_eq!(cpu_ms_from_stat(stat, 100), 3000);
+        // 字段不足 / hz=0 回退 0
+        assert_eq!(cpu_ms_from_stat("1 (x) R 0", 100), 0);
+        assert_eq!(cpu_ms_from_stat(stat, 0), 0);
     }
 
     #[test]

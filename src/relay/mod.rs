@@ -130,6 +130,9 @@ pub struct AgentKpiSample {
     /// agent 进程 RSS（KB，`/proc/self/statm`）。admin KPI 可观测 agent 内存
     /// 画像时间线（R5#136-146 内存画像最小子集，长稳验收的 RSS 判据旁证）。
     pub rss_kb: u64,
+    /// agent 进程累计 CPU 时间（ms，utime+stime）。两次采样差 = 区间 CPU
+    /// 使用率——admin KPI 可见 agent 功耗画像（R5#136-146 功耗采样最小子集）。
+    pub cpu_ms: u64,
 }
 
 /// KPI 历史窗口长度：agent 心跳 15s × 120 = 30min。
