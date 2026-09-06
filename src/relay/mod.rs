@@ -133,6 +133,9 @@ pub struct AgentKpiSample {
     /// agent 进程累计 CPU 时间（ms，utime+stime）。两次采样差 = 区间 CPU
     /// 使用率——admin KPI 可见 agent 功耗画像（R5#136-146 功耗采样最小子集）。
     pub cpu_ms: u64,
+    /// agent CPU/主板温度（℃，hwmon 传感器；无传感器 0）。功耗硬采样最小
+    /// 子集——admin KPI 可观测 agent 温度趋势（过热告警的基础数据）。
+    pub cpu_temp: f64,
 }
 
 /// KPI 历史窗口长度：agent 心跳 15s × 120 = 30min。

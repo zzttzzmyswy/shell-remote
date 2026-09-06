@@ -125,6 +125,7 @@ async fn sender_loop(
                         "bp_count": k.bp_count,
                         "rss_kb": self_rss_kb(),
                         "cpu_ms": self_cpu_ms(),
+                        "cpu_temp": self_cpu_temp(),
                     });
                 }
                 let ping = ping.to_string();
@@ -171,6 +172,34 @@ fn self_cpu_ms() -> u64 {
         .ok()
         .map(|s| cpu_ms_from_stat(&s, hz))
         .unwrap_or(0)
+}
+
+/// 当前 CPU/主板温度（℃，hwmon 传感器毫度 /1000；找不到回退 0.0）。
+/// 功耗硬采样最小子集（R5#136-146）：扫描 `/sys/class/hwmon/*/temp*_input`
+/// 取第一个非零温度（coretemp/dell_smm/nvme 均可）。无传感器环境回退 0。
+fn self_cpu_temp() -> f64 {
+    let Ok(dir) = std::fs::read_dir("/sys/class/hwmon") else {
+        return 0.0;
+    };
+    for entry in dir.flatten() {
+        let Ok(rd) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for f in rd.flatten() {
+            let name = f.file_name().to_string_lossy().to_string();
+            if !(name.starts_with("temp") && name.ends_with("_input")) {
+                continue;
+            }
+            if let Ok(raw) = std::fs::read_to_string(f.path()) {
+                if let Ok(milli) = raw.trim().parse::<i64>() {
+                    if milli > 0 {
+                        return milli as f64 / 1000.0;
+                    }
+                }
+            }
+        }
+    }
+    0.0
 }
 
 async fn flush_output(
@@ -2044,6 +2073,14 @@ mod tests {
         // 字段不足 / hz=0 回退 0
         assert_eq!(cpu_ms_from_stat("1 (x) R 0", 100), 0);
         assert_eq!(cpu_ms_from_stat(stat, 0), 0);
+    }
+
+    #[test]
+    fn test_self_cpu_temp_safe_or_positive() {
+        // R5#136-146 功耗硬采样：有 hwmon 传感器环境应返回非负温度（≥0，
+        // 本机 coretemp ≈ 77℃）；无传感器环境回退 0 不 panic。
+        let t = self_cpu_temp();
+        assert!(t >= 0.0 && t < 150.0, "cpu_temp 应在合理范围, got {t}");
     }
 
     #[test]
