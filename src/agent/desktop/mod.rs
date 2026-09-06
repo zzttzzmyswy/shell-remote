@@ -135,6 +135,73 @@ fn resolved_display(runtime: &Option<String>, config: &Option<String>) -> Option
     runtime.clone().or_else(|| config.clone())
 }
 
+/// 帧 buffer 池（R5 #127 SIMD 内存池第一块）：预分配复用 `Vec<u8>`，
+/// 避开高频路径（字节转换/合成帧）每帧堆分配——编码输入 buffer 借出
+/// 复用、用后归还（cap 保留）。运行期统计复用/新分配计数，可观测
+/// 池命中率。为后续 frame-ring（捕获侧预分配 + 引用计数）的组件基础。
+#[derive(Debug)]
+pub struct FramePool {
+    /// 空闲 buffer（复用 Pooled 保持 cap）。
+    free: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// 池上限（超过则新释放的 buffer 直接丢弃，防无限膨胀）。
+    capacity: usize,
+    /// 借出命中（复用）次数。
+    reused: std::sync::atomic::AtomicU64,
+    /// 借出新分配次数。
+    allocated: std::sync::atomic::AtomicU64,
+}
+
+impl FramePool {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            free: std::sync::Mutex::new(Vec::new()),
+            capacity: capacity.max(1),
+            reused: std::sync::atomic::AtomicU64::new(0),
+            allocated: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 预分配 `n` 个容量 `size` 的 buffer（启动时摊分初始化成本）。
+    pub fn prealloc(&self, n: usize, size: usize) {
+        let mut free = self.free.lock().unwrap();
+        for _ in 0..n {
+            free.push(vec![0u8; size]);
+        }
+    }
+
+    /// 借出一个容量 ≥ `size` 的 buffer：池中有则复用（不重置长度，
+    /// 调用方按需使用前 `size` 字节），否则新分配。
+    pub fn acquire(&self, size: usize) -> Vec<u8> {
+        let mut free = self.free.lock().unwrap();
+        for i in (0..free.len()).rev() {
+            if free[i].capacity() >= size {
+                let mut buf = free.swap_remove(i);
+                buf.clear();
+                self.reused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return buf;
+            }
+        }
+        drop(free);
+        self.allocated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Vec::with_capacity(size)
+    }
+
+    /// 归还用后 buffer（cap 保留供复用）；池满则丢弃。
+    pub fn release(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        let mut free = self.free.lock().unwrap();
+        if free.len() < self.capacity {
+            free.push(buf);
+        }
+    }
+
+    /// (复用次数, 新分配次数)——可观测池命中率。
+    pub fn stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering as O;
+        (self.reused.load(O::Relaxed), self.allocated.load(O::Relaxed))
+    }
+}
+
 /// Controls the desktop capture+encode task.
 /// 心跳扩展 KPI 快照（R5#150）：agent 心跳携带的最小桌面运行态。
 /// 供 relay/admin 侧可观测（不依赖浏览器面板），字段无锁原子读。
@@ -1989,6 +2056,52 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_frame_pool_reuses_buffers() {
+        // R5 #127 内存池第一块：acquire/release 循环复用——同尺寸 buffer
+        // 借出 N 次只有首轮新分配，后续全部命中池（零堆分配）。
+        let pool = FramePool::new(4);
+        let b1 = pool.acquire(100);
+        assert_eq!(pool.stats(), (0, 1), "首次借必需新分配");
+        pool.release(b1);
+        let b2 = pool.acquire(100);
+        assert_eq!(pool.stats(), (1, 1), "第二次借应复用池中 buffer");
+        pool.release(b2);
+        // 归还后借出仍命中，不新增分配。
+        let b3 = pool.acquire(100);
+        assert_eq!(pool.stats(), (2, 1));
+    }
+
+    #[test]
+    fn test_frame_pool_capacity_capped() {
+        // 池上限 2：释放 3 个后只保留 2 个（防无限膨胀）。
+        let pool = FramePool::new(2);
+        for _ in 0..3 {
+            pool.release(vec![0u8; 64]);
+        }
+        let mut nonempty = 0;
+        for _ in 0..3 {
+            let b = pool.acquire(64);
+            if !b.is_empty() {
+                nonempty += 1; // 复用保留 cap 的 buffer（已 clear 为空 Vec）
+            }
+            assert!(b.is_empty(), "acquire 返回的空 Vec（cap 保留）");
+        }
+        // 第三次借因池中只有 2 个 → 新分配 1 次。
+        assert_eq!(pool.stats().1, 1, "第三个借出超出池容量 → 新分配");
+    }
+
+    #[test]
+    fn test_frame_pool_grows_for_larger_size() {
+        // 池中只有小 buffer 时借大尺寸 → 新分配（不硬塞）。
+        let pool = FramePool::new(2);
+        pool.release(vec![0u8; 10]);
+        let big = pool.acquire(1000);
+        assert!(big.capacity() >= 1000);
+        let (reused, allocated) = pool.stats();
+        assert_eq!((reused, allocated), (0, 1), "不匹配尺寸 → 新分配");
+    }
 
     #[test]
     fn test_active_at_threshold() {
