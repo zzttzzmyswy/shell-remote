@@ -92,7 +92,28 @@ pub struct SharedState {
     /// (`shell-remote-<arch>[.exe]`, plus an optional `shell-remote-<arch>.version`
     /// companion). `None` when `--agent-upgrade-dir` is unset (upgrades off).
     pub upgrade_dir: RwLock<Option<std::path::PathBuf>>,
+    /// Agent 心跳 KPI 历史（R5 丙111/140：admin KPI 曲线数据源）。每 session
+    /// 一个定长 VecDeque（agent 心跳 15s × [`KPI_HISTORY_CAP`] = 30min 窗口），
+    /// 由 `route_agent_message` 拦截 `ping` 消息时采样心跳 payload 的 `kpi`
+    /// 字段。容量到顶丢弃最旧（FIFO）。
+    pub kpi_history: RwLock<HashMap<String, std::collections::VecDeque<AgentKpiSample>>>,
 }
+
+/// Agent 心跳采样的一帧桌面 KPI（`agent/mod.rs sender_loop` 心跳 payload 的
+/// `kpi` 字段）。`at_unix_ms` 为 relay 收到心跳的墙钟时刻。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AgentKpiSample {
+    pub at_unix_ms: u64,
+    pub running: bool,
+    pub codec: String,
+    pub fps: u32,
+    pub quality_permille: u32,
+    pub bitrate_kbps: u32,
+    pub encode_ms: u32,
+}
+
+/// KPI 历史窗口长度：agent 心跳 15s × 120 = 30min。
+pub const KPI_HISTORY_CAP: usize = 120;
 
 /// One entry in the access audit trail. `conn` is the session id, `prefix` is
 /// the first 8 chars of the token (never the full secret), `permission` is
@@ -226,6 +247,7 @@ impl SharedState {
             desktop_streams: RwLock::new(HashMap::new()),
             agent_upgrades: RwLock::new(HashMap::new()),
             upgrade_dir: RwLock::new(None),
+            kpi_history: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1323,6 +1345,7 @@ pub async fn start(
             .route(&format!("{}/login", ap), axum::routing::post(admin::login_handler))
             .route(&format!("{}/logout", ap), axum::routing::post(admin::logout_handler))
             .route(&format!("{}/api/overview", ap), get(admin::overview_handler))
+            .route(&format!("{}/api/session/kpi/:sid", ap), get(admin::session_kpi_handler))
             .route(&format!("{}/api/session/kick", ap), axum::routing::post(admin::kick_handler))
             .route(&format!("{}/api/token/revoke", ap), axum::routing::post(admin::revoke_handler))
             .route(&format!("{}/api/token/regenerate", ap), axum::routing::post(admin::regenerate_handler))

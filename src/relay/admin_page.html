@@ -234,6 +234,7 @@
             <th data-i18n="th_browsers">Browsers</th>
             <th data-i18n="th_last_active">Last active</th>
             <th data-i18n="th_tokens">Tokens</th>
+            <th>KPI</th>
             <th data-i18n="th_actions">Actions</th>
           </tr>
         </thead>
@@ -1334,6 +1335,15 @@
     // Actions
     const tdA = document.createElement('td'); tdA.className = 'actions';
     tdA.appendChild(buildConnectButton(s));
+
+    // KPI 曲线按钮（R5 丙111/140）：点击展开/收起行内 fps/bitrate 时间序列。
+    const kpi = document.createElement('button'); kpi.className = 'btn btn-sm'; kpi.textContent = '📈';
+    kpi.title = 'Desktop KPI (fps / bitrate)';
+    kpi.addEventListener('click', () => onShowKpi(s.session_id, kpi));
+    const tdK = document.createElement('td');
+    tdK.appendChild(kpi);
+    tr.appendChild(tdK);
+
     const regen = document.createElement('button'); regen.className = 'btn btn-sm'; regen.textContent = t('regenerate');
     regen.style.marginLeft = '6px';
     regen.addEventListener('click', () => onRegenerate(s));
@@ -1344,6 +1354,77 @@
     tr.appendChild(tdA);
 
     return tr;
+  }
+
+  // KPI 曲线：点击会话行的 📈 展开一个 canvas，画 agent 心跳 KPI 时间序列
+  // （fps 蓝线 / bitrate 绿线，15s 粒度、30min 窗口）。再点收起。
+  async function onShowKpi(sid, btn) {
+    const existing = document.getElementById('kpi-row-' + sid);
+    if (existing) { existing.remove(); btn.classList.remove('btn-primary'); return; }
+    let samples = [];
+    try {
+      const data = await api('/api/session/kpi/' + encodeURIComponent(sid));
+      samples = (data && data.samples) || [];
+    } catch (_) { samples = []; }
+    const tr = document.createElement('tr');
+    tr.id = 'kpi-row-' + sid;
+    const td = document.createElement('td');
+    td.colSpan = 8;
+    const canvas = document.createElement('canvas');
+    canvas.width = 720; canvas.height = 150;
+    canvas.style.maxWidth = '100%';
+    td.appendChild(canvas);
+    tr.appendChild(td);
+    btn.closest('tr').after(tr);
+    btn.classList.add('btn-primary');
+    drawKpi(canvas, samples);
+  }
+
+  function drawKpi(canvas, samples) {
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height, padL = 44, padR = 8, padT = 10, padB = 20;
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = '11px monospace';
+    // 空态
+    if (!samples.length) {
+      ctx.fillStyle = '#888'; ctx.textAlign = 'center';
+      ctx.fillText('No KPI yet — agent heartbeat samples every 15s (desktop on).', w / 2, h / 2);
+      return;
+    }
+    const plotW = w - padL - padR, plotH = h - padT - padB;
+    // 网格
+    ctx.strokeStyle = 'rgba(128,128,128,0.25)';
+    ctx.beginPath();
+    for (let i = 0; i <= 4; i++) {
+      const y = padT + plotH * i / 4;
+      ctx.moveTo(padL, y); ctx.lineTo(w - padR, y);
+    }
+    ctx.stroke();
+    const n = samples.length;
+    const xAt = (i) => padL + plotW * i / Math.max(1, n - 1);
+    const scale = (v, max) => padT + plotH - plotH * Math.min(1, (v || 0) / max);
+    const line = (key, max, color) => {
+      ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+      for (let i = 0; i < n; i++) {
+        const v = samples[i][key] || 0;
+        const x = xAt(i), y = scale(v, max);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    };
+    line('fps', 60, '#4f8cff');
+    line('bitrate_kbps', Math.max(2000, ...samples.map(s => s.bitrate_kbps || 0)), '#3fbf6f');
+    // 轴标
+    ctx.fillStyle = '#999'; ctx.textAlign = 'left';
+    ctx.fillText('60', 4, padT + 8);
+    ctx.fillText('30', 4, padT + plotH / 2 + 3);
+    ctx.fillText('0', 4, padT + plotH + 3);
+    ctx.textAlign = 'right';
+    ctx.fillText(n + '×15s', w - padR, h - 4);
+    // 图例
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#4f8cff'; ctx.fillText('─ fps', padL, padT + 2);
+    ctx.fillStyle = '#3fbf6f'; ctx.fillText('─ bitrate', padL + 60, padT + 2);
   }
 
   function buildTokenRow(s, tk) {

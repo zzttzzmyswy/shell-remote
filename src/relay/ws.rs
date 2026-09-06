@@ -57,6 +57,47 @@ pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) {
 // ── Shared agent message routing ─────────────────────────────────────
 
 pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, text_str: &str) {
+    // Agent 心跳（15s）格式特殊：`{"type":"ping","session_id":...,"kpi":{...}}`
+    // **没有 payload 字段**，严格的 [`ProtoMessage`] 反序列化会因
+    // `missing field 'payload'` 失败（真实心跳现即如此）。因此在严格解析
+    // 之前先用宽松 JSON 检查 ping：采样桌面 KPI 进 admin 曲线历史后拦截
+    // （ping 是 agent→relay 保活，无需转发浏览器；R5 丙111/140 admin KPI）。
+    if let Ok(loose) = serde_json::from_str::<serde_json::Value>(text_str) {
+        if loose.get("type").and_then(|v| v.as_str()) == Some("ping") {
+            if let Some(k) = loose.get("kpi") {
+                let at_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let sample = crate::relay::AgentKpiSample {
+                    at_unix_ms,
+                    running: k.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+                    codec: k
+                        .get("codec")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    fps: k.get("fps").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    quality_permille: k
+                        .get("quality_permille")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    bitrate_kbps: k
+                        .get("bitrate_kbps")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    encode_ms: k.get("encode_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                };
+                let mut hist = state.kpi_history.write().await;
+                let dq = hist.entry(session_id.to_string()).or_default();
+                if dq.len() >= crate::relay::KPI_HISTORY_CAP {
+                    dq.pop_front();
+                }
+                dq.push_back(sample);
+            }
+            return;
+        }
+    }
     if let Ok(proto_msg) = serde_json::from_str::<ProtoMessage>(text_str) {
         // Agent self-upgrade progress: capture it for the admin panel's
         // devices page (polled via /api/overview) and stop here — the frame
@@ -1544,6 +1585,55 @@ mod tests {
 
         assert!(rx1.try_recv().is_ok());
         assert!(rx2.try_recv().is_ok());
+    }
+
+    /// R5 丙111/140：agent 心跳 ping 携带 KPI → relay 采样进 kpi_history
+    /// （admin KPI 曲线数据源）；无 kpi 字段的 ping 不产生样本。
+    #[tokio::test]
+    async fn test_route_agent_message_samples_ping_kpi() {
+        let state = make_state("");
+        let msg = json!({
+            "type": "ping",
+            "session_id": "sid1",
+            "kpi": { "running": true, "codec": "av1", "fps": 30,
+                    "quality_permille": 1000, "bitrate_kbps": 1388, "encode_ms": 12 }
+        })
+        .to_string();
+        route_agent_message(&state, "sid1", &msg).await;
+        route_agent_message(&state, "sid1", &msg).await;
+
+        let hist = state.kpi_history.read().await;
+        let dq = hist.get("sid1").expect("ping KPI sample captured");
+        assert_eq!(dq.len(), 2);
+        let s = dq.back().unwrap();
+        assert!(s.running && s.codec == "av1" && s.fps == 30);
+        assert_eq!(s.quality_permille, 1000);
+        assert_eq!(s.bitrate_kbps, 1388);
+        assert_eq!(s.encode_ms, 12);
+        assert!(s.at_unix_ms > 0);
+
+        // 无 kpi 字段的 ping：不产生样本（保持 2）。
+        let bare = json!({"type":"ping","session_id":"sid1"}).to_string();
+        route_agent_message(&state, "sid1", &bare).await;
+        let hist2 = state.kpi_history.read().await;
+        assert_eq!(hist2.get("sid1").map(|d| d.len()).unwrap_or(0), 2);
+    }
+
+    /// KPI 历史容量到顶丢弃最旧（FIFO，30min 窗口）。
+    #[tokio::test]
+    async fn test_kpi_history_caps_and_drops_oldest() {
+        let state = make_state("");
+        let cap = crate::relay::KPI_HISTORY_CAP;
+        for _ in 0..(cap + 5) {
+            let msg =
+                json!({"type":"ping","session_id":"s","kpi":{"fps":30,"bitrate_kbps":1000}})
+                    .to_string();
+            route_agent_message(&state, "s", &msg).await;
+        }
+        let hist = state.kpi_history.read().await;
+        let dq = hist.get("s").unwrap();
+        assert_eq!(dq.len(), cap, "窗口到顶不再增长");
+        assert!(dq.front().unwrap().at_unix_ms <= dq.back().unwrap().at_unix_ms);
     }
 
     #[tokio::test]

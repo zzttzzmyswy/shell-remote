@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -210,6 +210,26 @@ pub async fn overview_handler(
         "recording_enabled": state.recorder.is_some(),
         "mcp_audit_enabled": state.recorder.is_some(),
         "conn_log": conn_log,
+    }))
+    .into_response()
+}
+
+/// Admin KPI 曲线数据（R5 丙111/140）：返回指定 session 的 agent 心跳 KPI
+/// 时间序列（fps/bitrate/quality/codec，15s 粒度、30min 窗口）。前端画
+/// canvas 折线用；session 无历史时返回空数组。
+pub async fn session_kpi_handler(
+    State(state): State<Arc<SharedState>>,
+    Path(sid): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let hist = state.kpi_history.read().await;
+    let samples = hist.get(&sid).cloned().unwrap_or_default();
+    Json(json!({
+        "session_id": sid,
+        "samples": samples,
     }))
     .into_response()
 }
