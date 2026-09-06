@@ -171,6 +171,16 @@ pub async fn overview_handler(
             "device": info.device,
             "agent_version": info.agent_version,
             "capabilities": info.capabilities,
+            "desktop_proto": state
+                .desktop_proto
+                .read()
+                .await
+                .get(sid)
+                .map(|(enc, dec, _, dropped)| json!({
+                    "encoded_bytes": enc,
+                    "decoded_bytes": dec,
+                    "dropped_frames": dropped,
+                })),
             "upgrade": upgrades.get(sid),
             "browser_count": browser_count,
             "last_active_seconds": last_active_seconds,
