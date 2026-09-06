@@ -95,9 +95,14 @@ impl DesktopStream {
     /// 只有连续丢帧超过 [`MAX_CONSECUTIVE_DROPS`] 才判定 viewer 死亡移除。
     /// 瞬时积压（解码停顿/切后台几百 ms）能自愈，不至于"一满就踢→反复
     /// 重连→闪烁"。
-    pub async fn push_frag(&self, is_key: bool, bytes: Vec<u8>) {
+    ///
+    /// 返回本拍因缓冲满被跳过（丢旧）的 viewer 数（R5#16 回传拥塞信号：
+    /// >0 说明 relay→浏览器传输段发生了拥塞/积压，调用方据此限频回传
+    /// agent，作为浏览器段 e2e/dq 之外的传输段拥塞证据）。
+    pub async fn push_frag(&self, is_key: bool, bytes: Vec<u8>) -> u32 {
         let mut viewers = self.inner.viewers.write().await;
         let mut dead = Vec::new();
+        let mut congested = 0u32;
         for (id, ctx) in viewers.iter_mut() {
             if !ctx.key_ok && !is_key {
                 continue;
@@ -113,6 +118,7 @@ impl DesktopStream {
                 }
                 Err(_) => {
                     ctx.drop_count += 1;
+                    congested += 1;
                     if ctx.drop_count >= MAX_CONSECUTIVE_DROPS {
                         dead.push(id.clone());
                     }
@@ -126,6 +132,7 @@ impl DesktopStream {
                 w.remove(&id);
             }
         }
+        congested
     }
 
     async fn broadcast_to_viewers(&self, bytes: Vec<u8>) {
@@ -459,6 +466,24 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap(), vec![1, 2, 3]);
         assert_eq!(rx.recv().await.unwrap(), vec![4, 5]);
         assert_eq!(rx.recv().await.unwrap(), vec![6]);
+    }
+
+    #[tokio::test]
+    async fn test_push_frag_reports_congested_drops() {
+        // R5#16：viewer 缓冲满（丢旧保新）时 push_frag 返回被跳过 viewer 数，
+        // relay 据此限频回传 agent 拥塞信号。
+        let st = DesktopStream::new();
+        let (_vid, mut rx, _init) = st.add_viewer().await;
+        // 填满 16 帧缓冲（channel cap=16）：第 17 帧起 try_send 失败被丢旧。
+        for i in 0..17u8 {
+            st.push_frag(true, vec![i]).await;
+        }
+        let congested = st.push_frag(true, vec![99]).await;
+        assert!(congested >= 1, "viewer 缓冲满后应报告 drop，got {congested}");
+        // 消费一帧腾出空位后，下一帧恢复投递（drop 计数归零）
+        assert_eq!(rx.recv().await.unwrap(), vec![0]);
+        let congested2 = st.push_frag(true, vec![100]).await;
+        assert_eq!(congested2, 0, "缓冲有空位后不再 drop");
     }
 
     #[tokio::test]

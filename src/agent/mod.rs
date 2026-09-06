@@ -1636,6 +1636,25 @@ async fn run_session(
                                     out.control(ack).await;
                                 }
 
+                                "desktop:congested" => {
+                                    // R5#16 relay→浏览器 fan-out 拥塞回传
+                                    // （relay viewer 缓冲满丢旧保新，≥5s 限频）：
+                                    // 作为"传输段拥塞"证据记录——浏览器 qos
+                                    // 上报的 e2e/dq 是浏览器段，relay drop 是
+                                    // 传输段，两者互补；此处不动 QoS 决策
+                                    // （agent 的码率/帧率收敛仍由浏览器段主导）。
+                                    let dropped = msg
+                                        .payload
+                                        .get("dropped")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    tracing::warn!(
+                                        session = %client.session_id,
+                                        dropped,
+                                        "relay fan-out congested (backpressure, R5#16)"
+                                    );
+                                }
+
                                 "desktop:reqkey" => {
                                     // 浏览器请求关键帧（接入/参考链断裂/解码错误，
                                     // 对齐 rustdesk 控制端 refresh_video）：置 flag，

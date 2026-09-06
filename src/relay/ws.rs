@@ -148,7 +148,46 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                         .get("key")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    ds.push_frag(is_key, bytes).await;
+                    let congested = ds.push_frag(is_key, bytes).await;
+                    // R5#16 回传拥塞信号：fan-out 丢旧保新发生（viewer 消费
+                    // 跟不上——弱网/页面休眠/切后台）→ 限频（≥5s）向 agent
+                    // 回传 desktop:congested。agent 侧作为"relay→浏览器传输段
+                    // 拥塞"证据参与弱网归因（浏览器 qos 上报的 e2e/dq 是
+                    // 浏览器段，relay drop 是传输段，两者互补）。仅回 agent，
+                    // 不进 broadcast_types，也不入 EventBuffer（现发现报）。
+                    if congested > 0 {
+                        let should_notify = {
+                            let guard = state.last_congest_notify.read().await;
+                            guard
+                                .get(session_id)
+                                .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(5))
+                        };
+                        if should_notify {
+                            state
+                                .last_congest_notify
+                                .write()
+                                .await
+                                .insert(session_id.to_string(), std::time::Instant::now());
+                            if let Some(tx) = state
+                                .agent_broadcast
+                                .read()
+                                .await
+                                .get(session_id)
+                                .and_then(|cm| cm.agent.clone())
+                            {
+                                let _ = deliver(
+                                    &tx,
+                                    "desktop:congested",
+                                    serde_json::json!({
+                                        "type": "desktop:congested",
+                                        "session_id": session_id,
+                                        "payload": { "dropped": congested }
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                    }
                 }
             }
             return;
@@ -1533,6 +1572,42 @@ mod tests {
         let snap = desktop_state_snapshot(&state, &sid).await.expect("snapshot after stopped");
         let v: serde_json::Value = serde_json::from_str(&snap).unwrap();
         assert_eq!(v["payload"]["running"], false);
+    }
+
+    #[tokio::test]
+    async fn test_desktop_congested_backpressure_to_agent() {
+        // R5#16：relay fan-out 丢旧保新（viewer 消费慢，缓冲满）→ 限频向
+        // agent 回传 desktop:congested——传输段拥塞证据（与浏览器段互补）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let (_agent_tx, mut agent_rx) = insert_channel_map(&state, &sid).await;
+        // 预建流 + 一个不消费的 viewer（16 帧缓冲填满后开始丢旧）
+        let ds = {
+            let mut streams = state.desktop_streams.write().await;
+            streams
+                .entry(sid.clone())
+                .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                .clone()
+        };
+        let (_vid, _rx, _init) = ds.add_viewer().await;
+        // 20 个 key 帧：前 16 填缓冲，后 4 个触发丢旧 → 应回传 congested
+        for _ in 0..20 {
+            let frag = serde_json::json!({
+                "type": "desktop:video",
+                "session_id": sid,
+                "payload": { "kind": "frag", "data": "AQID", "key": true }
+            });
+            route_agent_message(&state, &sid, &frag.to_string()).await;
+        }
+        // agent 通道应收到 desktop:congested（限频 5s 内≥1 次）
+        let mut saw_congested = false;
+        while let Ok(msg) = agent_rx.try_recv() {
+            if msg.contains("desktop:congested") {
+                saw_congested = true;
+            }
+        }
+        assert!(saw_congested, "viewer 拥塞应回传 desktop:congested 给 agent");
     }
 
     #[tokio::test]

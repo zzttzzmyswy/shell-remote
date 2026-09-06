@@ -89,6 +89,10 @@ pub struct SharedState {
     /// `desktop:stopped` → false。浏览器 SSE 建立/重建时 relay 据此立即补发
     /// `desktop:state` 快照，UI 无需依赖仍在事件缓冲中的历史事件即可恢复视图。
     pub desktop_states: RwLock<HashMap<String, bool>>,
+    /// 每会话最近一次 `desktop:congested` 回传时刻（R5#16 回传拥塞信号限频
+    /// 用）：relay→浏览器 fan-out 丢旧保新发生时向 agent 回传拥塞信号，
+    /// ≥5s / 次避免高频消息。keyed by session id。
+    pub last_congest_notify: RwLock<HashMap<String, std::time::Instant>>,
     /// Last `agent:upgrade_progress` payload per session (drives the admin
     /// device panel's upgrade status cell). Keyed by session id.
     pub agent_upgrades: RwLock<HashMap<String, serde_json::Value>>,
@@ -250,6 +254,7 @@ impl SharedState {
             conn_log: RwLock::new(std::collections::VecDeque::new()),
             desktop_streams: RwLock::new(HashMap::new()),
             desktop_states: RwLock::new(HashMap::new()),
+            last_congest_notify: RwLock::new(HashMap::new()),
             agent_upgrades: RwLock::new(HashMap::new()),
             upgrade_dir: RwLock::new(None),
             kpi_history: RwLock::new(HashMap::new()),
