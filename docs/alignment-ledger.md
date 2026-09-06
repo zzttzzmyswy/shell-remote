@@ -68,7 +68,7 @@
 | 8 | SSE 空闲超时对齐心跳 | ◐ | |
 | 9 | 重连退避 60s 上限 | ◐ | 浏览器 10 次退避已有；agent 控制优先待补 |
 | 10 | agent 重连幂等替换 | ⬜ | |
-| 11 | relay 重启后重发 init 状态机 | ⬜ | |
+| 11 | relay 重启后重发 init 状态机 | ✔ | 第 21 轮：agent 会话级 `desktop_want_running` 跨重连传递——断线退出时记录桌面状态并显式 stop（防 orphan task 向失效连接发帧），重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init）。实测两轮 relay 重启均 `auto-restoring desktop stream` + `capture started 1280x720` |
 | 12 | SSE 重建补 desktop:state | ⬜ | |
 | 13 | 多 agent 同 IP 白名单 | ⬜ | |
 | 14 | 混合通道二进制分辨 | ⬜ | 线协议整块（批次 2 #41）未做 |
@@ -76,7 +76,7 @@
 | 16 | relay→agent 背压回传 | ◐ | relay viewer 缓冲水位已降 16；回传拥塞信号未做 |
 | 17 | 12s 超时统一 ≤5s | ◐ | |
 | 18 | 发送失败即重连 | ◐ | |
-| 19 | 桌面开启竞态幂等 | ◐ | |
+| 19 | 桌面开启竞态幂等 | ✔ | `DesktopManager::start` 首行 `if self.is_running() { return; }`（检查→置 running 间无 await，并发安全）；第 21 轮代码级核实修正 |
 | 20 | 半开连接心跳兜底 | ◐ | |
 | 21 | 未知消息白名单丢弃 | ✔ | relay route_agent_message 白名单外丢弃+日志（ws.rs KNOWN 常量） |
 | 22 | WS/HTTP 限流等价 | ✔ | agent_conn_rate_ok 共享 ev: 30/min 配额（agent_events_handler + agent_ws_send_handler，测试 test_agent_conn_rate_shared_ws_http） |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **57%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 23%。
-- **R5 落地清单（200 点）**：✔ 类约 **68%**（可靠通道 11 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 10 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 21%。
+- **R5 落地清单（200 点）**：✔ 类约 **70%**（可靠通道 13 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 10 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 20%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -181,4 +181,8 @@
 - **第 20 轮新增合入**：
   1. 弱网 KPI 矩阵（`tools/weaknet_kpi_matrix.sh`）：netem 弱网档位（RTT 50/300/800 × 丢包 0/2%）逐档浏览器采样 QoS KPI（渲染 fps / e2e / 网络 RTT / qos_state / bitrate）→ KPI 汇总表 + **用户铁律断言"动态画面弱网不降帧"**（fps≥15；静态 fps=1 正确跳过，不误报）。实测采样正常（e2e 51ms、probe 4ms、qos_state Good、静态 fps=1 INFO 分支）。无 netem 权限自动降级到正常档基线 → R5#157 / R4 丁142 弱网 KPI 矩阵。
   2. 记录观察：连续 playwright 会话后新 join 的 `toggle-desktop-btn` 可能 disabled（疑测试会话残留，生产每次新标签页是干净 SSE 会话）——与批次1 #12（SSE 重建补 desktop:state）相关，台账 ⬜ 未闭合，如实记录。
+- **第 21 轮新增合入**：
+  1. relay 重启后桌面流自动恢复（`agent/mod.rs run_session` 加 `desktop_want_running` 会话级标志）：断线退出时记录桌面 running 并显式 stop（修掉孤儿 task——run_desktop_loop 是 tokio::spawn detach，desktop drop 不停它，会继续向失效 relay 发帧浪费 CPU + 重连双发冲突）；重连后自动 `desktop.start`（新 send_url，首帧强制 IDR 重发 init 给新 DesktopStream）。**实测**：两轮 relay 重启均显 `reconnected with desktop previously running — auto-restoring desktop stream` + `capture started 1280x720`（agent 日志证据）；用户手动关闭桌面（pagehide stop）后 running=false → 重连不自动开（符合预期）→ R5#11。
+  2. 台账修正：**#19 桌面开启竞态幂等已实现**（`DesktopManager::start` 首行 `is_running` 守卫，检查→置 running 无 await 并发安全），此前误标 ◐。
+  3. 诊断结论：#20 记录的连续会话按钮 disabled 现象，在干净复现下**不存在**（会话2 按钮正常 enabled + caps 正常）——疑 playwright 连续实例会话残留，非产品 bug；#12（SSE 重建补 desktop:state）实际已工作（桌面保持运行时新 join 收 caps 正常）。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
