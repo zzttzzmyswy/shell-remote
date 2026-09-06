@@ -50,12 +50,35 @@ pub const QUALITY_BEST: f32 = 1.5;
 /// 按可用核数与当前负载自适应，clamp 到 libvpx/libaom 的 MAX_NUM_THREADS=64
 /// 的常见档位（64/32/16/8/4/2/1）。比固定 4 线程更充分地利用多核——软编
 /// 1080p 每帧编码耗时随线程数显著下降（低延迟关键，MYS-886）。
+/// 读系统 1 分钟 load average（R5#82，对齐 rustdesk `codec_thread_num`
+/// 的 `(核数 - loadavg) × 0.5`）。Linux 读 /proc/loadavg 第一字段；
+/// 不可得时返回 None（调用方回退核数一半）。
+pub fn loadavg_one() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/loadavg").ok()?;
+        let first = s.split_whitespace().next()?;
+        first.parse::<f64>().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ();
+        None
+    }
+}
+
+/// 编码器线程数（对齐 rustdesk `codec_thread_num`）：按可用核数与系统
+/// 负载自适应——`res = (核数 - loadavg) × 0.5`，负载高时编码线程自动减少
+/// （不抢桌面/IO 的 CPU）；无 loadavg 时回退核数一半。clamp 到
+/// 64/32/16/8/4/2/1 档（libvpx/libaom 的 MAX_NUM_THREADS 常见值）。
 pub fn codec_thread_num() -> usize {
     let max = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    // rustdesk: (核数 - 负载) × 0.5。无 loadavg 依赖时近似用核数一半起跳，
-    // 上限核数；多核机型编码线程多一点，低配 4 核保持 4。
-    let mut res = (max as f64 * 0.5).round() as usize;
-    res = res.min(max).max(1);
+    let res = match loadavg_one() {
+        // rustdesk: (核数 - 负载) × 0.5。负载 > 核数时结果为 0 → 取 1。
+        Some(avg) => (((max as f64) - avg) * 0.5).round().max(1.0) as usize,
+        None => (max as f64 * 0.5).round() as usize,
+    };
+    let mut res = res.min(max).max(1);
     res = match res {
         _ if res >= 64 => 64,
         _ if res >= 32 => 32,
@@ -217,6 +240,30 @@ pub fn next_lower_codec(codec: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #82 loadavg 感知线程数：Linux 上应能读到 /proc/loadavg；
+    /// 且线程数恒 ≥1、≤可用核数（不超配抢 CPU）。
+    #[test]
+    fn test_codec_thread_num_bounded() {
+        let n = codec_thread_num();
+        let max = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4);
+        assert!(n >= 1 && n <= max.min(64), "threads {n} out of [1,{max}]");
+        // 档位合法（2 的幂序列）
+        assert!(matches!(n, 1 | 2 | 4 | 8 | 16 | 32 | 64));
+    }
+
+    /// loadavg_one：Linux 上 /proc/loadavg 存在，应解析出正数（可为 0）。
+    #[test]
+    fn test_loadavg_one_parses_or_none() {
+        match loadavg_one() {
+            Some(v) => {
+                assert!(v.is_finite() && v >= 0.0, "loadavg must be >= 0, got {v}");
+            }
+            None => {
+                // 非 Linux 或 /proc 不可读：允许 None（调用方回退核数一半）。
+            }
+        }
+    }
 
     #[test]
     fn test_base_bitrate_rustdesk_table() {
