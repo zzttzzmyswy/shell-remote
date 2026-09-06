@@ -201,6 +201,10 @@ pub struct DesktopManager {
     /// 供浏览器面板显示"静止/活跃"（R5#25 空闲回收可见性——静止时 4s IDR、
     /// 不空转编码回收资源，用户在面板上能看到状态而非误以为卡死）。
     last_active_at: Arc<std::sync::atomic::AtomicI64>,
+    /// relay→浏览器 fan-out 拥塞回传累计次数（R5#16 背压可观测闭环）：
+    /// agent 每收到 `desktop:congested` 递增；qos-ack 回传 `bp_count` 供
+    /// 浏览器面板显示"relay 拥塞"计数——传输段拥塞对用户/调试可见。
+    backpressure: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DesktopManager {
@@ -230,6 +234,7 @@ impl DesktopManager {
             gray: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idr_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
+            backpressure: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -278,6 +283,19 @@ impl DesktopManager {
         let now = unix_ms_now();
         let last = self.last_active_at.load(std::sync::atomic::Ordering::Relaxed);
         active_at(last, now)
+    }
+
+    /// R5#16 relay→浏览器 fan-out 拥塞回传计数：agent 每收到
+    /// `desktop:congested` 递增，qos-ack 回传供面板显示（传输段拥塞可观测）。
+    pub fn bump_backpressure(&self) {
+        use std::sync::atomic::Ordering as O;
+        self.backpressure.fetch_add(1, O::Relaxed);
+    }
+
+    /// 累计 relay 段拥塞次数（面板"relay 拥塞"计数）。
+    pub fn backpressure_count(&self) -> u32 {
+        use std::sync::atomic::Ordering as O;
+        self.backpressure.load(O::Relaxed)
     }
 
     /// 请求下一个编码帧立即出关键帧（浏览器接入/解码错误/参考链断裂时调用，
@@ -1910,6 +1928,16 @@ mod tests {
         assert!(!active_at(1_000_000, 1_005_000), "5s 静止");
         // 时钟异常（now < last）不应 panic，视为活跃（饱和为 0）。
         assert!(active_at(1_000_000, 999_000));
+    }
+
+    #[test]
+    fn test_backpressure_counter_accumulates() {
+        // R5#16 可观测闭环：relay 拥塞计数从 0 起、bump 递增、qos-ack 读值。
+        let dm = DesktopManager::new(DesktopConfig::default());
+        assert_eq!(dm.backpressure_count(), 0);
+        dm.bump_backpressure();
+        dm.bump_backpressure();
+        assert_eq!(dm.backpressure_count(), 2);
     }
 
     #[test]

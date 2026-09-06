@@ -944,6 +944,8 @@
       // R5#25 空闲回收可见性：agent 回传 active（最近真实新帧 ≤1.5s）——
       // 静止时 agent 已回收编码资源，面板"目标帧率/活动"行显示"静止"。
       this._ackActive = (typeof ack.active === 'boolean') ? ack.active : undefined;
+      // R5#16 relay 段拥塞计数（agent 累计 desktop:congested）→ 面板显示。
+      this._ackBp = (typeof ack.bp_count === 'number') ? ack.bp_count : undefined;
     }
     // TestDelay 探针回包：agent 原样 echo t0，本地单调时钟算纯网络 RTT。
     receiveTestDelayAck(ack) {
@@ -1204,6 +1206,14 @@
             if (self._ttfvMs !== null) wl += ' · 首帧 ' + self._ttfvMs + 'ms';
             weaknet.textContent = wl;
             weaknet.style.color = self._weakNet ? '#f0a020' : '';
+          }
+          // R5#16 relay 段拥塞计数（agent 回传 bp_count）——传输段拥塞
+          // 可观测（与浏览器段 e2e/丢帧互补；>0 说明 relay fan-out 丢过旧帧）。
+          const bpEl = document.getElementById('metric-bp');
+          if (bpEl) {
+            bpEl.textContent = (self._ackBp !== undefined && self._ackBp > 0)
+              ? self._ackBp + ' 次'
+              : (self._ackBp === 0 ? '0' : '-');
           }
           // QoS 反馈已移至 250ms 独立定时器（R5#72），此处不再重复上报。
           // 停滞检测同理（250ms 定时器内）。
