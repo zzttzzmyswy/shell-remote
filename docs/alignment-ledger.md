@@ -126,7 +126,7 @@
 
 ### 批次 3 · 编码器与 QoS 深化（81-120）
 
-◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；#84 编码耗时预算已合入（`mod.rs` 慢帧 >66ms×10 → `next_lower_codec` 降档）；#111 RTT 分带（4 档：<100 正常 / 100-300 微调 / 300-800 低档 / >800 预警，收紧低档阈值但**不绕过 over 主判据**——恒定高 RTT 不降码率）+ #113 中值滤波（9 窗口抗尖峰，`median_delay`，测试覆盖）已合入。其余（threads loadavg、AV1 测速门槛、H264 热备、质量 250ms 反馈、CBR 纪律、弱网 KPI 矩阵）未做。
+◐ #81 cpu_used/superblock 面积判据已合入（`aom.rs av1_cpu_used/av1_superblock_size`，纯面积对齐 rustdesk）；#82 编码线程数 loadavg 自适应已合入（`encoder.rs codec_thread_num` 用 `(核数-loadavg)×0.5`，负载高自动减线程，测试 `test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）；#84 编码耗时预算已合入（`mod.rs` 慢帧 >66ms×10 → `next_lower_codec` 降档）；#111 RTT 分带 + #113 中值滤波已合入（`mod.rs`，测试覆盖）。其余（AV1 测速门槛、H264 热备、质量 250ms 反馈、CBR 纪律、弱网 KPI 矩阵）未做。
 
 ### 批次 4 · 抓帧能效（121-146）
 
@@ -160,9 +160,8 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **51%**（甲 帧率/IDR/RTT分带、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 23%（丙遥测剩余、戊发布门槛）；◐ 26%。
-- **R5 落地清单（200 点）**：✔ 类约 **54%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 4 项 / 打包 3 项 / 遥测测试 8 项）；⬜ 30%。
-- **第 12 轮新增合入**：
-  1. RTT 中值滤波（`mod.rs median_window` 9 窗口 + `median_delay`，adjust_ratio 改用中值替代 2 窗口均值——单次尖峰不触发降码率，`test_qos_median_filters_spike`）→ R2 甲25 / R5#113；
-  2. RTT 分带（`mod.rs rtt_band`：<100 正常 / 100-300 微调 / 300-800 低档 / >800 预警，收紧低档阈值但**不绕过 over 主判据**——恒定高 RTT 是传播延迟不降码率，仅真拥塞才降，`test_qos_rtt_band_classification`）→ R4 丁142 / R5#111。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、admin KPI 曲线、光标独立通道、独立 100ms ack 批、TestDelay 探针等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **R4/5（200 点）**：✔ 类约 **53%**（甲 帧率/IDR/RTT分带、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账）；⬜ 21%（丙遥测剩余、戊发布门槛）；◐ 26%。
+- **R5 落地清单（200 点）**：✔ 类约 **56%**（可靠通道 9 项 / 前端 20 项 / 抓帧 6 项 / 编码器 5 项 / 打包 3 项 / 遥测测试 8 项）；⬜ 28%。
+- **第 13 轮新增合入**：
+  1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、admin KPI 曲线、光标独立通道、独立 100ms ack 批、TestDelay 探针、AV1 测速门槛、H264 热备、质量 250ms 反馈、CBR 纪律等——在台账对应 ⬜/◐ 行，未宣称完成。
