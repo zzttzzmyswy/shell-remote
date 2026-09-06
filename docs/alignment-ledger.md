@@ -34,7 +34,7 @@
 |---|---|---|---|
 | 61-70 | 连接与能力 | ◐ | 时钟校准 7 次剔除>500ms（desktop.js:_calibrateClock）、WS 优先回退 HTTP、TTFV 已打点（本轮）；能力探测缓存/MSE 能力协商等未做 |
 | 71-80 | 拉流与解复用 | ◐ | seqn 解析+真实丢帧（desktop.js:_handleMoof）、demux 重同步已有；逐帧 binary 帧头协议未做（仍在 JSON 批） |
-| 81-90 | 解码与渲染 | ◐ | 解码即渲染、队列 24/2、停滞 500ms reqkey 均有；光标叠加层/超龄丢弃 2s 未做 |
+| 81-90 | 解码与渲染 | ◐ | 解码即渲染、队列 24/2、停滞 500ms reqkey 均有；**光标叠加层已做**（第 18 轮：X11 GetImage 不含光标层——agent `poll_cursor` 100ms 节流 XQueryPointer → `desktop:cursor` 轻量消息 → 浏览器 `.sr-cursor-overlay` 叠加渲染，实测光标跟随鼠标）；超龄丢弃 2s 已做 |
 | 91-100 | 指标与面板 | ◐ | jitter/丢帧(seq)/e2e/目标帧率/TTFV/弱网标记（本轮补齐）；JS 内存曲线/离开 stop 未补 |
 | 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；30s 判死/重连降质/能力回退链待补 |
 
@@ -115,7 +115,7 @@
 | 56 | 面板三组分组 | ✔ | session.html 流畅度/质量/传输 三段（R3 己197） |
 | 57-59 | 面板补行（目标帧率/quality/弱网） | ✔ | 本轮：gofps/reqkey/weaknet/TTFV 行（desktop.js+session.html） |
 | 60 | e2e 与解码排队分流 | ✔ | 解码队列行加时延估算 dq/dfps×1000ms（desktop.js，e2e 归因分流） |
-| 61-64 | 内存曲线/rAF 暂停/光标通道 | ◐ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；光标通道未做 |
+| 61-64 | 内存曲线/rAF 暂停/光标通道 | ◐ | JS 内存行（desktop.js+session.html，当前+峰值）；rAF 静止暂停已天然满足；**光标独立通道已做**（第 18 轮：agent XQueryPointer 100ms 节流 → desktop:cursor → 浏览器 overlay，X11 GetImage 不含光标层是真实缺口） |
 | 65-66 | 能力探测/时钟 7 次 | ◐ | 时钟 7 次有；能力探测缓存 sessionStorage（desktop.js connect） |
 | 67-70 | MSE 回退/降级提示/解码器释放/重连降质 | ◐ | MSE 回退有 |
 | 71 | 帧到达 jitter 面板 | ✔ | metric-jitter（v0.42） |
@@ -160,8 +160,8 @@
 
 ## 合入进度总计（本轮结束）
 
-- **R4/5（200 点）**：✔ 类约 **55%**（甲 帧率/IDR/RTT分带/TestDelay探针、乙 Player 主体+韧性+错误恢复+内存+排队归因、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 25%。
-- **R5 落地清单（200 点）**：✔ 类约 **63%**（可靠通道 11 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 9 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项）；⬜ 24%。
+- **R4/5（200 点）**：✔ 类约 **56%**（甲 帧率/IDR/RTT分带/TestDelay探针、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 24%。
+- **R5 落地清单（200 点）**：✔ 类约 **65%**（可靠通道 11 项 / 前端 20 项 / 抓帧 6 项 / 编码器 7 项 / 打包 3 项 / 遥测测试 9 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项）；⬜ 23%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -174,4 +174,6 @@
 - **第 17 轮新增合入**：
   1. WS/HTTP 限流等价（`relay/ws.rs agent_conn_rate_ok`）：agent WS uplink 与 HTTP `/agent/events` 共享 per-IP `ev:` 30/min 连接配额（同一 key 无法切通道绕过），events handler 改复用辅助；测试 `test_agent_conn_rate_shared_ws_http`（30 放行/31 超限/异 IP 独立）→ R5#22。
   2. 台账修正：**#28 20s WS ping 已做**（`handle_agent_ws_uplink` 每 20s server-side ping，agent 死链 ~35s 检出），此前误标 ◐，代码级核实后标 ✔。
-- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、光标独立通道、独立 100ms ack 批、AV1 测速门槛、质量 250ms 反馈等——在台账对应 ⬜/◐ 行，未宣称完成。
+- **第 18 轮新增合入**：
+  1. 光标独立通道（`capture.rs poll_cursor` + `FrameSource::set_cursor_cb` + `desktop:cursor` + `web/desktop.js updateCursor`）：**X11 `GetImage`/`ShmGetImage` 不含光标层——远程用户看不到鼠标指针是真实缺口**。agent 捕获线程 `next_frame` 内 100ms 节流 `XQueryPointer` → 位置经 `cursor_cb` → `desktop:cursor {x,y,shown}` 轻量消息（光标移动不触发整帧重编码）→ relay broadcast_types/KNOWN 白名单 → 浏览器 `.sr-cursor-overlay`（内联 SVG 箭头 + 捕获分辨率→显示尺寸映射）。**浏览器实测**：overlay 出现在屏幕中心（638,342≈640,360）、注入鼠标移动到 (300,200)/(600,450) 后 overlay 跟随到 (299,190)/(598,428)。另确认 enigo 注入需 DISPLAY 环境（测试环境未设导致注入失败，非代码 bug）→ R4 乙81-90 / R5#64。
+- **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、QoS 五态状态机完整化、独立 100ms ack 批、AV1 测速门槛、质量 250ms 反馈等——在台账对应 ⬜/◐ 行，未宣称完成。
