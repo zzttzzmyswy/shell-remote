@@ -36,7 +36,7 @@
 | 71-80 | 拉流与解复用 | ◐ | seqn 解析+真实丢帧（desktop.js:_handleMoof）、demux 重同步已有；逐帧 binary 帧头协议未做（仍在 JSON 批） |
 | 81-90 | 解码与渲染 | ◐ | 解码即渲染、队列 24/2、停滞 500ms reqkey 均有；**光标叠加层已做**（第 18 轮：X11 GetImage 不含光标层——agent `poll_cursor` 100ms 节流 XQueryPointer → `desktop:cursor` 轻量消息 → 浏览器 `.sr-cursor-overlay` 叠加渲染，实测光标跟随鼠标）；超龄丢弃 2s 已做 |
 | 91-100 | 指标与面板 | ◐ | jitter/丢帧(seq)/e2e/目标帧率/TTFV/弱网标记（本轮补齐）；JS 内存曲线**已做**（第 22 轮批次2 #61：当前+峰值行）、离开 stop **已做**（session.js pagehide/beforeunload → notifyDesktopLeave → desktopView.disconnect 停流）；第 35 轮核实修正 |
-| 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；**30s 判死已做**（第 37 轮：浏览器播放器 `_lastDataAt` 看门狗——曾连上但 30s 无任何视频数据 → 判死重连，静止安全因 4s IDR 心跳仍到达）；**能力回退链已做**（`_onDecodeError` 黑名单切 codec → `desktop:codec` 请求 agent 降档 + `_scheduleDecodeRecover` 1500ms 防抖重建流兜底）；重连降质待补 |
+| 101-110 | 错误与恢复 | ◐ | 解码错误分级 reqkey/重建已有；**30s 判死已做**（第 37 轮：浏览器播放器 `_lastDataAt` 看门狗——曾连上但 30s 无任何视频数据 → 判死重连，静止安全因 4s IDR 心跳仍到达）；**能力回退链已做**（`_onDecodeError` 黑名单切 codec → `desktop:codec` 请求 agent 降档 + `_scheduleDecodeRecover` 1500ms 防抖重建流兜底）；**重连降质已做**（第 41 轮：session.js `requestReconnect`——30s 窗口 ≥2 次重连（join 看门狗/30s 判死/SSE 断线）判重连风暴 → 标记降质，join 成功后 `applyQualityOnJoin` 请求 speed 低码率档，稳定 15s 无重连自动恢复 best） |
 
 ### 丙 遥测（111-140）
 
@@ -44,7 +44,7 @@
 
 ### 丁 弱网纵深（141-170）
 
-◐ 部分。弱网模式 UI 标记（本轮）、reqkey 恢复、IDR 带宽占比、注册风暴保护、RTT 分带（中值滤波+4 档判定，mod.rs rat_band）、输入降采样已有；重连窗口降质量未做；**TestDelay 探针已做**（第 14 轮：浏览器 1s 单调时钟探测包 → agent 即时 echo → 纯网络层 RTT，probe_ms 随 qos 上报参与拥塞归因）。第 36 轮核实修正。
+◐ 部分。弱网模式 UI 标记（本轮）、reqkey 恢复、IDR 带宽占比、注册风暴保护、RTT 分带（中值滤波+4 档判定，mod.rs rat_band）、输入降采样已有；重连窗口降质量**已做**（第 41 轮：session.js 重连风暴检测 → join 成功后请求 speed 档 → 15s 稳定恢复 best）；TestDelay 探针已做（第 14 轮，1s 单调时钟探测包 → agent 即时 echo → 纯网络层 RTT，probe_ms 随 qos 上报参与拥塞归因）。
 
 ### 戊 发布门槛（171-200）
 
@@ -230,4 +230,6 @@
 - **第 40 轮新增合入**：
   1. R5#16 背压可观测闭环：agent `DesktopManager` 加 `backpressure` 计数（收到 `desktop:congested` 递增，`bump_backpressure`/`backpressure_count` + 单测 `test_backpressure_counter_accumulates`）；qos-ack 回传 `bp_count`；浏览器面板新增"relay 拥塞"行（metric-bp，agent 回传 >0 显示次数）——传输段拥塞对用户/调试可见。全量 `cargo test` **389 通过**（+1）。
   2. 核实修正（R4/5 表）：61-70 连接与能力——MSE/WebCodecs 能力协商（`_webcodecsAvailable` 安全上下文+VideoDecoder 检测 → webcodecs/mse/none + sessionStorage 缓存复用）与能力探测缓存均已做；101-110 能力回退链——`_onDecodeError` 黑名单切 codec + `_scheduleDecodeRecover` 重建流兜底均已做；台账过时标"未做"。
+- **第 41 轮新增合入**：
+  1. 重连窗口降质量（R4 乙101-110 重连降质）：session.js `requestReconnect` 统一重连入口——30s 窗口 ≥2 次重连（join 看门狗 / 30s 判死 / SSE 断线）判**重连风暴** → 标记降质（不在重连窗口直接发命令避免丢消息）→ join 成功后 `applyQualityOnJoin` 发 `desktop:quality {speed}` 低码率档（重建流带宽压力骤减，更易稳定）→ 15s 无重连自动恢复 `best`。desktop.js 30s 判死改走 `window.__requestReconnect` 统一通道。**验证**：`node --check` 两文件通过 + 引用齐全（requestReconnect/applyQualityOnJoin/__requestReconnect 两端一致）。纯前端改动。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
