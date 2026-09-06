@@ -843,6 +843,8 @@
       for (const f of this._frames) { try { f.close(); } catch (e) {} }
       this._frames = [];
       if (this._dec) { try { this._dec.close(); } catch (e) {} this._dec = null; }
+      // 光标 overlay 清理（R5#64 通道断开后移除，避免元素/样式残留）。
+      if (this._cursorEl) { try { this._cursorEl.remove(); } catch (e) {} this._cursorEl = null; }
       this._desc = null;
       this._lastCaptureMs = 0;
       this._lastE2eMs = undefined;
