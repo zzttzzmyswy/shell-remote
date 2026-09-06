@@ -93,6 +93,10 @@ pub struct SharedState {
     /// 用）：relay→浏览器 fan-out 丢旧保新发生时向 agent 回传拥塞信号，
     /// ≥5s / 次避免高频消息。keyed by session id。
     pub last_congest_notify: RwLock<HashMap<String, std::time::Instant>>,
+    /// 每会话最近一次 KPI 异常告警时刻（批次5 告警雏形）：active 且 fps<10
+    /// （动态内容异常降帧，用户铁律动态不降帧）→ 告警日志，≥30s / 次避免
+    /// 刷屏。keyed by session id。
+    pub last_kpi_alert: RwLock<HashMap<String, std::time::Instant>>,
     /// Last `agent:upgrade_progress` payload per session (drives the admin
     /// device panel's upgrade status cell). Keyed by session id.
     pub agent_upgrades: RwLock<HashMap<String, serde_json::Value>>,
@@ -118,6 +122,11 @@ pub struct AgentKpiSample {
     pub quality_permille: u32,
     pub bitrate_kbps: u32,
     pub encode_ms: u32,
+    /// 内容活跃（agent 心跳快照，R5#25）：admin KPI 可观测静止/活跃时间线。
+    pub active: bool,
+    /// relay→浏览器 fan-out 拥塞累计次数（agent 心跳快照，R5#16）：admin KPI
+    /// 可观测传输段拥塞时间线。
+    pub bp_count: u32,
 }
 
 /// KPI 历史窗口长度：agent 心跳 15s × 120 = 30min。
@@ -255,6 +264,7 @@ impl SharedState {
             desktop_streams: RwLock::new(HashMap::new()),
             desktop_states: RwLock::new(HashMap::new()),
             last_congest_notify: RwLock::new(HashMap::new()),
+            last_kpi_alert: RwLock::new(HashMap::new()),
             agent_upgrades: RwLock::new(HashMap::new()),
             upgrade_dir: RwLock::new(None),
             kpi_history: RwLock::new(HashMap::new()),

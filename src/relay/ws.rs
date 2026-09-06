@@ -54,6 +54,13 @@ pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) {
     }
 }
 
+/// 批次5 告警判据：内容活跃（非静止）但编码帧率 <10 —— 动态内容异常降帧
+/// （用户铁律：动态画面不降帧，正常动态 fps ≥15）。静止（active=false，
+/// fps=1）属正常，不告警。纯函数便于单测。
+fn kpi_anomalous(active: bool, fps: u32) -> bool {
+    active && fps < 10
+}
+
 // ── Shared agent message routing ─────────────────────────────────────
 
 pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, text_str: &str) {
@@ -87,7 +94,32 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32,
                     encode_ms: k.get("encode_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    active: k.get("active").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bp_count: k.get("bp_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                 };
+                // 批次5 告警雏形：active 且 fps<10（动态内容异常降帧）→ 告警
+                // 日志（≥30s/会话限频）。静止（active=false,fps=1）不告警。
+                if sample.running && kpi_anomalous(sample.active, sample.fps) {
+                    let should_alert = {
+                        let guard = state.last_kpi_alert.read().await;
+                        guard
+                            .get(session_id)
+                            .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(30))
+                    };
+                    if should_alert {
+                        state
+                            .last_kpi_alert
+                            .write()
+                            .await
+                            .insert(session_id.to_string(), std::time::Instant::now());
+                        tracing::warn!(
+                            session = %session_id,
+                            fps = sample.fps,
+                            active = sample.active,
+                            "KPI anomaly: dynamic content at abnormally low fps (R5 告警)"
+                        );
+                    }
+                }
                 let mut hist = state.kpi_history.write().await;
                 let dq = hist.entry(session_id.to_string()).or_default();
                 if dq.len() >= crate::relay::KPI_HISTORY_CAP {
@@ -1818,7 +1850,8 @@ mod tests {
             "type": "ping",
             "session_id": "sid1",
             "kpi": { "running": true, "codec": "av1", "fps": 30,
-                    "quality_permille": 1000, "bitrate_kbps": 1388, "encode_ms": 12 }
+                    "quality_permille": 1000, "bitrate_kbps": 1388, "encode_ms": 12,
+                    "active": true, "bp_count": 3 }
         })
         .to_string();
         route_agent_message(&state, "sid1", &msg).await;
@@ -1832,6 +1865,8 @@ mod tests {
         assert_eq!(s.quality_permille, 1000);
         assert_eq!(s.bitrate_kbps, 1388);
         assert_eq!(s.encode_ms, 12);
+        assert!(s.active, "active must be sampled from agent heartbeat (R5#25)");
+        assert_eq!(s.bp_count, 3, "bp_count must be sampled from agent heartbeat (R5#16)");
         assert!(s.at_unix_ms > 0);
 
         // 无 kpi 字段的 ping：不产生样本（保持 2）。
@@ -1839,6 +1874,18 @@ mod tests {
         route_agent_message(&state, "sid1", &bare).await;
         let hist2 = state.kpi_history.read().await;
         assert_eq!(hist2.get("sid1").map(|d| d.len()).unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn test_kpi_anomalous_threshold() {
+        // 批次5 告警判据：active（内容在动）但 fps<10 → 异常（动态不降帧
+        // 铁律下正常动态 fps≥15）；静止（active=false, fps=1）不告警。
+        assert!(kpi_anomalous(true, 5), "动态但 fps=5 应告警");
+        assert!(kpi_anomalous(true, 9));
+        assert!(!kpi_anomalous(true, 10), "fps=10 达阈值不告警");
+        assert!(!kpi_anomalous(true, 30), "动态满帧不告警");
+        assert!(!kpi_anomalous(false, 1), "静止 1fps 正常不告警");
+        assert!(!kpi_anomalous(false, 0));
     }
 
     /// KPI 历史容量到顶丢弃最旧（FIFO，30min 窗口）。
