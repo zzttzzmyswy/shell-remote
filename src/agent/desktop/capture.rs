@@ -298,6 +298,10 @@ pub struct X11Source {
     /// 每 N 帧重查一次 root geometry（display 分辨率运行时变更检测，
     /// rustdesk `Rect`/HotPlug 对齐）。X setup 缓存不反映 xrandr 变更。
     recheck: u32,
+    /// 是否已注册 XRANDR ScreenChangeNotify（R5#131 分辨率事件驱动）。
+    /// 注册后 `next_frame` 用 `poll_for_event` 读事件——只有真变更才触发
+    /// 重建，替代固定 30 帧一次的 `get_geometry` 轮询往返。
+    randr_registered: bool,
 }
 
 /// MIT-SHM segment: SysV shared memory mapped into our address space and
@@ -341,7 +345,7 @@ impl X11Source {
                 screen.root,
             )
         };
-        Ok(Self {
+        let mut src = Self {
             conn,
             screen_num,
             root,
@@ -352,7 +356,28 @@ impl X11Source {
             shm: None,
             shm_failed: false,
             recheck: 0,
-        })
+            randr_registered: false,
+        };
+        // 注册 XRANDR ScreenChangeNotify（R5#131）：分辨率事件驱动替代轮询。
+        // 失败静默——事件驱动是优化，无扩展时回落现有 30 帧轮询。
+        use x11rb::protocol::randr::{ConnectionExt as _, NotifyMask};
+        match src
+            .conn
+            .randr_select_input(src.root, NotifyMask::SCREEN_CHANGE)
+        {
+            Ok(cookie) => match cookie.check() {
+                Ok(()) => {
+                    src.randr_registered = true;
+                }
+                Err(e) => {
+                    tracing::debug!(%e, "randr select_input failed — falling back to geometry polling");
+                }
+            },
+            Err(e) => {
+                tracing::debug!(%e, "randr select_input cookie failed — falling back to geometry polling");
+            }
+        }
+        Ok(src)
     }
 
     /// Try to initialise the MIT-SHM fast path. Quietly falls back to
@@ -595,30 +620,58 @@ impl FrameSource for X11Source {
     }
 
     fn next_frame(&mut self) -> Result<Frame, String> {
+        use x11rb::connection::Connection as _;
         use x11rb::protocol::xproto::ConnectionExt as _;
-        // 定期重查 root geometry：屏幕分辨率运行时变更（xrandr / 多屏切换）
-        // 时下一帧按新尺寸抓取，pipeline 据此重建编码器（rustdesk display
-        // 变更检测对齐）。失败静默（保持上次尺寸，下次再试）。
-        self.recheck += 1;
-        if self.recheck >= 30 {
-            self.recheck = 0;
-            let mut resized = false;
-            if let Ok(cookie) = self.conn.get_geometry(self.root) {
-                if let Ok(geo) = cookie.reply() {
-                    if geo.width > 0 && geo.height > 0 {
-                        // 分辨率变了：SHM 段尺寸失效，重建。
-                        if self.width != geo.width || self.height != geo.height {
-                            resized = true;
+        // 分辨率变更检测（R5#131 事件驱动）：已注册 XRANDR ScreenChangeNotify
+        // 时用 poll_for_event 读事件——只有真变更才重建，替代固定 30 帧一次的
+        // get_geometry 轮询往返。无事件/未注册时回落轮询（保持旧行为）。
+        let mut resized = false;
+        if self.randr_registered {
+            loop {
+                match self.conn.poll_for_event() {
+                    Ok(Some(ev)) => {
+                        if let Ok(x11rb::protocol::Event::RandrScreenChangeNotify(randr_ev)) =
+                            x11rb::protocol::Event::try_from(ev)
+                        {
+                            let width = randr_ev.width;
+                            let height = randr_ev.height;
+                            if width > 0 && height > 0 {
+                                if self.width != width || self.height != height {
+                                    resized = true;
+                                }
+                                self.width = width;
+                                self.height = height;
+                            }
                         }
-                        self.width = geo.width;
-                        self.height = geo.height;
+                    }
+                    Ok(None) => break, // 无更多事件
+                    Err(e) => {
+                        tracing::debug!(%e, "poll_for_event failed — falling back to geometry polling");
+                        self.randr_registered = false;
+                        break;
                     }
                 }
             }
-            if resized {
-                self.teardown_shm();
-                self.shm_failed = false;
+        } else {
+            self.recheck += 1;
+            if self.recheck >= 30 {
+                self.recheck = 0;
+                if let Ok(cookie) = self.conn.get_geometry(self.root) {
+                    if let Ok(geo) = cookie.reply() {
+                        if geo.width > 0 && geo.height > 0 {
+                            if self.width != geo.width || self.height != geo.height {
+                                resized = true;
+                            }
+                            self.width = geo.width;
+                            self.height = geo.height;
+                        }
+                    }
+                }
             }
+        }
+        if resized {
+            self.teardown_shm();
+            self.shm_failed = false;
         }
         // 首次（或分辨率变更后）尝试开启 MIT-SHM 快路径；失败则标记失败
         // 不再每帧重试（回落 GetImage）。
@@ -1006,6 +1059,33 @@ mod tests {
         if non_zero == 0 {
             eprintln!("X11 frame is all-black {}x{} (Xvfb root unpainted)", w, h);
         }
+    }
+
+    /// #131 分辨率事件驱动：支持 RANDR 的服务器上应成功注册
+    /// ScreenChangeNotify（`randr_registered=true`）——事件驱动替代轮询。
+    /// 无扩展时允许注册失败（回落轮询），但必须不破坏首帧捕获。
+    #[test]
+    fn test_x11_randr_event_driven_resolution() {
+        let display = std::env::var("SR_XTEST_DISPLAY").unwrap_or_else(|_| ":99".into());
+        let mut src = match X11Source::open(Some(&display)) {
+            Ok(s) => s,
+            Err(e) => {
+                if e.contains("connect") && std::env::var("SR_NO_XTEST").is_ok() {
+                    return;
+                }
+                panic!("x11 open failed: {e}");
+            }
+        };
+        // Xvfb :96 带 RANDR → 应注册成功；无扩展时允许失败但帧仍可捕获。
+        if src.randr_registered {
+            eprintln!("XRANDR ScreenChangeNotify registered (event-driven resolution)");
+        } else {
+            eprintln!("XRANDR unavailable — falling back to geometry polling (allowed)");
+        }
+        // 事件驱动路径必须不破坏捕获：首帧尺寸与分辨率一致。
+        let (w, h) = src.resolution();
+        let fr = src.next_frame().expect("frame with randr registered");
+        assert_eq!(fr.bgra.len(), w * h * 4);
     }
 
     /// XComposite fallback path (used when the root `GetImage` fails, e.g.

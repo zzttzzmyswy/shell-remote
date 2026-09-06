@@ -30,7 +30,7 @@ encoding_rs = "0.8"
 sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["io"] }
 openh264-sys2 = { version = "0.9.8", features = ["source"] }
-x11rb = { version = "0.14", features = ["image", "composite", "shm"] }
+x11rb = { version = "0.14", features = ["image", "composite", "shm", "randr"] }
 enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
 tokio-tungstenite = { version = "0.23", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 futures-util = "0.3.34"
