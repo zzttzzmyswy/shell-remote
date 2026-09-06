@@ -24,6 +24,10 @@
   // 立即 force_idr 补上（对齐 rustdesk 控制端 refresh_video 语义），
   // 不再靠大缓冲硬扛。
   const MAX_DECODE_QUEUE = 24;
+  // final-review #2：被 P2P 抢占踢出后的冷却期——期内不再抢 P2P（钉住 relay，
+  // 防并发 viewer last-wins 单活跃 slot 的双方互踢）；期满后的下一次 connect
+  // 允许重试 P2P（竞争消失后自动恢复直连）。
+  const P2P_REJECT_COOLDOWN_MS = 60000;
 
   window.DesktopView = class {
     constructor() {
@@ -126,6 +130,11 @@
       this._lanAddrs = [];
       // disconnect() 置位：探测/拉流途中被显式断开时不触发 fallback 连锁。
       this._lanCancelled = false;
+      // final-review #2：被 P2P 抢占踢出后（并发 viewer，agent 单活跃 last-wins
+      // slot）本连接周期不再尝试 P2P——钉住 relay 防双方互踢；用户切换或冷却
+      // 期满后清除（见 _p2pRejectedActive）。
+      this._p2pRejected = false;
+      this._p2pRejectedAt = 0;
     }
 
     // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
@@ -278,9 +287,14 @@
       if (el) el.classList.add('hidden');
     }
 
-    connect() {
+    connect(resetP2pRejected) {
       if (this._decRecoverTimer) { clearTimeout(this._decRecoverTimer); this._decRecoverTimer = null; }
       this.disconnect(false);
+      // final-review #2：用户主动切换（终端↔桌面）/新流接入开启全新连接周期时
+      // 清除 P2P 被拒标记，允许重新尝试 P2P（竞争消失后恢复直连）；内部自动
+      // 重连（_onP2pLost/_startFeeding/ws.onclose 等）不传参，冷却期内保持
+      // 钉住 relay，打断并发 viewer 的互踢循环。
+      if (resetP2pRejected) { this._p2pRejected = false; this._p2pRejectedAt = 0; }
       this._showLoading();
       const self = this;
       // MSE 模式首帧信号：video loadeddata（WebCodecs 已走 _onDecoded）。
@@ -336,6 +350,10 @@
     // 不可达 → _startP2p()（Task 3，其内部失败再回退 _startWs）。同网段
     // 判定天然隐含：跨网段连不上 agent host candidate → fetch 失败 → 下一个。
     _startLan() {
+      // final-review #2：被 P2P 抢占踢出后（冷却期内）不再重试 LAN/P2P，直接
+      // 钉住 relay（_startWs）。避免并发 viewer 相互抢占时，"踢出方"每次自动重连
+      // 又回到 P2P 再踢别人——双方反复互踢直到 _streamRetries 耗尽黑屏。
+      if (this._p2pRejectedActive()) { this._startWs(); return; }
       const addrs = this._lanAddrs || [];
       if (!addrs.length || this._transport === 'lan') { this._startP2p(); return; }
       const self = this;
@@ -350,8 +368,13 @@
         // 探测上限 9s：LAN server 在无 init 时最多等 10s 才收尾，避免把
         // P2P/relay 回退拖到那时（探测期桌面未起的场景）。
         const probeTimer = setTimeout(function() { controller.abort(); }, 9000);
+        // final-review #1：探测 fetch 必须挂上 AbortController.signal——否则同网段
+        // 黑洞地址的 TCP connect 挂在 OS 超时（数十秒），9s 的 probeTimer.abort()
+        // 无效、tryNext() 走不下去，整条 lan→p2p→relay 回退被拖住（P2P 失败
+        // 不黑屏）。挂上 signal 后 9s 必 abort → fetch 立即 reject → catch → tryNext。
         fetch('http://' + a + '/agent/desktop/stream', {
-          headers: { 'Accept': 'video/mp4' }
+          headers: { 'Accept': 'video/mp4' },
+          signal: controller.signal
         }).then(function(resp) {
           if (controller.signal.aborted) { clearTimeout(probeTimer); tryNext(); return null; }
           if (!resp.ok || !resp.body) { clearTimeout(probeTimer); tryNext(); return null; }
@@ -439,6 +462,9 @@
     // fMP4 字节（agent 端镜像投递）经 DataChannel 到达 → 现有 _feed demux。
     // 键鼠上行不改：仍走 relay session send（Task 6 再评估切 DataChannel）。
     _startP2p() {
+      // final-review #2：被 P2P 抢占踢出后（冷却期内）不再发起 offer 抢 P2P，
+      // 直接钉住 relay（并发 viewer last-wins 单活跃 slot，见 _onP2pLost）。
+      if (this._p2pRejectedActive()) { this._startWs(); return; }
       // MSE 模式 / 浏览器不支持 RTCPeerConnection：直接走现有 WS→fetch。
       // DataChannel 仅 WebCodecs 路径可用（MSE 不接 DataChannel 字节）。
       if (!this._webcodecsAvailable() || typeof RTCPeerConnection === 'undefined') {
@@ -448,15 +474,18 @@
       const self = this;
       try {
         this._p2pPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        // DataChannel：agent 端把 desktop:video 的 fMP4 字节镜像投进来。
+        // 不可靠 + 无序（Task 6，与 agent str0m make_offer 侧同步）：丢包不重传、
+        // 不阻塞后续消息——fMP4 丢旧保新、帧时效优先，避免可靠有序通道在弱网下
+        // 的 head-of-line 卡顿拖住整条下行。
+        // final-review：createDataChannel 在 pc 已关闭时抛 InvalidStateError——
+        // 与构造同 try 防护，抛错即 _onP2pFailed（关 pc + 回退 relay），避免
+        // 从 _startP2p 裸抛出去跳过回退、留下无超时的黑 view。
+        this._p2pDc = this._p2pPc.createDataChannel('desktop', { ordered: false, maxRetransmits: 0 });
       } catch (e) {
         this._onP2pFailed();
         return;
       }
-      // DataChannel：agent 端把 desktop:video 的 fMP4 字节镜像投进来。
-      // 不可靠 + 无序（Task 6，与 agent str0m make_offer 侧同步）：丢包不重传、
-      // 不阻塞后续消息——fMP4 丢旧保新、帧时效优先，避免可靠有序通道在弱网下
-      // 的 head-of-line 卡顿拖住整条下行。
-      this._p2pDc = this._p2pPc.createDataChannel('desktop', { ordered: false, maxRetransmits: 0 });
       this._p2pDc.binaryType = 'arraybuffer';
       this._p2pDc.onmessage = function(ev) {
         if (typeof ev.data === 'string') return; // 控制帧忽略
@@ -521,6 +550,10 @@
     // 造成双开 WS/fetch。
     _onP2pFailed() {
       if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
+      // final-review #2：协商阶段失败（5s 超时/agent failed 广播/answer 不匹配）
+      // 同样标记被拒——并发 viewer 中"输掉"一方据此钉住 relay；配合 _onP2pLost
+      // 的标记，任何形式的 P2P 失败后冷却期内都不再抢 P2P。
+      this._markP2pRejected();
       if (this._p2pPc) {
         try { this._p2pPc.close(); } catch (e) {}
         this._p2pPc = null;
@@ -532,6 +565,21 @@
         this._transport = 'relay';
         this._startWs();
       }
+    }
+
+    // final-review #2：标记本 viewer 已从 P2P 被踢出（并发 viewer last-wins
+    // 单活跃 slot，见 src/agent/p2p.rs）。之后 _startLan/_startP2p 在冷却期内
+    // 直接钉住 relay，不再重复发起 offer 造成双方互踢、直到 _streamRetries 耗尽。
+    _markP2pRejected() {
+      this._p2pRejected = true;
+      this._p2pRejectedAt = Date.now();
+    }
+
+    // 冷却期内为 true：本周期不再抢 P2P（_startLan/_startP2p 直走 _startWs）。
+    _p2pRejectedActive() {
+      return this._p2pRejected &&
+        this._p2pRejectedAt > 0 &&
+        (Date.now() - this._p2pRejectedAt) < P2P_REJECT_COOLDOWN_MS;
     }
 
     // 已建连后 DataChannel/ICE 中途断 → 复用 _streamRetries 重连（同 WS/fetch
@@ -548,6 +596,10 @@
       this._p2pDc = null;
       if (window.__p2pTransport === this) window.__p2pTransport = null;
       this._transport = 'relay';
+      // final-review #2：P2P 会话以任何方式结束（含 last-wins 抢占踢出）→ 本
+      // 连接周期钉住 relay，不再抢 P2P。wasConnected 分支的自动重连会在
+      // 冷却期内直走 _startWs，从根上打断并发 viewer 的互踢循环。
+      this._markP2pRejected();
       if (wasConnected) {
         // 建连后中断：走统一重连（复用 _streamRetries 退避）。
         if (this._streamRetries < 10) {
@@ -613,6 +665,13 @@
     // agent 广播的 p2p-state：{state: connecting|connected|failed}。
     handleState(msg) {
       const st = msg.payload && msg.payload.state;
+      // final-review #2：已锚定 P2P 后收到 agent failed 广播（last-wins 抢占对
+      // 旧会话的回执/死链看门狗拆除）→ 按断链收尾：_onP2pLost 里已 _markP2pRejected，
+      // 重连处于冷却期将钉住 relay，不再抢 P2P。幂等（pc 已关则早退）。
+      if (st === 'failed' && this.connected && this._transport === 'p2p') {
+        this._onP2pLost();
+        return;
+      }
       // 连接状态以本地 pc.connectionState 为准（onconnectionstatechange）；
       // 这里只在 agent 侧握手失败而本地仍没连上时提前回退 relay（不等 5s 超时）。
       if (st === 'failed' && this._transport !== 'p2p' && this._p2pPc && !this.connected) {

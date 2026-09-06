@@ -396,7 +396,7 @@
         if (msg.payload && msg.payload.running && !desktopActive && !desktopStarting) {
             // 其它浏览器已开启桌面：本地直接进入观看
             showDesktopView();
-            desktopView.connect();
+            desktopView.connect(true);
         }
         // 阶段2 LAN 直连：agent 同网段直连地址（"ip:port"），浏览器据此
         // 优先 http://<addr>/agent/desktop/stream 直连拉流（绕开 relay）。
@@ -417,7 +417,7 @@
             if (!desktopActive && !desktopStarting) {
                 // 桌面在跑：直接进入观看并拉流。
                 showDesktopView();
-                desktopView.connect();
+                desktopView.connect(true);
             }
         } else if (desktopActive && !window.__codecSwitchPending) {
             // 桌面已停且不在编码热切换：退回终端视图。
@@ -440,7 +440,7 @@
         // 先 connect 再设置：connect() 内部 disconnect(false) 会清空面板状态，
         // 若在此前赋值会被一并清掉（backend 行恒为 '-'）。
         showDesktopView();
-        desktopView.connect();
+        desktopView.connect(true);
         window._srDesktopInfo = window._srDesktopInfo || {};
         window._srDesktopInfo.backend = (msg.payload && msg.payload.backend) || null;
         // R5#136-146 多显示器拓扑：agent 枚举的 RANDR 输出列表随 started
