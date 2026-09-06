@@ -94,7 +94,7 @@
 | 34 | 弱网输入降采样 | ✔ | e2e>300ms 2:1 / >800ms 4:1（desktop.js:_onPointerMove） |
 | 35 | 弱网控制消息直通 | ✔ | 已由组合覆盖：#29 控制消息非 lossy 优先 + #15 独立有界控制 channel + #2 命令 ack（seq+确认）+ #33/#34 输入节流/降采样——弱网下控制消息不被数据挤掉且可确认；第 29 轮核实修正 |
 | 36-38 | KCP/白名单/IPv6 | ⬜ | 远期 |
-| 39 | 多会话隔离压测 | ⬜ | |
+| 39 | 多会话隔离压测 | ✔ | 第 31 轮：`tools/multi_session_isolation.sh`——同 relay 并行 N 个独立 agent（各自 `--key`+`--session-id`，`--desktop-capture none`），验证注册/共存/隔离（会话数+在线数+心跳互不干扰）；实测 3 agent 3/3 注册、overview 3 会话 3 在线 PASS |
 | 40 | 批次验收：重连矩阵 | ⬜ | |
 
 ### 批次 2 · 打包与前端（41-80）
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **83%**（可靠通道 26 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **84%**（可靠通道 26 项 / 前端 22 项 / 抓帧 6 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -209,4 +209,6 @@
   2. 台账核实修正：#35 弱网控制消息直通**已由组合覆盖**（#29 控制非 lossy 优先 + #15 独立有界 channel + #2 命令 ack + #33/#34 输入节流/降采样）。
 - **第 30 轮新增合入**：
   1. 剪贴板大文本防护（`mod.rs clipboard_truncate` + `CLIPBOARD_MAX_CHARS` 512KB）：set/get 双向安全截断到最近 UTF-8 字符边界（`floor_char_boundary`）——防超大控制消息阻塞上行 / 远端剪贴板写入卡顿（完整文本走文件传输为远期方向）。测试 `test_clipboard_truncate_boundary`（未超限原样 / 英文精确截断 / 中文不切半字 / 混排合法 UTF-8），全量 `cargo test` **384 通过** → R5#32。
+- **第 31 轮新增合入**：
+  1. 多会话隔离压测（`tools/multi_session_isolation.sh`，R5#39）：同一 relay 下并行起 N 个独立 agent（各自 `--key` + `--session-id`，`--desktop-capture none` 验证会话级共存）→ 注册逐条确认（agent 日志 session established）→ admin `overview` 校验会话数/在线数 → PASS 断言。实测 **3 agent：3/3 注册成功、overview 会话数=3 在线=3**（多会话共存正常，注册/心跳隔离，桌面互不干扰）。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
