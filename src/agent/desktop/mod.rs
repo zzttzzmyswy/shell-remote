@@ -1181,6 +1181,9 @@ pub struct QosAdaptive {
     last_delay: u32,
     /// 延期历史（HISTORY_DELAY_LEN=2）。
     delay_history: std::collections::VecDeque<u32>,
+    /// RTT 尖峰中值窗口（R2 甲25 / R5#113）：9 样本，取中值替代 2 窗口均值
+    /// ——单次尖峰（TCP 重传/GC 停顿）不会瞬时触发降码率。
+    median_window: std::collections::VecDeque<u32>,
     /// 首个 delay 样本后的用户 fps（None = 未收过样本）。
     delay_fps: Option<u32>,
     /// 距上次 ratio 调整的秒数累计（ADJUST_RATIO_INTERVAL=3s）。
@@ -1258,6 +1261,7 @@ impl QosAdaptive {
             quality_ratio,
             last_delay: 0,
             delay_history: std::collections::VecDeque::new(),
+            median_window: std::collections::VecDeque::new(),
             delay_fps: None,
             ratio_elapsed_s: 0,
             frame_count_s: 0,
@@ -1275,6 +1279,32 @@ impl QosAdaptive {
             self.delay_history.iter().sum::<u32>() / len as u32
         } else {
             QOS_DELAY_THRESHOLD_150MS
+        }
+    }
+
+    /// RTT 中值（R2 甲25 / R5#113）：9 窗口排序取中位，单次尖峰不触发降档。
+    fn median_delay(&self) -> u32 {
+        let mut v: Vec<u32> = self.median_window.iter().copied().collect();
+        if v.is_empty() {
+            return QOS_DELAY_THRESHOLD_150MS;
+        }
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    /// RTT 分带（R4 丁142 / R5#111）：按中值延时返回弱网档位，
+    /// 供 adjust_ratio 参考——<100 正常 / 100-300 微调 / 300-800 低档 /
+    /// >800 预警。返回 0=正常, 1=微调, 2=低档, 3=预警。
+    fn rtt_band(&self) -> u8 {
+        let m = self.median_delay();
+        if m < 100 {
+            0
+        } else if m < 300 {
+            1
+        } else if m < 800 {
+            2
+        } else {
+            3
         }
     }
 
@@ -1307,6 +1337,12 @@ impl QosAdaptive {
         }
         self.delay_history.push_back(delay);
         let avg = self.avg_delay().max(10);
+        // RTT 尖峰中值滤波（R5#113）：9 窗口，单次尖峰不改变判定。
+        if self.median_window.len() > 8 {
+            self.median_window.pop_front();
+        }
+        self.median_window.push_back(delay);
+        let med = self.median_delay().max(10);
         // 基线延时更新（rustdesk RttCalculator 的简化版）：avg ≤ 基线立降，
         // 否则每次样本按 QOS_BASELINE_LEAK 缓慢上抬——固定 RTT（传播延迟）
         // 会慢慢被学成"新基线"，只有真正显著高于基线才判拥塞。
@@ -1393,7 +1429,9 @@ impl QosAdaptive {
     /// 动态屏好网（over 小）才升；`avg − 基线`（拥塞增量）大则无条件降；
     /// +150kbps/3s 限幅防陡升；min 按质量档与 1Mbps 基线。
     fn adjust_ratio(&mut self, dynamic: bool) {
-        let max_delay = self.avg_delay();
+        // 用 9 窗口中值替代 2 窗口均值（R5#113 抗尖峰）：单次 RTT 尖峰
+        // （TCP 重传/GC 停顿）不会瞬时把码率砍下去。
+        let max_delay = self.median_delay();
         let target_ratio = self.quality_ratio;
         let current_ratio = self.ratio;
         let current_bitrate = self.bitrate_kbps as f32;
@@ -1439,19 +1477,26 @@ impl QosAdaptive {
         // 动态画面永久糊屏）——那才是与 rustdesk 表现走向两极端的一环。
         // 恢复路径（over 小）保留 rustdesk 的"动态屏才升"门。
         let over = max_delay.saturating_sub(self.baseline_delay.max(10));
-        if over < 100 {
+        // RTT 分带（R4 丁142 / R5#111）：中值延时档位修正阈值——绝对 RTT 已
+        // 很高的会话（band>=2），相对增量更小的拥塞也要降（弱网韧性）。
+        // **不绕过 over 主判据**：恒定高 RTT（baseline 学成后 over≈0）是
+        // 传播延迟而非拥塞，绝不该降码率（固定 RTT 降码率只更糊无改善）。
+        // band 3（>800ms 预警）只是把降档步长加大，仍要求 over 证实拥塞。
+        let band = self.rtt_band();
+        let threshold = if band >= 2 { 60 } else { 100 }; // 低档带阈值收紧
+        if over < threshold {
             if dynamic {
                 v = current_ratio * 1.05;
             }
-        } else if over < 150 {
-            v = current_ratio * 0.95;
-        } else if over < 250 {
+        } else if over < threshold + 50 {
+            v = current_ratio * if band >= 3 { 0.9 } else { 0.95 };
+        } else if over < threshold + 150 {
             v = current_ratio * 0.9;
-        } else if over < 400 {
+        } else if over < threshold + 300 {
             v = current_ratio * 0.85;
         } else {
             v = current_ratio * 0.8;
-        };
+        }
 
         if let Some(r150) = ratio_add_150kbps {
             if v > r150 && r150 > current_ratio && current_ratio >= QOS_BR_SPEED {
@@ -1654,6 +1699,54 @@ mod tests {
             decode_fps_hint: dfps,
             decode_queue_hint: dq,
             now_us,
+        }
+    }
+
+    /// #113 中值滤波抗尖峰：9 窗口填满后再塞一个极端尖峰，median_delay
+    /// 应保持在中值附近（不跟尖峰走），而 2 窗口均值会瞬间被拉高。
+    #[test]
+    fn test_qos_median_filters_spike() {
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        // 9 个正常样本 40ms。
+        let mut now = 2_000_000u64;
+        for _ in 0..9 {
+            q.on_delay(40, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            now += 1_000_000;
+        }
+        let before = q.median_delay();
+        assert_eq!(before, 40, "9x40ms 中值 = 40");
+        // 一个 2000ms 尖峰。
+        q.on_delay(2000, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        let after = q.median_delay();
+        assert!(
+            after <= 40 || after == 40 || after < 1000,
+            "median must resist a single 2000ms spike, got {after}"
+        );
+        assert!(after < 1000, "single spike must not move median to its value, got {after}");
+    }
+
+    /// #111 RTT 分带：<100 正常(0) / 100-300 微调(1) / 300-800 低档(2) /
+    /// >800 预警(3)。中值窗口需填满才反映。
+    #[test]
+    fn test_qos_rtt_band_classification() {
+        let cases: &[(u32, u8)] = &[
+            (40, 0),
+            (80, 0),
+            (150, 1),
+            (250, 1),
+            (500, 2),
+            (750, 2),
+            (900, 3),
+            (1200, 3),
+        ];
+        for &(delay, want) in cases {
+            let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+            let mut now = 2_000_000u64;
+            for _ in 0..9 {
+                q.on_delay(delay, 1, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+                now += 1_000_000;
+            }
+            assert_eq!(q.rtt_band(), want, "rtt {delay}ms -> band {want}");
         }
     }
 
