@@ -112,6 +112,20 @@
       // 达阈值请求切 codec"——避免持续软解失败空转重连）。阈值：30s 内 3 次。
       this._decErrCount = 0;
       this._decErrWindowStart = 0;
+      // Task 3：浏览器侧 RTCPeerConnection + DataChannel 下行传输（P2P）。
+      // _transport = 'p2p' 时 fMP4 字节来自 DataChannel；'relay' 走现有
+      // WS/fetch。_startP2p 协商失败/超时 → _onP2pFailed → _startWs 回退；
+      // 已建连后中途断 → _onP2pLost 复用 _streamRetries 重连。
+      this._transport = 'relay';
+      this._p2pPc = null;        // RTCPeerConnection（协商失败/断开即置 null）
+      this._p2pDc = null;        // RTCDataChannel
+      this._p2pTimeout = null;   // 协商 5s 超时定时器
+      this._p2pFallbackDone = false; // 本次 connect 是否已回退 relay（防双开 WS）
+      // 阶段2 LAN 直连：agent 上报的同网段直连地址（"ip:port"）。
+      // session.js 的 desktop:capabilities 处理写入；缺省/未开启 → []。
+      this._lanAddrs = [];
+      // disconnect() 置位：探测/拉流途中被显式断开时不触发 fallback 连锁。
+      this._lanCancelled = false;
     }
 
     // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
@@ -297,9 +311,10 @@
         if (this.canvas) this.canvas.classList.remove('hidden');
         if (this.video) this.video.classList.add('hidden');
         // 先校准时钟到 relay 时基，再拉流（不阻塞重连：校准失败也继续）。
-        // 下行优先 WS，失败自动回退 HTTP fetch。
+        // Task 5：下行优先 LAN（agent 上报的同网段直连地址），全部不可达 →
+        // _startP2p()（Task 3 WebRTC，其内部失败再回退 _startWs）。
         const self = this;
-        this._calibrateClock().then(function() { self._startWs(); });
+        this._calibrateClock().then(function() { self._startLan(); });
         return;
       }
       // 回退：MSE 播放器（旧浏览器）。
@@ -314,8 +329,302 @@
       }
     }
 
+    // ── LAN 直连下行（Task 5）：agent 上报的同网段直连地址 → 直接 fetch
+    // http://ip:port/agent/desktop/stream 拉 fMP4（绕 relay/P2P）。与
+    // WS/fetch 的 _poll 同构 demux（_feed 逐箱解析，fMP4 格式不变）。
+    // 每个地址依次探测：读到 fMP4 init 前缀（ftyp）即判定可用并接管；全部
+    // 不可达 → _startP2p()（Task 3，其内部失败再回退 _startWs）。同网段
+    // 判定天然隐含：跨网段连不上 agent host candidate → fetch 失败 → 下一个。
+    _startLan() {
+      const addrs = this._lanAddrs || [];
+      if (!addrs.length || this._transport === 'lan') { this._startP2p(); return; }
+      const self = this;
+      this._lanCancelled = false;
+      let i = 0;
+      const tryNext = function() {
+        if (self._lanCancelled) return; // 已显式断开，不再启动 fallback
+        if (i >= addrs.length) { self._startP2p(); return; } // 全部失败 → P2P
+        const a = addrs[i++];
+        const controller = new AbortController();
+        self.controller = controller;
+        // 探测上限 9s：LAN server 在无 init 时最多等 10s 才收尾，避免把
+        // P2P/relay 回退拖到那时（探测期桌面未起的场景）。
+        const probeTimer = setTimeout(function() { controller.abort(); }, 9000);
+        fetch('http://' + a + '/agent/desktop/stream', {
+          headers: { 'Accept': 'video/mp4' }
+        }).then(function(resp) {
+          if (controller.signal.aborted) { clearTimeout(probeTimer); tryNext(); return null; }
+          if (!resp.ok || !resp.body) { clearTimeout(probeTimer); tryNext(); return null; }
+          const reader = resp.body.getReader();
+          // 读首个 chunk：必须是 fMP4 init（agent 的 init 段以 ftyp 开头，
+          // lan.rs 缓存的首块即 init）。未成功前不把字节喂进 demux。
+          return reader.read().then(function(result) {
+            if (controller.signal.aborted) { tryNext(); return null; }
+            clearTimeout(probeTimer);
+            if (result.done) { tryNext(); return null; }
+            const v = result.value;
+            if (!v || !v.byteLength || !self._isFmp4Init(v)) {
+              // 可达但非 fMP4 init（占用/错误响应）→ 视为不可用，试下一个。
+              try { controller.abort(); } catch (e) {}
+              tryNext();
+              return null;
+            }
+            // LAN 直连可用：接管此后所有字节（复用 _feed demux）。
+            self._transport = 'lan';
+            return self._startFeeding(controller, reader, v, '桌面已连接 (LAN)');
+          }).catch(function() { clearTimeout(probeTimer); tryNext(); });
+        }).catch(function() { clearTimeout(probeTimer); tryNext(); });
+      };
+      tryNext();
+    }
+
+    // fMP4 init 判定：agent 的 init 段格式为 ftyp + moov（mp4.rs
+    // mp4_init_segment），首个 chunk 必须以 size+ftyp 开头才算可用。
+    _isFmp4Init(v) {
+      if (!v || v.byteLength < 8) return false;
+      const size = (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
+      if (size < 8 || size > 32 * 1024 * 1024) return false;
+      return v[4] === 0x66 && v[5] === 0x74 && v[6] === 0x79 && v[7] === 0x70; // 'ftyp'
+    }
+
+    // 共享连接态入口：fetch 已返回 200 + body → 建立连接态并从 reader 逐块
+    // 拉取（_startFetch 与 _startLan 复用）。`initial` = LAN 探测已读出的首
+    // 个 chunk（探测成功后接着同一 reader 消费，不二次 fetch）。
+    _startFeeding(controller, reader, initial, statusText) {
+      this._streamRetries = 0;
+      this.connected = true;
+      this._bindInput();
+      this._startMetrics();
+      this.setStatus(statusText, false);
+      this._buf = new Uint8Array(0); // demux 缓冲（新流重开）
+      this.reader = reader;
+      const self = this;
+      // 首块先入 demux（LAN 探测已读、未喂过），再进入 read 循环。
+      if (initial && initial.byteLength) {
+        self._trackBandwidth(initial.byteLength);
+        self._feed(initial);
+      }
+      function pump() {
+        if (controller.signal.aborted) return Promise.resolve();
+        return reader.read().then(function(result) {
+          if (result.done) {
+            if (self.connected && self._streamRetries < 10) {
+              self._streamRetries += 1;
+              self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
+              self.disconnect(false);
+              const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000);
+              setTimeout(function() { self.connect(); }, delay);
+            } else {
+              self.setStatus('桌面流已结束', true);
+            }
+            return;
+          }
+          const v = result.value;
+          if (v && v.byteLength) {
+            self._trackBandwidth(v.byteLength);
+            self._feed(v);
+          }
+          return pump();
+        }).catch(function(e) {
+          if (!controller.signal.aborted) {
+            self.setStatus('桌面流中断: ' + e.message, true);
+          }
+        });
+      }
+      return pump();
+    }
+
+    // ── P2P 下行（Task 3）：RTCPeerConnection + DataChannel ──────
+    // 浏览器是 offerer、agent 是 answerer（Task 2 方向）。建连成功后
+    // fMP4 字节（agent 端镜像投递）经 DataChannel 到达 → 现有 _feed demux。
+    // 键鼠上行不改：仍走 relay session send（Task 6 再评估切 DataChannel）。
+    _startP2p() {
+      // MSE 模式 / 浏览器不支持 RTCPeerConnection：直接走现有 WS→fetch。
+      // DataChannel 仅 WebCodecs 路径可用（MSE 不接 DataChannel 字节）。
+      if (!this._webcodecsAvailable() || typeof RTCPeerConnection === 'undefined') {
+        this._startWs();
+        return;
+      }
+      const self = this;
+      try {
+        this._p2pPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      } catch (e) {
+        this._onP2pFailed();
+        return;
+      }
+      // DataChannel：agent 端把 desktop:video 的 fMP4 字节镜像投进来。
+      // 不可靠 + 无序（Task 6，与 agent str0m make_offer 侧同步）：丢包不重传、
+      // 不阻塞后续消息——fMP4 丢旧保新、帧时效优先，避免可靠有序通道在弱网下
+      // 的 head-of-line 卡顿拖住整条下行。
+      this._p2pDc = this._p2pPc.createDataChannel('desktop', { ordered: false, maxRetransmits: 0 });
+      this._p2pDc.binaryType = 'arraybuffer';
+      this._p2pDc.onmessage = function(ev) {
+        if (typeof ev.data === 'string') return; // 控制帧忽略
+        self._trackBandwidth(ev.data.byteLength);
+        self._feed(new Uint8Array(ev.data));
+      };
+      this._p2pDc.onclose = function() { self._onP2pLost(); };
+      this._p2pPc.onicecandidate = function(ev) {
+        if (ev.candidate && typeof window.sendDesktopP2p === 'function') {
+          window.sendDesktopP2p({ candidate: ev.candidate.candidate });
+        }
+      };
+      this._p2pPc.onconnectionstatechange = function() {
+        const st = self._p2pPc && self._p2pPc.connectionState;
+        if (st === 'connected') {
+          if (self._p2pTimeout) { clearTimeout(self._p2pTimeout); self._p2pTimeout = null; }
+          self._transport = 'p2p';
+          self.connected = true;
+          self._streamRetries = 0;
+          self._bindInput();
+          self._startMetrics();
+          self.setStatus('桌面已连接 (P2P)', false);
+          self._buf = new Uint8Array(0); // demux 缓冲
+          // 首帧快路径：P2P 下 init 段可能在通道打开前被静默丢弃，1.5s 没
+          // 首帧 → reqkey 立即让 agent 重出关键帧+init（对齐 WS 路径行为）。
+          self._firstFrameTimer = setTimeout(function() {
+            if (self.connected && !self._gotFirstFrame) self._requestKey();
+          }, 1500);
+        } else if (st === 'failed' || st === 'disconnected') {
+          self._onP2pLost();
+        }
+      };
+      window.__p2pTransport = this;
+      // 协商 5s 超时 → 回退 relay（期间未连上 p2p）。
+      this._p2pTimeout = setTimeout(function() {
+        if (self._transport !== 'p2p') self._onP2pFailed();
+      }, 5000);
+      try {
+        this._p2pPc.createOffer().then(function(offer) {
+          if (!self._p2pPc) return;
+          // setLocalDescription 是异步 Promise：拒绝（如协商中途 pc 关闭）不得
+          // 变未处理 rejection——随外层链一并 log+回退（对齐 _addRemoteCandidate）。
+          self._p2pPc.setLocalDescription(offer).catch(function(e) {
+            console.warn('[p2p] setLocalDescription 失败:', e);
+            self._onP2pFailed();
+          });
+          if (typeof window.sendDesktopP2p === 'function') {
+            // 契约（Task 2）：{sdp, candidates[]} → desktop:p2p-offer。
+            window.sendDesktopP2p({ sdp: offer.sdp, candidates: [] });
+          }
+        }).catch(function() { self._onP2pFailed(); });
+      } catch (e) {
+        this._onP2pFailed();
+      }
+    }
+
+    // 协商失败（RTCPeerConnection 构造/不可用、createOffer/setLocalDescription
+    // 异常、5s 超时未连上、agent failed 广播）→ 一次性回退现有 WS→fetch。
+    // 构造函数本身抛异常时 _p2pPc 仍是 null——所以清理与回退不放在
+    // `if (this._p2pPc)` 内，保证**任何**失败点都落到 _startWs（不黑屏）。
+    // 幂等：_p2pFallbackDone 防 5s 超时与 promise rejection 双路径同时进入
+    // 造成双开 WS/fetch。
+    _onP2pFailed() {
+      if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
+      if (this._p2pPc) {
+        try { this._p2pPc.close(); } catch (e) {}
+        this._p2pPc = null;
+        this._p2pDc = null;
+        if (window.__p2pTransport === this) window.__p2pTransport = null;
+      }
+      if (this._transport !== 'p2p' && !this._p2pFallbackDone) {
+        this._p2pFallbackDone = true;
+        this._transport = 'relay';
+        this._startWs();
+      }
+    }
+
+    // 已建连后 DataChannel/ICE 中途断 → 复用 _streamRetries 重连（同 WS/fetch
+    // onclose 语义）；协商/建连中途（从未 connected）→ 一次性回退 WS。
+    _onP2pLost() {
+      // 幂等：pc 已关闭且未在 p2p 连接态 —— _onP2pFailed/disconnect 已处理，
+      // 此时 dc.onclose 撞进来不再重复回退。
+      if (!this._p2pPc && !this.connected) return;
+      if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
+      const self = this;
+      const wasConnected = this.connected && this._transport === 'p2p';
+      if (this._p2pPc) { try { this._p2pPc.close(); } catch (e) {} }
+      this._p2pPc = null;
+      this._p2pDc = null;
+      if (window.__p2pTransport === this) window.__p2pTransport = null;
+      this._transport = 'relay';
+      if (wasConnected) {
+        // 建连后中断：走统一重连（复用 _streamRetries 退避）。
+        if (this._streamRetries < 10) {
+          this._streamRetries += 1;
+          this.setStatus('桌面流重启… (' + this._streamRetries + ')', false);
+          this.disconnect(false);
+          const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000);
+          setTimeout(function() { self.connect(); }, delay);
+        } else {
+          this.setStatus('桌面流已结束', true);
+          this.connected = false;
+        }
+      } else {
+        // 协商/建连中途失败：一次性回退现有 WS 链路。这里与 _onP2pFailed 同置
+        // _p2pFallbackDone，防止本路径 _startWs 之后，pending 的 setLocalDescription
+        // / handleAnswer 拒绝再触发 _onP2pFailed → 第二次 _startWs（双开 WS）。
+        this._p2pFallbackDone = true;
+        this._startWs();
+      }
+    }
+
+    // agent 应答（desktop:p2p-answer）：接受 SDP + 内嵌候选。Task 2 契约：
+    // {sdp, candidates[]}。
+    handleAnswer(msg) {
+      if (!this._p2pPc) return;
+      const p = msg.payload || {};
+      const sdp = p.sdp;
+      const self = this;
+      if (sdp) {
+        try {
+          // setRemoteDescription 异步拒绝不能留未处理 rejection：log + 回退
+          //（对齐 _addRemoteCandidate；回退由 _p2pFallbackDone 去重）。
+          this._p2pPc.setRemoteDescription({ type: 'answer', sdp: sdp }).catch(function(e) {
+            console.warn('[p2p] setRemoteDescription 失败:', e);
+            self._onP2pFailed();
+          });
+        } catch (e) {}
+      }
+      const cands = p.candidates || [];
+      for (const c of cands) {
+        this._addRemoteCandidate(c);
+      }
+    }
+
+    // trickle ICE：agent 经 relay 转发的远端 candidate。
+    handleRemoteCandidate(msg) {
+      if (!this._p2pPc) return;
+      const c = msg.payload && msg.payload.candidate;
+      if (c) this._addRemoteCandidate(c);
+    }
+
+    // addIceCandidate 需携带 m-line 定位（分隔且 A/V/Data 都在 index 0）；
+    // Promise 拒绝（如重复/端点候选）静默吞掉，不产生未处理 rejection。
+    _addRemoteCandidate(c) {
+      if (!this._p2pPc || typeof c !== 'string') return;
+      try {
+        Promise.resolve(
+          this._p2pPc.addIceCandidate({ candidate: c, sdpMid: '0' })
+        ).catch(function() {});
+      } catch (e) {}
+    }
+
+    // agent 广播的 p2p-state：{state: connecting|connected|failed}。
+    handleState(msg) {
+      const st = msg.payload && msg.payload.state;
+      // 连接状态以本地 pc.connectionState 为准（onconnectionstatechange）；
+      // 这里只在 agent 侧握手失败而本地仍没连上时提前回退 relay（不等 5s 超时）。
+      if (st === 'failed' && this._transport !== 'p2p' && this._p2pPc && !this.connected) {
+        this._onP2pFailed();
+      }
+    }
+
     // ── 拉流：WS 优先（relay WS 下行），失败回退 HTTP fetch ──────
+    // 幂等守卫：已有 WS 在途（_startWs 在 new WebSocket 后立即置位）则不二次
+    // 打开——防止 P2P 双回退路径（_onP2pLost/_onP2pFailed 叠加）双开 WS 风暴。
     _startWs() {
+      if (this._ws) return;
       const token = sessionStorage.getItem('shell-remote-token');
       if (!token || typeof WebSocket === 'undefined') {
         this._startFetch();
@@ -400,43 +709,10 @@
           self.disconnect();
           return null;
         }
-        self._streamRetries = 0;
-        self.connected = true;
-        self._bindInput();
-        self._startMetrics();
-        self.setStatus('桌面已连接', false);
+        self._transport = 'relay';
         const reader = resp.body.getReader();
-        self.reader = reader;
-        self._buf = new Uint8Array(0); // demux 缓冲
-
-        function pump() {
-          if (controller.signal.aborted) return Promise.resolve();
-          return reader.read().then(function(result) {
-            if (result.done) {
-              if (self.connected && self._streamRetries < 10) {
-                self._streamRetries += 1;
-                self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
-                self.disconnect(false);
-                const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000);
-                setTimeout(function() { self.connect(); }, delay);
-              } else {
-                self.setStatus('桌面流已结束', true);
-              }
-              return;
-            }
-            const v = result.value;
-            if (v && v.byteLength) {
-              self._trackBandwidth(v.byteLength);
-              self._feed(v);
-            }
-            return pump();
-          }).catch(function(e) {
-            if (!controller.signal.aborted) {
-              self.setStatus('桌面流中断: ' + e.message, true);
-            }
-          });
-        }
-        return pump();
+        // 与 LAN 直连共用同一连接后拉取循环（_feed demux 同构）。
+        return self._startFeeding(controller, reader, null, '桌面已连接');
       }).catch(function(e) {
         if (!controller.signal.aborted) {
           self.setStatus('无法连接桌面: ' + e.message, true);
@@ -874,6 +1150,18 @@
       }
       if (this.controller) { this.controller.abort(); this.controller = null; }
       if (this.reader) { this.reader.cancel().catch(function() {}); this.reader = null; }
+      // relay WS 兜底同闭：断连即关（否则残留 WS 继续 feed 已断开的视图，且
+      // 重连 _startWs 的 `if (this._ws) return` 会误认为已有连接在途）。
+      if (this._ws) { try { this._ws.onclose = null; this._ws.close(); } catch (e) {} this._ws = null; }
+      // LAN 探测/拉流在途时被显式断开：_startLan 的 fallback 连锁据此停住。
+      this._lanCancelled = true;
+      // P2P 会话清理（Task 3）：关 pc/dc、清协商超时、解除 __p2pTransport。
+      if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
+      if (this._p2pPc) { try { this._p2pPc.close(); } catch (e) {} this._p2pPc = null; }
+      if (this._p2pDc) { try { this._p2pDc.onmessage = null; this._p2pDc.onclose = null; } catch (e) {} this._p2pDc = null; }
+      if (window.__p2pTransport === this) window.__p2pTransport = null;
+      this._transport = 'relay';
+      this._p2pFallbackDone = false; // 每次 disconnect 复位，重连时才允许再次 P2P→relay 回退
       this.connected = false;
       if (resetRetries !== false) this._streamRetries = 0;
       this._bpsBytes = 0;
@@ -1192,6 +1480,13 @@
             }
           }
           if (uplink) uplink.textContent = self._uplinkMode || '-';
+          // 下行通道：lan（LAN 直连）| p2p（DataChannel）| relay（WS/fetch）。
+          // Task 5 起下行优先 lan → p2p → relay（完整矩阵见 Task 6）。
+          const downlink = document.getElementById('metric-downlink');
+          if (downlink) {
+            downlink.textContent = self._transport === 'lan' ? 'lan'
+              : (self._transport === 'p2p' ? 'p2p' : 'relay');
+          }
           if (decoder) decoder.textContent = self._decoderLabel();
           if (encoder) encoder.textContent = self._encoderLabel();
           // JS 内存曲线（R2 丁131 / R5#61）：长会话泄漏观测——Chrome 暴露

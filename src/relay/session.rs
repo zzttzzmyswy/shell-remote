@@ -20,6 +20,10 @@ pub struct SessionInfo {
     /// 能力字符串列表（`codec:av1` / `backend:x11` / `desktop:gray` 等）。
     /// 老版本 agent 不报 → 空。admin overview 展示，浏览器可据此协商。
     pub capabilities: Vec<String>,
+    /// 阶段2 LAN 直连地址（"ip:port"）：agent 注册消息带 `lan_addr` 后存此，
+    /// 浏览器经 agent 的 `desktop:capabilities.lan_addrs` 拿到做同网段探测
+    /// 直连（不经过 relay）。老版本 / 未开启 `--desktop-lan-port` → None。
+    pub lan_addr: Option<String>,
 }
 
 pub struct SessionRegistry {
@@ -126,6 +130,7 @@ impl SessionRegistry {
                     device: None,
                     agent_version: None,
                     capabilities: Vec::new(),
+                    lan_addr: None,
                 },
             );
         }
@@ -200,6 +205,7 @@ impl SessionRegistry {
                     device: None,
                     agent_version: None,
                     capabilities: Vec::new(),
+                    lan_addr: None,
                 },
             );
         }
@@ -270,6 +276,15 @@ impl SessionRegistry {
     pub async fn set_agent_version(&self, session_id: &str, version: Option<String>) {
         if let Some(info) = self.sessions.write().await.get_mut(session_id) {
             info.agent_version = version;
+        }
+    }
+
+    /// 阶段2 LAN 直连：存/换注册消息携带的 `lan_addr`（"ip:port"，浏览器
+    /// 同网段探测直连地址）。与 capabilities 一样在 registration 后单独
+    /// 录入，避免扰动 register 的 token 流程。会话不存在时静默。
+    pub async fn set_lan_addr(&self, session_id: &str, lan_addr: Option<String>) {
+        if let Some(info) = self.sessions.write().await.get_mut(session_id) {
+            info.lan_addr = lan_addr;
         }
     }
 
@@ -704,6 +719,39 @@ mod tests {
         assert_eq!(list[0].0, r.session_id);
         assert_eq!(list[0].1.tokens.len(), 2);
         assert!(list[0].1.device.is_none(), "no device reported by default");
+    }
+
+    /// 阶段2 LAN 直连：agent 注册消息带 `lan_addr`（"ip:port"）后，relay 存进
+    /// session 表可读回；未上报保持 None（老版本 agent / 未开启
+    /// --desktop-lan-port 时无此字段 → None）。浏览器经 desktop:capabilities
+    /// 拿到该地址做同网段探测直连。
+    #[tokio::test]
+    async fn test_register_stores_lan_addr() {
+        let registry = SessionRegistry::new();
+        let r = registry.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        assert!(
+            registry.get(&sid).await.unwrap().lan_addr.is_none(),
+            "未上报 lan_addr 应为 None（老版本/未开启 LAN 直连）"
+        );
+        registry
+            .set_lan_addr(&sid, Some("192.168.1.5:43210".to_string()))
+            .await;
+        assert_eq!(
+            registry.get(&sid).await.unwrap().lan_addr.as_deref(),
+            Some("192.168.1.5:43210")
+        );
+        // 覆盖（agent 重启换端口后再次上报）→ 新值生效。
+        registry
+            .set_lan_addr(&sid, Some("10.0.0.8:51234".to_string()))
+            .await;
+        assert_eq!(
+            registry.get(&sid).await.unwrap().lan_addr.as_deref(),
+            Some("10.0.0.8:51234")
+        );
+        // 清除（关闭 LAN 直连）→ None。
+        registry.set_lan_addr(&sid, None).await;
+        assert!(registry.get(&sid).await.unwrap().lan_addr.is_none());
     }
 
     #[tokio::test]

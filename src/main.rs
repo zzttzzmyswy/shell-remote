@@ -166,6 +166,13 @@ enum Command {
         /// X11 display to capture (defaults to $DISPLAY).
         #[arg(long)]
         desktop_display: Option<String>,
+
+        /// LAN 直连桌面流监听端口（agent 本地 HTTP server，阶段2 基础）。
+        /// 0 = 不启动（默认，不开任何端口）；显式指定则同局域网浏览器可直连
+        /// `http://<agent-lan-ip>:<port>/agent/desktop/stream` 拉桌面流（绕开
+        /// relay 中转，浏览器同网段探测在后续阶段接入）。
+        #[arg(long, default_value_t = 0)]
+        desktop_lan_port: u16,
     },
 }
 
@@ -286,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
             desktop_quality,
             desktop_min_bitrate,
             desktop_display,
+            desktop_lan_port,
         } => {
             let desired = match session_id.as_deref() {
                 Some(s) => {
@@ -311,6 +319,8 @@ async fn main() -> anyhow::Result<()> {
                     _ => crate::agent::desktop::encoder::QUALITY_BALANCED,
                 },
                 display: desktop_display,
+                lan_port: desktop_lan_port,
+                lan_addr: None, // 由 run_session 在 LanDesktop::spawn 后注入
             };
             agent::start(
                 relay_url,

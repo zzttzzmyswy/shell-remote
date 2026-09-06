@@ -398,6 +398,14 @@
             showDesktopView();
             desktopView.connect();
         }
+        // 阶段2 LAN 直连：agent 同网段直连地址（"ip:port"），浏览器据此
+        // 优先 http://<addr>/agent/desktop/stream 直连拉流（绕开 relay）。
+        // 数组缺省/空 = 未开启 --desktop-lan-port，desktop.js 直接落 P2P。
+        const lanAddrs = (msg.payload && msg.payload.lan_addrs) || [];
+        desktopView._lanAddrs = Array.isArray(lanAddrs)
+            ? lanAddrs.filter(function (a) { return typeof a === 'string' && a.length > 0; })
+            : [];
+        window._srLanAddrs = desktopView._lanAddrs;
     });
 
     window.shellRemote.on('desktop:state', function(msg) {
@@ -463,6 +471,42 @@
             }
         }
     });
+
+    // ── P2P 信令消息层（Task 2 只搭通道，Task 3 才触发协商并实现传输）────
+    // desktop:p2p-offer 发出后，agent 经 relay 回 desktop:p2p-answer /
+    // desktop:p2p-candidate / desktop:p2p-state。这里统一路由到可选的
+    // window.__p2pTransport 句柄：不存在说明该会话未启用 P2P，静默忽略，
+    // 不影响现有桌面流行为。
+    window.shellRemote.on('desktop:p2p-answer', function (msg) {
+        if (window.__p2pTransport && window.__p2pTransport.handleAnswer) {
+            window.__p2pTransport.handleAnswer(msg);
+        }
+    });
+    window.shellRemote.on('desktop:p2p-candidate', function (msg) {
+        if (window.__p2pTransport && window.__p2pTransport.handleRemoteCandidate) {
+            window.__p2pTransport.handleRemoteCandidate(msg);
+        }
+    });
+    window.shellRemote.on('desktop:p2p-state', function (msg) {
+        if (window.__p2pTransport && window.__p2pTransport.handleState) {
+            window.__p2pTransport.handleState(msg);
+        }
+    });
+    // P2P 发送辅助（Task 3 收口 schema）：按 payload 形态分派到对应消息类型。
+    //   {sdp, candidates[]}  → desktop:p2p-offer（协商发起）
+    //   {candidate}          → desktop:p2p-candidate（trickle ICE）
+    // Task 2 把同一载荷同时发到两个消息（reviewer Minor）：已修正为本分发。
+    // 暴露到 window 供 desktop.js（独立 IIFE，先于 session.js 加载）的
+    // _startP2p 调用——会话打开时两脚本都已执行，调用点无先后问题。
+    function sendDesktopP2p(payload) {
+        if (!payload || !window.shellRemote || !window.shellRemote.send) return;
+        if (typeof payload.sdp === 'string') {
+            window.shellRemote.send('desktop:p2p-offer', payload);
+        } else if (typeof payload.candidate === 'string') {
+            window.shellRemote.send('desktop:p2p-candidate', payload);
+        }
+    }
+    window.sendDesktopP2p = sendDesktopP2p;
 
     // agent 上行链路方式（ws | http）变化时上报，指标面板展示。
     window.shellRemote.on('desktop:uplink', function(msg) {

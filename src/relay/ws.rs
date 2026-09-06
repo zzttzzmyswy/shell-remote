@@ -54,6 +54,16 @@ pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) {
     }
 }
 
+/// 阶段2 LAN 直连：解析注册消息的 `lan_addr` 字段（agent 本地桌面流 HTTP
+/// 端点地址 "ip:port"）。缺省/空串/非字符串 → None（老版本 agent 或未开启
+/// `--desktop-lan-port`，兼容）。
+fn parse_lan_addr(body: &Value) -> Option<String> {
+    body.get("lan_addr")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// 批次5 告警判据：内容活跃（非静止）但编码帧率 <10 —— 动态内容异常降帧
 /// （用户铁律：动态画面不降帧，正常动态 fps ≥15）。静止（active=false，
 /// fps=1）属正常，不告警。纯函数便于单测。
@@ -310,8 +320,25 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             "desktop:cmd-ack",
             "desktop:cursor",
             "test-delay-ack",
+            // Task 2 P2P 信令（agent→浏览器）：answer/candidate/state 属
+            // 控制消息（non-lossy），与 desktop:started 同路径广播。offer 是
+            // 浏览器→agent 方向，不进这里。约定：p2p-offer/answer/candidate
+            // 已在 proto requires_write 的 read_only_types（浏览器只读观看者
+            // 也能参与协商）。
+            "desktop:p2p-answer",
+            "desktop:p2p-candidate",
+            "desktop:p2p-state",
         ];
         if broadcast_types.contains(&proto_msg.msg_type.as_str()) {
+            // 复盘日志（Task 6 轻量）：P2P 状态切换（connecting/connected/failed）
+            // 广播给全体浏览器——浏览器据此知道传输层选中 p2p 还是回退 relay。
+            if proto_msg.msg_type == "desktop:p2p-state" {
+                tracing::info!(
+                    session = %session_id,
+                    p2p_state = %proto_msg.payload.get("state").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "transport: desktop:p2p-state broadcast"
+                );
+            }
             // fs:result is browser-facing (file manager reads + downloads).
             // A browser download reuses `_mcp_request_id` as its correlation
             // id, so it must still be broadcast — treating it as an MCP RPC
@@ -907,6 +934,14 @@ pub async fn agent_send_handler(
                     .await;
             }
         }
+
+        // 阶段2 LAN 直连：注册消息可带 `lan_addr`（"ip:port"），存入会话表
+        // 供 admin 展示；浏览器经 agent 的 desktop:capabilities.lan_addrs 拿到
+        // 同网段探测直连地址。老版本 / 未开启 --desktop-lan-port → None。
+        state
+            .sessions
+            .set_lan_addr(&session_id, parse_lan_addr(&body))
+            .await;
 
         let tokens_json: Vec<Value> = tokens
             .iter()
@@ -1683,6 +1718,16 @@ pub async fn browser_send_handler(
     })
     .to_string();
 
+    // 复盘日志（Task 6 轻量）：浏览器发起的 P2P 信令（offer/candidate）转发
+    // 给 agent —— 下行传输层协商路径的可观测点。
+    if msg_type.starts_with("desktop:p2p") {
+        tracing::info!(
+            session = %session_id,
+            msg = msg_type,
+            "transport: browser p2p signaling -> agent"
+        );
+    }
+
     {
         let broadcast = state.agent_broadcast.read().await;
         if let Some(cm) = broadcast.get(&session_id) {
@@ -1933,6 +1978,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_register_lan_addr_roundtrip() {
+        // 阶段2 LAN 直连：agent:register 消息带 lan_addr → parse → set_lan_addr
+        // 存进 SessionInfo；缺省/空串/非字符串保持 None（老版本兼容）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        assert!(
+            state.sessions.get(&sid).await.unwrap().lan_addr.is_none(),
+            "未上报 lan_addr 应为 None"
+        );
+
+        let with_addr = serde_json::json!({
+            "type": "agent:register",
+            "lan_addr": "192.168.1.5:43210",
+        });
+        state
+            .sessions
+            .set_lan_addr(&sid, parse_lan_addr(&with_addr))
+            .await;
+        assert_eq!(
+            state.sessions.get(&sid).await.unwrap().lan_addr.as_deref(),
+            Some("192.168.1.5:43210")
+        );
+
+        // 空串 → None（不存空地址）。
+        let empty = serde_json::json!({ "type": "agent:register", "lan_addr": "" });
+        assert!(parse_lan_addr(&empty).is_none(), "空串 lan_addr 应解析为 None");
+        // 缺省字段 / 非字符串 → None。
+        let missing = serde_json::json!({ "type": "agent:register" });
+        assert!(parse_lan_addr(&missing).is_none());
+        let non_str = serde_json::json!({ "type": "agent:register", "lan_addr": 42 });
+        assert!(parse_lan_addr(&non_str).is_none(), "非字符串 lan_addr 应解析为 None");
+    }
+
+    #[tokio::test]
     async fn test_desktop_protocol_overhead_stats() {
         // R5#43 二进制直转观察性子集：base64 编码/解码字节累计——量化 JSON
         // 协议膨胀（"AQID"=4 字符编码 3 字节解码），binary 化 ROI 数据。
@@ -2060,6 +2140,41 @@ mod tests {
             .expect("browser must receive desktop:started")
             .unwrap();
         assert!(got.contains("desktop:started") && got.contains("h264"), "got: {got}");
+    }
+
+    #[tokio::test]
+    async fn test_desktop_p2p_signaling_broadcasts_to_browsers() {
+        // Task 2 P2P 信令：agent→浏览器 的 desktop:p2p-answer/candidate/state
+        // 必须走 broadcast_types 广播（non-lossy 控制消息）；且不触发
+        // desktop:video / desktop:started 的特殊路径（不建桌面 fan-out 流）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        insert_channel_map(&state, &sid).await;
+        let mut sse_rx = add_browser(&state, &sid, "brow1").await;
+
+        for ty in ["desktop:p2p-answer", "desktop:p2p-candidate", "desktop:p2p-state"] {
+            let payload = match ty {
+                "desktop:p2p-state" => serde_json::json!({ "state": "connected" }),
+                "desktop:p2p-candidate" => serde_json::json!({ "candidate": "candidate:1 1 udp" }),
+                _ => serde_json::json!({ "sdp": "{}", "candidates": [] }),
+            };
+            let msg = serde_json::json!({
+                "type": ty,
+                "session_id": sid,
+                "payload": payload
+            });
+            route_agent_message(&state, &sid, &msg.to_string()).await;
+            let got = tokio::time::timeout(std::time::Duration::from_millis(2000), sse_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("browser must receive {ty}"))
+                .unwrap();
+            assert!(got.contains(ty), "got: {got}");
+        }
+        assert!(
+            state.desktop_streams.read().await.is_empty(),
+            "p2p 消息不应建桌面 fan-out 流（与 desktop:video/started 路径隔离）"
+        );
     }
 
     async fn add_browser(

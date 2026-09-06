@@ -19,6 +19,7 @@ pub mod input;
 pub mod mp4;
 pub mod openh264;
 pub mod rate;
+pub mod webrtc;
 #[cfg(feature = "vp9")]
 pub mod vpx;
 #[cfg(feature = "av1")]
@@ -90,6 +91,15 @@ pub struct DesktopConfig {
     /// 质量档倍率（speed=0.5 / balanced=0.67 / best=1.5，rustdesk 同款）。
     /// 决定目标码率（base_bitrate × quality）与 QP 区间。
     pub quality: f32,
+    /// LAN 直连桌面流监听端口（agent 本地 HTTP server，阶段2 基础）。
+    /// `0` = 不启动（默认，不开任何端口）；显式指定则同局域网浏览器可直连
+    /// `http://<agent-lan-ip>:<port>/agent/desktop/stream` 拉桌面流（绕开 relay）。
+    pub lan_port: u16,
+    /// LAN 直连地址（"ip:port"）：`LanDesktop::spawn` 成功后由
+    /// `agent::run_session` 注入（绑定端口/出口 IP 在 spawn 后才知道）。
+    /// 随 `desktop:capabilities.lan_addrs` 下发给浏览器做同网段探测直连；
+    /// `None` = 未开启（不广播，浏览器不探测）。
+    pub lan_addr: Option<String>,
 }
 
 impl Default for DesktopConfig {
@@ -110,6 +120,8 @@ impl Default for DesktopConfig {
             max_bps: 0,
             display: None,
             quality: crate::agent::desktop::encoder::QUALITY_BALANCED,
+            lan_port: 0,
+            lan_addr: None,
         }
     }
 }
@@ -735,6 +747,9 @@ impl DesktopManager {
                 Vec::new()
             },
             "capture": cfg.capture,
+            // 阶段2 LAN 直连地址（"ip:port"）：浏览器同网段探测 → 优先
+            // http://<addr>/agent/desktop/stream 直连拉流。未开启 → []。
+            "lan_addrs": cfg.lan_addr.clone().into_iter().collect::<Vec<_>>(),
         })
     }
 }
@@ -2798,6 +2813,26 @@ mod tests {
         if cfg!(feature = "vp9") {
             assert!(caps["codecs"].as_array().unwrap().contains(&serde_json::json!("vp8")));
         }
+    }
+
+    /// 阶段2 LAN 直连：capabilities_json 的 `lan_addrs` 默认 []，注入后含
+    /// "ip:port"，浏览器据此同网段探测直连。
+    #[test]
+    fn test_capabilities_lan_addrs_from_config() {
+        let dm = DesktopManager::new(DesktopConfig::default());
+        let caps = dm.capabilities_json();
+        assert_eq!(
+            caps["lan_addrs"].as_array().map(|a| a.len()).unwrap_or(1),
+            0,
+            "未注入 lan_addr 时 lan_addrs 应为 []"
+        );
+
+        let mut cfg = DesktopConfig::default();
+        cfg.lan_addr = Some("192.168.1.5:43210".to_string());
+        let dm = DesktopManager::new(cfg);
+        let caps = dm.capabilities_json();
+        let addrs = caps["lan_addrs"].as_array().unwrap();
+        assert_eq!(addrs.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(), vec!["192.168.1.5:43210"]);
     }
 
     #[test]

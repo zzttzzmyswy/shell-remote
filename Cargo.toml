@@ -1,6 +1,6 @@
 [package]
 name = "shell-remote"
-version = "0.42.0"
+version = "0.43.0"
 edition = "2021"
 description = "Self-hosted collaborative remote SSH tool with MCP support"
 
@@ -44,6 +44,7 @@ axum-server = { version = "0.7", default-features = false, features = ["tls-rust
 time = { version = "0.3", features = ["formatting"] }
 # axum-server tls-rustls 启用 ring provider；直接依赖 rustls 以便显式 install_default
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+str0m = { version = "0.23.1", default-features = false, features = ["rust-crypto"] }
 
 [build-dependencies]
 pkg-config = "0.3"

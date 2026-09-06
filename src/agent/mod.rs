@@ -4,6 +4,8 @@ pub mod desktop;
 pub mod encoding;
 pub mod exec_sessions;
 pub mod fs;
+pub mod lan;
+pub mod p2p;
 pub mod shell;
 pub mod upgrade;
 
@@ -50,6 +52,7 @@ struct UploadReassembly {
 /// Outbound message handle. The main loop never blocks on HTTP: terminal
 /// output is pushed to a bounded, coalesced channel; control/result messages
 /// are pushed to a bounded channel drained with priority by a background task.
+#[derive(Clone)]
 struct Out {
     control_tx: tokio::sync::mpsc::Sender<String>,
     output_tx: tokio::sync::mpsc::Sender<(String, Vec<u8>)>,
@@ -732,6 +735,41 @@ async fn run_session(
         );
     }
 
+    // Task 4（阶段2 LAN 直连基础）：agent 本地 HTTP server 暴露与 relay 同构的
+    // /agent/desktop/stream，同局域网浏览器直连 agent 拉桌面流、绕开中转。
+    // 仅显式 --desktop-lan-port N（lan_port != 0）开启；默认 0 不开任何端口。
+    // 会话结束 drop 时 LanDesktop 中止 server/feed 任务，端口释放供重连重新 bind。
+    // 必须在 register 与 DesktopManager::new 之前：绑定端口/出口 IP 只有 spawn
+    // 后才知道，注册消息的 lan_addr 与 desktop:capabilities.lan_addrs 都要它。
+    let lan_desktop = if desktop_cfg.lan_port != 0 {
+        // Task 6 CORS 收窄 + final-review #4 fail-closed：LAN 无认证端点只放行
+        // relay 同源页面读流。relay_url 解析失败 → LanDesktop::spawn 拒绝启动
+        //（不 serve 通配），这里走到 Err 分支记日志、不开服务。
+        let relay_origin = crate::agent::lan::relay_origin(relay_url);
+        match crate::agent::lan::LanDesktop::spawn(desktop_cfg.lan_port, relay_origin).await {
+            Ok(lan) => {
+                tracing::info!(
+                    addr = %lan.addr_report(),
+                    cors_origin = %lan.cors_origin(),
+                    "LAN desktop stream server up (--desktop-lan-port)"
+                );
+                Some(lan)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lan_port = desktop_cfg.lan_port,
+                    "LAN desktop server bind failed: {e}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // 上报地址（"ip:port"，None = 未开启）：注册消息随 `lan_addr` 上报 relay，
+    // 同时注入 DesktopManager 的 config（capabilities_json 的 lan_addrs）。
+    let lan_addr_report = lan_desktop.as_ref().map(|lan| lan.addr_report());
+
     let mut client = RelayClient::connect_with_retry(
         relay_url,
         key.clone(),
@@ -740,6 +778,7 @@ async fn run_session(
         cached_tokens,
         10,
         insecure_tls,
+        lan_addr_report.clone(),
     )
     .await?;
 
@@ -768,7 +807,13 @@ async fn run_session(
     // single-task FIFO so the byte stream reaches the relay in order
     // (concurrent sends could reorder fragments and break playback).
     // 先建 DesktopManager，心跳扩展（R5#150）需要它的 KPI 快照。
-    let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(desktop_cfg.clone()));
+    // lan_addr 已由上面的 LanDesktop::spawn 得出（None = 未开启阶段2）。
+    let mut dm_cfg = desktop_cfg.clone();
+    dm_cfg.lan_addr = lan_addr_report.clone();
+    let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(dm_cfg));
+    // Task 2 P2P 信令会话槽：None = 无活动协商；offer 到达时宿主 peer +
+    // 驱动任务，desktop:stop / 二次 offer / 会话结束 时回收。
+    let p2p_state = crate::agent::p2p::P2pState::default();
     tokio::spawn(sender_loop(
         client.http_client().clone(),
         client.send_url().to_string(),
@@ -1124,8 +1169,45 @@ async fn run_session(
             });
         }
     }
+    // Task 3：P2P 已建连时把 desktop:video 的 fMP4 字节镜像一份进 DataChannel
+    //（relay POST 行为/编码/QoS 零改动，仅加一条镜像投递）。闭包外 clone，
+    // Arc 引用计数使闭包与消息循环共享同一个投递口。
+    let video_tx = p2p_state.video_tx.clone();
+    let last_init = p2p_state.last_init.clone();
     let post_fn: crate::agent::desktop::PostFn = Arc::new(move |msg| {
         let t = msg["type"].as_str().unwrap_or("?").to_string();
+        // fMP4 镜像投递：解析 desktop:video 的 base64 data（init=ftyp+moov /
+        // frag=moof+mdat，不带 JSON 包裹），投给 P2P 消费循环写 DataChannel。
+        // init 单独缓存一份（建连时补推，见 p2p 驱动任务 Connected 分支）。
+        // 通道未建/未开时静默丢弃（丢旧保新，浏览器 reqkey/重连兜底）。p2p 侧
+        // MirroredQueue::push 同步非阻塞（有界丢旧保新，满丢最旧；std RwLock
+        // 读不跨 await，见 p2p.rs）。
+        if t == "desktop:video" {
+            let kind = msg["payload"]["kind"].as_str();
+            let data_b64 = msg["payload"]["data"].as_str();
+            if let Some(data_b64) = data_b64 {
+                if let Some(bytes) = crate::agent::fs::decode_b64(data_b64) {
+                    if kind == Some("init") {
+                        *last_init.write().unwrap() = Some(bytes.clone());
+                    }
+                    // LAN 直连镜像（Task 4）：同源 fMP4 字节喂给本地 DesktopStream
+                    // fan-out（init→set_init，frag→push_frag；关键帧标志取
+                    // payload.key 或 flags=="key"，与 WS 二进制上行判定一致）。
+                    if let Some(lan) = lan_desktop.as_ref() {
+                        let is_init = kind == Some("init");
+                        let is_key = is_init
+                            || msg["payload"]["key"].as_bool().unwrap_or(false)
+                            || msg["payload"]["flags"].as_str() == Some("key");
+                        lan.feed(is_init, is_key, bytes.clone());
+                    }
+                    if let Ok(guard) = video_tx.read() {
+                        if let Some(q) = guard.as_ref() {
+                            q.push(bytes);
+                        }
+                    }
+                }
+            }
+        }
         let _ = post_tx.send(msg); // unbounded: 不会失败, 由 consumer 批内丢旧
         tracing::trace!("post_fn queued {t}");
     });
@@ -1663,7 +1745,59 @@ async fn run_session(
 
                                 "desktop:stop" => {
                                     tracing::info!("desktop:stop requested");
+                                    // 桌面上层流停止；P2P 信令会话一并回收（驱动
+                                    // 任务 abort，浏览器回退 relay 路径，Task 3/6）。
+                                    crate::agent::p2p::shutdown(&p2p_state).await;
                                     desktop.stop(post_fn.clone()).await;
+                                }
+
+                                "desktop:p2p-offer" => {
+                                    // 浏览器作为 offerer 发起的 WebRTC 协商（Task 3
+                                    // createOffer 产物）。agent 应答 → desktop:p2p-answer
+                                    // {sdp, candidates[]}；建连/失败由驱动任务广播
+                                    // desktop:p2p-state。窗口内二次 offer = last-wins。
+                                    let sdp = msg
+                                        .payload
+                                        .get("sdp")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let candidates: Vec<String> = msg
+                                        .payload
+                                        .get("candidates")
+                                        .and_then(|v| v.as_array())
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    tracing::info!(
+                                        sdp_bytes = sdp.len(),
+                                        cands = candidates.len(),
+                                        "desktop:p2p-offer received"
+                                    );
+                                    let ctrl = task_control_tx.clone();
+                                    crate::agent::p2p::handle_offer(
+                                        &p2p_state,
+                                        client.session_id.clone(),
+                                        ctrl,
+                                        &sdp,
+                                        &candidates,
+                                    )
+                                    .await;
+                                }
+
+                                "desktop:p2p-candidate" => {
+                                    // trickle ICE：浏览器把候选中途到达的 remote
+                                    // candidate 喂给正在握手的共享 peer。
+                                    if let Some(c) = msg
+                                        .payload
+                                        .get("candidate")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        crate::agent::p2p::handle_candidate(&p2p_state, c).await;
+                                    }
                                 }
 
                                 "desktop:codec" => {
@@ -2037,12 +2171,14 @@ async fn run_session(
     // R5#11 会话退出：记录桌面是否在跑（供重连恢复），并停止当前流——
     // run_desktop_loop 是 tokio::spawn 的孤儿 task（desktop drop 不停它），
     // 不显式 stop 会继续向已失效的 relay 连接发帧（浪费 CPU + 重连后与
-    // 新流双发冲突）。
+    // 新流双发冲突）。P2P 驱动任务同是孤儿 task：先回收再断连，防其继续
+    // 向失效连接广播 desktop:p2p-state。
     *desktop_want_running = desktop.is_running();
     if desktop.is_running() {
         tracing::warn!("session ending with desktop running — stopping stream for reconnect recovery");
         desktop.stop(post_fn.clone()).await;
     }
+    crate::agent::p2p::shutdown(&p2p_state).await;
 
     // Tokens were already cached into `cached_tokens` right after registration,
     // so `start` can replay them on reconnect — nothing to return here.

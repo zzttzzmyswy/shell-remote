@@ -228,6 +228,13 @@ pub fn requires_write(msg_type: &str) -> bool {
         "desktop:reqkey",
         "desktop:test-delay",
         "desktop:clipboard:get",
+        // Task 2 P2P 信令：浏览器→agent 的 offer/candidate 不改变桌面状态，
+        // 只读观看者也能发起协商（answer/state 是 agent→浏览器方向，本就
+        // 不经 requires_write，加入为了对称与可测性）。
+        "desktop:p2p-offer",
+        "desktop:p2p-answer",
+        "desktop:p2p-candidate",
+        "desktop:p2p-state",
     ];
     if read_only_types.contains(&msg_type) {
         return false;
@@ -392,6 +399,13 @@ mod tests {
         assert!(!requires_write("desktop:reqkey"));
         assert!(!requires_write("desktop:test-delay"));
         assert!(!requires_write("desktop:clipboard:get"));
+        // Task 2 P2P 信令：浏览器→agent 的 p2p-offer/candidate 不应被只读
+        // 观看者 403 阻断（协商不改变桌面状态）；agent→浏览器 的 answer/state
+        // 本就经广播，加入保持对称。
+        assert!(!requires_write("desktop:p2p-offer"));
+        assert!(!requires_write("desktop:p2p-answer"));
+        assert!(!requires_write("desktop:p2p-candidate"));
+        assert!(!requires_write("desktop:p2p-state"));
         assert!(requires_write("desktop:mouse"));
         assert!(requires_write("desktop:key"));
         assert!(requires_write("desktop:clipboard:set"));

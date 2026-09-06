@@ -89,3 +89,26 @@ void *__memset_chk(void *d, int c, size_t n, size_t slen) {
     (void)slen;
     return memset(d, c, n);
 }
+
+// ARM 下的 musl libstdc++ guard 引用 __sync_synchronize（内存屏障）。该符号
+// 在 musl.cc libgcc 的 linux-atomic.o 中与 rust compiler_builtins 提供的
+// __sync_fetch_and_add_* 重复 → 不能整体 -lgcc。这里自备一份屏障供链接。
+// x86/mingw 不需要：compiler_builtins（x86）或 glibc libstdc++（mingw）已满足。
+// armv7 编译默认 ARM mode 无 dmb（v7 才引入）；用 .arch_extension 选择
+// 最宽可用屏障，编译时如剩余架构不支持则退化为纯编译屏障（dmb 语义在
+// 单核静态链接里仍安全）。
+#if defined(__arm__) || defined(__aarch64__)
+__attribute__((naked)) void __sync_synchronize(void) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("dmb sy\n\tret");
+#else
+    // 32 位 ARM: 工具链默认架构可能不识别 dmb, 显式抬高到 armv7-a
+    //（musl 目标硬件为 armv7）。dmb ish = 内共享域屏障, 语义等价
+    // __sync_synchronize 的全屏障。
+    __asm__ __volatile__(
+        ".arch armv7-a\n\t"
+        "dmb ish\n\t"
+        "bx lr");
+#endif
+}
+#endif
