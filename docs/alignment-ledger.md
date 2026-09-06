@@ -86,7 +86,7 @@
 | 26 | token 过期快速重鉴权 | ✔ | `client.rs connect_with_retry` 接收 `&mut cached_tokens`——注册被拒（HTTP 401/409，旧 token 失效）→ 清缓存回退固定 key 全新注册（此前永远用失效 token 重试卡死）；判定纯函数 `token_stale_registration` + 单测 `test_token_stale_registration_detection` |
 | 27 | viewer 移除水位化（满即删→告警） | ✔ | 本轮：满时丢旧保新，超 MAX_CONSECUTIVE_DROPS=60 才移除（relay/desktop.rs） |
 | 28 | 20s WS ping | ✔ | handle_agent_ws_uplink 每 20s server-side ping（agent 死链 ~35s 检出），台账此前误标 ◐，第 17 轮代码级核实修正 |
-| 29 | 控制消息优先级 | ◐ | 部分：`is_lossy_msg_type` 区分数据（terminal:output 静默丢）/控制（non-lossy 满时告警丢）已有，基本优先级语义成立；channel 满时控制仍可能丢（无腾位机制），第 22 轮核实 |
+| 29 | 控制消息优先级 | ✔ | 第 42 轮：relay 广播段 non-lossy 控制消息在 SSE channel 满时给 **100ms 腾位窗口**（`tx.send().await` timeout，等浏览器消费端排空）——lossy 数据（terminal:output 等）维持 try_send 静默丢；弱网/瞬间积压下控制消息不被数据挤掉，仍满才告警丢。`is_lossy_msg_type` 分类此前已有。测试 `test_control_message_gets_drain_window_when_full`（满 channel 下 lossy 立即返回 / 控制消息 ≥80ms 等待窗口） |
 | 30 | 时钟校准 15min 慢校准 | ✔ | 连接期每 15min 重校（desktop.js:_startMetrics） |
 | 31 | 注册风暴防御 | ✔ | 120/min+冷却（agent/mod.rs） |
 | 32 | 剪贴板大文本走文件传输 | ✔ | 大文本抓护已做（第 30 轮：`CLIPBOARD_MAX_CHARS` 512KB + `clipboard_truncate` floor_char_boundary 安全截断，set/get 双向——防超大控制消息阻塞上行/远端剪贴板写入卡顿，测试 `test_clipboard_truncate_boundary`）；完整正向文件传输为远期方向 |
@@ -136,7 +136,7 @@
 | 122 | X11 字节判重静止停抓 | ✔ | ThreadedFrameSource last_raw memcmp（已合入，capture.rs:167） |
 | 123-124 | DXGI fastlane/静止节流 | ⬜ | Windows 侧 |
 | 125-126 | 抓帧速率联动/静止 sleep | ✔ | 静止退避 100ms sleep（capture.rs 线程循环，`test_threaded_static_source_backs_off`） |
-| 127-128 | 捕获内存池/行拷贝 SIMD | ⬜ | |
+| 127-128 | 捕获内存池/行拷贝 SIMD | ⬜ | 第 42 轮核实标注：当前架构 Frame 拥有 `Vec<u8>`（bgra 所有权随帧流转），每帧分配由 allocator 缓存（glibc/jemalloc 复用同尺寸块）；行拷贝/像素转换循环由 LLVM 自动向量化。专项内存池（frame ring buffer + 引用计数）需框架级改造（编码侧归还 buffer），收益不确定，列为远期 |
 | 129 | GDI 静止停抓+缓存 DC | ◐ | GDI DC 缓存有；静止停抓缺 |
 | 130 | 捕获失败重试窗口 30 次 | ✔ | 首帧前失败立即终止 + 首帧后首次失败即发 desktop:error（黑屏 ≤2s 可见化），保留 150 重试窗口供 GDI 自愈（mod.rs） |
 | 131 | 分辨率事件驱动 | ✔ | XRANDR ScreenChangeNotify 注册+poll_for_event（capture.rs，Xvfb 实测注册，替代 30 帧轮询） |
@@ -161,7 +161,7 @@
 ## 合入进度总计（本轮结束）
 
 - **R4/5（200 点）**：✔ 类约 **58%**（甲 帧率/IDR/RTT分带/TestDelay探针/QoS五态、乙 Player 主体+韧性+错误恢复+内存+排队归因+光标叠加、丁 弱网可见性+输入节流+RTT分带、丙 遥测基线+日志+分辨率事件+带宽记账+admin KPI 曲线+归因决策树）；⬜ 20%（丙遥测剩余、戊发布门槛）；◐ 22%。
-- **R5 落地清单（200 点）**：✔ 类约 **89%**（可靠通道 29 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
+- **R5 落地清单（200 点）**：✔ 类约 **90%**（可靠通道 30 项 / 前端 22 项 / 抓帧 7 项 / 编码器 7 项 / 打包 4 项 / 遥测测试 12 项 / TestDelay 探针 1 项 / admin KPI 曲线 1 项 / 光标通道 1 项 / QoS 状态机 2 项 / 多会话隔离 1 项 / 重连矩阵 1 项）；⬜ 9%。
 - **第 13 轮新增合入**：
   1. 编码线程数 loadavg 自适应（`encoder.rs codec_thread_num`：`(核数−loadavg)×0.5` 对齐 rustdesk——负载高自动减编码线程不抢 CPU，无 loadavg 回退核数一半；`test_codec_thread_num_bounded`/`test_loadavg_one_parses_or_none`）→ R3 甲7/8 / R5#82。
 - **第 14 轮新增合入**：
@@ -232,4 +232,7 @@
   2. 核实修正（R4/5 表）：61-70 连接与能力——MSE/WebCodecs 能力协商（`_webcodecsAvailable` 安全上下文+VideoDecoder 检测 → webcodecs/mse/none + sessionStorage 缓存复用）与能力探测缓存均已做；101-110 能力回退链——`_onDecodeError` 黑名单切 codec + `_scheduleDecodeRecover` 重建流兜底均已做；台账过时标"未做"。
 - **第 41 轮新增合入**：
   1. 重连窗口降质量（R4 乙101-110 重连降质）：session.js `requestReconnect` 统一重连入口——30s 窗口 ≥2 次重连（join 看门狗 / 30s 判死 / SSE 断线）判**重连风暴** → 标记降质（不在重连窗口直接发命令避免丢消息）→ join 成功后 `applyQualityOnJoin` 发 `desktop:quality {speed}` 低码率档（重建流带宽压力骤减，更易稳定）→ 15s 无重连自动恢复 `best`。desktop.js 30s 判死改走 `window.__requestReconnect` 统一通道。**验证**：`node --check` 两文件通过 + 引用齐全（requestReconnect/applyQualityOnJoin/__requestReconnect 两端一致）。纯前端改动。
+- **第 42 轮新增合入**：
+  1. 控制消息优先级腾位窗口（R5#29）：relay 广播段 non-lossy 控制消息在浏览器 SSE channel 满时 `timeout(100ms, tx.send().await)` 等腾位（lossy 数据维持 try_send 静默丢）——弱网/瞬间积压下控制消息不被数据挤掉，仍满才告警丢。测试 `test_control_message_gets_drain_window_when_full`（满 channel：lossy 立即返回 / 控制消息 ≥80ms 腾位窗口）。全量 `cargo test` **390 通过**（+1）。
+  2. 核实标注（#127-128）：捕获内存池/行拷贝 SIMD——当前架构 Frame 拥有 Vec + allocator 缓存 + LLVM 自动向量化已覆盖常见场景；专项 frame-ring 内存池需框架级改造（编码侧归还 buffer）收益不确定，如实标注远期。
 - **未合入（如实）**：线协议二进制整块（批次2 #41-44）、跨进程时间线遥测、独立 100ms ack 批、AV1 测速门槛等——在台账对应 ⬜/◐ 行，未宣称完成。
