@@ -124,6 +124,10 @@ pub struct RelayClient {
     pub tokens: Vec<(String, String)>,
     /// 自签 https relay 模式：上行(register/SSE/桌面WS)跳过证书校验。
     pub insecure_tls: bool,
+    /// relay 是否支持 desktop:video 二进制上行（R5 #41 能力告知）。register
+    /// 响应带 `desktop_binary: true` 才为 true；老 relay 无该字段 → false，
+    /// agent 保持 JSON+base64（兼容回退）。
+    pub desktop_binary: bool,
 }
 
 /// 429（relay 对每 IP `agent:register` 限流，见 relay/ws.rs）时用固定
@@ -142,6 +146,16 @@ fn next_retry_delay(is_rate_limited: bool, prev: Duration, max: Duration) -> Dur
     } else {
         Duration::from_secs(std::cmp::min(prev.as_secs().saturating_mul(2), max.as_secs()))
     }
+}
+
+/// 解析 register 响应中的 `desktop_binary` 能力告知（R5 #41）：新 relay 带
+/// `desktop_binary: true` → agent WS 上行改发 binary desktop:video 帧；
+/// 缺省/非 bool → false（JSON+base64 兼容回退）。
+fn parse_desktop_binary(response: &serde_json::Value) -> bool {
+    response
+        .get("desktop_binary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 impl RelayClient {
@@ -289,6 +303,7 @@ impl RelayClient {
             session_id: String::new(),
             tokens: Vec::new(),
             insecure_tls,
+            desktop_binary: false,
         };
 
         Self::handle_register_response(&mut client, &response)?;
@@ -334,6 +349,11 @@ impl RelayClient {
                 client.tokens.push((token, permission));
             }
         }
+
+        // R5 #41：relay 能力告知——新 relay 在 register 响应带
+        // `desktop_binary: true`（agent WS uplink 支持 binary desktop:video
+        // 帧）。老 relay 无此字段 → false（JSON+base64 兼容回退）。
+        client.desktop_binary = parse_desktop_binary(response);
 
         Ok(())
     }
@@ -486,6 +506,16 @@ mod tests {
         #[cfg(not(all(target_os = "linux", feature = "wayland")))]
         assert!(!on.iter().any(|c| c == "backend:wayland"), "无 wayland feature 不应声明");
         std::env::remove_var("WAYLAND_DISPLAY");
+    }
+
+    #[test]
+    fn test_parse_desktop_binary_capability() {
+        // R5 #41 能力告知：缺省 false（老 relay），带 true 才启用 binary 上行。
+        assert!(!parse_desktop_binary(&serde_json::json!({"type": "agent:registered"})));
+        assert!(!parse_desktop_binary(&serde_json::json!({"desktop_binary": false})));
+        assert!(parse_desktop_binary(&serde_json::json!({"desktop_binary": true})));
+        // 非 bool 值容错为 false。
+        assert!(!parse_desktop_binary(&serde_json::json!({"desktop_binary": "yes"})));
     }
 
     #[tokio::test]

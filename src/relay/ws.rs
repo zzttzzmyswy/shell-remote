@@ -713,6 +713,10 @@ async fn route_bin_desktop_frame(
     }
     let is_key = flags & BIN_FRAME_FLAG_KEY != 0;
     let congested = ds.push_frag(is_key, payload.to_vec()).await;
+    tracing::debug!(
+        kind = "frag", seq, bytes = %payload.len(), is_key, congested,
+        "desktop:video-bin pushed"
+    );
     if congested > 0 {
         // R5#16 回传拥塞信号（限频 ≥5s），语义与 JSON text 路径一致。
         let should_notify = {
@@ -970,6 +974,10 @@ pub async fn agent_send_handler(
             "type": "agent:registered",
             "session_id": session_id,
             "evicted": evicted,
+            // R5 #41 binary 传输能力告知：新 relay 的 agent WS uplink 支持
+            // desktop:video 二进制帧（Message::Binary → route_bin_desktop_frame）。
+            // 老 relay 无此字段 → agent 保持 JSON+base64（兼容回退）。
+            "desktop_binary": true,
             "payload": { "tokens": tokens_json }
         }))
         .into_response();

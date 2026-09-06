@@ -822,6 +822,9 @@ async fn run_session(
             .to_string();
         let sid = client.session_id.clone();
         let server_auth = client.server_auth().to_string();
+        // R5 #41：relay 是否支持 desktop:video 二进制上行（register 响应
+        // `desktop_binary: true`）。老 relay → false，WS 路径保持 JSON+base64。
+        let desktop_binary = client.desktop_binary;
         // 自签 https relay 模式：桌面 WS 上行同样跳过证书校验（与 register
         // 通道保持一致——relay 是自签证书, 不信任则 wss 握手必失败）。
         let insecure_tls = client.insecure_tls();
@@ -1002,15 +1005,74 @@ async fn run_session(
                 }
                 if let Some(stream) = ws.as_mut() {
                     use futures_util::SinkExt;
-                    let payload = serde_json::Value::Array(out.clone()).to_string();
-                    match stream.send(payload.into()).await {
-                        Ok(()) => sent_via_ws = true,
-                        Err(e) => {
-                            tracing::warn!("desktop WS send failed: {e} — falling back to HTTP");
+                    // R5 #41 binary 上行（relay 支持时）：ctrl 消息合并一个
+                    // text JSON 数组帧，desktop:video 逐帧发 binary 帧
+                    // （[flags:u8][seq:u32 LE][len:u32 LE][fMP4 字节]，无
+                    // base64 膨胀）；relay 侧 Message::Binary 分支直转。
+                    // 老 relay（desktop_binary=false）走原 JSON 数组 text。
+                    if desktop_binary {
+                        let mut ws_ok = true;
+                        let media_msgs: Vec<&serde_json::Value> =
+                            out.iter().filter(|m| m["type"] == "desktop:video").collect();
+                        tracing::debug!(out = %out.len(), media = %media_msgs.len(), "uplink WS binary dispatch");
+                        let ctrl: Vec<serde_json::Value> = out
+                            .iter()
+                            .filter(|m| m["type"] != "desktop:video")
+                            .cloned()
+                            .collect();
+                        if !ctrl.is_empty() {
+                            let payload = serde_json::Value::Array(ctrl).to_string();
+                            if stream.send(payload.into()).await.is_err() {
+                                ws_ok = false;
+                            }
+                        }
+                        if ws_ok {
+                            for m in out.iter().filter(|m| m["type"] == "desktop:video") {
+                                let kind = m["payload"]["kind"].as_str().unwrap_or("frag");
+                                let seq = m["payload"]["seq"].as_u64().unwrap_or(0) as u32;
+                                let is_key = m["payload"]["key"].as_bool().unwrap_or(false);
+                                let data_b64 = m["payload"]["data"].as_str().unwrap_or("");
+                                if let Some(bytes) = crate::agent::fs::decode_b64(data_b64) {
+                                    let flags = if kind == "init" {
+                                        crate::proto::BIN_FRAME_FLAG_INIT
+                                    } else if is_key {
+                                        crate::proto::BIN_FRAME_FLAG_KEY
+                                    } else {
+                                        0
+                                    };
+                                    let frame = crate::proto::encode_bin_frame(flags, seq, &bytes);
+                                    match stream.send(frame.into()).await {
+                                        Ok(()) => {
+                                            tracing::debug!(kind = %kind, seq, bytes = %bytes.len(), "uplink WS binary frame sent");
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("desktop WS binary send failed: {e}");
+                                            ws_ok = false;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!(kind = %kind, "uplink binary: base64 decode failed, dropped");
+                                }
+                            }
+                        }
+                        sent_via_ws = ws_ok;
+                        if !ws_ok {
+                            tracing::warn!("desktop WS binary send failed — falling back to HTTP");
                             ws = None;
                             ws_failures += 1;
-                            // 本批按实际结果改走 HTTP（uplink 标记已按 WS 发出,
-                            // 下批会纠正）。
+                        }
+                    } else {
+                        let payload = serde_json::Value::Array(out.clone()).to_string();
+                        match stream.send(payload.into()).await {
+                            Ok(()) => sent_via_ws = true,
+                            Err(e) => {
+                                tracing::warn!("desktop WS send failed: {e} — falling back to HTTP");
+                                ws = None;
+                                ws_failures += 1;
+                                // 本批按实际结果改走 HTTP（uplink 标记已按 WS 发出,
+                                // 下批会纠正）。
+                            }
                         }
                     }
                 }
