@@ -2006,23 +2006,27 @@ async fn run_session(
 
                                 "desktop:gray" => {
                                     // 灰度模式开关（web 桌面控制栏，弱网省带宽）：
-                                    // 只翻编码前降色度 flag，即时生效不重建流。
-                                    // R5#2 命令 ack（即时生效，无失败路径 → ok）。
+                                    // VP9/H264 翻编码前 UV 置 128 flag（即时生效）；
+                                    // AV1 切 monochrome 并重建流（码流无色度平面，
+                                    // 省更多码率）。R5#2 命令 ack：失败带 error。
                                     let enabled = msg
                                         .payload
                                         .get("enabled")
                                         .and_then(|v| v.as_bool())
                                         .unwrap_or(false);
-                                    desktop.set_gray(enabled);
                                     let seq = msg
                                         .payload
                                         .get("seq")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0);
+                                    let result = desktop.set_gray(enabled, post_fn.clone()).await;
                                     let ack = Message {
                                         msg_type: "desktop:cmd-ack".to_string(),
                                         session_id: client.session_id.clone(),
-                                        payload: serde_json::json!({ "seq": seq, "ok": true }),
+                                        payload: match &result {
+                                            Ok(()) => serde_json::json!({ "seq": seq, "ok": true }),
+                                            Err(e) => serde_json::json!({ "seq": seq, "ok": false, "error": e }),
+                                        },
                                     };
                                     out.control(ack).await;
                                 }

@@ -172,6 +172,8 @@ pub fn target_bitrate(width: u32, height: u32, max_bps: u64, quality: f32) -> u6
 /// Construct an encoder for a codec name (`av1` / `vp9` / `h264`).
 /// `max_bps` 语义：0 = 自动按 rustdesk 模型（base_bitrate × quality），
 /// >0 = 用户硬顶。`quality` = 质量档倍率（speed/balanced/best）。
+/// `monochrome`（MYS-954 灰度增强）：仅 AV1 生效（libaom 原生 monochrome
+/// 码流）；其它 codec 忽略（走编码前 UV 置 128 的像素级灰度）。
 pub fn new_encoder(
     codec: &str,
     w: u32,
@@ -179,6 +181,7 @@ pub fn new_encoder(
     max_bps: u64,
     fps: f64,
     quality: f32,
+    monochrome: bool,
 ) -> Result<Box<dyn VideoEncoder>, String> {
     let target = target_bitrate(w, h, max_bps, quality);
     let (q_min, q_max) = calc_q_values(quality);
@@ -194,8 +197,10 @@ pub fn new_encoder(
         #[cfg(feature = "av1")]
         "av1" => {
             let (q_min_a, q_max_a) = calc_q_values_aom(quality);
-            crate::agent::desktop::aom::AomEncoder::new(w, h, target, fps, q_min_a, q_max_a)
-                .map(|e| Box::new(e) as Box<dyn VideoEncoder>)
+            crate::agent::desktop::aom::AomEncoder::new(
+                w, h, target, fps, q_min_a, q_max_a, monochrome,
+            )
+            .map(|e| Box::new(e) as Box<dyn VideoEncoder>)
         }
         other => Err(format!("unsupported desktop codec: {other}")),
     }
@@ -211,6 +216,7 @@ pub fn create_encoder_fallback(
     max_bps: u64,
     fps: f64,
     quality: f32,
+    monochrome: bool,
 ) -> Result<(Box<dyn VideoEncoder>, String), String> {
     let codec_l = codec.to_ascii_lowercase();
     let chain: Vec<&str> = match codec_l.as_str() {
@@ -222,7 +228,7 @@ pub fn create_encoder_fallback(
     };
     let mut last_err = String::new();
     for c in chain {
-        match new_encoder(c, w, h, max_bps, fps, quality) {
+        match new_encoder(c, w, h, max_bps, fps, quality, monochrome) {
             Ok(e) => return Ok((e, c.to_string())),
             Err(e) => last_err = format!("{c}: {e}"),
         }

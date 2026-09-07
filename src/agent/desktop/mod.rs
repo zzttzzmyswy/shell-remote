@@ -100,6 +100,11 @@ pub struct DesktopConfig {
     /// 随 `desktop:capabilities.lan_addrs` 下发给浏览器做同网段探测直连；
     /// `None` = 未开启（不广播，浏览器不探测）。
     pub lan_addr: Option<String>,
+    /// 单色编码（MYS-954 灰度增强，仅 AV1 生效）：libaom cfg.monochrome=1，
+    /// 码流不含色度平面，全部比特预算给亮度。比"UV 填 128 再压缩"省更多
+    /// 码率；VP9/H264 无 monochrome，仍走编码前 UV 置 128 的像素级灰度。
+    /// 灰度开关切换时 pipeline 按此 flag 重建编码器（与 codec 切换同机制）。
+    pub monochrome: bool,
 }
 
 impl Default for DesktopConfig {
@@ -120,6 +125,7 @@ impl Default for DesktopConfig {
             max_bps: 0,
             display: None,
             quality: crate::agent::desktop::encoder::QUALITY_BALANCED,
+            monochrome: false,
             lan_port: 0,
             lan_addr: None,
         }
@@ -302,6 +308,10 @@ pub struct DesktopManager {
     /// 弱网下带宽占用显著下降（亮度是主观关键），画质降为灰度可接受。
     /// 运行时即时生效，不重建编码器/不重启流。
     gray: Arc<std::sync::atomic::AtomicBool>,
+    /// 单色编码（MYS-954 灰度增强）：AV1 时随灰度开关切换，重建桌面流生效
+    /// （libaom monochrome 码流）。与 gray flag 独立存储——VP9/H264 下
+    /// gray 只翻 flag，monochrome 恒 false。
+    monochrome: std::sync::RwLock<bool>,
     /// 浏览器关键帧请求（desktop:reqkey → 本 flag → 编码循环 force_idr）。
     /// 接入/参考链断裂/解码错误时即时重同步，不再等周期 IDR（对齐 rustdesk
     /// 控制端 refresh_video 语义，MYS-886）。
@@ -345,6 +355,7 @@ impl DesktopManager {
             qos_last_bp: std::sync::atomic::AtomicU32::new(0),
             qos_bitrate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gray: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            monochrome: std::sync::RwLock::new(false),
             idr_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
             backpressure: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -375,13 +386,40 @@ impl DesktopManager {
         Ok(())
     }
 
-    /// 灰度模式开关（web 端 `desktop:gray`）。只翻转编码前降色度 flag，
-    /// 下一帧即时生效——不重建编码器、不重启流（与 set_codec/set_quality
-    /// 的"重启重建"不同，灰度是纯编码前像素处理）。
-    pub fn set_gray(&self, enabled: bool) {
+    /// 灰度模式开关（web 端 `desktop:gray`）。两层实现（MYS-954 增强）：
+    /// - AV1：切换 cfg.monochrome 并**重建桌面流**（libaom 原生 monochrome
+    ///   码流不含色度平面，全部比特给亮度——比"UV 填 128 再压缩"省更多
+    ///   码率；且 AV1 是默认 codec，弱网省带宽主要走这条）。重建为低频
+    ///   操作可接受（set_codec/set_quality 同机制）。
+    /// - VP9/H264：无 monochrome 能力，翻转编码前 UV 置 128 的像素级灰度
+    ///   flag（下一帧即时生效，不重建）。AV1 上该 flag 同时保留——monochrome
+    ///   下编码器忽略色度，无副作用。
+    pub async fn set_gray(&self, enabled: bool, post: PostFn) -> Result<(), String> {
         use std::sync::atomic::Ordering as O;
         self.gray.store(enabled, O::Relaxed);
         tracing::info!(enabled, "desktop gray mode {}", if enabled { "ON" } else { "OFF" });
+        let is_av1 = self
+            .codec
+            .read()
+            .map(|c| c.eq_ignore_ascii_case("av1"))
+            .unwrap_or(false);
+        let monochrome_changed = {
+            let mut cur = self
+                .monochrome
+                .write()
+                .map_err(|_| "monochrome lock poisoned".to_string())?;
+            if *cur != enabled && is_av1 {
+                *cur = enabled;
+                true
+            } else {
+                false
+            }
+        };
+        if monochrome_changed && self.is_running() {
+            self.stop(post.clone()).await;
+            self.start(post).await;
+        }
+        Ok(())
     }
 
     pub fn gray_enabled(&self) -> bool {
@@ -689,6 +727,8 @@ impl DesktopManager {
         cfg.codec = codec;
         // 运行时档位（web 码率/质量下拉可改）覆盖启动默认值。
         cfg.quality = self.quality.read().map(|q| *q).unwrap_or(cfg.quality);
+        // 运行时单色（灰度开关在 AV1 下触发）。
+        cfg.monochrome = self.monochrome.read().map(|m| *m).unwrap_or(false);
         // 运行时选屏（web 显示器下拉可改）覆盖启动 --desktop-display。
         let disp = self.display.read().map(|d| d.clone()).unwrap_or(None);
         cfg.display = resolved_display(&disp, &cfg.display);
@@ -954,6 +994,7 @@ async fn rebuild_encoder_degrade(
         cfg.max_bps,
         cfg.fps,
         cfg.quality,
+        cfg.monochrome,
     )?;
     *enc = new_enc;
     cfg.codec = actual.clone();
@@ -1071,6 +1112,7 @@ async fn run_desktop_pipeline(
         cfg.max_bps,
         cfg.fps,
         cfg.quality,
+        cfg.monochrome,
     ) {
         Ok(pair) => pair,
         Err(e) => {
@@ -1308,6 +1350,7 @@ async fn run_desktop_pipeline(
                 cfg.max_bps,
                 cfg.fps,
                 cfg.quality,
+                cfg.monochrome,
             ) {
                 Ok((new_enc, actual)) => {
                     enc = new_enc;
@@ -2222,7 +2265,7 @@ fn maybe_rescale(
     if nw < 2 || nh < 2 {
         return;
     }
-    match encoder::new_encoder(&cfg.codec, nw as u32, nh as u32, cfg.max_bps, cfg.fps, cfg.quality) {
+    match encoder::new_encoder(&cfg.codec, nw as u32, nh as u32, cfg.max_bps, cfg.fps, cfg.quality, cfg.monochrome) {
         Ok(mut new_enc) => {
             tracing::warn!(
                 "desktop: {} encode resolution {enc_w}x{enc_h} -> {nw}x{nh} (bytes={:.0}% budget)",
@@ -2898,14 +2941,19 @@ mod tests {
         assert!(tm.len() <= 1_400);
     }
 
-    #[test]
-    fn test_set_gray_flag_roundtrip() {
+    #[tokio::test]
+    async fn test_set_gray_flag_roundtrip() {
         let dm = DesktopManager::new(DesktopConfig::default());
+        let post: PostFn = std::sync::Arc::new(|_| {});
         assert!(!dm.gray_enabled(), "gray defaults off");
-        dm.set_gray(true);
+        assert!(!*dm.monochrome.read().unwrap(), "monochrome defaults off");
+        dm.set_gray(true, post.clone()).await.unwrap();
         assert!(dm.gray_enabled());
-        dm.set_gray(false);
+        // AV1 默认 codec：灰度开启 → monochrome 同步置位（重建流在 start 后）。
+        assert!(*dm.monochrome.read().unwrap());
+        dm.set_gray(false, post).await.unwrap();
         assert!(!dm.gray_enabled());
+        assert!(!*dm.monochrome.read().unwrap());
     }
 
     fn budget(fps: f64) -> f64 {
@@ -2918,7 +2966,7 @@ mod tests {
         // MYS-886: 分辨率阶梯已禁用 (SCALES = [1.0])。超预算时 maybe_rescale
         // **不再降分辨率** —— 码率交给 AV1/VP9 CBR 在固定分辨率下控制。
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality, false).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 0usize;
         let (mut enc_w, mut enc_h) = (w0, h0);
@@ -2945,7 +2993,7 @@ mod tests {
     #[test]
     fn test_maybe_rescale_restores_on_lightly_budgeted_content() {
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps, cfg.quality, false).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 1usize;
         let (mut enc_w, mut enc_h) = (1440usize, 810usize);
@@ -2967,7 +3015,7 @@ mod tests {
     fn test_tune_once_prefers_resolution_before_stride() {
         // 新策略: 超预算先降分辨率(模糊不掉帧), 分辨率到底才降帧率。
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality, false).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut stride_idx = 0usize;
         let mut scale_idx = 0usize;
@@ -2991,7 +3039,7 @@ mod tests {
         // 分辨率已到顶仍超预算 → 降帧率
         let mut byte_win2: VecDeque<u32> = (0..48).map(|_| (budget(cfg.fps) * 1.5) as u32).collect();
         let mut since_change2 = 30u32;
-        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
+        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps, cfg.quality, false).unwrap();
         let mut stride2 = 0usize;
         let mut scale2 = SCALES.len() - 1;
         let (mut ew2, mut eh2) = (480usize, 270usize);
@@ -3007,7 +3055,7 @@ mod tests {
     #[test]
     fn test_tune_once_restores_slowly() {
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1440, 810, cfg.max_bps, cfg.fps, cfg.quality, false).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut stride_idx = 2usize;
         let mut scale_idx = 1usize; // 分辨率与帧率都降过
@@ -3039,7 +3087,7 @@ mod tests {
     #[test]
     fn test_maybe_rescale_respects_cooldown_and_bounds() {
         let cfg = DesktopConfig::default();
-        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
+        let mut enc = encoder::new_encoder("h264", 1920, 1080, cfg.max_bps, cfg.fps, cfg.quality, false).unwrap();
         let (w0, h0) = (1920usize, 1080usize);
         let mut scale_idx = 0usize;
         let (mut enc_w, mut enc_h) = (w0, h0);
@@ -3054,7 +3102,7 @@ mod tests {
         );
         assert_eq!(scale_idx, 0, "cooldown must block change");
         // 已经是最小档: 极端超预算也不能再降
-        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps, cfg.quality).unwrap();
+        let mut enc2 = encoder::new_encoder("h264", 480, 270, cfg.max_bps, cfg.fps, cfg.quality, false).unwrap();
         let mut scale_idx = SCALES.len() - 1;
         let (mut ew, mut eh) = (480usize, 270usize);
         let mut byte_win2: VecDeque<u32> = (0..48).map(|_| (budget(cfg.fps) * 1.5) as u32).collect();

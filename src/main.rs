@@ -319,6 +319,7 @@ async fn main() -> anyhow::Result<()> {
                     _ => crate::agent::desktop::encoder::QUALITY_BALANCED,
                 },
                 display: desktop_display,
+                monochrome: false,
                 lan_port: desktop_lan_port,
                 lan_addr: None, // 由 run_session 在 LanDesktop::spawn 后注入
             };

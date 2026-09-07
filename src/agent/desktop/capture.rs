@@ -81,11 +81,27 @@ pub fn open_source(
                 .to_string(),
         ),
         #[cfg(windows)]
-        // 显式指定时尊重用户选择（不验证首帧）
-        "dxgi" => ok_backend(crate::agent::desktop::dxgi::DxgiSource::open(), "dxgi"),
+        // 显式指定时尊重用户选择（不验证首帧）。display 支持数字选屏
+        // （"0"=主屏、"1"=第 2 块，MYS-954 多屏）——非数字串在 Windows
+        // 上无 X11 DISPLAY 语义，忽略并走默认屏。
+        "dxgi" => {
+            let idx = display.and_then(parse_monitor_index).unwrap_or(0);
+            ok_backend(
+                crate::agent::desktop::dxgi::DxgiSource::open_at(idx),
+                "dxgi",
+            )
+        }
         #[cfg(not(windows))]
         "dxgi" => Err("DXGI capture is Windows-only".to_string()),
-        "gdi" | "windows" => open_gdi().map(|s| (s, "gdi".to_string())),
+        "gdi" | "windows" => {
+            #[cfg(windows)]
+            {
+                let idx = display.and_then(parse_monitor_index).unwrap_or(0);
+                ok_backend(gdi::GdiSource::open_at(idx), "gdi")
+            }
+            #[cfg(not(windows))]
+            open_gdi().map(|s| (s, "gdi".to_string()))
+        }
         "auto" => open_auto(display),
         other => Err(format!("unknown capture kind: {}", other)),
     }
@@ -98,16 +114,27 @@ fn ok_backend(
     r.map(|s| (Box::new(s) as Box<dyn FrameSource>, name.to_string()))
 }
 
+/// 解析 Windows 多屏选择值（MYS-954）："0"/"1"/… = 显示器枚举序号。
+/// 其它值（X11 ":0" 之类）在 Windows 上无意义 → None（走默认主屏）。
+#[cfg(windows)]
+fn parse_monitor_index(display: &str) -> Option<usize> {
+    display.trim().parse::<usize>().ok()
+}
+
 /// Platform auto-detect: Windows prefers dxgi (60fps capable) then GDI;
 /// Linux prefers wayland-portal when running under a Wayland session, else X11.
 fn open_auto(display: Option<&str>) -> Result<(Box<dyn FrameSource>, String), String> {
     #[cfg(windows)]
     {
-        match crate::agent::desktop::dxgi::DxgiSource::open_verified() {
+        let idx = display.and_then(parse_monitor_index).unwrap_or(0);
+        match crate::agent::desktop::dxgi::DxgiSource::open_verified_at(idx) {
             Ok(s) => Ok((Box::new(s) as Box<dyn FrameSource>, "dxgi".to_string())),
             Err(e) => {
                 tracing::warn!("dxgi capture unavailable ({e}) — falling back to GDI");
-                open_gdi().map(|s| (s, "gdi".to_string()))
+                #[cfg(windows)]
+                {
+                    ok_backend(gdi::GdiSource::open_at(idx), "gdi")
+                }
             }
         }
     }
@@ -916,18 +943,25 @@ impl X11Source {
 
 #[cfg(windows)]
 mod gdi {
-    use super::{Frame, FrameSource};
-    use windows_sys::Win32::Foundation::GetLastError;
+    use super::{Frame, FrameSource, MonitorInfo};
+    use windows_sys::Win32::Foundation::{GetLastError, RECT};
     use windows_sys::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        DIB_RGB_COLORS, HBITMAP, HDC, SRCCOPY,
+        GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, MONITORINFO, SRCCOPY,
     };
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, MONITORENUMPROC};
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
     pub struct GdiSource {
         width: usize,
         height: usize,
+        /// 目标显示器在虚拟桌面坐标系中的矩形（MYS-954 多屏）。主屏（或
+        /// 未指定）时为 (0,0)；BitBlt 源坐标用 left/top 偏移取到对应屏。
+        mon_x: i32,
+        mon_y: i32,
+        /// 枚举顺序中的显示器序号（access-lost 重建时保持同一块屏）。
+        monitor_index: usize,
         /// Cached screen DC (see `blit`): per-frame GetDC is 3-4x slower and
         /// starves high-fps capture; the cache is dropped on BitBlt failure
         /// via `rebuild`.
@@ -938,11 +972,76 @@ mod gdi {
 
     unsafe impl Send for GdiSource {}
 
+    /// EnumDisplayMonitors 枚举全部显示器几何（系统枚举顺序，主屏通常在
+    /// 前）。`GetMonitorInfoW` 取 `rcMonitor`（虚拟桌面坐标 + 分辨率）。
+    /// 失败的显示器（GetMonitorInfoW 返回 0）跳过。
+    pub(super) fn list_monitors_gdi() -> Vec<MonitorInfo> {
+        struct Ctx {
+            idx: u32,
+            out: Vec<MonitorInfo>,
+        }
+        let mut ctx = Ctx { idx: 0, out: Vec::new() };
+        unsafe {
+            EnumDisplayMonitors(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                Some(enum_proc),
+                &mut ctx as *mut Ctx as isize,
+            );
+        }
+        unsafe extern "system" fn enum_proc(
+            hmon: windows_sys::Win32::Graphics::Gdi::HMONITOR,
+            _hdc: HDC,
+            _rect: *mut RECT,
+            lparam: isize,
+        ) -> windows_sys::Win32::Foundation::BOOL {
+            let ctx = unsafe { &mut *(lparam as *mut Ctx) };
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if unsafe { GetMonitorInfoW(hmon, &mut mi) } != 0 {
+                let r = &mi.rcMonitor;
+                ctx.out.push(MonitorInfo {
+                    name: format!("DISPLAY{}", ctx.idx + 1),
+                    width: (r.right - r.left).max(0) as u32,
+                    height: (r.bottom - r.top).max(0) as u32,
+                    x: r.left,
+                    y: r.top,
+                });
+            }
+            ctx.idx += 1;
+            1 // continue enumeration
+        }
+        ctx.out
+    }
+
     impl GdiSource {
         pub fn open() -> Result<Self, String> {
+            Self::open_at(0)
+        }
+
+        /// Open capture for the `index`-th display monitor（EnumDisplayMonitors
+        /// 枚举顺序，0 = 主屏）。抓帧时按该屏在虚拟桌面中的矩形 BitBlt。
+        pub fn open_at(index: usize) -> Result<Self, String> {
+            let monitors = list_monitors_gdi();
+            if index >= monitors.len() {
+                return Err(format!(
+                    "no GDI monitor #{index} (only {} detected)",
+                    monitors.len()
+                ));
+            }
+            let m = &monitors[index];
+            tracing::info!(
+                monitor = index,
+                name = %m.name,
+                geom = %format!("{}x{}+{},{}", m.width, m.height, m.x, m.y),
+                "gdi capture monitor selected"
+            );
             let mut s = Self {
                 width: 0,
                 height: 0,
+                mon_x: m.x,
+                mon_y: m.y,
+                monitor_index: index,
                 screen_dc: std::ptr::null_mut(),
                 mem_dc: std::ptr::null_mut(),
                 bmp: std::ptr::null_mut(),
@@ -968,8 +1067,19 @@ mod gdi {
                 ReleaseDC(std::ptr::null_mut(), self.screen_dc);
                 self.screen_dc = std::ptr::null_mut();
             }
-            let width = GetSystemMetrics(SM_CXSCREEN) as usize;
-            let height = GetSystemMetrics(SM_CYSCREEN) as usize;
+            // 多屏（MYS-954）：分辨率取目标显示器矩形（EnumDisplayMonitors
+            // 枚举顺序与 open_at 选屏一致）；屏幕 DC 是整个虚拟桌面，BitBlt
+            // 源坐标用 mon_x/mon_y 偏移取到对应屏。
+            let monitors = list_monitors_gdi();
+            let (width, height) = match monitors.get(self.monitor_index) {
+                Some(m) if m.width >= 2 && m.height >= 2 => (m.width as usize, m.height as usize),
+                _ => (
+                    GetSystemMetrics(SM_CXSCREEN) as usize,
+                    GetSystemMetrics(SM_CYSCREEN) as usize,
+                ),
+            };
+            self.mon_x = monitors.get(self.monitor_index).map(|m| m.x).unwrap_or(0);
+            self.mon_y = monitors.get(self.monitor_index).map(|m| m.y).unwrap_or(0);
             let screen_dc = GetDC(std::ptr::null_mut());
             if screen_dc.is_null() {
                 return Err(format!("GetDC failed (err={})", GetLastError()));
@@ -1008,7 +1118,11 @@ mod gdi {
             }
             let w = self.width as i32;
             let h = self.height as i32;
-            let ok = BitBlt(self.mem_dc, 0, 0, w, h, self.screen_dc, 0, 0, SRCCOPY);
+            // 多屏（MYS-954）：BitBlt 源坐标 = 目标显示器在虚拟桌面中的
+            // 原点（主屏 0,0；副屏为正/负偏移），取到该屏内容。
+            let sx = self.mon_x;
+            let sy = self.mon_y;
+            let ok = BitBlt(self.mem_dc, 0, 0, w, h, self.screen_dc, sx, sy, SRCCOPY);
             if ok != 0 {
                 return Ok(());
             }
@@ -1019,7 +1133,9 @@ mod gdi {
             }
             let w = self.width as i32;
             let h = self.height as i32;
-            let ok = BitBlt(self.mem_dc, 0, 0, w, h, self.screen_dc, 0, 0, SRCCOPY);
+            let sx = self.mon_x;
+            let sy = self.mon_y;
+            let ok = BitBlt(self.mem_dc, 0, 0, w, h, self.screen_dc, sx, sy, SRCCOPY);
             if ok == 0 {
                 return Err(format!("BitBlt failed (err={})", GetLastError()));
             }
@@ -1058,20 +1174,26 @@ mod gdi {
             (self.width, self.height)
         }
 
+        fn list_monitors(&self) -> Vec<MonitorInfo> {
+            list_monitors_gdi()
+        }
+
         fn next_frame(&mut self) -> Result<Frame, String> {
             unsafe {
-                // display 分辨率运行时变更检测：GetSystemMetrics 极廉价，每帧
-                // 对比一次；变化则重建整个 GDI context（rustdesk display
-                // 变更对齐）。rebuild 内部会重新 GetSystemMetrics + 建
-                // screen DC / compatible bitmap，BitBlt 下一帧即新尺寸。
-                let sw = GetSystemMetrics(SM_CXSCREEN) as usize;
-                let sh = GetSystemMetrics(SM_CYSCREEN) as usize;
-                if sw > 0 && sh > 0 && (sw != self.width || sh != self.height) {
-                    tracing::info!(
-                        "gdi display resize: {}x{} -> {}x{}",
-                        self.width, self.height, sw, sh
-                    );
-                    self.rebuild()?;
+                // display 分辨率运行时变更检测：每帧重读显示器矩形（廉价），
+                // 变化则重建整个 GDI context（rustdesk display 变更对齐）。
+                // rebuild 内部重新枚举 monitors + 建 screen DC / compatible
+                // bitmap，BitBlt 下一帧即新尺寸/新偏移。
+                let m = list_monitors_gdi().get(self.monitor_index).cloned();
+                if let Some(m) = m {
+                    let (mw, mh) = (m.width as usize, m.height as usize);
+                    if mw >= 2 && mh >= 2 && (mw != self.width || mh != self.height) {
+                        tracing::info!(
+                            "gdi display resize: {}x{} -> {}x{}",
+                            self.width, self.height, mw, mh
+                        );
+                        self.rebuild()?;
+                    }
                 }
                 self.blit()?;
                 let h = self.height;
