@@ -1663,6 +1663,11 @@ pub struct QosAdaptive {
     /// 最近一次采样的动态屏判定（字节帧率 ≥ 2 帧/秒）。fps 决策用——动态
     /// 屏永不降到 `QOS_DYNAMIC_MIN_FPS` 以下。
     dynamic: bool,
+    /// 最近一次观测到内容帧的采样时刻（unix us）。活动迟滞用：其后
+    /// `QOS_DYNAMIC_GRACE_US` 内的空采样不判静止（1fps 编码节拍下内容帧
+    /// 1s 才一颗，无迟滞时 250ms 窗大多抓空 → dynamic 抖回 false → fps
+    /// 钉死 1 —— 用户"操作时一直 1fps"的自锁环）。
+    last_content_us: Option<u64>,
     /// 健康基线延时（ms，漏桶式近端最低 avg，等价 rustdesk 的 RTT 估计）。
     /// 从首个样本即开始学习；quality 只对"avg 显著高于基线"的增量（拥塞
     /// 证据）做降档，固定传播延迟即使 800ms 也不降级。
@@ -1715,6 +1720,10 @@ const QOS_HISTORY_DELAY_LEN: usize = 2;
 /// 是浏览器解码背压，且下限为 15——低于此的动态内容毫无流畅可言）。静态屏
 /// 保持 MIN_FPS=1 省带宽（静态无内容，掉帧不可见）。
 const QOS_DYNAMIC_MIN_FPS: u32 = 15;
+/// 活动迟滞窗（微秒）：观测到内容帧后，此窗内的空采样仍判动态。
+/// 1.5s > 1fps 编码节拍的 1s 间隔 → 内容帧之间不会误判静止；
+/// 真静止 1.5s 后自然落回 1fps（带宽开销可控）。
+const QOS_DYNAMIC_GRACE_US: u64 = 1_500_000;
 /// 解码背压触发 fps 降档的解码帧率阈值（浏览器每秒实际解码帧数）。
 const QOS_DECODE_BACK_PRESSURE_FPS: u32 = 20;
 /// 解码背压触发 fps 降档的解码队列深度阈值。
@@ -1760,6 +1769,7 @@ impl QosAdaptive {
             ratio_elapsed_s: 0,
             frame_count_s: 0,
             dynamic: false,
+            last_content_us: None,
             baseline_delay: 0,
             bitrate_kbps: 0,
             first_sample_us: None,
@@ -1913,12 +1923,22 @@ impl QosAdaptive {
         // 每秒只有 1 个字节帧，永远判不出动态，也就永远回不到高帧率（正是
         // 用户"动态页面被调到 1 帧"的机制根因）。首样本（elapsed<0.1，计时
         // 基准刚建立）沿用上一次判定。
-        let dynamic = if elapsed_s >= 0.1 {
-            frame_count >= 1
-        } else {
-            self.dynamic
-        };
-        self.dynamic = dynamic;
+        //
+        // 活动迟滞（MYS-886 v0.45 用户复测"操作时一直 1fps"）：fps=1 节拍下
+        // 内容帧 1s 一颗，250ms 采样窗大多抓空（frame_count=0）→ 无迟滞时
+        // dynamic 抖回 false → fps 钉死 1。现在观测到内容帧后记 last_content_us，
+        // 其后 GRACE 窗内的空采样仍视为动态（编码节拍升到 30fps 后帧密集，
+        // 窗口会持续命中；真静止 GRACE 过后自然落回 1fps）。
+        if elapsed_s >= 0.1 {
+            if frame_count >= 1 {
+                self.last_content_us = Some(ctx.now_us);
+            }
+            let since_content_us = self
+                .last_content_us
+                .map_or(u64::MAX, |t| ctx.now_us.saturating_sub(t));
+            self.dynamic = frame_count >= 1 || since_content_us <= QOS_DYNAMIC_GRACE_US;
+        }
+        let dynamic = self.dynamic;
 
         // ── fps：内容驱动（用户铁律：动态画面永不因网络降帧）──
         // 静态 → 1fps（无内容，开销归零）；有内容 → 立即拉满到配置上限。
@@ -2451,6 +2471,36 @@ mod tests {
             decode_queue_hint: 0,
             relay_congest_delta: 0,
             now_us,
+        }
+    }
+
+    /// MYS-886 动态帧率"不敏感/1fps 自锁"回归：静止起步（fps=1），用户开始
+    /// 操作后每秒只产 1 帧 → 250ms 采样窗大多 frame_count=0、偶尔 1 →
+    /// dynamic 抖动把 fps 钉在 1（旧代码）。修复后：只要观测窗内**出现过**
+    /// 内容帧，fps 就升档并保持（迟滞），不能因后续空采样立即摔回 1。
+    #[test]
+    fn test_qos_stale_to_active_recovers_full_fps() {
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        // 静止期：每 250ms 采样、0 帧 → fps=1。
+        let mut now = 1_000_000u64;
+        for _ in 0..12 {
+            let (fps, _) = q.on_delay(40, 20, 0, 0.25, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            now += 250_000;
+            assert_eq!(fps, QOS_MIN_FPS, "静止期应为 1fps");
+        }
+        // 用户开始操作：fps=1 时编码 1s 一帧 → 4 个采样中恰 1 个 frame_count=1。
+        let (fps1, _) = q.on_delay(40, 20, 1, 0.25, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        now += 250_000;
+        assert!(fps1 > QOS_MIN_FPS, "出现内容帧必须升帧率，got {fps1}");
+        // 关键断言：随后 3 个空采样（新帧还没到 1s 节拍）不得摔回 1——
+        // 旧代码这里直接 dynamic=false → fps=1，表现为"操作时一直 1fps"。
+        for i in 0..3 {
+            let (fps, _) = q.on_delay(40, 20, 0, 0.25, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            now += 250_000;
+            assert!(
+                fps >= QOS_DYNAMIC_MIN_FPS,
+                "活动后空采样窗口（{i}）不得跌回 1fps，got {fps}"
+            );
         }
     }
 
