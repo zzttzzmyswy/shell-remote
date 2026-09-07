@@ -31,6 +31,8 @@ pub struct Vp9Encoder {
     /// 是否 VP8（否则 VP9）。VP8 是低内存设备的降级档（rustdesk 4G 内存
     /// 判定），浏览器 WebCodecs 原生支持 VP8 解码。
     is_vp8: bool,
+    /// 帧级码率守卫当前档位（set_overshoot_qp 幂等去重）。
+    overshoot_level: u32,
     /// 下一次 encode 强制关键帧（通过 encode flags 传 VPX_EFLAG_FORCE_KF）。
     force_kf: bool,
     /// 递增帧时间戳（timebase 1ms，对齐 rustdesk：每帧 +1000/fps）。
@@ -138,6 +140,7 @@ impl Vp9Encoder {
                 max_bps: 0,
                 is_vp8,
                 quality: crate::agent::desktop::encoder::QUALITY_BALANCED,
+                overshoot_level: 0,
                 force_kf: false,
                 pts_ms: 0,
             })
@@ -275,6 +278,36 @@ impl Vp9Encoder {
         }
     }
 
+    /// 帧级码率守卫（BitrateGuard）：`VP9E_SET_QUANTIZER_ONE_PASS` 控件把
+    /// rc->worst/best_quality 钉到收紧后的 qindex（libvpx
+    /// ctrl_set_quantizer_one_pass → cfg.rc_min=max=qp → vp9_change_config，
+    /// 运行期 config 应用路径，不触碰有闪退风险的 vpx_codec_enc_config_set
+    /// 直调）。档位→QP：每档 +6，封顶 60。VP8（降级档）无 one-pass 控件，
+    /// 静默忽略。0 档经 `set_quality`（低频）恢复质量档默认 q 区间。
+    pub fn set_overshoot_qp(&mut self, level: u32) {
+        if self.is_vp8 {
+            return;
+        }
+        let level = level.min(super::BitrateGuard::MAX_LEVEL);
+        if level == self.overshoot_level {
+            return;
+        }
+        self.overshoot_level = level;
+        if level == 0 {
+            self.set_quality(self.quality);
+            return;
+        }
+        let (_, base_q_max) = crate::agent::desktop::encoder::calc_q_values(self.quality);
+        let qp = (base_q_max + 6 * level as u32).min(60);
+        unsafe {
+            set_ctl(
+                &mut self.ctx,
+                vpx_sys::vp8e_enc_control_id::VP9E_SET_QUANTIZER_ONE_PASS as c_int,
+                qp as c_int,
+            );
+        }
+    }
+
     /// Read back the current target bitrate (bps).
     pub fn bitrate_bps(&self) -> u64 {
         self.bitrate_bps
@@ -342,6 +375,10 @@ impl crate::agent::desktop::encoder::VideoEncoder for Vp9Encoder {
 
     fn set_quality(&mut self, ratio: f32) {
         Vp9Encoder::set_quality(self, ratio);
+    }
+
+    fn set_overshoot_qp(&mut self, level: u32) {
+        Vp9Encoder::set_overshoot_qp(self, level);
     }
 
     fn bitrate_bps(&self) -> u64 {

@@ -39,6 +39,11 @@ pub trait VideoEncoder: Send {
     /// 运行时按质量档调整编码（rustdesk QoS 行为）：重算目标码率 + QP 区间。
     /// 默认 no-op（H.264 软编不支持动态质量）。
     fn set_quality(&mut self, _ratio: f32) {}
+    /// 帧级码率守卫（MYS-886 BitrateGuard）：按档位收紧编码器量化上限，
+    /// 压住 CBR 瞬时 overshoot（用户方案：动态调 QP 压码率，不降 fps）。
+    /// `level` 0..=BitrateGuard::MAX_LEVEL；0 = 回到质量档默认 QP 上限。
+    /// 默认 no-op（无对应运行时控件的编码器安全忽略）。
+    fn set_overshoot_qp(&mut self, _level: u32) {}
 }
 
 /// rustdesk 同款质量档 → 码率倍率（`libs/scrap/src/common/codec.rs`）。

@@ -54,6 +54,8 @@ pub struct H264Encoder {
     height: u32,
     fps: f64,
     bitrate_bps: u64,
+    /// new_ext 的目标码率（守卫恢复档位的基准）。
+    base_bitrate_bps: u64,
 }
 
 // The encoder runs on a single task in `DesktopManager`; Rust-side accesses
@@ -169,6 +171,7 @@ impl H264Encoder {
             height: h,
             fps,
             bitrate_bps,
+            base_bitrate_bps: bitrate_bps,
         })
     }
 
@@ -271,6 +274,22 @@ impl H264Encoder {
         self.bitrate_bps = bps;
     }
 
+    /// 帧级码率守卫（BitrateGuard）：OpenH264 无 one-pass quantizer 控件，
+    /// 用 `ENCODER_OPTION_BITRATE` SetOption 压目标码率（官方支持的运行时
+    /// 接口，非 aom/vpx 的 config_set 崩溃路径）。每档压到 base×(1-0.15×level)
+    /// （6 档最低 ~10%），iMaxQp=42 恒定约束单帧上界。0 档回 base。
+    pub fn set_overshoot_qp(&mut self, level: u32) {
+        let level = level.min(super::BitrateGuard::MAX_LEVEL);
+        if level == 0 {
+            let base = self.base_bitrate_bps;
+            self.set_bitrate(base);
+            return;
+        }
+        let target = self.base_bitrate_bps.saturating_mul(100 - 15 * level as u64) / 100;
+        let target = target.max(50_000);
+        self.set_bitrate(target);
+    }
+
     /// Read back the current target bitrate from the encoder.
     pub fn bitrate_bps(&self) -> u64 {
         let mut bi = SBitrateInfo {
@@ -347,6 +366,10 @@ impl crate::agent::desktop::encoder::VideoEncoder for H264Encoder {
 
     fn set_bitrate(&mut self, bps: u64) {
         H264Encoder::set_bitrate(self, bps);
+    }
+
+    fn set_overshoot_qp(&mut self, level: u32) {
+        H264Encoder::set_overshoot_qp(self, level);
     }
 
     fn bitrate_bps(&self) -> u64 {

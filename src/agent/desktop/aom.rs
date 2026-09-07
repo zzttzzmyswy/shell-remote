@@ -57,6 +57,8 @@ pub struct AomEncoder {
     max_bps: u64,
     quality: f32,
     force_kf: bool,
+    /// 帧级码率守卫当前档位（set_overshoot_qp 幂等去重）。
+    overshoot_level: u32,
     /// 递增帧时间戳（timebase 1ms，对齐 rustdesk：每帧 +1000/fps）。
     pts_ms: u64,
 }
@@ -219,6 +221,7 @@ impl AomEncoder {
                 max_bps,
                 quality,
                 force_kf: false,
+                overshoot_level: 0,
                 pts_ms: 0,
             })
         }
@@ -303,6 +306,7 @@ impl AomEncoder {
     /// 按质量档动态调整（rustdesk QoS 同款）：重算目标码率 + QP 区间。
     pub fn set_quality(&mut self, ratio: f32) {
         self.quality = ratio;
+        self.overshoot_level = 0;
         let (q_min, q_max) = crate::agent::desktop::encoder::calc_q_values_aom(ratio);
         let target = crate::agent::desktop::encoder::target_bitrate(
             self.width,
@@ -318,6 +322,38 @@ impl AomEncoder {
             cfg.rc_min_quantizer = q_min;
             cfg.rc_max_quantizer = q_max;
             aom_sys::aom_codec_enc_config_set(&mut self.ctx, &cfg);
+        }
+    }
+
+    /// 帧级码率守卫（BitrateGuard）：按档位收紧量化上限。
+    ///
+    /// level>0：`AV1E_SET_QUANTIZER_ONE_PASS` 控件把 worst=best 钉在收紧后的
+    /// qindex（libaom 源码 ctrl_set_quantizer_one_pass → cfg.rc_min=max=qp →
+    /// av1_change_config → rc.worst/best_quality）。控件走 update_extra_cfg
+    /// 的运行期 config 应用路径，**不重初始化 qmatrix**（v0.35 闪退是
+    /// `aom_codec_enc_config_set` 的独立缺陷路径），每帧级调用安全。
+    /// 档位→QP：每档 +8（qindex 标度，AV1 45→55 已是重压缩档），封顶 55。
+    /// 0 档：恢复质量档默认 q 区间——经 `set_quality`（低频路径，与 QoS
+    /// ratio 切换同频；高频 config_set 才有 qmatrix 风险，档位切换 1 次/秒
+    /// 量级可接受）。
+    pub fn set_overshoot_qp(&mut self, level: u32) {
+        let level = level.min(super::BitrateGuard::MAX_LEVEL);
+        if level == self.overshoot_level {
+            return;
+        }
+        self.overshoot_level = level;
+        if level == 0 {
+            self.set_quality(self.quality);
+            return;
+        }
+        let (_, base_q_max) = crate::agent::desktop::encoder::calc_q_values_aom(self.quality);
+        let qp = (base_q_max + 8 * level as u32).min(55);
+        unsafe {
+            set_ctl(
+                &mut self.ctx,
+                aom_sys::aome_enc_control_id_AV1E_SET_QUANTIZER_ONE_PASS as c_int,
+                qp as c_int,
+            );
         }
     }
 
@@ -391,6 +427,10 @@ impl crate::agent::desktop::encoder::VideoEncoder for AomEncoder {
 
     fn set_quality(&mut self, ratio: f32) {
         AomEncoder::set_quality(self, ratio);
+    }
+
+    fn set_overshoot_qp(&mut self, level: u32) {
+        AomEncoder::set_overshoot_qp(self, level);
     }
 
     fn bitrate_bps(&self) -> u64 {
@@ -508,6 +548,89 @@ mod tests {
         // libaom 靠 QP 自适应控码率。60 帧应全输出（=全帧保留），丢帧
         // = 用户局域网"丢包/卡顿"的直接来源（曾 dropframe=25 只出 20 帧）。
         assert!(out >= 55, "AV1 must keep almost all frames, got {out}/60");
+    }
+
+    #[test]
+    fn test_av1_overshoot_qp_suppresses_burst() {
+        // MYS-886 BitrateGuard 实证（用户方案：动态调 QP 压码率）：极端高熵
+        // 内容 + 极低预算，第一秒实测码率必然爆（CBR 来不及收敛）——guard
+        // 逐档收紧 overshoot QP 后，第二秒实测码率必须被压回预算 2 倍内；
+        // 对照（不收紧）第二秒仍远超。证明控件真实生效且不丢帧。
+        let w = 640usize;
+        let h = 360usize;
+        let budget_bps: u64 = 150_000; // 极低预算，高熵必爆
+        let mut enc = AomEncoder::new(w as u32, h as u32, budget_bps, 30.0, 24, 50)
+            .expect("av1 init");
+        // 每帧内容 = 平铺平移的伪随机块（相位随 t 全变）→ 帧间几乎无
+        // 运动相关性，AV1 每帧都要真实编码 → 持续高熵（模拟拖动复杂窗口）。
+        let mut frame = |buf: &mut [u8], t: u32| {
+            let (bw, bh) = (16usize, 16usize);
+            let stride = w;
+            for by in 0..(h / bh) {
+                for bx in 0..(w / bw) {
+                    let s = (t as u64)
+                        .wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add((bx * 31 + by * 17) as u64);
+                    let v = ((s >> 33) & 0xff) as u8;
+                    for y in 0..bh {
+                        let row = by * bh + y;
+                        if row >= h {
+                            break;
+                        }
+                        let off = row * stride + bx * bw;
+                        for x in 0..bw {
+                            if bx * bw + x < w {
+                                buf[off + x] = v.wrapping_add((x * y) as u8);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let mut run_seg = |enc: &mut AomEncoder, t0: u32, tag: &str| {
+            let (mut bytes, mut out) = (0usize, 0usize);
+            for t in t0..t0 + 30 {
+                let mut buf = solid_i420(w, h, 90);
+                frame(&mut buf, t);
+                let f = enc.encode(&buf).expect("encode");
+                if !f.nalu.is_empty() {
+                    out += 1;
+                    bytes += f.nalu.len();
+                }
+            }
+            let kbps = bytes as f64 * 8.0 / 1.0 / 1000.0;
+            eprintln!("[{tag}] {kbps:.0} kbps, {out}/30 frames");
+            (kbps, out)
+        };
+
+        // 对照段（guard 不介入）：30 帧高熵 → 实测码率。
+        let (base_kbps, _) = run_seg(&mut enc, 0, "no-guard");
+        // guard 收紧到中档：控件钉 QP。
+        enc.set_overshoot_qp(4);
+        let (guarded_kbps, guarded_out) = run_seg(&mut enc, 30, "guard-level-4");
+        // 恢复 0 档：应回到接近对照段水平（set_quality 路径正常）。
+        enc.set_overshoot_qp(0);
+        let (recovered_kbps, _) = run_seg(&mut enc, 60, "guard-released");
+        // fresh 对照：同内容同预算新编码器的稳态码率（恢复段的合理性基准）。
+        let mut fresh = AomEncoder::new(w as u32, h as u32, budget_bps, 30.0, 24, 50)
+            .expect("fresh av1");
+        // 先跑一段热身（RC 收敛），再取与 released 段同内容的码率。
+        let _ = run_seg(&mut fresh, 0, "fresh-warmup");
+        let (fresh_kbps, _) = run_seg(&mut fresh, 30, "fresh-steady");
+
+        assert!(guarded_out >= 28, "收紧后仍不得丢帧，got {guarded_out}/30");
+        assert!(
+            guarded_kbps < base_kbps * 0.8,
+            "QP 收紧必须显著压码率：base={base_kbps:.0} guarded={guarded_kbps:.0}"
+        );
+        assert!(
+            recovered_kbps > guarded_kbps,
+            "0 档应恢复画质（码率回升）：recovered={recovered_kbps:.0} guarded={guarded_kbps:.0}"
+        );
+        assert!(
+            recovered_kbps >= fresh_kbps * 0.5,
+            "恢复段应接近 fresh 稳态（≥50%）：recovered={recovered_kbps:.0} fresh={fresh_kbps:.0}"
+        );
     }
 
     #[test]

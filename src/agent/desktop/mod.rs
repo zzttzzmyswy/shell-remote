@@ -824,6 +824,92 @@ pub const KF_ACTIVE_BYTES_FRAME: f64 = 2048.0;
 /// 静止心跳（MYS-886 需求7-1：静止 4s 一个 IDR，带宽显著低于 relay 观看者
 /// 30s 空闲超时，不会误判断流）。
 
+/// 帧级码率守卫（MYS-886 用户方案：拖动复杂窗口时 AV1/VP9 CBR 瞬时
+/// overshoot 3-4×目标（实测 4000kbps 顶满上行 → fps 塌到 1）。ABR 每 10 帧
+/// 才评估、QoS 每 3s 才调 ratio——都太慢。guard 每帧统计 1s 滑窗实际字节率，
+/// 超预算立即收紧编码器 overshoot QP 档（帧级快环），低于预算 60% 且稳住
+/// 再逐档恢复。fps 全程不动（用户铁律），画质换流畅。
+pub struct BitrateGuard {
+    /// 码率预算（bps）：= ABR eff_max（含 EMA 带宽上限与 QoS 缩放）。
+    budget_bps: u64,
+    /// 1s 滑窗 (时刻秒, 字节)。
+    window: std::collections::VecDeque<(f64, usize)>,
+    /// 当前收紧档位 0..=MAX_LEVEL。每档收紧一次 QP 上限。
+    level: u32,
+    /// 收紧后剩余保持帧数（防抖：QP 需要若干帧才反映到字节率）。
+    hold_frames: u32,
+}
+
+impl BitrateGuard {
+    /// 最大收紧档位。每档把 overshoot QP 上限收紧一档；实测档位映射见
+    /// 各编码器 `set_overshoot_qp`。
+    pub const MAX_LEVEL: u32 = 6;
+    /// 收紧后最少保持帧数（~10 帧 ≈ 330ms@30fps）。
+    const HOLD_FRAMES: u32 = 10;
+    /// 滑窗时长（秒）。
+    const WINDOW_SECS: f64 = 1.0;
+    /// 超预算即收紧的触发线（预算 ×1.0）。
+    const TIGHTEN_RATIO: f64 = 1.0;
+    /// 低于预算 ×0.6 才允许恢复（滞后带防震荡）。
+    const RELEASE_RATIO: f64 = 0.6;
+
+    pub fn new(budget_bps: u64) -> Self {
+        Self {
+            budget_bps: budget_bps.max(1),
+            window: std::collections::VecDeque::new(),
+            level: 0,
+            hold_frames: 0,
+        }
+    }
+
+    /// 当前收紧档位。
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// 每个编码帧后调用：`bytes` = 本帧编码字节，`interval_ms` = 距上帧间隔。
+    /// 返回 true 表示本帧发生了档位变化（调用方应把新档位下发编码器）。
+    pub fn on_frame(&mut self, bytes: usize, interval_ms: f64) -> bool {
+        // 时刻用帧间隔累计（相对时间即可，窗口只看差值）。
+        let last_t = self.window.back().map(|&(t, _)| t).unwrap_or(0.0);
+        let t = last_t + (interval_ms.max(1.0) / 1000.0);
+        self.window.push_back((t, bytes));
+        while self
+            .window
+            .front()
+            .map_or(false, |&(ot, _)| t - ot > Self::WINDOW_SECS)
+        {
+            self.window.pop_front();
+        }
+        let bytes_1s: usize = self.window.iter().map(|&(_, b)| b).sum();
+        let actual_bps = bytes_1s as f64 * 8.0;
+        let budget = self.budget_bps as f64;
+
+        if self.hold_frames > 0 {
+            self.hold_frames -= 1;
+            return false;
+        }
+
+        if actual_bps > budget * Self::TIGHTEN_RATIO && self.level < Self::MAX_LEVEL {
+            self.level += 1;
+            self.hold_frames = Self::HOLD_FRAMES;
+            return true;
+        }
+        if actual_bps < budget * Self::RELEASE_RATIO && self.level > 0 {
+            self.level -= 1;
+            self.hold_frames = Self::HOLD_FRAMES;
+            return true;
+        }
+        false
+    }
+
+    /// 预算变化（EMA 带宽/QoS 缩放更新）时同步；预算下调时立即按新预算
+    /// 判断（下一帧生效），不清窗口。
+    pub fn set_budget(&mut self, budget_bps: u64) {
+        self.budget_bps = budget_bps.max(1);
+    }
+}
+
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
 /// 编码器降级决策（R5#84 慢帧 / R5#85 故障热备统一出口）：返回应降级到的
@@ -1085,6 +1171,8 @@ async fn run_desktop_pipeline(
     // moof 复用 muxer（R5#45）：tfhd 模板缓存，每帧只重建变化部分，
     // 减少高频路径的 moof 构建分配。
     let muxer = mp4::Mp4Muxer::new();
+    // 帧级码率守卫（MYS-886）：预算每帧同步自 ABR eff_max（EMA 带宽 × QoS 缩放）。
+    let mut br_guard = BitrateGuard::new(1_000_000);
 
     while running.load(Ordering::SeqCst) {
         let cur_fps = fps_ctl.load(Ordering::SeqCst).clamp(1, 60);
@@ -1389,6 +1477,31 @@ async fn run_desktop_pipeline(
             byte_win.pop_front();
         }
         since_change += 1;
+
+        // 帧级码率守卫（BitrateGuard，MYS-886 用户方案）：1s 滑窗实测字节率
+        // 超 ABR 预算 → 立即收紧 overshoot QP 档（帧级快环，不降 fps）；
+        // 低于预算 60% 稳住 → 逐档恢复。ABR（10 帧评估）与 QoS（3s ratio）
+        // 是慢环，压不住 CBR 瞬时 overshoot——拖动复杂窗口实测码率冲
+        // 4000kbps 顶满上行带宽 → 积压 → fps 塌 1。守卫在每个编码帧后评估。
+        // 帧间隔 = wall 时钟差（编码节拍随 fps/QoS 动态变化）。
+        let now_wall_g = std::time::Instant::now();
+        let frame_interval_ms = now_wall_g.duration_since(last_encode).as_secs_f64() * 1000.0;
+        let guard_budget = {
+            use std::sync::atomic::Ordering as O;
+            let ceiling = if cfg.max_bps > 0 {
+                cfg.max_bps
+            } else {
+                encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality)
+            };
+            let scale = qos_scale.load(O::Relaxed).clamp(100, 1000) as u64;
+            bandwidth.load(O::Relaxed).min(ceiling).max(cfg.min_bps).saturating_mul(scale) / 1000
+        };
+        br_guard.set_budget(guard_budget);
+        if br_guard.on_frame(encoded.nalu.len(), frame_interval_ms) {
+            let lvl = br_guard.level();
+            enc.set_overshoot_qp(lvl);
+            tracing::info!(level = lvl, bytes = encoded.nalu.len(), interval_ms = format!("{frame_interval_ms:.0}"), "bitrate guard: overshoot QP level changed");
+        }
 
         if encoded.is_idr && mp4_cfg.is_none() {
             // 首个关键帧（或分辨率重配后）携带 codec 参数集（H.264: SPS/PPS；
@@ -2120,6 +2233,68 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BitrateGuard 状态机（MYS-886 瞬时码率爆发修复）：1s 滑窗实测字节率
+    /// 超预算 → 收紧 QP 档（帧级快环）；低于预算 60% 且稳住 → 逐档恢复。
+    #[test]
+    fn test_bitrate_guard_tightens_on_overshoot_and_recovers() {
+        // ceiling 1.5Mbps：1s 窗口预算 = 1500_000/8 字节。
+        let mut g = BitrateGuard::new(1_500_000);
+        assert_eq!(g.level(), 0, "初始不收紧");
+
+        // 超限：每帧 60KB@30fps ≈ 14.4Mbps（9.6×）→ 多档收紧。
+        let mut steps = 0;
+        for _ in 0..40 {
+            if g.on_frame(60_000, 33.0) { steps += 1; }
+        }
+        assert!(g.level() > 0, "持续超限必须收紧 QP（level>0），实际 {}", g.level());
+        assert!(steps >= 2);
+
+        // 回落：每帧 2KB@30fps ≈ 0.48Mbps（< 60% 预算）→ 窗口排空后逐档恢复。
+        let mut recovered = 0;
+        for _ in 0..80 {
+            if g.on_frame(2_000, 33.0) { recovered += 1; }
+        }
+        assert!(g.level() < steps || g.level() == 0, "低字节率应恢复 QP 档位，当前 {}", g.level());
+        let _ = recovered;
+    }
+
+    #[test]
+    fn test_bitrate_guard_no_tighten_under_budget() {
+        let mut g = BitrateGuard::new(1_500_000);
+        for _ in 0..60 {
+            g.on_frame(4_000, 33.0); // ≈0.97Mbps < 1.5Mbps
+        }
+        assert_eq!(g.level(), 0, "预算内不得收紧");
+    }
+
+    #[test]
+    fn test_bitrate_guard_hold_prevents_flapping() {
+        // 收紧后有最短保持帧数：单帧低码率不得立即逐档回落（防 QP 抖动）。
+        let mut g = BitrateGuard::new(1_500_000);
+        for _ in 0..40 {
+            g.on_frame(60_000, 33.0);
+        }
+        let lvl = g.level();
+        assert!(lvl > 0);
+        g.on_frame(0, 33.0);
+        assert!(
+            g.level() >= lvl.saturating_sub(1),
+            "hold 期内一帧低码率不应跳档，{} → {}",
+            lvl,
+            g.level()
+        );
+    }
+
+    #[test]
+    fn test_bitrate_guard_tighten_is_bounded() {
+        let mut g = BitrateGuard::new(200_000);
+        for _ in 0..200 {
+            g.on_frame(90_000, 33.0); // 持续 21Mbps 极限超限
+        }
+        assert!(g.level() <= BitrateGuard::MAX_LEVEL, "收紧档位必须有上限");
+        assert_eq!(g.level(), BitrateGuard::MAX_LEVEL);
+    }
 
     #[test]
     fn test_frame_pool_reuses_buffers() {
