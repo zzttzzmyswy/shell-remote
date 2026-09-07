@@ -94,12 +94,12 @@ cargo build --release
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
 | `--shell` | `/bin/bash` | Shell 路径 |
 | `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；**可重复使用**——新的 agent 用相同 ID 注册会顶替旧会话（旧 Token 失效），不再报冲突 |
-| `--desktop-capture` | `auto` | 桌面捕获后端：`auto` / `x11` / `wayland` / `gdi` / `none`（`none` 关闭桌面功能；Wayland 需要 xdg-desktop-portal，暂未实现，建议 X11/XWayland） |
-| `--desktop-codec` | `h264` | 桌面编码格式（当前仅 H.264；VP8/VP9/HEVC 因许可与浏览器兼容原因未内置，见下） |
-| `--desktop-fps` | `15` | 桌面捕获帧率 |
-| `--desktop-max-bitrate` | `800` | 最大编码码率（kbps，用户需求原数值 800） |
-| `--desktop-min-bitrate` | `200` | 最小编码码率（kbps，用户需求原数值 200） |
-| `--desktop-display` | `$DISPLAY` | 指定 X11 显示（如 `:1`），默认取 `$DISPLAY` |
+| `--desktop-capture` | `auto` | 桌面捕获后端：`auto` / `dxgi` / `gdi` / `x11` / `wayland` / `none`（Windows 默认 DXGI Desktop Duplication，失败回退 GDI；`wayland` 需 `--features wayland` 构建且运行时存在 xdg-desktop-portal + PipeWire） |
+| `--desktop-codec` | `av1` | 桌面编码格式：`av1`（libaom）/ `vp9`（libvpx）/ `vp8` / `h264`（openh264）；初始化失败自动按 av1→vp9→vp8→h264 回退 |
+| `--desktop-fps` | `30` | 桌面编码帧率上限（默认 30，QoS 内容驱动：静止 1fps、动态满帧） |
+| `--desktop-max-bitrate` | `0`（自动） | 最大编码码率（kbps，0 = 自动按 base_bitrate×质量档） |
+| `--desktop-min-bitrate` | `80` | 最小编码码率（kbps，静态桌面足够；动态由 ABR 拉回） |
+| `--desktop-display` | 平台默认 | Linux：X11 display（如 `:1`，默认取 `$DISPLAY`）；Windows：显示器枚举序号（`"0"`=主屏、`"1"`=第 2 块屏，MYS-954 多屏选屏，会话页显示器下拉运行时可切） |
 | `--desktop-lan-port` | `0` | LAN 直连桌面流监听端口（阶段2）。`0` = 不启用；非 0 时同网段浏览器直接 `http://agent-ip:port/agent/desktop/stream` 拉流，绕开 relay |
 
 输出示例：
@@ -118,27 +118,26 @@ session: a1b2c3d4
 
 ## 桌面共享
 
-在 agent 模式下共享设备真实桌面：浏览器端"桌面"按钮开流，画面以 H.264 实时编码后经 relay 转发播放（`/agent/desktop/stream`）。
+在 agent 模式下共享设备真实桌面：浏览器端"桌面"按钮开流，画面实时编码后经 relay 转发播放（`/agent/desktop/stream`）。
 
 - 启动：浏览器会话页点击工具栏"桌面"按钮（默认关闭、点击才开流）→ 收到 `desktop:started` 后自动连接视频流；再点"终端"切回。
 - 权限：开流/关流需 rw Token（`requires_write`）；观看桌面画面 rw/ro 均可。
-- 码率：按用户需求 **最高 800kbps、最低 200kbps** 自适应动态调整（`--desktop-max-bitrate` / `--desktop-min-bitrate`，单位 kbps，默认 800/200）。
-- 编码：软件编码（openh264，BSD 许可）兜底；`--desktop-codec h264`。**硬件编码（VAAPI / Windows Media Foundation）按"软编兜底、尽可能硬编"的需求预留为后续扩展**，当前版本为纯软编。
+- 码率：自适应动态调整（`--desktop-max-bitrate` / `--desktop-min-bitrate`，单位 kbps；默认 0 = 自动按 rustdesk 模型 base_bitrate×质量档，1080p balanced ≈1388kbps）。
+- 编码：**纯软件编码**，默认 AV1（libaom），可切 VP9（libvpx）/ VP8 / H.264（openh264）——`--desktop-codec`；初始化失败按 av1→vp9→vp8→h264 自动回退。**不调用 GPU 编码**（Windows 上 DXGI 只用于屏幕捕获，编码全在 CPU；D3D11 设备在无可用 GPU 驱动时自动回退 WARP 软光栅），带显卡的 Windows 与无显卡环境行为一致。硬件编码（VAAPI / Media Foundation）预留为后续扩展。
+- 灰度模式：会话页桌面控制栏"灰度"开关，弱网下省带宽。AV1 下切换为 **libaom 原生 monochrome 码流**（色度平面不进码流，实测比彩色省 ~30% 码率，重建流生效）；VP9/H.264 下编码前把色度置中性（下一帧即时生效）。
+- 多显示器：`desktop:started` 上报远端显示器拓扑（X11 RANDR 输出 / Windows DXGI 输出 / GDI 显示器枚举），指标面板"远端显示器"行可见；多屏时会话页出现"显示器"下拉，选择后重建桌面流切换到对应屏幕（Windows 上 `"0"`=主屏、`"1"`=第 2 块屏，以此类推）。
 - 下行通道（P2P 直连，阶段1/2）：默认探测顺序 **LAN → WebRTC DataChannel → relay**，全部自动、用户无感：
   - **LAN**：agent 带 `--desktop-lan-port` 时，浏览器与 agent 同网段直接 `http://agent-ip:port/agent/desktop/stream` 拉流（CORS 限定 relay 同源）；**部署限制**：该 LAN 拉流为 `http://` 混合内容——relay/会话页以 **HTTPS** 提供时浏览器会直接拦截此 fetch，Stage-2 LAN 直连不可用（无挂起、快速回退 P2P/relay），LAN 通道仅在 relay/会话页走纯 HTTP 时生效；WebRTC P2P 与 relay 回退不受影响；
   - **WebRTC**：协商经 relay 信令（`desktop:p2p-*`）完成，DataChannel 承载 fMP4 字节（不可靠模式、丢旧保新）；
   - **relay**：前两者失败/打洞不通时自动回退既有 `/agent/desktop/stream` 转发，功能不劣于旧版。
   - 指标面板"下行通道"行显示当前路径（`lan` / `p2p` / `relay`）。已知限制：P2P 高动态持续帧率受 str0m SCTP cwnd 慢启动限制（LAN/relay 无此问题）；P2P 会话为单活跃 viewer（并发 viewer 自动走 relay）。
-- 捕获：X11（含 XWayland）与 Windows GDI 已实现；Wayland 原生捕获需 xdg-desktop-portal + PipeWire 运行时，本版本未内置（agent 会给出明确错误提示，可用 XWayland 走 X11 后端）。
-- 传输：fMP4（fragmented MP4）流式推给浏览器 MSE，新加入的观者从最近一个关键帧（IDR）开始接收，无需等待下一个 GOP。
-- 其它编码格式（VP8/VP9/HEVC）：考虑二进制体积与许可（x265/libvpx 体积大且 HEVC 浏览器兼容面窄），当前仅内置 H.264——它对全浏览器 MSE 兼容性最好，符合"编码器过大则只选压缩效率足够且浏览器可解"的要求。
+- 捕获：Windows DXGI Desktop Duplication（默认，多屏可选）→ GDI BitBlt 回退（多屏可选）；Linux X11（含 XWayland）与 Wayland 原生（portal + PipeWire，需 `--features wayland` 构建）。
 
 ### 桌面共享 CLI 示例
 
 ```bash
 ./shell-remote agent --relay-url https://relay.example.com \
-  --desktop-capture auto --desktop-fps 15 \
-  --desktop-max-bitrate 800 --desktop-min-bitrate 200
+  --desktop-capture auto --desktop-fps 30
 ```
 
 ## Windows Agent

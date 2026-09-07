@@ -12,10 +12,15 @@
 //! secure desktop (UAC prompt). On failure the capture chain falls back to
 //! GDI (see `capture::open_source`); `--desktop-capture gdi` forces the old
 //! path.
+//!
+//! 多显示器（MYS-954）：按 `EnumOutputs` 顺序枚举所有桌面输出，每个输出
+//! 独立 `DuplicateOutput`（一个 duplication 只能绑一个 output）。选择值 =
+//! 全局 output 序号（`open(output_index)`），`list_monitors_static` 供
+//! `desktop:started` 上报拓扑（名称 `DXGI<ai>.<oi>` + 桌面坐标/分辨率）。
 
 #![cfg(windows)]
 
-use super::capture::{Frame, FrameSource};
+use super::capture::{Frame, FrameSource, MonitorInfo};
 
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -23,11 +28,66 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::Interface;
 
+/// Enumerate every desktop output across all adapters (in DXGI enumeration
+/// order). Returns `(adapter_index, output_index, IDXGIOutput1, desc)`.
+/// 失败的 output（cast 到 IDXGIOutput1 失败）跳过。
+pub(crate) fn enumerate_outputs() -> Vec<(u32, u32, IDXGIOutput1, DXGI_OUTPUT_DESC)> {
+    let mut out = Vec::new();
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return out;
+    };
+    let mut ai: u32 = 0;
+    while let Ok(a) = unsafe { factory.EnumAdapters1(ai) } {
+        let mut oi: u32 = 0;
+        while let Ok(o) = unsafe { a.EnumOutputs(oi) } {
+            if let Ok(o1) = o.cast::<IDXGIOutput1>() {
+                if let Ok(desc) = unsafe { o.GetDesc() } {
+                    out.push((ai, oi, o1, desc));
+                }
+            }
+            oi += 1;
+        }
+        ai += 1;
+    }
+    out
+}
+
+fn desc_to_monitor_name(desc: &DXGI_OUTPUT_DESC, ai: u32, oi: u32) -> String {
+    let device = {
+        let arr: &[u16] = &desc.DeviceName;
+        let len = arr.iter().position(|&c| c == 0).unwrap_or(arr.len());
+        String::from_utf16_lossy(&arr[..len])
+    };
+    if device.is_empty() {
+        format!("DXGI{ai}.{oi}")
+    } else {
+        device
+    }
+}
+
+/// 静态枚举远端显示器拓扑（无需 duplication）：DXGI 输出名称 + 桌面坐标
+/// 分辨率。`desktop:started.displays` 上报用（MYS-954 Windows 多屏）。
+pub(crate) fn list_monitors_static() -> Vec<MonitorInfo> {
+    enumerate_outputs()
+        .into_iter()
+        .map(|(ai, oi, _o1, desc)| MonitorInfo {
+            name: desc_to_monitor_name(&desc, ai, oi),
+            width: (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left).max(0) as u32,
+            height: (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top).max(0) as u32,
+            x: desc.DesktopCoordinates.left,
+            y: desc.DesktopCoordinates.top,
+        })
+        .collect()
+}
+
 /// One duplication session. Self-heals on access-lost (mode switch, session
 /// change, secure desktop transit) by rebuilding every object once.
 pub struct DxgiSource {
     width: usize,
     height: usize,
+    /// 选中的全局 output 序号（enumerate_outputs 的下标）。access-lost
+    /// 重建时用它找回同一个 output。
+    output_index: usize,
     _factory: IDXGIFactory1,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -41,33 +101,42 @@ unsafe impl Send for DxgiSource {}
 
 impl DxgiSource {
     pub fn open() -> Result<Self, String> {
-        unsafe { Self::build() }
+        Self::open_at(0)
     }
 
-    unsafe fn build() -> Result<Self, String> {
-        // 1. DXGI factory → first adapter → first output → IDXGIOutput1.
+    /// Open duplication on the `index`-th desktop output (0 = primary, order
+    /// follows DXGI enumeration). 越界 = 明确报错（浏览器选屏值过期，如
+    /// 拔掉显示器后未刷新拓扑——重建流即可恢复）。
+    pub fn open_at(index: usize) -> Result<Self, String> {
+        unsafe { Self::build(index) }
+    }
+
+    unsafe fn build(index: usize) -> Result<Self, String> {
+        // 1. DXGI factory → enumerate all outputs → pick the requested one.
         let factory: IDXGIFactory1 =
             CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
-        let mut adapter: Option<IDXGIAdapter1> = None;
-        let mut output1: Option<IDXGIOutput1> = None;
+        let mut picked: Option<(IDXGIAdapter1, IDXGIOutput1)> = None;
+        let mut cur: usize = 0;
         let mut ai: u32 = 0;
         while let Ok(a) = factory.EnumAdapters1(ai) {
             let mut oi: u32 = 0;
             while let Ok(out) = a.EnumOutputs(oi) {
                 if let Ok(o1) = out.cast::<IDXGIOutput1>() {
-                    adapter = Some(a.clone());
-                    output1 = Some(o1);
-                    break;
+                    if cur == index {
+                        picked = Some((a.clone(), o1));
+                        break;
+                    }
+                    cur += 1;
                 }
                 oi += 1;
             }
-            if output1.is_some() {
+            if picked.is_some() {
                 break;
             }
             ai += 1;
         }
-        let adapter = adapter.ok_or_else(|| "no DXGI output found".to_string())?;
-        let output1 = output1.unwrap();
+        let (adapter, output1) =
+            picked.ok_or_else(|| format!("no DXGI output #{index} (only {cur} outputs)"))?;
 
         // 2. D3D11 device on the duplication adapter (must match, else
         // DuplicateOutput fails with E_INVALIDARG). When creating on an
@@ -164,6 +233,7 @@ impl DxgiSource {
         Ok(Self {
             width,
             height,
+            output_index: index,
             _factory: factory,
             device,
             context,
@@ -226,7 +296,13 @@ impl DxgiSource {
     /// stream, so we surface a clear error the auto chain turns into a GDI
     /// fallback.
     pub fn open_verified() -> Result<Self, String> {
-        let mut s = Self::open()?;
+        Self::open_verified_at(0)
+    }
+
+    /// [`Self::open_verified`] 的选屏版：在 `index`-th 输出上建 duplication
+    /// 并验证首帧（MYS-954 Windows 多屏）。
+    pub fn open_verified_at(index: usize) -> Result<Self, String> {
+        let mut s = Self::open_at(index)?;
         let first = unsafe { s.capture_once(1500)? };
         if first.is_empty() {
             return Err(
@@ -284,7 +360,7 @@ impl FrameSource for DxgiSource {
                     // duplication once (mode switch, session reconnect).
                     if e.contains("ACCESS_LOST") || e.contains("DEVICE_REMOVED") {
                         let (w, h) = (self.width, self.height);
-                        match Self::build() {
+                        match Self::build(self.output_index) {
                             Ok(s) => {
                                 *self = s;
                                 tracing::info!("dxgi duplication rebuilt after access loss");
@@ -310,5 +386,9 @@ impl FrameSource for DxgiSource {
                 }
             }
         }
+    }
+
+    fn list_monitors(&self) -> Vec<MonitorInfo> {
+        list_monitors_static()
     }
 }

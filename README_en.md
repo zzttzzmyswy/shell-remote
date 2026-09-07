@@ -89,12 +89,12 @@ cargo build --release
 | `--token-type` | `rw` | Token type: `rw`, `ro`, or `both` |
 | `--shell` | `/bin/bash` | Shell binary path |
 | `--session-id` | — | Custom session id (5-20 alphanumeric) shown in admin to distinguish devices; **reusable** — a new agent registering with the same id takes over the old session (old tokens invalidated), no more conflict error |
-| `--desktop-capture` | `auto` | Desktop capture backend: `auto` / `x11` / `wayland` / `gdi` / `none` (`none` disables desktop; native Wayland capture needs xdg-desktop-portal, not yet implemented — use X11/XWayland) |
-| `--desktop-codec` | `h264` | Desktop video codec (H.264 only for now; see "Desktop Sharing") |
-| `--desktop-fps` | `15` | Desktop capture frame rate |
-| `--desktop-max-bitrate` | `800` | Maximum encode bitrate (kbps, 800 as specified) |
-| `--desktop-min-bitrate` | `200` | Minimum encode bitrate (kbps, 200 as specified) |
-| `--desktop-display` | `$DISPLAY` | Selected X11 display (e.g. `:1`), defaults to `$DISPLAY` |
+| `--desktop-capture` | `auto` | Desktop capture backend: `auto` / `dxgi` / `gdi` / `x11` / `wayland` / `none` (Windows defaults to DXGI Desktop Duplication with GDI fallback; `wayland` needs a build with `--features wayland` plus xdg-desktop-portal + PipeWire at runtime) |
+| `--desktop-codec` | `av1` | Desktop video codec: `av1` (libaom) / `vp9` (libvpx) / `vp8` / `h264` (openh264); init failure falls back automatically av1→vp9→vp8→h264 |
+| `--desktop-fps` | `30` | Desktop encode fps cap (content-driven QoS: 1 fps static, full fps on activity) |
+| `--desktop-max-bitrate` | `0` | Hard encode bitrate cap (kbps); 0 = auto (rustdesk base_bitrate × quality model, 1080p balanced ≈1388 kbps) |
+| `--desktop-min-bitrate` | `80` | Minimum encode bitrate (kbps) |
+| `--desktop-display` | platform default | Linux: X11 display (e.g. `:1`, defaults to `$DISPLAY`); Windows: monitor enumeration index (`"0"` = primary, `"1"` = second, MYS-954 multi-monitor, switchable live from the session page) |
 
 Output:
 
@@ -109,20 +109,20 @@ Open `http://<relay-ip>:3000`, enter server password and token. Main area: xterm
 
 ## Desktop Sharing
 
-Share the agent's real desktop in agent mode: click the "Desktop" button in the browser session page to open the stream; the picture is H.264-encoded in real time and forwarded over the relay (`/agent/desktop/stream`).
+Share the agent's real desktop in agent mode: click the "Desktop" button in the browser session page to open the stream; the picture is encoded in real time and forwarded over the relay (`/agent/desktop/stream`).
 
 - Start: click the "Desktop" toolbar button in the session page (off by default, click to open) → on `desktop:started`, the browser auto-connects the video stream; click "Terminal" to switch back.
 - Permission: starting/stopping the stream needs an rw token (`requires_write`); watching the stream works with rw or ro.
-- Bitrate: adaptive, **max 800 kbps, min 200 kbps** (`--desktop-max-bitrate` / `--desktop-min-bitrate`, default 800/200).
-- Encoding: software (openh264, BSD license) with `--desktop-codec h264`. **Hardware encoding (VAAPI / Windows Media Foundation) is a planned extension — current version is pure software.**
-- Capture: X11 (incl. XWayland) and Windows GDI are implemented; native Wayland needs xdg-desktop-portal + PipeWire, not included here (the agent prints a clear error; use XWayland).
-- Transport: fragmented MP4 streamed to browser MSE; late joiners start at the most recent key frame (IDR).
-- Other codecs (VP8/VP9/HEVC): omitted to keep the binary small and browsers compatible (x265/libvpx are large and HEVC MSE support is spotty). H.264 has the widest MSE support, matching the requirement "if encoders are too large, ship only the format that compresses well and every browser can decode".
+- Bitrate: adaptive (`--desktop-max-bitrate` / `--desktop-min-bitrate`, kbps; 0 = auto via the rustdesk model base_bitrate × quality, 1080p balanced ≈1388 kbps).
+- Encoding: **pure software** — AV1 (libaom) by default, switchable to VP9 (libvpx) / VP8 / H.264 (openh264) via `--desktop-codec`; init failure falls back av1→vp9→vp8→h264. **No GPU encoding is used** (on Windows DXGI is used for capture only — encoding runs entirely on the CPU; the D3D11 device falls back to WARP rasterization when no GPU driver is usable, so GPU-equipped and GPU-less Windows behave identically). Hardware encoding (VAAPI / Media Foundation) is a planned extension.
+- Grayscale mode: "灰度" toggle in the session desktop control bar saves bandwidth on weak links. On AV1 it switches to a **native libaom monochrome bitstream** (no chroma planes in the stream, ~30% bitrate saving in tests, stream rebuild applies it); on VP9/H.264 chroma is neutralized before encoding (takes effect on the next frame).
+- Multi-monitor: `desktop:started` reports the remote display topology (X11 RANDR outputs / Windows DXGI outputs / GDI monitors), visible in the metrics panel "remote displays" row; with multiple displays a "display" dropdown appears in the session page — selecting one rebuilds the stream on that display (Windows: `"0"` = primary, `"1"` = second, and so on).
+- Capture: Windows DXGI Desktop Duplication (default, multi-monitor selectable) → GDI BitBlt fallback (multi-monitor selectable); Linux X11 (incl. XWayland) and native Wayland (portal + PipeWire, build with `--features wayland`).
+- Transport: fragmented MP4 streamed to browser MSE / WebCodecs; late joiners start at the most recent key frame (IDR).
 
 ```bash
 ./shell-remote agent --relay-url https://relay.example.com \
-  --desktop-capture auto --desktop-fps 15 \
-  --desktop-max-bitrate 800 --desktop-min-bitrate 200
+  --desktop-capture auto --desktop-fps 30
 ```
 
 ## Windows Agent

@@ -59,6 +59,10 @@ pub struct AomEncoder {
     force_kf: bool,
     /// 帧级码率守卫当前档位（set_overshoot_qp 幂等去重）。
     overshoot_level: u32,
+    /// 单色流（MYS-954 灰度增强）：cfg.monochrome=1，码流不含色度平面，
+    /// 全部比特预算给亮度。输入仍是完整 I420 buffer（U/V 填 128），编码器
+    /// 内部忽略色度。Chrome WebCodecs/MSE 按 av01C monochrome 位正常解码。
+    monochrome: bool,
     /// 递增帧时间戳（timebase 1ms，对齐 rustdesk：每帧 +1000/fps）。
     pts_ms: u64,
 }
@@ -78,6 +82,8 @@ impl AomEncoder {
     /// Create an AV1 encoder pinned to `w x h` at `fps` frames/s.
     /// `bitrate_bps` = 目标码率（已由 encoder::target_bitrate 计算）；
     /// `q_min/q_max` = 质量档对应的 QP 区间（rustdesk 同款）。
+    /// `monochrome`（MYS-954 灰度增强）：cfg.monochrome=1 → 码流不含色度
+    /// 平面，全部比特预算给亮度（比"UV 填 128 再压缩"省更多码率）。
     pub fn new(
         w: u32,
         h: u32,
@@ -85,6 +91,7 @@ impl AomEncoder {
         fps: f64,
         q_min: u32,
         q_max: u32,
+        monochrome: bool,
     ) -> Result<Self, String> {
         assert!(w % 2 == 0 && h % 2 == 0, "dimensions must be even for 4:2:0");
         assert!(bitrate_bps > 0 && fps > 0.0);
@@ -105,6 +112,9 @@ impl AomEncoder {
             cfg.g_w = w;
             cfg.g_h = h;
             cfg.g_threads = crate::agent::desktop::encoder::codec_thread_num() as c_uint;
+            // 单色（MYS-954）：码流无色度平面，全部比特给亮度；av1C mono 位
+            // 由编码器序列头自动置位，浏览器按 av01 profile0 正常解码。
+            cfg.monochrome = monochrome as c_uint;
             cfg.g_timebase.num = 1;
             cfg.g_timebase.den = 1000;
             cfg.g_error_resilient = 0;
@@ -222,6 +232,7 @@ impl AomEncoder {
                 quality,
                 force_kf: false,
                 overshoot_level: 0,
+                monochrome,
                 pts_ms: 0,
             })
         }
@@ -500,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_av1_encoder_produces_frames() {
-        let mut enc = AomEncoder::new(320, 240, 400_000, 15.0, 24, 50).expect("av1 init");
+        let mut enc = AomEncoder::new(320, 240, 400_000, 15.0, 24, 50, false).expect("av1 init");
         let mut saw_key = false;
         let mut bytes = 0usize;
         for t in 0..30 {
@@ -527,7 +538,7 @@ mod tests {
     fn test_av1_bitrate_actually_controlled() {
         // 800k 目标下实测码率应收敛在目标附近 (CBR, 固定分辨率 —— 这正是
         // 用户要求"禁止自动降低分辨率"的底气)。
-        let mut enc = AomEncoder::new(1280, 720, 800_000, 30.0, 24, 50).expect("av1 init");
+        let mut enc = AomEncoder::new(1280, 720, 800_000, 30.0, 24, 50, false).expect("av1 init");
         let (mut bytes, mut out) = (0usize, 0usize);
         for t in 0..60u32 {
             let mut buf = solid_i420(1280, 720, (t % 251) as u8);
@@ -559,7 +570,7 @@ mod tests {
         let w = 640usize;
         let h = 360usize;
         let budget_bps: u64 = 150_000; // 极低预算，高熵必爆
-        let mut enc = AomEncoder::new(w as u32, h as u32, budget_bps, 30.0, 24, 50)
+        let mut enc = AomEncoder::new(w as u32, h as u32, budget_bps, 30.0, 24, 50, false)
             .expect("av1 init");
         // 每帧内容 = 平铺平移的伪随机块（相位随 t 全变）→ 帧间几乎无
         // 运动相关性，AV1 每帧都要真实编码 → 持续高熵（模拟拖动复杂窗口）。
@@ -612,7 +623,7 @@ mod tests {
         enc.set_overshoot_qp(0);
         let (recovered_kbps, _) = run_seg(&mut enc, 60, "guard-released");
         // fresh 对照：同内容同预算新编码器的稳态码率（恢复段的合理性基准）。
-        let mut fresh = AomEncoder::new(w as u32, h as u32, budget_bps, 30.0, 24, 50)
+        let mut fresh = AomEncoder::new(w as u32, h as u32, budget_bps, 30.0, 24, 50, false)
             .expect("fresh av1");
         // 先跑一段热身（RC 收敛），再取与 released 段同内容的码率。
         let _ = run_seg(&mut fresh, 0, "fresh-warmup");
@@ -637,7 +648,7 @@ mod tests {
     fn test_av1_1080p_complex_throughput_bench() {
         // 1080p 高熵内容下 realtime 档的实际编码吞吐 —— 复杂内容"4-8s 延时"
         // 的直接瓶颈衡量（MYS-886 需求2）。不设断言, 输出 fps 供人工评估。
-        let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0, 24, 50).expect("av1 init");
+        let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0, 24, 50, false).expect("av1 init");
         let start = std::time::Instant::now();
         let n = 30u32;
         for t in 0..n {
@@ -688,7 +699,7 @@ mod bench_encode_time {
     #[test]
     #[ignore]
     fn av1_1280x800_long_desktop_like_stress() {
-        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45).expect("av1 init");
+        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45, false).expect("av1 init");
         let mut ticks = 0u64;
         let start = std::time::Instant::now();
         // 持续 180s 冲刺（fps=1 → ~180 编码帧，但每帧都是完整桌面帧）
@@ -752,7 +763,7 @@ mod bench_encode_time {
 
     #[test]
     fn bench_av1_1080p_complex_encode_ms_per_frame() {
-        let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0, 10, 30).expect("av1 init");
+        let mut enc = AomEncoder::new(1920, 1080, 800_000, 30.0, 10, 30, false).expect("av1 init");
         let start = std::time::Instant::now();
         let n = 15u32;
         for t in 0..n {
@@ -777,7 +788,7 @@ mod bench_encode_time {
         // 验证：仅高频 set_bitrate（aom_codec_enc_config_set 改 rc_target）+
         // encode 是否独立触发 quantize 崩溃（MYS-886 根因排查：已确认
         // 每帧 set_frame_rate 是崩溃源，此处隔离 set_bitrate）。
-        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45).expect("av1 init");
+        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45, false).expect("av1 init");
         fn frame(t: u64, w: usize, h: usize) -> Vec<u8> {
             let mut buf = vec![128u8; w * h + w * h / 2];
             let wx = ((t as usize * 37) % (w * 2)) as isize - w as isize / 2;
@@ -818,7 +829,7 @@ mod bench_encode_time {
     fn av1_1280x800_static_kbps_check() {
         // 验证静态桌面稳态码率（对比 rustdesk 537kb）：静态帧+每2s关键帧
         // +细微光标扰动，测实际输出字节/秒。
-        let mut enc = AomEncoder::new(1280, 800, 573_000, 30.0, 24, 45).expect("av1 init");
+        let mut enc = AomEncoder::new(1280, 800, 573_000, 30.0, 24, 45, false).expect("av1 init");
         let (w, h) = (1280usize, 800usize);
         let mut base = vec![128u8; w*h + w*h/2];
         let mut total = 0u64; let mut frames = 0u64;
@@ -848,7 +859,7 @@ mod bench_encode_time {
     #[test]
     #[ignore]
     fn av1_dynamic_rc_reconfig_repro() {
-        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45).expect("av1 init");
+        let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45, false).expect("av1 init");
         let mut qos = 1000u32; // 千分比
         let mut phase = 0usize;
         // 模拟桌面内容：静态底 + 移动窗口块
@@ -896,5 +907,48 @@ mod bench_encode_time {
             let _ = enc.encode(&buf).expect("encode");
         }
         eprintln!("av1 dynamic rc 6000 frames OK");
+    }
+
+    /// MYS-954 灰度增强：monochrome 模式——码流不含色度平面。验证：
+    /// 1) monochrome=true 能正常出帧/关键帧；2) 同内容下字节数显著低于
+    /// 彩色模式（色度比特预算转给亮度，总比特省 ≥20%）。
+    #[test]
+    fn test_av1_monochrome_saves_bytes_and_flags() {
+        let (w, h) = (640usize, 360usize);
+        // 内容：彩色噪声纹理（U/V 填充显著偏离 128 的值，模拟彩色桌面）
+        let mut frame = |t: u32| -> Vec<u8> {
+            let mut buf = vec![0u8; w * h + w * h / 2];
+            let seed = t.wrapping_mul(2654435761).wrapping_add(7);
+            for i in 0..buf.len() {
+                buf[i] = ((i as u32)
+                    .wrapping_mul(31)
+                    .wrapping_add(seed)
+                    >> (i % 3) * 5) as u8;
+            }
+            buf
+        };
+        let encode_total = |mono: bool| -> (usize, usize) {
+            let mut enc =
+                AomEncoder::new(w as u32, h as u32, 500_000, 30.0, 24, 50, mono).expect("av1 init");
+            let (mut bytes, mut keys) = (0usize, 0usize);
+            for t in 0..60u32 {
+                let f = enc.encode(&frame(t)).expect("encode");
+                if f.is_idr {
+                    keys += 1;
+                }
+                bytes += f.nalu.len();
+            }
+            (bytes, keys)
+        };
+        let (color_bytes, color_keys) = encode_total(false);
+        let (mono_bytes, mono_keys) = encode_total(true);
+        eprintln!(
+            "av1 mono vs color: {mono_bytes} vs {color_bytes} bytes, keys {mono_keys}/{color_keys}"
+        );
+        assert!(mono_keys > 0 && color_keys > 0, "both must emit key frames");
+        assert!(
+            (mono_bytes as f64) < (color_bytes as f64) * 0.8,
+            "monochrome must save ≥20% bitrate: {mono_bytes} vs {color_bytes}"
+        );
     }
 }
