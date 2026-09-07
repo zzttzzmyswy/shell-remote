@@ -1,6 +1,6 @@
 [package]
 name = "shell-remote"
-version = "0.47.0"
+version = "0.48.0"
 edition = "2021"
 description = "Self-hosted collaborative remote SSH tool with MCP support"
 
@@ -77,10 +77,8 @@ windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics
 # Wayland 原生捕获: portal + PipeWire（构建需 zbus/gstreamer 与系统的
 # xdg-desktop-portal；未启用时 --desktop-capture wayland 给出可操作错误）。
 wayland = ["dep:zbus", "dep:gstreamer", "dep:gstreamer-app"]
-# VP9 软编（libvpx）。默认开启；若目标机没有 libvpx 静态/动态库可关闭，
-# 此时 --desktop-codec vp9 会被拒绝、codecs 列表只剩 h264。
-# AV1 软编（libaom）。两者并存，默认 AV1（压缩率最高的同时码率真实受控，
-# 让用户要求"禁止自动降低分辨率"成立）；agent 可用 --desktop-codec 切 vp9。
-default = ["vp9", "av1"]
-vp9 = []
+# AV1 软编（libaom）+ H.264 软编（OpenH264，默认编译进库）。默认 AV1
+# （压缩率最高的同时码率真实受控，让用户要求"禁止自动降低分辨率"成立）；
+# agent 可用 --desktop-codec 切 h264。MYS-954：VP8/VP9（libvpx）已移除。
+default = ["av1"]
 av1 = []

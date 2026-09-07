@@ -20,8 +20,6 @@ pub mod mp4;
 pub mod openh264;
 pub mod rate;
 pub mod webrtc;
-#[cfg(feature = "vp9")]
-pub mod vpx;
 #[cfg(feature = "av1")]
 pub mod aom;
 
@@ -75,8 +73,8 @@ pub type PostFn = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 pub struct DesktopConfig {
     /// Capture backend: `auto`, `x11`, `wayland`, `gdi`/`windows` or `none`.
     pub capture: String,
-    /// Encoder codec (`h264` / `vp9` / `av1`). Default AV1: 压缩率最高,
-    /// 码率在固定分辨率下真实受控 —— 支撑"禁止自动降低分辨率"。
+    /// Encoder codec (`h264` / `av1`; MYS-954 VP8/VP9 已移除). Default AV1:
+    /// 压缩率最高, 码率在固定分辨率下真实受控 —— 支撑"禁止自动降低分辨率"。
     pub codec: String,
     /// Nominal encode frame rate.
     pub fps: f64,
@@ -102,7 +100,7 @@ pub struct DesktopConfig {
     pub lan_addr: Option<String>,
     /// 单色编码（MYS-954 灰度增强，仅 AV1 生效）：libaom cfg.monochrome=1，
     /// 码流不含色度平面，全部比特预算给亮度。比"UV 填 128 再压缩"省更多
-    /// 码率；VP9/H264 无 monochrome，仍走编码前 UV 置 128 的像素级灰度。
+    /// 码率；H264 无 monochrome，仍走编码前 UV 置 128 的像素级灰度。
     /// 灰度开关切换时 pipeline 按此 flag 重建编码器（与 codec 切换同机制）。
     pub monochrome: bool,
 }
@@ -141,8 +139,6 @@ impl DesktopConfig {
 
     pub fn supports_codec(&self, codec: &str) -> bool {
         codec.eq_ignore_ascii_case("h264")
-            || (cfg!(feature = "vp9")
-                && (codec.eq_ignore_ascii_case("vp9") || codec.eq_ignore_ascii_case("vp8")))
             || (cfg!(feature = "av1") && codec.eq_ignore_ascii_case("av1"))
     }
 }
@@ -239,7 +235,7 @@ fn pooled_frame(pool: &FramePool, w: usize, h: usize, bgra: &[u8]) -> capture::F
 pub struct DesktopKpi {
     /// 桌面流是否在跑（agent 心跳时刻）。
     pub running: bool,
-    /// 当前编码方案（`av1` / `vp9` / `h264`）。
+    /// 当前编码方案（`av1` / `h264`）。
     pub codec: String,
     /// 当前目标帧率（内容驱动：静态 1 / 动态满帧 / 背压降档）。
     pub fps: u32,
@@ -274,7 +270,7 @@ pub struct DesktopManager {
     /// （MYS-886 指标失真根因）。由 DesktopManager::set_clock_offset 注入，
     /// 默认 0 ＝ 未校准（行为与旧版一致）。
     clock_offset: std::sync::atomic::AtomicI64,
-    /// 运行时编码方案（av1/vp9/h264）。初始 = config.codec，前端可通过
+    /// 运行时编码方案（av1/h264）。初始 = config.codec，前端可通过
     /// desktop:codec 热切换（重建桌面流），见 [`Self::set_codec`]。
     codec: std::sync::RwLock<String>,
     /// 运行时目标编码帧率（内容驱动：静态 1fps / 动态满帧 / 解码背压才降帧，
@@ -309,7 +305,7 @@ pub struct DesktopManager {
     /// 运行时即时生效，不重建编码器/不重启流。
     gray: Arc<std::sync::atomic::AtomicBool>,
     /// 单色编码（MYS-954 灰度增强）：AV1 时随灰度开关切换，重建桌面流生效
-    /// （libaom monochrome 码流）。与 gray flag 独立存储——VP9/H264 下
+    /// （libaom monochrome 码流）。与 gray flag 独立存储——H264 下
     /// gray 只翻 flag，monochrome 恒 false。
     monochrome: std::sync::RwLock<bool>,
     /// 浏览器关键帧请求（desktop:reqkey → 本 flag → 编码循环 force_idr）。
@@ -391,7 +387,7 @@ impl DesktopManager {
     ///   码流不含色度平面，全部比特给亮度——比"UV 填 128 再压缩"省更多
     ///   码率；且 AV1 是默认 codec，弱网省带宽主要走这条）。重建为低频
     ///   操作可接受（set_codec/set_quality 同机制）。
-    /// - VP9/H264：无 monochrome 能力，翻转编码前 UV 置 128 的像素级灰度
+    /// - H264：无 monochrome 能力，翻转编码前 UV 置 128 的像素级灰度
     ///   flag（下一帧即时生效，不重建）。AV1 上该 flag 同时保留——monochrome
     ///   下编码器忽略色度，无副作用。
     pub async fn set_gray(&self, enabled: bool, post: PostFn) -> Result<(), String> {
@@ -547,7 +543,7 @@ impl DesktopManager {
     /// QoS 动态调整目标帧率（内容驱动：静态 1fps/动态满帧/解码背压才降帧，下限
     /// 15）。编码循环按此值动态改 tick 周期。
     ///
-    /// 上限不是 60：软编（VP9/AV1 1080p）单帧编码 30-60ms，16.7ms 的 60fps
+    /// 上限不是 60：软编（AV1 1080p）单帧编码 30-60ms，16.7ms 的 60fps
     /// 预算编不出来只会让编码队列越积越深、端到端延时飙升（实测 200-600ms，
     /// MYS-886 卡顿回归根因之一）。上限取 `--desktop-fps`（默认 30），用户
     /// 显式要求更高帧率才提升。
@@ -569,7 +565,7 @@ impl DesktopManager {
         tracing::info!(qos_scale = permille, "desktop QoS: bitrate scale adjusted");
     }
 
-    /// 运行时热切换编码方案（av1/vp9/h264）。仅当桌面正在运行时重建
+    /// 运行时热切换编码方案（av1/h264）。仅当桌面正在运行时重建
     /// 桌面流（stop 旧流 → start 新流，前端按新 init 段的 codec box
     /// 自动切换解码）。codec 不变时是 no-op。
     pub async fn set_codec(&self, codec: &str, post: PostFn) -> Result<(), String> {
@@ -784,10 +780,6 @@ impl DesktopManager {
             "running": self.is_running(),
             "codecs": if cfg.enabled() {
                 let mut v = vec!["h264"];
-                if cfg!(feature = "vp9") {
-                    v.push("vp9");
-                    v.push("vp8");
-                }
                 if cfg!(feature = "av1") {
                     v.push("av1");
                 }
@@ -821,7 +813,7 @@ impl Drop for DesktopManager {
 
 /// Encode-resolution scale steps (fraction of the capture size). Length 1
 /// disables the adaptive resolution entirely — MYS-886: 用户明确"禁止自动
-/// 降低分辨率"(对比 rustdesk 太糊)。码率完全交给 AV1/VP9 CBR 在固定分辨率
+/// 降低分辨率"(对比 rustdesk 太糊)。码率完全交给 AV1 CBR 在固定分辨率
 /// 下控制(两者实测 60/60 帧码率受控在预算 ~10-60% 内)。
 /// 若将来要恢复自适应分辨率, 改回 &[1.0, 0.75, 0.5, 0.375] 即可。
 const SCALES: &[f64] = &[1.0];
@@ -864,7 +856,7 @@ pub const KF_ACTIVE_BYTES_FRAME: f64 = 2048.0;
 /// 静止心跳（MYS-886 需求7-1：静止 4s 一个 IDR，带宽显著低于 relay 观看者
 /// 30s 空闲超时，不会误判断流）。
 
-/// 帧级码率守卫（MYS-886 用户方案：拖动复杂窗口时 AV1/VP9 CBR 瞬时
+/// 帧级码率守卫（MYS-886 用户方案：拖动复杂窗口时 AV1 CBR 瞬时
 /// overshoot 3-4×目标（实测 4000kbps 顶满上行 → fps 塌到 1）。ABR 每 10 帧
 /// 才评估、QoS 每 3s 才调 ratio——都太慢。guard 每帧统计 1s 滑窗实际字节率，
 /// 超预算立即收紧编码器 overshoot QP 档（帧级快环），低于预算 60% 且稳住
@@ -953,7 +945,7 @@ impl BitrateGuard {
 /// The capture → convert → encode → mux → post loop.
 /// Handles OpenH264's penalty frame-skipping (observed on high-motion
 /// 编码器降级决策（R5#84 慢帧 / R5#85 故障热备统一出口）：返回应降级到的
-/// 下一档 codec（av1→vp9→vp8→h264），None = 不降。触发条件二选一：
+/// 下一档 codec（av1→h264，MYS-954 VP8/VP9 已移除），None = 不降。触发条件二选一：
 /// 连续 [`SLOW_ENCODE_TRIGGER`] 帧单帧编码 > [`SLOW_ENCODE_MS`]（CPU 跑
 /// 不动，慢），或连续 [`ENCODE_ERR_TRIGGER`] 帧 encode 返回 Err（编码器
 /// 实际故障/崩溃，坏）。已降级过（`already_degraded`，一次性防重建风暴）
@@ -1201,7 +1193,7 @@ async fn run_desktop_pipeline(
     let mut last_static: Option<(usize, usize, Vec<u8>)> = None;
     let mut last_static_at = std::time::Instant::now();
     // 编码耗时预算（R2 甲19/20 / R5#84）：连续 ≥10 帧单帧编码 >66ms 判定
-    // 当前 codec 在软编上不堪重负，降级到更低复杂度的 codec（av1→vp9→h264，
+    // 当前 codec 在软编上不堪重负，降级到更低复杂度的 codec（av1→h264，
     // 复用 fallback 链）。避免"持续超帧预算 → e2e 堆积 → QoS 误判拥塞"的
     // 假阳性路径；降级一次性，成功后重置计数。
     let mut slow_encode_streak: u32 = 0;
@@ -1548,7 +1540,7 @@ async fn run_desktop_pipeline(
 
         if encoded.is_idr && mp4_cfg.is_none() {
             // 首个关键帧（或分辨率重配后）携带 codec 参数集（H.264: SPS/PPS；
-            // VP9: profile/level），构建 mux config 并下发 init。
+            // AV1: profile/level），构建 mux config 并下发 init。
             if let Some(sample) = enc.mux_sample(&encoded) {
                 let c = mp4::Mp4Config {
                     width: enc_w as u32,
@@ -2892,14 +2884,14 @@ mod tests {
         // 未达阈值：不降。
         assert_eq!(next_degrade_codec("av1", 9, 0, false), None, "slow <10 不降");
         assert_eq!(next_degrade_codec("av1", 0, 4, false), None, "err <5 不降");
-        // #84 慢帧：连续 10 帧 >66ms → 降一档（av1→vp9）。
-        assert_eq!(next_degrade_codec("av1", 10, 0, false).as_deref(), Some("vp9"));
+        // #84 慢帧：连续 10 帧 >66ms → 降一档（av1→h264，MYS-954 VP8/VP9 已移除）。
+        assert_eq!(next_degrade_codec("av1", 10, 0, false).as_deref(), Some("h264"));
         // #85 故障热备：连续 5 帧 encode Err → 降一档。
-        assert_eq!(next_degrade_codec("av1", 0, 5, false).as_deref(), Some("vp9"));
+        assert_eq!(next_degrade_codec("av1", 0, 5, false).as_deref(), Some("h264"));
         // 两路径都达：仍只降一档（复用 fallback 链）。
-        assert_eq!(next_degrade_codec("vp9", 10, 5, false).as_deref(), Some("vp8"));
+        assert_eq!(next_degrade_codec("av1", 10, 5, false).as_deref(), Some("h264"));
         // 已降级过：不再降（一次性防重建风暴）。
-        assert_eq!(next_degrade_codec("vp9", 10, 5, true), None);
+        assert_eq!(next_degrade_codec("av1", 10, 5, true), None);
         // h264 末档：无更低 codec，不降（丢帧追新兜底）。
         assert_eq!(next_degrade_codec("h264", 10, 5, false), None);
     }
@@ -3131,9 +3123,7 @@ mod tests {
         let caps = dm.capabilities_json();
         assert_eq!(caps["available"], true);
         assert!(caps["codecs"].as_array().unwrap().contains(&serde_json::json!("h264")));
-        if cfg!(feature = "vp9") {
-            assert!(caps["codecs"].as_array().unwrap().contains(&serde_json::json!("vp8")));
-        }
+        assert!(caps["codecs"].as_array().unwrap().contains(&serde_json::json!("av1")));
     }
 
     /// 阶段2 LAN 直连：capabilities_json 的 `lan_addrs` 默认 []，注入后含
@@ -3160,8 +3150,9 @@ mod tests {
     fn test_supports_codec_known() {
         let cfg = DesktopConfig::default();
         assert!(cfg.supports_codec("h264"));
-        assert_eq!(cfg.supports_codec("vp9"), cfg!(feature = "vp9"));
-        assert_eq!(cfg.supports_codec("vp8"), cfg!(feature = "vp9"));
+        assert!(cfg.supports_codec("av1"));
+        assert!(!cfg.supports_codec("vp9"));
+        assert!(!cfg.supports_codec("vp8"));
         assert!(!cfg.supports_codec("hevc"));
     }
 

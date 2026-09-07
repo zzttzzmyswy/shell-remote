@@ -1,16 +1,16 @@
 //! Codec-agnostic video encoder abstraction for the desktop pipeline.
 //!
-//! Both `openh264::H264Encoder` and `vpx::Vp9Encoder` implement
+//! Both `openh264::H264Encoder` and `aom::AomEncoder` implement
 //! [`VideoEncoder`] so `run_desktop_pipeline` can be written once. The
 //! returned [`EncodedFrame`] carries codec-specific parameter sets (SPS/PPS
-//! for H.264; profile/level for VP9 via [`VideoEncoder::mux_sample`]).
+//! for H.264; profile/level for AV1 via [`VideoEncoder::mux_sample`]).
 
-/// One encoded picture. `nalu` is Annex-B for H.264, a raw VP9 frame for VP9.
+/// One encoded picture. `nalu` is Annex-B for H.264, a raw AV1 frame for AV1.
 /// `sps`/`pps` (H.264) present on IDR frames.
 #[derive(Debug)]
 pub struct EncodedFrame {
     pub nalu: Vec<u8>,
-    /// True when this frame is a random-access point (IDR / VP9 key frame).
+    /// True when this frame is a random-access point (IDR / AV1 key frame).
     pub is_idr: bool,
     pub sps: Option<Vec<u8>>,
     pub pps: Option<Vec<u8>>,
@@ -30,7 +30,7 @@ pub trait VideoEncoder: Send {
     fn fps(&self) -> f64;
     fn width(&self) -> u32;
     fn height(&self) -> u32;
-    /// `h264` | `vp9`.
+    /// `h264` | `av1`.
     fn codec(&self) -> &'static str;
     /// Produce the MP4 sample description (codec parameter set) used to build
     /// the init segment. H.264 needs SPS/PPS from an IDR frame; VP9 carries
@@ -129,28 +129,24 @@ pub fn base_bitrate(width: u32, height: u32) -> u64 {
     (preset_bitrate as f64 * (pixels as f64 / preset_pixels as f64)).round() as u64
 }
 
-/// rustdesk 同款 QP 区间映射（`vpxcodec::calc_q_values`）：
-/// q_min∈[0,36]、q_max∈[37,56]，高质量档区间更紧（清晰）、极速档更松（模糊但快）。
-pub fn calc_q_values(ratio: f32) -> (u32, u32) {
-    let b = (ratio * 100.0) as u32;
-    let b = b.min(200);
-    let (q_min1, q_min2) = (36u32, 0u32);
-    let (q_max1, q_max2) = (56u32, 37u32);
-    let t = b as f32 / 200.0;
-    let q_min = (((1.0 - t) * q_min1 as f32 + t * q_min2 as f32).round() as u32).clamp(q_min2, q_min1);
-    let q_max = (((1.0 - t) * q_max1 as f32 + t * q_max2 as f32).round() as u32).clamp(q_max2, q_max1);
-    (q_min, q_max)
-}
-
 /// rustdesk AV1 专用 QP 区间（`libs/scrap/src/common/aom.rs calc_q_values`）：
 /// q_min∈[24,5]、q_max∈[45,25]。与 VP9（q_min∈[36,0]/q_max∈[56,37]）不同档。
 /// AV1 的 QP 标度更紧（libaom 量化 5-45 覆盖全质量谱），直接套 VP9 的
 /// 区间会在低 quality 时过度量化（卡顿/糊）或高 quality 超预算。
+///
+/// MYS-954：VP8/VP9 已移除，VP9 式 `calc_q_values`（q_max∈[37,56]）随之
+/// 删除，这里只剩 AV1 的映射。
+///
+/// MYS-954 码率失控修复：q_max 高端由 45 放开到 63。实时屏显在"大量移动
+/// 画面"下 CBR 预算不足时，RC 需要把 QP 压得足够狠才能把瞬时码率拖回预算
+/// （旧上限 38~45 在 720p/1080p 高动态下实测压不下来，码率冲到预算数倍）。
+/// q_min 端点不动（低 QP = 清晰，正常内容下 RC 不会用到 q_max；q_max 只
+/// 是钳制，普通场景无画质代价）。
 pub fn calc_q_values_aom(ratio: f32) -> (u32, u32) {
     let b = (ratio * 100.0) as u32;
     let b = b.min(200);
     let (q_min1, q_min2) = (24u32, 5u32);
-    let (q_max1, q_max2) = (45u32, 25u32);
+    let (q_max1, q_max2) = (63u32, 35u32);
     let t = b as f32 / 200.0;
     let q_min = (((1.0 - t) * q_min1 as f32 + t * q_min2 as f32).round() as u32).clamp(q_min2, q_min1);
     let q_max = (((1.0 - t) * q_max1 as f32 + t * q_max2 as f32).round() as u32).clamp(q_max2, q_max1);
@@ -184,15 +180,8 @@ pub fn new_encoder(
     monochrome: bool,
 ) -> Result<Box<dyn VideoEncoder>, String> {
     let target = target_bitrate(w, h, max_bps, quality);
-    let (q_min, q_max) = calc_q_values(quality);
     match codec.to_ascii_lowercase().as_str() {
         "h264" => crate::agent::desktop::openh264::H264Encoder::new(w, h, target, fps)
-            .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
-        #[cfg(feature = "vp9")]
-        "vp9" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, target, fps, q_min, q_max, false)
-            .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
-        #[cfg(feature = "vp9")]
-        "vp8" => crate::agent::desktop::vpx::Vp9Encoder::new(w, h, target, fps, q_min, q_max, true)
             .map(|e| Box::new(e) as Box<dyn VideoEncoder>),
         #[cfg(feature = "av1")]
         "av1" => {
@@ -207,8 +196,8 @@ pub fn new_encoder(
 }
 
 /// 自动降级创建编码器（rustdesk `set_fallback` 行为）：请求的 codec 初始化
-/// 失败时按 `av1 → vp9 → h264` 顺序回退，返回 (编码器, 实际生效 codec)。
-/// 用于硬件不可用/静态链接缺失时保证桌面流仍能启动。
+/// 失败时按 `av1 → h264` 顺序回退（MYS-954：VP8/VP9 已移除），返回
+/// (编码器, 实际生效 codec)。用于硬件不可用/静态链接缺失时保证桌面流仍能启动。
 pub fn create_encoder_fallback(
     codec: &str,
     w: u32,
@@ -220,11 +209,9 @@ pub fn create_encoder_fallback(
 ) -> Result<(Box<dyn VideoEncoder>, String), String> {
     let codec_l = codec.to_ascii_lowercase();
     let chain: Vec<&str> = match codec_l.as_str() {
-        "av1" => vec!["av1", "vp9", "vp8", "h264"],
-        "vp9" => vec!["vp9", "vp8", "h264"],
-        "vp8" => vec!["vp8", "h264"],
+        "av1" => vec!["av1", "h264"],
         "h264" => vec!["h264"],
-        other => vec![other, "vp9", "vp8", "h264"],
+        other => vec![other, "h264"],
     };
     let mut last_err = String::new();
     for c in chain {
@@ -236,11 +223,11 @@ pub fn create_encoder_fallback(
     Err(format!("all encoders failed — {last_err}"))
 }
 
-/// 返回编码复杂度顺序中的下一档更低 codec（`av1 → vp9 → vp8 → h264`）。
-/// 用于编码耗时预算降级（R5#84）：当前 codec 软编跑不动时换更廉价的档。
-/// 已是 h264（末档）返回 `None`。
+/// 返回编码复杂度顺序中的下一档更低 codec（`av1 → h264`，MYS-954：
+/// VP8/VP9 已移除）。用于编码耗时预算降级（R5#84）：当前 codec 软编跑不动
+/// 时换更廉价的档。已是 h264（末档）返回 `None`。
 pub fn next_lower_codec(codec: &str) -> Option<String> {
-    let order = ["av1", "vp9", "vp8", "h264"];
+    let order = ["av1", "h264"];
     let idx = order.iter().position(|c| *c == codec)?;
     if idx + 1 < order.len() {
         Some(order[idx + 1].to_string())
@@ -297,20 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn test_calc_q_values_maps_quality() {
-        // 高质量档 QP 更紧（清晰），极速档更松。
-        let (q_min, q_max) = calc_q_values(QUALITY_BEST);
-        assert!(q_min < q_max && q_min <= 36 && q_max >= 37);
-        let (q_min_s, q_max_s) = calc_q_values(QUALITY_SPEED);
-        assert!(q_min_s >= q_min && q_max_s >= q_max, "speed 应比 best 更松");
-    }
-
-    #[test]
     fn test_next_lower_codec_chain() {
-        // 编码复杂度降级链 av1→vp9→vp8→h264；末档为 None（不再降）。
-        assert_eq!(next_lower_codec("av1").as_deref(), Some("vp9"));
-        assert_eq!(next_lower_codec("vp9").as_deref(), Some("vp8"));
-        assert_eq!(next_lower_codec("vp8").as_deref(), Some("h264"));
+        // 编码复杂度降级链 av1→h264（MYS-954：VP8/VP9 已移除）；末档为 None（不再降）。
+        assert_eq!(next_lower_codec("av1").as_deref(), Some("h264"));
         assert_eq!(next_lower_codec("h264"), None);
         // 未知 codec：不猜测降级（保持原样，防把未知串错降）。
         assert_eq!(next_lower_codec("wegotno"), None);

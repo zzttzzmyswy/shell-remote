@@ -1,7 +1,7 @@
-//! Fragmented MP4 (fMP4) muxer for streaming H.264 / VP9 to browser MSE.
+//! Fragmented MP4 (fMP4) muxer for streaming H.264 / AV1 to browser MSE.
 //!
 //! Produces two kinds of byte sequences:
-//! - `mp4_init_segment`: `ftyp` + `moov` (incl. `avcC`/`vpcC` sample entry) —
+//! - `mp4_init_segment`: `ftyp` + `moov` (incl. `avcC`/`av1C` sample entry) —
 //!   sent once per stream so the browser can initialize its `SourceBuffer`.
 //! - `mp4_fragment`: one `moof` + `mdat` per encoded frame — appended to the
 //!   source buffer for as long as the viewer stays connected; each fragment
@@ -12,23 +12,18 @@
 //! A viewer that joins mid-stream needs the current init segment again — the
 //! relay caches and replays it (see `relay::desktop`).
 
-/// 视频采样描述：codec 参数集（H.264 走 avcC；VP9 走 vpcC；AV1 走 av1C）。
+/// 视频采样描述：codec 参数集（H.264 走 avcC；AV1 走 av1C）。
 #[derive(Clone, Debug)]
 pub enum VisualSample {
     /// H.264: bare SPS/PPS NAL (no start code, no length prefix), carried in
     /// the `avcC` box.
     H264 { sps: Vec<u8>, pps: Vec<u8> },
-    /// VP9: profile_idc / level_idc, carried in the `vpcC` box.
-    Vp9 { profile: u8, level: u8 },
-    /// VP8: 与 VP9 同构的 `vpcC` config record，但 sample entry 用 `vp08`
-    /// box、codec 串用 `vp08.*`（Chrome 用它区分 VP8/VP9 解码器）。
-    Vp8 { profile: u8, level: u8 },
     /// AV1: profile / level (level is AV1 level_idx, carried in `av1C`).
     Av1 { profile: u8, level: u8 },
 }
 
-/// Parameters that describe the encoded stream (resolved from SPS/PPS or VP9
-/// config).
+/// Parameters that describe the encoded stream (resolved from SPS/PPS or the
+/// sample config).
 #[derive(Clone, Debug)]
 pub struct Mp4Config {
     pub width: u32,
@@ -41,8 +36,8 @@ pub struct Mp4Config {
 
 impl Mp4Config {
     /// The codec string the browser uses to create its source buffer /
-    /// WebCodecs decoder. H.264 → `avc1.xxxxxx`（取自 SPS）; VP9 →
-    /// `vp09.PP.LL.DD`（profile/level/bitdepth）。
+    /// WebCodecs decoder. H.264 → `avc1.xxxxxx`（取自 SPS）; AV1 →
+    /// `av01.P.LLT.DD`。
     pub fn codec_string(&self) -> String {
         match &self.sample {
             VisualSample::H264 { sps, .. } => {
@@ -52,12 +47,6 @@ impl Mp4Config {
                     (0x64, 0x00, 0x1f) // baseline-ish fallback
                 };
                 format!("avc1.{:02X}{:02X}{:02X}", profile, compat, level)
-            }
-            VisualSample::Vp9 { profile, level } => {
-                format!("vp09.{:02}.{:02}.08", profile, level)
-            }
-            VisualSample::Vp8 { profile, level } => {
-                format!("vp08.{:02}.{:02}.08", profile, level)
             }
             VisualSample::Av1 { profile, level } => {
                 // AV1 codec string: av01.P.LLT.DD；P=profile, LL=seq_level_idx
@@ -175,7 +164,7 @@ fn dref() -> Vec<u8> {
 fn avcc(cfg: &Mp4Config) -> Vec<u8> {
     let (sps, pps) = match &cfg.sample {
         VisualSample::H264 { sps, pps } => (sps, pps),
-        VisualSample::Vp9 { .. } | VisualSample::Vp8 { .. } | VisualSample::Av1 { .. } => {
+        VisualSample::Av1 { .. } => {
             unreachable!("avcC is h264-only")
         }
     };
@@ -196,7 +185,6 @@ fn avcc(cfg: &Mp4Config) -> Vec<u8> {
     box_of(b"avcC", &p)
 }
 
-/// VP9 codec configuration record (`vpcC`). 8-bit 4:2:0, BT.709.
 fn avc1(cfg: &Mp4Config) -> Vec<u8> {
     let avcc_box = avcc(cfg);
     let mut p = Vec::new();
@@ -218,29 +206,9 @@ fn avc1(cfg: &Mp4Config) -> Vec<u8> {
     box_of(b"avc1", &p)
 }
 
-fn vpcc(profile: u8, level: u8) -> Vec<u8> {
-    // version/flags (full box, version 1) then:
-    //   profile(1) level(1) bitDepth(4) chromaSubsampling(3) videoFullRange(1)
-    //   colourPrimaries(1) transferCharacteristics(1) matrixCoefficients(1)
-    //   codecInitializationDataSize(2)
-    let mut p = Vec::new();
-    p.push(1); // full box version
-    p.extend_from_slice(&[0, 0, 0]); // flags
-    p.push(profile);
-    p.push(level);
-    p.push((8u8 << 4) | (1u8 << 1)); // bitDepth=8, chromaSubsampling=1 (4:2:0)
-    p.push(1); // colourPrimaries = BT.709
-    p.push(1); // transferCharacteristics = BT.709
-    p.push(1); // matrixCoefficients = BT.709
-    p.extend_from_slice(&u16b(0)); // codecInitializationDataSize
-    box_of(b"vpcC", &p)
-}
-
 fn sample_entry(cfg: &Mp4Config) -> Vec<u8> {
     match &cfg.sample {
         VisualSample::H264 { .. } => avc1(cfg),
-        VisualSample::Vp9 { profile, level } => vp09(cfg, *profile, *level),
-        VisualSample::Vp8 { profile, level } => vp08(cfg, *profile, *level),
         VisualSample::Av1 { profile, level } => av01(cfg, *profile, *level),
     }
 }
@@ -301,41 +269,6 @@ fn av01(cfg: &Mp4Config, profile: u8, level: u8) -> Vec<u8> {
     p.extend_from_slice(&u16b(0xffff)); // pre_defined
     p.extend_from_slice(&av1c_box);
     box_of(b"av01", &p)
-}
-
-fn vp08(cfg: &Mp4Config, profile: u8, level: u8) -> Vec<u8> {
-    // VP8 的 sample entry 与 VP9 完全同构（同一个 vpcC config record），
-    // 仅 box 名换 `vp08`。ISO/IEC 14496-15: VP8CodecConfigurationRecord
-    // 复用 VPCConfigurationRecord。
-    let p = vpx_sample_payload(cfg, profile, level);
-    box_of(b"vp08", &p)
-}
-
-fn vp09(cfg: &Mp4Config, profile: u8, level: u8) -> Vec<u8> {
-    let p = vpx_sample_payload(cfg, profile, level);
-    box_of(b"vp09", &p)
-}
-
-/// VP8/VP9 共用 sample entry payload（visual sample entry 骨架 + vpcC）。
-fn vpx_sample_payload(cfg: &Mp4Config, profile: u8, level: u8) -> Vec<u8> {
-    let vpcc_box = vpcc(profile, level);
-    let mut p = Vec::new();
-    p.extend_from_slice(&[0u8; 6]); // reserved
-    p.extend_from_slice(&u16b(1)); // data_reference_index
-    p.extend_from_slice(&u16b(0)); // pre_defined
-    p.extend_from_slice(&[0u8; 2]); // reserved
-    p.extend_from_slice(&[0u8; 12]); // pre_defined
-    p.extend_from_slice(&u16b(cfg.width as u16));
-    p.extend_from_slice(&u16b(cfg.height as u16));
-    p.extend_from_slice(&u32b(0x00480000)); // horizresolution
-    p.extend_from_slice(&u32b(0x00480000)); // vertresolution
-    p.extend_from_slice(&u32b(0)); // reserved
-    p.extend_from_slice(&u16b(1)); // frame_count
-    p.extend_from_slice(&[0u8; 32]); // compressorname
-    p.extend_from_slice(&u16b(24)); // depth
-    p.extend_from_slice(&u16b(0xffff)); // pre_defined
-    p.extend_from_slice(&vpcc_box);
-    p
 }
 
 fn stsd(cfg: &Mp4Config) -> Vec<u8> {
@@ -700,24 +633,6 @@ mod tests {
         }
     }
 
-    fn vp8_cfg() -> Mp4Config {
-        Mp4Config {
-            width: 320,
-            height: 240,
-            fps: 15.0,
-            sample: VisualSample::Vp8 { profile: 0, level: 10 },
-        }
-    }
-
-    fn vp9_cfg() -> Mp4Config {
-        Mp4Config {
-            width: 320,
-            height: 240,
-            fps: 15.0,
-            sample: VisualSample::Vp9 { profile: 0, level: 10 },
-        }
-    }
-
     fn av1_cfg() -> Mp4Config {
         Mp4Config {
             width: 320,
@@ -759,16 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn test_vp9_init_segment_contains_vpcc() {
-        let init = mp4_init_segment(&vp9_cfg());
-        assert_eq!(&init[4..8], b"ftyp");
-        assert!(init.windows(8).any(|w| &w[4..8] == b"moov"));
-        assert!(init.windows(4).any(|w| w == b"vpcC"), "vp9 init must carry vpcC");
-        assert!(init.windows(4).any(|w| w == b"vp09"), "vp9 sample entry must be vp09");
-        assert_eq!(init.len() as u32, box_total(&init, 0));
-    }
-
-    #[test]
     fn test_av1_init_segment_contains_av1c() {
         let init = mp4_init_segment(&av1_cfg());
         assert_eq!(&init[4..8], b"ftyp");
@@ -784,22 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vp8_init_segment_contains_vpcc() {
-        let init = mp4_init_segment(&vp8_cfg());
-        assert_eq!(&init[4..8], b"ftyp");
-        assert!(init.windows(8).any(|w| &w[4..8] == b"moov"));
-        assert!(init.windows(4).any(|w| w == b"vpcC"), "vp8 init must carry vpcC");
-        assert!(init.windows(4).any(|w| w == b"vp08"), "vp8 sample entry must be vp08");
-        assert!(!init.windows(4).any(|w| w == b"vp09"), "vp8 init must NOT be vp09");
-        assert_eq!(init.len() as u32, box_total(&init, 0));
-    }
-
-    #[test]
     fn test_codec_string() {
         let c = cfg();
         assert_eq!(c.codec_string(), "avc1.42001F");
-        assert_eq!(vp9_cfg().codec_string(), "vp09.00.10.08");
-        assert_eq!(vp8_cfg().codec_string(), "vp08.00.10.08");
         assert_eq!(av1_cfg().codec_string(), "av01.0.04M.08");
     }
 

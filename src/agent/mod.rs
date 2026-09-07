@@ -1802,7 +1802,7 @@ async fn run_session(
 
                                 "desktop:codec" => {
                                     // 热切换编码方案（web 页编码器下拉）：
-                                    // av1/vp9/h264，切换后自动重建桌面流。
+                                    // av1/h264，切换后自动重建桌面流。
                                     // R5#2 控制命令 ack：回 cmd-ack {seq, ok} 供
                                     // 浏览器确认操作结果（弱网/高负载下可见反馈）。
                                     let codec = msg
@@ -2006,7 +2006,7 @@ async fn run_session(
 
                                 "desktop:gray" => {
                                     // 灰度模式开关（web 桌面控制栏，弱网省带宽）：
-                                    // VP9/H264 翻编码前 UV 置 128 flag（即时生效）；
+                                    // H264 翻编码前 UV 置 128 flag（即时生效）；
                                     // AV1 切 monochrome 并重建流（码流无色度平面，
                                     // 省更多码率）。R5#2 命令 ack：失败带 error。
                                     let enabled = msg

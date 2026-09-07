@@ -86,8 +86,6 @@ struct Transport {
 fn build_capabilities() -> Vec<String> {
     let mut caps: Vec<String> = Vec::new();
     caps.push("codec:h264".to_string());
-    #[cfg(feature = "vp9")]
-    caps.push("codec:vp9".to_string());
     #[cfg(feature = "av1")]
     caps.push("codec:av1".to_string());
     #[cfg(target_os = "linux")]
@@ -479,12 +477,10 @@ mod tests {
     fn test_build_capabilities_platform_accurate() {
         // R5#44 细化：capability 声明真实——codec 按编译 feature，后端按平台。
         let caps = build_capabilities();
-        // codec：h264 恒在，av1/vp9 按 feature。
+        // codec：h264 恒在，av1 按 feature。
         assert!(caps.iter().any(|c| c == "codec:h264"));
         #[cfg(feature = "av1")]
         assert!(caps.iter().any(|c| c == "codec:av1"));
-        #[cfg(feature = "vp9")]
-        assert!(caps.iter().any(|c| c == "codec:vp9"));
         // 平台后端声明真实：非 Windows 不声明 Windows 专属 GDI/DXGI。
         #[cfg(not(target_os = "windows"))]
         assert!(
