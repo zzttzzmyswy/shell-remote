@@ -131,8 +131,8 @@ enum Command {
         #[arg(long, default_value = "auto")]
         desktop_capture: String,
 
-        /// Desktop encoder codec: av1 (libaom, default), vp9 (libvpx) or
-        /// h264 (OpenH264). av1/vp9 只在对应 feature 开启时可用。
+        /// Desktop encoder codec: av1 (libaom, default) or h264 (OpenH264)。
+        /// MYS-954：VP8/VP9（libvpx）已移除。
         #[arg(long, default_value = "av1")]
         desktop_codec: String,
 

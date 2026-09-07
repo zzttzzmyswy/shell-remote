@@ -124,14 +124,17 @@ impl AomEncoder {
             cfg.rc_target_bitrate = (bitrate_bps / 1000).min(u32::MAX as u64) as c_uint;
             cfg.rc_min_quantizer = q_min;
             cfg.rc_max_quantizer = q_max;
-            // rustdesk AV1 (webrtc 配置)：undershoot/overshoot 各 50%，缓冲
-            // 600/600/1000（初始/最优/总量）—— 比默认更紧的码率边界 + 更快
-            // 填满 rc buffer，降低首帧等待与码率收敛延迟（MYS-886 卡顿修复）。
-            cfg.rc_undershoot_pct = 50;
-            cfg.rc_overshoot_pct = 50;
-            cfg.rc_buf_initial_sz = 600;
-            cfg.rc_buf_optimal_sz = 600;
-            cfg.rc_buf_sz = 1000;
+            // 码率边界/缓冲（MYS-954 码率失控修复）：rustdesk 沿用的 VOD 型
+            // 600/600/1000ms + overshoot 50% 对实时桌面过松——大动态高熵下
+            // 允许码率冲到目标 1.5 倍并持续近 1 秒（实测 2000kbps+，带宽过载）。
+            // 收紧到实时档：overshoot ±25%、缓冲 100/100/150ms。CBR 反应变快，
+            // 爆发被限到目标×1.25 级、均码率贴预算；屏幕文字的低 min_q 保留
+            // （清晰度来源），高动态交给缓冲+guard 兜底。
+            cfg.rc_undershoot_pct = 25;
+            cfg.rc_overshoot_pct = 25;
+            cfg.rc_buf_initial_sz = 100;
+            cfg.rc_buf_optimal_sz = 100;
+            cfg.rc_buf_sz = 150;
             // AV1 不丢帧：rustdesk aom.rs 不设 rc_dropframe_thresh（默认 0）。
             // 我 v0.27 曾错误套用 VP9 的 dropframe=25，实测 60 帧只输出 20 帧
             // （丢 2/3）——用户局域网"丢包/卡顿"的直接来源。AV1 CBR 靠
@@ -141,7 +144,18 @@ impl AomEncoder {
             // 4.5s / 活跃 1.5s + 首帧强制），编码器不自动插关键帧。
             cfg.kf_mode = aom_sys::aom_kf_mode_AOM_KF_DISABLED;
             cfg.kf_min_dist = 0;
-            cfg.kf_max_dist = 0;
+            // MYS-954 崩溃根因修复：`kf_max_dist` 必须非 0。libaom 用
+            // `kf_cfg.key_freq_max == 0` 判定 all-intra 模式，从而按
+            // `AOM_ENC_ALLINTRA_BORDER(64)` 分配参考帧缓冲边框；但我们实际
+            // 编的是带运动搜索的 inter 帧 + 128x128 SB，1080p 底部 SB 下探
+            // 72px > 64px 边框 → var-based 分区 chroma_check 的色度 SAD 读
+            // 参考帧越界（SIGSEGV，AV1 专属、SIMD 无关、多轮 6+ 次复现）。
+            // 设非 0 后 all-intra 判定为假，参考帧用 inter 边框
+            // （`block_size_wide[sb] + 32` = 96/160 ≥ 72），越界路径消失。
+            // kf_mode 保持 AOM_KF_DISABLED → `auto_key=false`，自动插关键帧
+            // 依旧关闭，外部 force_idr 动态节奏（MYS-886）分毫不变；
+            // 65535 帧（30fps ≈ 36 分钟）远大于任何会话，等效"永不自动 KF"。
+            cfg.kf_max_dist = 65535;
 
             let mut ctx: aom_sys::aom_codec_ctx_t = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
             let rc = aom_sys::aom_codec_enc_init_ver(
@@ -559,6 +573,86 @@ mod tests {
         // libaom 靠 QP 自适应控码率。60 帧应全输出（=全帧保留），丢帧
         // = 用户局域网"丢包/卡顿"的直接来源（曾 dropframe=25 只出 20 帧）。
         assert!(out >= 55, "AV1 must keep almost all frames, got {out}/60");
+    }
+
+    #[test]
+    fn test_av1_no_bitrate_runaway_on_heavy_motion() {
+        // MYS-954 码率失控回归：大动态高熵内容（快速滚动/移动窗口，帧间强
+        // 变化）下 1s 滑窗实测码率不得失控。旧配置 VBV 600/1000ms +
+        // overshoot 50% 允许长时间 1.5x 爆发（用户实测 >2000kbps 顶满上行）；
+        // 收紧到 150ms 缓冲 + ±25% 后，滑窗峰值必须 ≤ 目标×1.6、均码率贴
+        // 近目标（±50%），且不丢帧（AV1 铁律）。
+        let (w, h) = (1280usize, 720usize);
+        let budget_bps: u64 = 1_000_000;
+        let (qmin, qmax) =
+            crate::agent::desktop::encoder::calc_q_values_aom(0.67); // 生产同款质量档映射（balanced）
+        let mut enc = AomEncoder::new(w as u32, h as u32, budget_bps, 30.0, qmin, qmax, false)
+            .expect("av1 init");
+        // 每帧 = 混合高动态（模拟真实"大量移动画面"）：快速滚动的图文长页
+        // （平移、可压缩）+ 右下角一块每帧全变的噪声"视频窗口"（不可压缩、
+        // 运动估计追不上，是码率压力的真实来源）。
+        let mut page = Vec::new(); // 高细节"长页面"（内容静止，整体平移）
+        {
+            let pw = w * 2;
+            page = vec![0u8; pw * h * 2];
+            for yy in 0..h * 2 {
+                let seed = (yy as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                for xx in 0..pw {
+                    let c = ((seed >> (xx % 32)) ^ (xx as u64 * 2654435761)) as u8;
+                    let on = (c & 0x3f) < 12;
+                    page[yy * pw + xx] = if on { (c & 0xf0).max(180) } else { (c & 0x1f).max(140).min(175) };
+                }
+            }
+        }
+        let mut frame = |buf: &mut [u8], t: u32| {
+            let stride = w;
+            let dy = (t as usize * 13) % (h * 2 - h); // 快速垂直滚动
+            for y in 0..h {
+                let base = y + dy;
+                for x in 0..w {
+                    buf[y * stride + x] = page[base * (w * 2) + x];
+                }
+            }
+            // 右下角噪声"视频窗"：120x80，每帧内容全变（MV 追不上 → 每帧全新熵）。
+            let vx0 = w - 130;
+            let vy0 = h - 90;
+            let seed = (t as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            for yy in 0..80usize {
+                for xx in 0..120usize {
+                    let c = ((seed.wrapping_add((yy * 120 + xx) as u64) >> 8) & 0xff) as u8;
+                    buf[(vy0 + yy) * stride + vx0 + xx] = c;
+                }
+            }
+        };
+        // 1s 滑窗（30 帧/窗）累计字节 → 实测 bps。
+        let mut window = std::collections::VecDeque::new();
+        let (mut total_bytes, mut out) = (0usize, 0usize);
+        let mut peak_bps: u64 = 0;
+        for t in 0..240u32 {
+            let mut buf = solid_i420(w, h, 90);
+            frame(&mut buf, t);
+            let f = enc.encode(&buf).expect("encode");
+            if !f.nalu.is_empty() {
+                out += 1;
+                total_bytes += f.nalu.len();
+                window.push_back(f.nalu.len());
+                if window.len() > 30 { window.pop_front(); }
+                let win_bytes: usize = window.iter().sum();
+                let win_bps = (win_bytes as u64) * 8 * 30 / 30; // 1s 窗 ×8bit
+                peak_bps = peak_bps.max(win_bps);
+            }
+        }
+        let avg_bps = total_bytes as u64 * 8 * 30 / 240;
+        eprintln!("av1 runaway: target={budget_bps} peak_1s={peak_bps} avg={avg_bps}");
+        assert!(out >= 230, "不得丢帧，got {out}/240");
+        assert!(
+            peak_bps <= budget_bps * 16 / 10,
+            "1s 滑窗码率失控：target={budget_bps} peak={peak_bps}"
+        );
+        assert!(
+            avg_bps >= budget_bps * 5 / 10 && avg_bps <= budget_bps * 15 / 10,
+            "均码率偏离目标：avg={avg_bps} target={budget_bps}"
+        );
     }
 
     #[test]

@@ -19,6 +19,57 @@
     const files = new FileManager('file-tree');
     const desktopView = new DesktopView();
 
+    // ── 桌面连接弹窗（P2P 进度 + 放弃 P2P 走 relay）────
+    // desktop.js 的 DesktopView.onProgress(stage, detail) 实时喂阶段；文案
+    // 面向用户（连接中… 让"卡住"可见，并可手动放弃 P2P 立即改中继）。
+    const connectModal = document.getElementById('connect-modal');
+    const connectStageEl = document.getElementById('connect-modal-stage');
+    const connectMetaEl = document.getElementById('connect-modal-meta');
+    const connectBarEl = document.getElementById('connect-modal-bar');
+    const skipP2pBtn = document.getElementById('connect-skip-p2p-btn');
+    let connectModalShown = false;
+    let connectT0 = 0;
+    const CONNECT_STAGE_PCT = { ws: 15, lan: 35, p2p: 60, relay: 75 };
+    function showConnectModal() {
+        if (connectModalShown) return;
+        connectModalShown = true;
+        connectT0 = Date.now();
+        connectModal.classList.remove('hidden');
+    }
+    function hideConnectModal() {
+        if (!connectModalShown) return;
+        connectModalShown = false;
+        connectModal.classList.add('hidden');
+    }
+    function updateConnectModal(stage, detail) {
+        const st = stage || '';
+        const text = detail || st;
+        // 成功/就绪/断开：关弹窗。失败会继续走 relay 阶段而非直接关。
+        if (st === 'connected' || st === 'p2p-connected' || st === 'stopped') { hideConnectModal(); return; }
+        if (st === 'ws' || st === 'lan' || st === 'p2p' || st === 'relay') { showConnectModal(); }
+        if (connectStageEl) connectStageEl.textContent = text;
+        // 只读史诗级…：实时显示已耗时 + P2P 细节（候选数/ICE 阶段在 detail 里）。
+        if (connectMetaEl) {
+            const sec = Math.floor((Date.now() - connectT0) / 1000);
+            connectMetaEl.textContent = '已等待 ' + sec + ' 秒' + (st === 'p2p' ? ' · P2P 直连协商中' : '');
+        }
+        if (connectBarEl) {
+            const pct = CONNECT_STAGE_PCT[st] || 50;
+            connectBarEl.style.width = pct + '%';
+        }
+        // 仅 P2P 协商阶段给"放弃 P2P"按钮；relay/其它阶段隐藏（relay 就是兜底）。
+        if (skipP2pBtn) skipP2pBtn.classList.toggle('hidden', st !== 'p2p');
+    }
+    desktopView.onProgress = updateConnectModal;
+    if (skipP2pBtn) {
+        skipP2pBtn.addEventListener('click', function () {
+            if (desktopView && typeof desktopView.skipP2P === 'function') {
+                desktopView.skipP2P();
+                if (skipP2pBtn) skipP2pBtn.classList.add('hidden');
+            }
+        });
+    }
+
     const onlineCountEl = document.getElementById('online-count');
     const sessionNameEl = document.getElementById('session-name');
     const toggleDesktopBtn = document.getElementById('toggle-desktop-btn');
@@ -377,13 +428,14 @@
     window.shellRemote.on('desktop:capabilities', function(msg) {
         clearJoinWatchdog();
         setDesktopEnabled(msg.payload && msg.payload.available);
-        // 按 agent 声明的可用编码过滤切换选项（codecs: ["av1","vp9","h264"]）。
+        // 按 agent 声明的可用编码过滤切换选项（codecs: ["av1","h264"]；
+        // MYS-954：VP8/VP9 已移除）。
         const codecs = (msg.payload && msg.payload.codecs) || [];
         const sel = document.getElementById('desktop-codec-select');
         if (sel && codecs.length) {
             const cur = sel.value;
             sel.innerHTML = '';
-            for (const c of ['av1', 'vp9', 'vp8', 'h264']) {
+            for (const c of ['av1', 'h264']) {
                 if (codecs.indexOf(c) >= 0) {
                     const o = document.createElement('option');
                     o.value = c;

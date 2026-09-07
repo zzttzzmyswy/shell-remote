@@ -139,6 +139,35 @@
       // 期满后清除（见 _p2pRejectedActive）。
       this._p2pRejected = false;
       this._p2pRejectedAt = 0;
+      // P2P 连接进展弹窗（session.js 连接中反馈）：onProgress(stage, detail)。
+      // stage ∈ ws|lan|p2p|relay|p2p-connected|connected；detail 为可读文案。
+      this.onProgress = null;
+      this._p2pCandidateCount = 0;
+      this._p2pStartAt = 0;
+    }
+
+    // 连接进展上报（会话页连接弹窗的实时反馈源）。
+    _emitProgress(stage, detail) {
+      if (typeof this.onProgress === 'function') {
+        try { this.onProgress(stage, detail); } catch (e) { /* 上报失败不影响播放器 */ }
+      }
+    }
+
+    // 用户主动放弃 P2P 直连、改走中继 relay（连接弹窗按钮触发）。协商中/探测
+    // 中调用：标记 P2P 被拒（冷却期内不再抢 P2P，_startLan/_startP2p 都会
+    // 检查 _p2pRejectedActive 落 _startWs）+ 关掉在飞协商 + 立即走 relay。
+    // 已连上（P2P 或 relay）时是 no-op——流已通无需切换。
+    skipP2P() {
+      if (this.connected) return;
+      this._markP2pRejected();
+      if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
+      if (this._p2pPc) {
+        try { this._p2pPc.close(); } catch (e) {}
+        this._p2pPc = null;
+      }
+      this._p2pDc = null;
+      this._emitProgress('relay', '已按选择放弃 P2P，改用中继（Relay）…');
+      if (!this._ws) this._startWs();
     }
 
     // 向 relay /api/clock 做 NTP 式往返采样，求得 (relay_epoch - 本地_epoch)。
@@ -285,10 +314,12 @@
     _showLoading() {
       const el = document.getElementById('desktop-loading');
       if (el) el.classList.remove('hidden');
+      this._emitProgress('ws', '连接会话…');
     }
     _hideLoading() {
       const el = document.getElementById('desktop-loading');
       if (el) el.classList.add('hidden');
+      this._emitProgress('connected', '画面已就绪');
     }
 
     connect(resetP2pRejected) {
@@ -358,6 +389,7 @@
       // 钉住 relay（_startWs）。避免并发 viewer 相互抢占时，"踢出方"每次自动重连
       // 又回到 P2P 再踢别人——双方反复互踢直到 _streamRetries 耗尽黑屏。
       if (this._p2pRejectedActive()) { this._startWs(); return; }
+      this._emitProgress('lan', '探测直连地址…');
       const addrs = this._lanAddrs || [];
       if (!addrs.length || this._transport === 'lan') { this._startP2p(); return; }
       const self = this;
@@ -476,6 +508,9 @@
         return;
       }
       const self = this;
+      this._p2pCandidateCount = 0;
+      this._p2pStartAt = Date.now();
+      this._emitProgress('p2p', 'P2P 直连协商中…');
       try {
         this._p2pPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
         // DataChannel：agent 端把 desktop:video 的 fMP4 字节镜像投进来。
@@ -499,18 +534,33 @@
       this._p2pDc.onclose = function() { self._onP2pLost(); };
       this._p2pPc.onicecandidate = function(ev) {
         if (ev.candidate && typeof window.sendDesktopP2p === 'function') {
+          self._p2pCandidateCount += 1;
+          self._emitProgress('p2p', 'P2P：ICE 候选已收集 ' + self._p2pCandidateCount + ' 个…');
           window.sendDesktopP2p({ candidate: ev.candidate.candidate });
+        }
+      };
+      this._p2pPc.oniceconnectionstatechange = function() {
+        const ice = self._p2pPc && self._p2pPc.iceConnectionState;
+        if (ice === 'checking') {
+          self._emitProgress('p2p', 'P2P：ICE 连通性检查中…');
+        } else if (ice === 'connected' || ice === 'completed') {
+          self._emitProgress('p2p', 'P2P：ICE 已连通');
+        } else if (ice === 'failed') {
+          self._emitProgress('relay', 'P2P：ICE 失败，改走中继（Relay）…');
         }
       };
       this._p2pPc.onconnectionstatechange = function() {
         const st = self._p2pPc && self._p2pPc.connectionState;
-        if (st === 'connected') {
+        if (st === 'connecting') {
+          self._emitProgress('p2p', 'P2P：正在建立数据通道…');
+        } else if (st === 'connected') {
           if (self._p2pTimeout) { clearTimeout(self._p2pTimeout); self._p2pTimeout = null; }
           self._transport = 'p2p';
           self.connected = true;
           self._streamRetries = 0;
           self._bindInput();
           self._startMetrics();
+          self._emitProgress('p2p-connected', 'P2P 直连已建立');
           self.setStatus('桌面已连接 (P2P)', false);
           self._buf = new Uint8Array(0); // demux 缓冲
           // 首帧快路径：P2P 下 init 段可能在通道打开前被静默丢弃，1.5s 没
@@ -554,6 +604,7 @@
     // 造成双开 WS/fetch。
     _onP2pFailed() {
       if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
+      this._emitProgress('relay', 'P2P 不可用，自动改走中继（Relay）…');
       // final-review #2：协商阶段失败（5s 超时/agent failed 广播/answer 不匹配）
       // 同样标记被拒——并发 viewer 中"输掉"一方据此钉住 relay；配合 _onP2pLost
       // 的标记，任何形式的 P2P 失败后冷却期内都不再抢 P2P。
@@ -688,6 +739,7 @@
     // 打开——防止 P2P 双回退路径（_onP2pLost/_onP2pFailed 叠加）双开 WS 风暴。
     _startWs() {
       if (this._ws) return;
+      this._emitProgress('relay', '正在通过中继（Relay）拉流…');
       const token = sessionStorage.getItem('shell-remote-token');
       if (!token || typeof WebSocket === 'undefined') {
         this._startFetch();
@@ -1225,6 +1277,7 @@
     }
 
     disconnect(resetRetries) {
+      this._emitProgress('stopped', '已断开');
       if (this._mse) {
         this._mse.disconnect(resetRetries);
         this._mse = null;
