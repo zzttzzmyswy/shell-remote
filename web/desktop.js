@@ -48,6 +48,8 @@
       this._vpcLevel = 10;
       this._frames = [];          // decoded VideoFrames pending render
       this._lastCaptureMs = 0;    // 最新解码帧的采集时间（e2e 延时）
+      this._lastCapMs = 0;        // 同上（QoS 序列陈旧度用，断线复位）
+      this._renderedCapMs = 0;    // 最近渲染帧的采集时间（超龄判定序列基线）
       this._lastE2eMs = undefined; // 最近一次解码时测得的即时管线延时（不含帧陈旧度）
       this._lastNewFrameAt = 0;   // 最近一次解码帧到达的本地时刻（静止判定）
       this._lastDataAt = 0;     // 最近一次视频数据(init/moof/mdat)到达时刻（R4 30s 判死看门狗）
@@ -100,6 +102,8 @@
       this._weakNet = false;
       // 帧超龄丢弃计数（R4 乙88：到达时已 >2s 旧 → 丢 + reqkey）
       this._staleDropped = 0;
+      // 已渲染帧的采集时间戳（序列陈旧度基线，见 _onDecoded/_render）
+      this._renderedCapMs = 0;
       // 时钟慢校准定时器（R3 丙135：连接后每 15min 重校一次，对抗长会话漂移）
       this._clockRecheckTimer = null;
       // JS 内存峰值（R2 丁131 / R5#61）：面板内存行显示当前 + 会话峰值。
@@ -1120,13 +1124,21 @@
         // epoch），不沿用"指标tick再算 now−旧采集"——那是帧陈旧度（≈1/fps，
         // fps=1 时高达数百 ms）而非真实延迟。fps 越低保真度越高，会反过来把
         // QoS 压进低帧率自锁（MYS-886 卡顿死锁的源头之一）。
-        this._lastE2eMs = Math.max(0, this._lastNewFrameAt + this._clockOffset - capMs);
-        // 帧超龄丢弃（对齐 R4 乙88）：解码链路若积压到帧已是 2s 前拍的旧画面，
-        // 它没有渲染价值（直播间追新语义）——直接丢掉，并请求关键帧让 agent
-        // 立即重出最新画面，而不是把这个陈旧帧画上去制造"慢半拍"观感。
-        // 阈值 2s 远高于正常 e2e（<150ms），只命中真正的积压崩溃；静态心跳
-        // IDR（≈10ms）与低 fps 正常帧（陈旧度≈1/fps ≤1s）都到不了这里。
-        if (this._lastE2eMs > 2000) {
+        const rawE2e = Math.max(0, this._lastNewFrameAt + this._clockOffset - capMs);
+        // 帧超龄判定改用**序列陈旧度**（本帧 srtc 与已渲染帧 srtc 的差），
+        // 不再信绝对 e2e：绝对读数依赖 agent/relay/浏览器三方时钟校准链，
+        // 任一环偏差（agent 校准失败、系统时钟跳变）会让 e2e 恒为几秒的
+        // 假读数 → 旧判定（e2e>2000 全丢）把每一帧都当超龄 → 渲染 0 帧
+        // 画面永久冻结、鼠标 4:1 降采样、QoS 假 Critical——正是 MYS-886
+        // "拖动窗口就卡死"的完整病理链。序列陈旧度只依赖同一时间轴上
+        // 帧与帧的差值，天然免疫时钟偏差：正常流（渲染帧 srtc 连续推进）
+        // 陈旧度 ≈ 帧间隔；真积压时新帧 srtc 比已渲染帧新 ≥2s，照样命中。
+        const stale = this._renderedCapMs > 0 && capMs > this._renderedCapMs
+          ? (capMs - this._renderedCapMs)
+          : 0;
+        this._lastCapMs = capMs;
+        this._lastE2eMs = rawE2e;
+        if (stale > 2000) {
           this._staleDropped += 1;
           try { frame.close(); } catch (e) {}
           this._requestKey();
@@ -1166,6 +1178,11 @@
       }
       const ctx = c.getContext('2d');
       ctx.drawImage(frame, 0, 0);
+      // 记录已渲染帧的采集时间戳（超龄判定的序列基线，见 _onDecoded）。
+      const renderedCap = this._captureByPts
+        ? this._captureByPts.get(frame.timestamp)
+        : null;
+      if (renderedCap) this._renderedCapMs = renderedCap;
       // 渲染帧率 = 实际画到 canvas 的新内容帧数（对齐远程桌面帧率），
       // 而非本地显示器刷新率（MYS-886：之前指标是 rAF 计数恒 60）。
       this._rafCount += 1;
@@ -1188,10 +1205,19 @@
         // 稳态语义，避免缓存灌入/I 帧瞬时 burst 把读数顶到几千 kbps 造成
         // 误读，MYS-886）。
         this._avgKbps = kbps;
-        // 峰值估计仍用于给 agent 评估上行能力（弱网降码率），不上面板。
-        if (kbps > this._peakKbps) this._peakKbps = kbps;
         this._bpsTs = now;
         this._bpsBytes = 0;
+        // 可用带宽估计（上报 agent 作码率天花板）：EMA 平滑当前实测值。
+        // 旧实现存"历史峰值"（单调不减）：网络变差后上报值仍停在峰值，
+        // agent 的 ceiling 永远顶格 → 码率压不进真实带宽 → relay/浏览器
+        // 积压数秒 → 帧全部超龄丢弃（渲染 0 帧卡死）。EMA 快速跟跌、
+        // 缓慢回升（升 0.1 / 降 0.5），对齐 rustdesk 带宽估计的收敛方向。
+        if (this._peakKbps > 0) {
+          const a = kbps < this._peakKbps ? 0.5 : 0.1;
+          this._peakKbps = Math.round(this._peakKbps + (kbps - this._peakKbps) * a);
+        } else {
+          this._peakKbps = kbps;
+        }
         if (this._peakKbps > 0 && window.shellRemote && window.shellRemote.send) {
           window.shellRemote.send('desktop:bitrate', { kbps: this._peakKbps });
         }
@@ -1236,6 +1262,8 @@
       this._hideLoading();
       this._desc = null;
       this._lastCaptureMs = 0;
+      this._lastCapMs = 0;
+      this._renderedCapMs = 0;
       this._lastE2eMs = undefined;
       this._lastNewFrameAt = 0;
       this._e2eMs = undefined;
@@ -1255,6 +1283,7 @@
       this._weakNetStrikes = 0;
       this._weakNet = false;
       this._staleDropped = 0;
+      this._renderedCapMs = 0;
       this._throttleCounter = 0;
       this._qosDfps = 0;
       if (this._moveTimer) { clearTimeout(this._moveTimer); this._moveTimer = null; }
@@ -1401,8 +1430,15 @@
           self._decodeCount = 0;
           self._qosDfps = dfps * 4; // 250ms 窗口 → 每秒
           if (self._e2eMs !== undefined && window.shellRemote && window.shellRemote.send) {
+            // 上报值 = min(绝对 e2e, 序列陈旧度+RTT)。绝对 e2e 依赖三方时钟
+            // 校准链，校准失效时恒为数秒假读数（agent 会据此判 Critical 并
+            // 压码率）；序列陈旧度（最近解码帧 srtc − 已渲染帧 srtc）时钟
+            // 无关、真积压时才会变大。取小者：时钟健康时两者接近，时钟
+            // 失效时退化为序列陈旧度（保真）。
+            const staleMs = self._renderedCapMs > 0 && self._lastCapMs > self._renderedCapMs
+              ? (self._lastCapMs - self._renderedCapMs) : 0;
             window.shellRemote.send('desktop:qos', {
-              delay_ms: Math.round(self._e2eMs),
+              delay_ms: Math.round(Math.min(self._e2eMs, staleMs + (self._probeRttMs || 0))),
               probe_ms: self._probeRttMs || 0,
               dfps: self._qosDfps,
               dq: self._dec ? self._dec.decodeQueueSize : 0,
@@ -1683,15 +1719,16 @@
       this._onPointerMove = function(e) {
         const p = self._toDesktopXY(e);
         if (!p) return;
-        // 弱网降采样：e2e 高时跳过部分事件（离散点按计数取）。
-        const e2e = self._e2eMs;
-        if (e2e !== undefined) {
+        // 弱网降采样：判据用**网络层探针 RTT**（纯网络往返、时钟无关），
+        // 不再用绝对 e2e——e2e 含时钟校准链，假高读数会把输入永久压到
+        // 4:1（本地操作极度迟滞的"一直卡住"手感，MYS-886）。鼠标 move
+        // 已有 10ms 合并（≈100Hz 追新），降采样只在真网络拥塞时介入。
+        const rtt = self._probeRttMs;
+        if (rtt > 0) {
           self._throttleCounter += 1;
-          if (e2e > 300) {
-            if (e2e > 800) {
-              if (self._throttleCounter % 4 !== 0) return;
-            } else if (self._throttleCounter % 2 !== 0) {
-              return;
+          if (rtt > 400) {
+            if (rtt > 800) {
+              if (self._throttleCounter % 2 !== 0) return;
             }
           }
         }

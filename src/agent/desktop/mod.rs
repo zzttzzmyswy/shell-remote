@@ -293,6 +293,8 @@ pub struct DesktopManager {
     qos_frames: Arc<std::sync::atomic::AtomicU64>,
     /// QoS 上次采样墙钟（微秒，供 on_qos_delay 算 elapsed_s）。
     qos_last_sample: std::sync::atomic::AtomicU64,
+    /// QoS 上次采样时的 relay 拥塞累计（供差分出采样间增量）。
+    qos_last_bp: std::sync::atomic::AtomicU32,
     /// 编码器当前目标码率（bps，由 pipeline 每次建/重建编码器时同步）。
     /// QoS ratio 的 150kbps 限幅与 1Mbps 基线用它（rustdesk store_bitrate）。
     qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
@@ -340,6 +342,7 @@ impl DesktopManager {
             qos: tokio::sync::Mutex::new(QosAdaptive::new(quality0)),
             qos_frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             qos_last_sample: std::sync::atomic::AtomicU64::new(0),
+            qos_last_bp: std::sync::atomic::AtomicU32::new(0),
             qos_bitrate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gray: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idr_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -447,6 +450,11 @@ impl DesktopManager {
             0.0
         };
         let frames = self.qos_frames.swap(0, O::Relaxed) as u32;
+        // 传输段拥塞增量：距上次采样 relay fan-out 丢帧次数。fan-out 每 5s
+        // 才向 agent 发一次 congested 通知，这里用累计值差分（采样间累计）。
+        let bp_total = self.backpressure.load(O::Relaxed);
+        let last_bp = self.qos_last_bp.swap(bp_total, O::Relaxed);
+        let relay_congest_delta = bp_total.saturating_sub(last_bp);
         let bitrate_bps = self.qos_bitrate.load(O::Relaxed);
         let ctx = QosSampleCtx {
             quality_ratio: self.config.quality.clamp(QOS_BR_SPEED, QOS_BR_BEST),
@@ -454,6 +462,7 @@ impl DesktopManager {
             bitrate_kbps: (bitrate_bps / 1000).max(1) as u32,
             decode_fps_hint: decode_fps,
             decode_queue_hint: decode_queue,
+            relay_congest_delta,
             now_us,
         };
         let (fps, permille) = {
@@ -1550,6 +1559,9 @@ pub struct QosAdaptive {
     /// 首个 delay 样本时刻（unix us），代理 rustdesk new_user_instant
     /// （1s 内 cap INIT_FPS）。
     first_sample_us: Option<u64>,
+    /// 距上次采样的传输段拥塞证据（relay fan-out 丢帧计数增量）。>0 时
+    /// `pipeline_bloated` 豁免失效（媒体链路确在丢帧，probe 探不出来）。
+    relay_congest_delta: u32,
 }
 
 /// rustdesk `video_qos.rs` / `scrap/codec.rs` 同款常量。
@@ -1612,6 +1624,9 @@ pub struct QosSampleCtx {
     pub decode_fps_hint: u32,
     /// 浏览器解码队列深度（WebCodecs decodeQueueSize）。
     pub decode_queue_hint: u32,
+    /// 传输段拥塞证据（relay fan-out 丢帧计数增量）。probe RTT 只探测控制
+    /// 通道小包，测不出媒体流把链路压满的拥塞——该证据补上这一盲区。
+    pub relay_congest_delta: u32,
     /// 采样时刻（unix 微秒），用于 new_user 1s 窗口。
     pub now_us: u64,
 }
@@ -1635,6 +1650,7 @@ impl QosAdaptive {
             baseline_delay: 0,
             bitrate_kbps: 0,
             first_sample_us: None,
+            relay_congest_delta: 0,
         }
     }
 
@@ -1742,6 +1758,7 @@ impl QosAdaptive {
         if self.bitrate_kbps != ctx.bitrate_kbps {
             self.bitrate_kbps = ctx.bitrate_kbps;
         }
+        self.relay_congest_delta = ctx.relay_congest_delta;
 
         let highest_fps = ctx.highest_fps.max(QOS_MIN_FPS);
 
@@ -1911,7 +1928,13 @@ impl QosAdaptive {
         // 无改善（动态画面保清晰铁律；解码积压已由 fps 背压降帧处理），
         // 跳过降档。probe 未上报（0）或 probe 同样高 → 维持原判据。
         let probe_med = self.probe_median_delay();
-        let pipeline_bloated = probe_med >= 1 && probe_med + 100 <= max_delay;
+        // MYS-886 修复：probe 只测控制通道小包往返，媒体流把链路压满时 probe
+        // 依然健康——旧判据（probe 健康 → 一律视为管线积压、永不降码率）在
+        // 带宽不足场景下把码率顶在 ceiling，relay/浏览器积压数秒、帧全部
+        // 超龄丢弃。传输段拥塞证据（relay fan-out 丢帧）存在时，媒体链路
+        // 确实在丢——按拥塞降档，不再被 probe 的"健康"假象豁免。
+        let pipeline_bloated =
+            probe_med >= 1 && probe_med + 100 <= max_delay && self.relay_congest_delta == 0;
         // RTT 分带（R4 丁142 / R5#111）：中值延时档位修正阈值——绝对 RTT 已
         // 很高的会话（band>=2），相对增量更小的拥塞也要降（弱网韧性）。
         // **不绕过 over 主判据**：恒定高 RTT（baseline 学成后 over≈0）是
@@ -2251,6 +2274,7 @@ mod tests {
             bitrate_kbps,
             decode_fps_hint: 0,
             decode_queue_hint: 0,
+            relay_congest_delta: 0,
             now_us,
         }
     }
@@ -2262,6 +2286,7 @@ mod tests {
             bitrate_kbps,
             decode_fps_hint: dfps,
             decode_queue_hint: dq,
+            relay_congest_delta: 0,
             now_us,
         }
     }
@@ -2476,6 +2501,29 @@ mod tests {
         }
         let p3 = q3.ratio_permille();
         assert!(p3 < 900, "无探针沿用原判据应降码率，实际 {p3}‰");
+    }
+
+    /// MYS-886 回归：probe 健康但 relay fan-out 在丢帧（媒体链路拥塞的直接
+    /// 证据）→ pipeline_bloated 豁免必须失效，码率要降。旧代码在带宽不足
+    /// 场景把码率顶在 ceiling，积压数秒、帧全部超龄丢弃（渲染 0 帧卡死）。
+    #[test]
+    fn test_qos_relay_congestion_overrides_pipeline_bloated() {
+        let mut now = 3_000_000u64;
+        let mut warm = QosAdaptive::new(QOS_BR_BALANCED);
+        for _ in 0..9 {
+            now += 300_000;
+            warm.on_delay(40, 20, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        }
+        // probe 恒 20ms（"网络健康"假象），e2e 800ms，但 relay 在丢帧
+        // （relay_congest_delta>0）→ 必须按拥塞降档。
+        let mut ctx = qos_ctx(QOS_BR_BALANCED, 600, now);
+        ctx.relay_congest_delta = 1;
+        for _ in 0..24 {
+            now += 300_000;
+            warm.on_delay(800, 20, 30, 1.0, &ctx);
+        }
+        let p = warm.ratio_permille();
+        assert!(p < 900, "relay 丢帧证据应解除豁免并降码率，实际 {p}‰");
     }
 
     /// probe 中值抗尖峰：单次 probe 尖峰不移动网络层中值（降档证据稳定）。

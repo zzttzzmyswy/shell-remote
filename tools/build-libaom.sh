@@ -51,6 +51,13 @@ for entry in "${PLATFORMS[@]}"; do
     -DBUILD_SHARED_LIBS=0
     -DCONFIG_AV1_ENCODER=1 -DCONFIG_AV1_DECODER=0
     -DCONFIG_MULTITHREAD=1
+    # x86 SIMD（MYS-886 卡顿修复）：此前两个独立问题导致 HAVE_SSE2/AVX2 全 0
+    # 的纯 C 构建——① ENABLE_NASM 默认 OFF；② 交叉编译下 CMAKE_SYSTEM_PROCESSOR
+    # 探测失败 → AOM_TARGET_CPU=generic（日志 "architecture is not supported"）。
+    # 显式传 AOM_TARGET_CPU + ENABLE_NASM=ON 双保险；nasm 缺失时 cmake 配置
+    # 直接报错（fail fast），不会静默回退纯 C。
+    -DAOM_TARGET_CPU=$(case "$target" in x86_64*) echo x86_64;; aarch64*) echo arm64;; armv7*) echo armv7;; *) echo "";; esac)
+    -DENABLE_NASM=ON
     # 交叉工具链(尤其 arm gnueabihf)的 specs 会注入 -latomic_asneeded,
     # 可执行链接测试会失败; 我们只产静态库, 跳过链接试跑。
     -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
@@ -65,6 +72,12 @@ for entry in "${PLATFORMS[@]}"; do
     )
   else
     CMAKE_ARGS+=(-DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx")
+  fi
+  # armv7 gnueabihf 默认 -mfloat-abi=softfp 不带 NEON 使能 → NEON intrinsics
+  # always_inline 报 target mismatch。显式 -mfpu=neon（与 libvpx 脚本的
+  # neon 能力对齐）；gnueabihf 的 ABI 本身硬浮点，直接可用。
+  if [[ "$target" == armv7* ]]; then
+    CMAKE_ARGS+=(-DCMAKE_C_FLAGS="-mfpu=neon -mfloat-abi=hard")
   fi
   cmake "$SRC" "${CMAKE_ARGS[@]}" >/tmp/aom-cmake-$target.log 2>&1 || {
     echo "cmake config failed for $target (see /tmp/aom-cmake-$target.log)"; tail -20 /tmp/aom-cmake-$target.log; popd >/dev/null; exit 1;
