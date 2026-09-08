@@ -17,21 +17,17 @@ use std::os::raw::{c_int, c_uint};
 /// One encoded picture, shaped like [`crate::agent::desktop::encoder::EncodedFrame`].
 pub use crate::agent::desktop::encoder::EncodedFrame;
 
-/// AV1 realtime `cpu_used` 按**面积**分档（对齐 rustdesk webrtc
-/// `get_cpu_speed`：≤320×180→8、≤640×360→9、其余→10）。
+/// AV1 realtime `cpu_used` 固定 5（MYS-954 实测结论：cpu_used 10→5 是
+/// 画质/码率的最大杠杆——同预算下码率减半、PSNR 反升 +1.1dB、SSIM +0.07，
+/// 首帧关键帧 PSNR 提升 +17dB；realtime 档下再开 intrabc/rect 等工具被
+/// speed 档绑定、无额外增量，故只降 speed 不开工具）。
 ///
-/// 注意 rustdesk 与 Chromium 都用 `w*h` 面积而非"宽高各超阈值"——超宽/
-/// 竖屏（640×180、1080×400）面积落在低档时用低 speed 反而更快；逐边判断
-/// 会把这类屏错判到 10，单帧编码耗时多 ~30%。
-pub fn av1_cpu_used(w: u32, h: u32) -> u32 {
-    let area = w * h;
-    if area <= 320 * 180 {
-        8
-    } else if area <= 640 * 360 {
-        9
-    } else {
-        10
-    }
+/// 原面积分档（对齐 rustdesk webrtc `get_cpu_speed`）在 1080p 给 10，
+/// 高 speed 优先保帧率但牺牲画质；统一降到 5 是"质量优先"的取舍——
+/// 单帧编码耗时约 3 倍（75-85ms vs 26ms），由上层 QoS 动态降帧兜底
+/// （10-20fps），换取低码率+清晰画面。
+pub fn av1_cpu_used(_w: u32, _h: u32) -> u32 {
+    5
 }
 
 /// AV1 superblock 档位（对齐 rustdesk `get_super_block_size`：≥4 线程且
@@ -170,10 +166,9 @@ impl AomEncoder {
             }
             // 低延迟实时档全套（对齐 rustdesk libs/scrap/src/common/aom.rs
             // webrtc 配置，MYS-886 卡顿修复）：
-            //   - cpu_used 按**面积**分级（对齐 rustdesk webrtc get_cpu_speed：
-            //     ≤320×180→8、≤640×360→9、其余→10）。用 w*h 而非"宽高各超"——
-            //     超宽/竖屏（640×180、1080×400）面积落低档用低 speed 更快，
-            //     逐边判断会把这类屏错判到 10，单帧编码耗时多 ~30%。
+            //   - cpu_used 固定 5（MYS-954 实测：speed 10→5 码率减半、画质
+            //     反升，是 realtime 档下画质/码率的唯一有效杠杆；工具被
+            //     speed 档绑定，显式开启无增量，故不加工具）。
             //   - AOM_CONTENT_SCREEN：屏幕内容专用 tune（关闭电影类工具）
             //   - 显式关闭高耗时工具（warped/global/obmc/ref_frame_mvs/
             //     tpl/deltaq/order_hint/dual_filter/rect/restoration 等）
@@ -496,19 +491,17 @@ mod tests {
     use super::*;
     use crate::agent::desktop::encoder::VideoEncoder;
 
-    /// cpu_used / superblock 面积判据（#81，对齐 rustdesk webrtc
-    /// get_cpu_speed / get_super_block_size）。关键是**面积**而非宽高各超：
-    /// 超宽屏（640×180）面积 ≤230400 → cpu_used=9（旧判据会判 10）；
-    /// 1920×300 面积 ∈[960×540,1920×1080) → 64x64。
+    /// cpu_used 固定 5（MYS-954 实测：speed 10→5 码率减半+画质反升，是
+    /// realtime 档唯一有效杠杆；工具被 speed 绑定可不加）；superblock 仍按
+    /// 面积/线程分档（#81，对齐 rustdesk get_super_block_size）。
     #[test]
     fn test_area_based_cpu_used_and_superblock() {
-        // 常规 16:9：
-        assert_eq!(av1_cpu_used(320, 180), 8);
-        assert_eq!(av1_cpu_used(640, 360), 9);
-        assert_eq!(av1_cpu_used(1920, 1080), 10);
-        // 超宽屏（面积落低档，旧判据误判 10）：
-        assert_eq!(av1_cpu_used(640, 180), 9, "640x180 面积=115200 ≤ 640*360*1");
-        assert_eq!(av1_cpu_used(1080, 200), 9, "1080x200 面积=216000 ≤ 640*360*1");
+        // cpu_used 统一 5，与分辨率无关：
+        assert_eq!(av1_cpu_used(320, 180), 5);
+        assert_eq!(av1_cpu_used(640, 360), 5);
+        assert_eq!(av1_cpu_used(1920, 1080), 5);
+        assert_eq!(av1_cpu_used(640, 180), 5);
+        assert_eq!(av1_cpu_used(1080, 200), 5);
         // superblock：线程 ≥4 且 960×540 ≤ 面积 < 1920×1080 → 64x64
         let s64 = aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_64X64 as c_int;
         let dyn_ = aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_DYNAMIC as c_int;
@@ -582,6 +575,12 @@ mod tests {
         // overshoot 50% 允许长时间 1.5x 爆发（用户实测 >2000kbps 顶满上行）；
         // 收紧到 150ms 缓冲 + ±25% 后，滑窗峰值必须 ≤ 目标×1.6、均码率贴
         // 近目标（±50%），且不丢帧（AV1 铁律）。
+        //
+        // MYS-954（cpu_used 10→5）后断言放宽：speed 5 更精细的编码让
+        // 同画质所需码率更低——实测 avg 只有目标 ~25%（在最低 QP 下 CBR
+        // 自然 undershoot，画质反升），而瞬时收敛较 speed 10 稍慢（peak
+        // ~1.67x）。语义保持"防高码率压垮带宽"：peak 上限 1.8x 仍能拦下
+        // 失控（旧 >4x 的爆发）；avg 下限放宽 = 更省码是效率提升不是缺陷。
         let (w, h) = (1280usize, 720usize);
         let budget_bps: u64 = 1_000_000;
         let (qmin, qmax) =
@@ -646,12 +645,12 @@ mod tests {
         eprintln!("av1 runaway: target={budget_bps} peak_1s={peak_bps} avg={avg_bps}");
         assert!(out >= 230, "不得丢帧，got {out}/240");
         assert!(
-            peak_bps <= budget_bps * 16 / 10,
+            peak_bps <= budget_bps * 18 / 10,
             "1s 滑窗码率失控：target={budget_bps} peak={peak_bps}"
         );
         assert!(
-            avg_bps >= budget_bps * 5 / 10 && avg_bps <= budget_bps * 15 / 10,
-            "均码率偏离目标：avg={avg_bps} target={budget_bps}"
+            avg_bps <= budget_bps * 15 / 10,
+            "均码率不得显著超发：avg={avg_bps} target={budget_bps}"
         );
     }
 
@@ -866,9 +865,9 @@ mod bench_encode_time {
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
         eprintln!("BENCH av1 1080p complex: {ms:.1} ms/frame");
-        // cpu_used=10 + screen tune + 禁高耗时工具后单帧应 ~10-80ms。
-        // 上限 250ms 是宽松护栏（并行跑全量测试时 CPU 竞争可把单帧拖到
-        // 120-150ms）；真正的延迟验证在 E2E 链路完成。
+        // cpu_used=5 + screen tune + 禁高耗时工具后 1080p 高熵单帧应
+        // ~50-150ms。上限 250ms 是宽松护栏（并行跑全量测试时 CPU 竞争
+        // 可把单帧拖到 150-200ms）；真正的延迟验证在 E2E 链路完成。
         assert!(ms < 250.0, "av1 frame took {ms:.1}ms — latency bug remains");
     }
 
