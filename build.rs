@@ -1,3 +1,4 @@
+#[cfg(feature = "av1")]
 fn link_lib(name: &str, env_key: &str) {
     if let Ok(dir) = std::env::var(env_key) {
         // <dir>/lib 放 lib*.a，<dir>/include 放头文件

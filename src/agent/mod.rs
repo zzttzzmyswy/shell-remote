@@ -1,10 +1,13 @@
 pub mod client;
 pub mod device;
+                                #[cfg(feature = "desktop")]
 pub mod desktop;
 pub mod encoding;
 pub mod exec_sessions;
 pub mod fs;
+                                #[cfg(feature = "desktop")]
 pub mod lan;
+                                #[cfg(feature = "desktop")]
 pub mod p2p;
 pub mod shell;
 pub mod upgrade;
@@ -23,7 +26,7 @@ use crate::proto::{McpResultPayload, Message};
 /// Returns the user's home directory, preferring `$HOME` (unix) and falling
 /// back to `%USERPROFILE%` (Windows). Used for the file-manager root default
 /// and the PTY child's cwd so the same code path works on both platforms.
-pub(crate) fn home_dir() -> String {
+pub fn home_dir() -> String {
     home_dir_from(
         std::env::var("HOME").ok(),
         std::env::var("USERPROFILE").ok(),
@@ -87,6 +90,7 @@ async fn sender_loop(
     mut control_rx: tokio::sync::mpsc::Receiver<String>,
     mut output_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
     heartbeat: Duration,
+    #[cfg(feature = "desktop")]
     desktop: Option<std::sync::Arc<crate::agent::desktop::DesktopManager>>,
 ) {
     let mut pending: HashMap<String, Vec<u8>> = HashMap::new();
@@ -114,7 +118,11 @@ async fn sender_loop(
             _ = heartbeat_tick.tick() => {
                 // 心跳扩展（R5#150）：桌面启用时附带运行态 KPI，relay/admin
                 // 可观测不依赖浏览器面板。字段少、低频（15s），开销可忽略。
+                #[cfg(feature = "desktop")]
                 let mut ping = serde_json::json!({"type": "ping", "session_id": &session_id});
+                #[cfg(not(feature = "desktop"))]
+                let ping = serde_json::json!({"type": "ping", "session_id": &session_id});
+                #[cfg(feature = "desktop")]
                 if let Some(dm) = &desktop {
                     let k = dm.kpi_snapshot();
                     ping["kpi"] = serde_json::json!({
@@ -142,6 +150,7 @@ async fn sender_loop(
 /// 当前进程 RSS（KB）。读 `/proc/self/statm` 第 2 字段（resident pages）
 /// × 4KB 页。非 Linux 回退 0（心跳 rss_kb 缺省）。用于 admin KPI 的
 /// "agent 内存画像"时间线（R5#136-146 内存画像最小子集）。
+                                #[cfg(feature = "desktop")]
 fn self_rss_kb() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
@@ -153,6 +162,7 @@ fn self_rss_kb() -> u64 {
 /// 从 `/proc/self/stat` 文本解析累计 CPU 毫秒（utime+stime，字段 14/15；
 /// comm 可含空格/括号 → `rsplit(") ")` 取后半，utime/stime 是后半字段
 /// 11/12）。`hz` = 时钟 tick/秒（`sysconf(_SC_CLK_TCK)`）。纯函数便于单测。
+                                #[cfg(feature = "desktop")]
 fn cpu_ms_from_stat(stat: &str, hz: u64) -> u64 {
     let Some(tail) = stat.rsplit(") ").next() else {
         return 0;
@@ -169,6 +179,7 @@ fn cpu_ms_from_stat(stat: &str, hz: u64) -> u64 {
 /// 当前进程累计 CPU 时间（ms，utime+stime）。非 Linux 回退 0。两次心跳
 /// 采样差 = 区间 CPU 使用率——admin KPI 可见 agent 功耗画像
 /// （R5#136-146 功耗采样最小子集）。
+                                #[cfg(feature = "desktop")]
 fn self_cpu_ms() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -188,6 +199,7 @@ fn self_cpu_ms() -> u64 {
 /// 当前 CPU/主板温度（℃，hwmon 传感器毫度 /1000；找不到回退 0.0）。
 /// 功耗硬采样最小子集（R5#136-146）：扫描 `/sys/class/hwmon/*/temp*_input`
 /// 取第一个非零温度（coretemp/dell_smm/nvme 均可）。无传感器环境回退 0。
+                                #[cfg(feature = "desktop")]
 fn self_cpu_temp() -> f64 {
     let Ok(dir) = std::fs::read_dir("/sys/class/hwmon") else {
         return 0.0;
@@ -669,6 +681,7 @@ pub async fn start(
     token_type: String,
     shell_path: String,
     session_id: Option<String>,
+    #[cfg(feature = "desktop")]
     desktop_cfg: crate::agent::desktop::DesktopConfig,
     insecure_tls: bool,
 ) -> anyhow::Result<()> {
@@ -679,6 +692,7 @@ pub async fn start(
     let mut cached_tokens: Option<Vec<(String, String)>> = None;
     // R5#11 会话级桌面状态：relay 重启/断线后自动恢复桌面流（跨 run_session
     // 重连传递"上次桌面是否在跑"）。
+    #[cfg(feature = "desktop")]
     let mut desktop_want_running = false;
 
     loop {
@@ -690,8 +704,10 @@ pub async fn start(
             &shell_path,
             session_id.as_deref(),
             &mut cached_tokens,
+            #[cfg(feature = "desktop")]
             &desktop_cfg,
             insecure_tls,
+            #[cfg(feature = "desktop")]
             &mut desktop_want_running,
         )
         .await
@@ -716,11 +732,13 @@ async fn run_session(
     shell_path: &str,
     session_id: Option<&str>,
     cached_tokens: &mut Option<Vec<(String, String)>>,
+    #[cfg(feature = "desktop")]
     desktop_cfg: &crate::agent::desktop::DesktopConfig,
     insecure_tls: bool,
     // R5#11 会话级桌面状态：进入时若为 true（上次断线前桌面在跑）→ 自动
     // 恢复桌面流；退出时回写当前状态并停掉旧流（防孤儿 task 继续向已失效
     // 的 relay 连接发帧）。
+    #[cfg(feature = "desktop")]
     desktop_want_running: &mut bool,
 ) -> anyhow::Result<()> {
     // Validate the root directory BEFORE registering with the relay. A bad
@@ -741,6 +759,7 @@ async fn run_session(
     // 会话结束 drop 时 LanDesktop 中止 server/feed 任务，端口释放供重连重新 bind。
     // 必须在 register 与 DesktopManager::new 之前：绑定端口/出口 IP 只有 spawn
     // 后才知道，注册消息的 lan_addr 与 desktop:capabilities.lan_addrs 都要它。
+    #[cfg(feature = "desktop")]
     let lan_desktop = std::sync::Arc::new(if desktop_cfg.lan_port != 0 {
         // Task 6 CORS 收窄 + final-review #4 fail-closed：LAN 无认证端点只放行
         // relay 同源页面读流。relay_url 解析失败 → LanDesktop::spawn 拒绝启动
@@ -768,6 +787,7 @@ async fn run_session(
     });
     // 上报地址（"ip:port"，None = 未开启）：注册消息随 `lan_addr` 上报 relay，
     // 同时注入 DesktopManager 的 config（capabilities_json 的 lan_addrs）。
+    #[cfg(feature = "desktop")]
     let lan_addr_report = lan_desktop.as_ref().as_ref().map(|lan| lan.addr_report());
 
     let mut client = RelayClient::connect_with_retry(
@@ -778,7 +798,10 @@ async fn run_session(
         cached_tokens,
         10,
         insecure_tls,
+        #[cfg(feature = "desktop")]
         lan_addr_report.clone(),
+        #[cfg(not(feature = "desktop"))]
+        None,
     )
     .await?;
 
@@ -808,11 +831,17 @@ async fn run_session(
     // (concurrent sends could reorder fragments and break playback).
     // 先建 DesktopManager，心跳扩展（R5#150）需要它的 KPI 快照。
     // lan_addr 已由上面的 LanDesktop::spawn 得出（None = 未开启阶段2）。
+    #[cfg(feature = "desktop")]
     let mut dm_cfg = desktop_cfg.clone();
-    dm_cfg.lan_addr = lan_addr_report.clone();
+    #[cfg(feature = "desktop")]
+    {
+        dm_cfg.lan_addr = lan_addr_report.clone();
+    }
+    #[cfg(feature = "desktop")]
     let desktop = std::sync::Arc::new(crate::agent::desktop::DesktopManager::new(dm_cfg));
     // Task 2 P2P 信令会话槽：None = 无活动协商；offer 到达时宿主 peer +
     // 驱动任务，desktop:stop / 二次 offer / 会话结束 时回收。
+    #[cfg(feature = "desktop")]
     let p2p_state = crate::agent::p2p::P2pState::default();
     tokio::spawn(sender_loop(
         client.http_client().clone(),
@@ -821,6 +850,7 @@ async fn run_session(
         control_rx,
         output_rx,
         Duration::from_secs(15),
+        #[cfg(feature = "desktop")]
         Some(desktop.clone()),
     ));
     // Keep a control sender for spawned long-running tasks (e.g. mcp:exec).
@@ -829,6 +859,7 @@ async fn run_session(
     // 时钟校准：采样 relay /api/clock 求 (relay_epoch - 本地_epoch) 偏移，
     // 注入 DesktopManager，srtc 打点落在 relay 时基 —— e2e 延时从此不再
     // 依赖 agent/浏览器两机系统时钟同步（MYS-886 指标失真根因）。
+    #[cfg(feature = "desktop")]
     if desktop_cfg.enabled() {
         let cc = client.http_client().clone();
         let clock_base = client.send_url().trim_end_matches("/agent/send").to_string();
@@ -866,7 +897,11 @@ async fn run_session(
             }
         });
     }
+    // 桌面 video 上行链路（WS binary / HTTP 批量）+ P2P/LAN 镜像投递：
+    // 全部 desktop-only，lean（无 desktop feature）构建不编译。
+    #[cfg(feature = "desktop")]
     let (post_tx, mut post_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    #[cfg(feature = "desktop")]
     {
         let pc = client.http_client().clone();
         let base = client
@@ -1172,11 +1207,15 @@ async fn run_session(
     // Task 3：P2P 已建连时把 desktop:video 的 fMP4 字节镜像一份进 DataChannel
     //（relay POST 行为/编码/QoS 零改动，仅加一条镜像投递）。闭包外 clone，
     // Arc 引用计数使闭包与消息循环共享同一个投递口。
+    #[cfg(feature = "desktop")]
     let video_tx = p2p_state.video_tx.clone();
+    #[cfg(feature = "desktop")]
     let last_init = p2p_state.last_init.clone();
     // LAN 投递口闭包专用 clone（Arc）：post_fn move 闭包持有它，外部消息
     // 循环保留原 Arc 供重建时 clear_init —— 避免整个 Option 被 move 进闭包。
+    #[cfg(feature = "desktop")]
     let lan_desktop_pf = lan_desktop.clone();
+    #[cfg(feature = "desktop")]
     let post_fn: crate::agent::desktop::PostFn = Arc::new(move |msg| {
         let t = msg["type"].as_str().unwrap_or("?").to_string();
         // fMP4 镜像投递：解析 desktop:video 的 base64 data（init=ftyp+moov /
@@ -1218,6 +1257,7 @@ async fn run_session(
     // R5#11 会话恢复：上次断线前桌面在跑 → 重连后自动恢复桌面流（新
     // send_url 的 post_fn；start 的首帧强制 IDR 会重发 init 给 relay 新建的
     // DesktopStream——否则 relay 重启后 viewer 拿不到参数集黑屏）。
+    #[cfg(feature = "desktop")]
     if *desktop_want_running && desktop_cfg.enabled() {
         tracing::warn!("reconnected with desktop previously running — auto-restoring desktop stream");
         desktop.start(post_fn.clone()).await;
@@ -1733,19 +1773,25 @@ async fn run_session(
 
                                     // Desktop capability snapshot so the web UI can
                                     // enable/disable the 桌面 button accordingly.
+                                    #[cfg(feature = "desktop")]
                                     let caps_msg = Message {
                                         msg_type: "desktop:capabilities".to_string(),
                                         session_id: client.session_id.clone(),
                                         payload: desktop.capabilities_json(),
                                     };
-                                    out.control(caps_msg).await;
+                                    #[cfg(feature = "desktop")]
+                                    {
+                                        out.control(caps_msg).await;
+                                    }
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:start" => {
                                     tracing::info!("desktop:start requested");
                                     desktop.start(post_fn.clone()).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:stop" => {
                                     tracing::info!("desktop:stop requested");
                                     // 桌面上层流停止；P2P 信令会话一并回收（驱动
@@ -1754,6 +1800,7 @@ async fn run_session(
                                     desktop.stop(post_fn.clone()).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:p2p-offer" => {
                                     // 浏览器作为 offerer 发起的 WebRTC 协商（Task 3
                                     // createOffer 产物）。agent 应答 → desktop:p2p-answer
@@ -1791,6 +1838,7 @@ async fn run_session(
                                     .await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:p2p-candidate" => {
                                     // trickle ICE：浏览器把候选中途到达的 remote
                                     // candidate 喂给正在握手的共享 peer。
@@ -1803,6 +1851,7 @@ async fn run_session(
                                     }
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:codec" => {
                                     // 热切换编码方案（web 页编码器下拉）：
                                     // av1/h264，切换后自动重建桌面流。
@@ -1839,6 +1888,7 @@ async fn run_session(
                                     out.control(ack).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:select-display" => {
                                     // 批次7 多显示器选屏（rustdesk 对齐）：切换
                                     // X11 捕获显示器。payload.display 为空 → 恢复
@@ -1874,6 +1924,7 @@ async fn run_session(
                                     out.control(ack).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:qos" => {
                                     // 端到端延时 + 解码背压反馈 → QoS（内容驱动
                                     // fps：静态1fps/动态满帧/解码背压才降帧；码率由
@@ -1929,6 +1980,7 @@ async fn run_session(
                                     out.control(qos_ack).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:test-delay" => {
                                     // TestDelay 探针（R4 甲 A1 / R5#148，对齐
                                     // rustdesk cm::TestDelay）：浏览器单调时钟探测
@@ -1957,6 +2009,7 @@ async fn run_session(
                                     out.control(ack).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:congested" => {
                                     // R5#16 relay→浏览器 fan-out 拥塞回传
                                     // （relay viewer 缓冲满丢旧保新，≥5s 限频）：
@@ -1979,6 +2032,7 @@ async fn run_session(
                                     );
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:reqkey" => {
                                     // 浏览器请求关键帧（接入/参考链断裂/解码错误，
                                     // 对齐 rustdesk 控制端 refresh_video）：置 flag，
@@ -1986,6 +2040,7 @@ async fn run_session(
                                     desktop.request_idr();
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:quality" => {
                                     // 码率档切换（web 码率下拉）：speed/balanced/best
                                     // + 自定义 kbps。改档后重建桌面流。R5#2 命令 ack。
@@ -2020,6 +2075,7 @@ async fn run_session(
                                     out.control(ack).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:gray" => {
                                     // 灰度模式开关（web 桌面控制栏，弱网省带宽）：
                                     // H264 翻编码前 UV 置 128 flag（即时生效）；
@@ -2054,6 +2110,7 @@ async fn run_session(
                                     out.control(ack).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:mouse" => {
                                     // 浏览器键鼠注入：desktop:mouse
                                     // {type,x,y,button,dx,dy}（RW 权限校验
@@ -2061,22 +2118,26 @@ async fn run_session(
                                     desktop.handle_mouse(&msg.payload).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:key" => {
                                     // desktop:key {code,down}（browser
                                     // KeyboardEvent.code 直传）。
                                     desktop.handle_key(&msg.payload).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:clipboard:set" => {
                                     // 浏览器把本地剪贴板文本推到远端。
                                     desktop.handle_clipboard_set(&msg.payload).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:clipboard:get" => {
                                     // 浏览器拉取远端剪贴板（回包经广播）。
                                     desktop.handle_clipboard_get(&post_fn).await;
                                 }
 
+                                #[cfg(feature = "desktop")]
                                 "desktop:bitrate" => {
                                     // 浏览器周期性上报的实测可用带宽 → 弱网自适应
                                     // (把编码码率天花板 clamp 到网络可承受范围)。
@@ -2200,12 +2261,15 @@ async fn run_session(
     // 不显式 stop 会继续向已失效的 relay 连接发帧（浪费 CPU + 重连后与
     // 新流双发冲突）。P2P 驱动任务同是孤儿 task：先回收再断连，防其继续
     // 向失效连接广播 desktop:p2p-state。
-    *desktop_want_running = desktop.is_running();
-    if desktop.is_running() {
-        tracing::warn!("session ending with desktop running — stopping stream for reconnect recovery");
-        desktop.stop(post_fn.clone()).await;
+    #[cfg(feature = "desktop")]
+    {
+        *desktop_want_running = desktop.is_running();
+        if desktop.is_running() {
+            tracing::warn!("session ending with desktop running — stopping stream for reconnect recovery");
+            desktop.stop(post_fn.clone()).await;
+        }
+        crate::agent::p2p::shutdown(&p2p_state).await;
     }
-    crate::agent::p2p::shutdown(&p2p_state).await;
 
     // Tokens were already cached into `cached_tokens` right after registration,
     // so `start` can replay them on reconnect — nothing to return here.
@@ -2318,6 +2382,7 @@ async fn execute_command(cmd: &str, timeout_ms: u64, shell: &str) -> (String, St
 mod tests {
     use super::*;
 
+    #[cfg(feature = "desktop")]
     #[test]
     fn test_self_rss_kb_reports_positive() {
         // R5#136-146 内存画像最小子集：Linux 下 /proc/self/statm 必然给出
@@ -2326,6 +2391,7 @@ mod tests {
         assert!(rss > 0, "self_rss_kb must be >0 on Linux, got {rss}");
     }
 
+    #[cfg(feature = "desktop")]
     #[test]
     fn test_cpu_ms_from_stat_parses_ticks() {
         // R5#136-146 功耗采样：构造 stat（comm 含空格/括号，utime 字段14=100、
@@ -2337,6 +2403,7 @@ mod tests {
         assert_eq!(cpu_ms_from_stat(stat, 0), 0);
     }
 
+    #[cfg(feature = "desktop")]
     #[test]
     fn test_self_cpu_temp_safe_or_positive() {
         // R5#136-146 功耗硬采样：有 hwmon 传感器环境应返回非负温度（≥0，
@@ -2706,6 +2773,7 @@ mod tests {
             control_rx,
             output_rx,
             std::time::Duration::from_millis(50),
+            #[cfg(feature = "desktop")]
             None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -2723,6 +2791,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "desktop")]
     #[tokio::test]
     async fn test_sender_loop_heartbeat_carries_desktop_kpi() {
         // R5#150：桌面启用时心跳必须附带 KPI（fps/codec/bitrate 等），

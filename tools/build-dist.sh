@@ -1,10 +1,18 @@
 #!/bin/bash
-# One-command release build for all 4 shipped platforms.
+# One-command release build for all 4 shipped platforms, producing BOTH:
+#   dist/shell-remote-<arch>        CLI 二进制（relay + agent 仅终端转发，lean）
+#   dist/shell-remote-ui-<arch>     UI 二进制（agent 终端 + 桌面转发）
 #
-# OpenH264 adds C++ (and thus the linked binary needs a C++ stdlib). All four
-# targets here link the distro/gcc sysroot's glibc libstdc++.a, which drags in
-# glibc-only symbols that musl does not have; we append a small stub archive
-# (tools/glibc-cxx-stubs.c) that maps those to plain C calls.
+# CLI 二进制（--no-default-features）不编译任何桌面代码：无 openh264/aom/
+# str0m/x11rb 等重依赖，纯 Rust + ring(C)，无需 libstdc++ 与 libaom。
+# UI 二进制需要 OpenH264(C++) 与 libaom(AV1)：沿用 libstdc++ 静态库 + stub
+# 方案（见下方说明）。
+#
+# aarch64/armv7 用 musl.cc 真 musl 工具链：UI 构建中 str0m 引入的 aws-lc-sys
+# C 代码用 glibc cross-gcc 编译会泄入 __isoc23_* glibc 符号、musl 链接失败
+# （MYS-931 gate）；CLI 构建的 ring(C/asm) 交叉编译同样用它。工具链解压到
+# $HOME/.cache/muslcc-<arch>（musl.cc 发布，GCC 11.2.1 + musl 1.2.3）。
+# x86_64 用系统 musl-gcc（默认 cc + crt-static 亦等价）；Windows 用 mingw。
 #
 # Usage:  tools/build-dist.sh
 # Env:    CACHE_DIR overrides $HOME/.cache/shell-remote-dist
@@ -17,24 +25,17 @@ CACHE="${CACHE_DIR:-$HOME/.cache/shell-remote-dist}"
 mkdir -p "$CACHE"
 STUB_SRC="$ROOT/tools/glibc-cxx-stubs.c"
 
-# target | cc | cxx | ar | dist name
-#
-# aarch64/armv7 用 musl.cc 真 musl 工具链（str0m 引入后其 aws-lc-sys C 代码
-# 用 glibc cross-gcc 编译会泄入 __isoc23_* glibc 符号、musl 链接失败，见
-# MYS-931 gate；经典 glibc-gcc + libstdc++ stub 方案在 vpx/aom/openh264
-# 纯 C/C++ 时代够用，str0m 加入后必须换）。工具链解压到
-# $HOME/.cache/muslcc-<arch>（musl.cc 发布，GCC 11.2.1 + musl 1.2.3）。
-# x86_64 用系统 musl-gcc（默认 cc + crt-static 亦等价）；Windows 用 mingw。
 MUSLCC_AARCH64="${MUSLCC_AARCH64:-$HOME/.cache/muslcc-aarch64/bin/aarch64-linux-musl-}"
 MUSLCC_ARMV7="${MUSLCC_ARMV7:-$HOME/.cache/muslcc-armv7/bin/arm-linux-musleabihf-}"
 if [ ! -x "${MUSLCC_AARCH64}gcc" ] || [ ! -x "${MUSLCC_ARMV7}gcc" ]; then
-  echo "ERROR: str0m 引入后 aarch64/armv7 需 musl.cc 工具链（aws-lc-sys C 代码
-用 glibc cross-gcc 会泄入 glibc 符号致 musl 链接失败）。请下载并解压到
-\$HOME/.cache/muslcc-{aarch64,armv7}（https://musl.cc/aarch64-linux-musl-cross.tgz 与
+  echo "ERROR: aarch64/armv7 需 musl.cc 工具链（UI 的 aws-lc-sys / CLI 的 ring
+C 代码交叉编译 + 链接）。请下载并解压到 \$HOME/.cache/muslcc-{aarch64,armv7}
+（https://musl.cc/aarch64-linux-musl-cross.tgz 与
 arm-linux-musleabihf-cross.tgz），或设 MUSLCC_AARCH64 / MUSLCC_ARMV7 指向
 <prefix>（需含 gcc/g++/ar）。" >&2
   exit 2
 fi
+# target | cc | cxx | ar | dist name
 PLATFORMS=(
   "x86_64-unknown-linux-musl|musl-gcc|g++|ar|shell-remote-x86_64"
   "aarch64-unknown-linux-musl|${MUSLCC_AARCH64}gcc|${MUSLCC_AARCH64}g++|${MUSLCC_AARCH64}ar|shell-remote-aarch64"
@@ -47,18 +48,26 @@ for entry in "${PLATFORMS[@]}"; do
   echo "== $target =="
   dir="$CACHE/${dist_name%.exe}"
   mkdir -p "$dir/x"
+
+  # ---- CLI 二进制（lean）：无桌面依赖，无需 libstdc++ stub / libaom ----
+  echo "-- $target: shell-remote (CLI, --no-default-features) --"
+  env CC="$cc" RUSTFLAGS="-C link-arg=-L$dir" \
+      cargo build --release --bin shell-remote --no-default-features \
+      --target "$target" --manifest-path "$ROOT/Cargo.toml"
+
+  # ---- UI 二进制（desktop）：libstdc++ stub 合并 + 静态 libaom ----
+  # 桌面编码的 OpenH264 引入 C++，链接需要 C++ 运行时。四个目标都链接
+  # distro/gcc sysroot 的 glibc libstdc++.a，其引用 glibc-only 符号
+  # （__*_chk、fopen64…），musl 链接失败 → 合并 glibc-cxx-stubs.c 的 stub。
+  # musl.cc 工具链的 libstdc++ 虽为 musl 构建，但 CACHE 里的 libaom 静态库
+  # 是旧 glibc 工具链预编译的，同样引用 fopen64 等 glibc 符号 → stub 也合入。
   rm -f "$dir/stub.o" "$dir/libstdc++.a"
   stdlib=$("$cxx" -print-file-name=libstdc++.a)
   echo "libstdc++: $stdlib ($cc)"
-  # glibc stub 需合并进所有目标的 libstdc++.a：x86_64-musl 的 distro g++ /
-  # mingw 的 libstdc++ 引用 glibc-only 符号（__*_chk、fopen64…）；musl.cc
-  # 工具链的 libstdc++ 虽为 musl 构建，但 CACHE 里的 libaom 静态库是旧
-  # glibc 工具链预编译的，同样引用 fopen64 等 glibc 符号 → stub 也要合入。
   "$cc" -O2 -c "$STUB_SRC" -o "$dir/stub.o"
   ( cd "$dir/x" && rm -f ./*.o 2>/dev/null; "$ar" x "$stdlib" )
   "$ar" rc "$dir/libstdc++.a" "$dir"/x/*.o "$dir/stub.o"
 
-  # AV1 (libaom)（MYS-954：VP8/VP9/libvpx 已移除，只剩 libaom 静态库）。
   LIBXAOM_FLAGS=()
   if [ -d "$CACHE/libaom-$target" ]; then
     LIBXAOM_FLAGS=("LIBXAOM_DIR=$CACHE/libaom-$target")
@@ -72,15 +81,17 @@ for entry in "${PLATFORMS[@]}"; do
   # 中为 arm/aarch64 提供了内联 dmb 屏障实现（stub.o 已合入 libstdc++.a）。
   # 不链 -lgcc：musl libgcc 的 linux-atomic.o 与 rust compiler_builtins 在
   # arm 下存在 __sync_fetch_and_add_* 重复符号定义。
-  RUSTFLAGS="-C link-arg=-L$dir"
+  echo "-- $target: shell-remote-ui (desktop agent) --"
   env CC="$cc" CXX="$cxx" AR="$ar" "${LIBXAOM_FLAGS[@]}" \
-      RUSTFLAGS="$RUSTFLAGS" \
-      cargo build --release --target "$target" --manifest-path "$ROOT/Cargo.toml"
+      RUSTFLAGS="-C link-arg=-L$dir" \
+      cargo build --release --bin shell-remote-ui \
+      --target "$target" --manifest-path "$ROOT/Cargo.toml"
 done
 
 # Windows agent 嵌入 requireAdministrator manifest: 让 SendInput 能操作
 # 提权窗口/多数弹窗(360 等)。UAC 安全桌面本身仍需服务级组件(后续)。
-echo "== embedding windows manifest =="
+# 仅 UI 二进制需要（桌面键鼠注入）；CLI 二进制不嵌入。
+echo "== embedding windows manifest (UI only) =="
 x86_64-w64-mingw32-windres "$ROOT/build/embed-manifest.rc" -O coff -o "$ROOT/build/agent_manifest.o"
 WIN_AOM_DIR="$CACHE/libaom-x86_64-pc-windows-gnu"
 WIN_LIBXAOM=()
@@ -101,7 +112,8 @@ WIN_STD="$CACHE/shell-remote-x86_64"
 RUSTFLAGS="-C link-args=$ROOT/build/agent_manifest.o -C target-feature=+crt-static \
 -C link-arg=-L$WIN_STD -C link-arg=-static-libstdc++" \
   env "${WIN_LIBXAOM[@]}" \
-  cargo build --release --target x86_64-pc-windows-gnu --manifest-path "$ROOT/Cargo.toml"
+  cargo build --release --bin shell-remote-ui \
+  --target x86_64-pc-windows-gnu --manifest-path "$ROOT/Cargo.toml"
 
 echo "== staging releases =="
 mkdir -p "$ROOT/dist"
@@ -109,6 +121,7 @@ mkdir -p "$ROOT/dist"
 # 不应中止其余目标(该目标可稍后停进程再补拷)。
 stage() { cp "$1" "$2" && echo "staged $2" || { echo "WARN: 未能覆盖 $2 (可能仍被运行中的进程占用)"; failed=1; }; }
 failed=0
+# CLI 二进制
 stage "$ROOT"/target/x86_64-unknown-linux-musl/release/shell-remote \
       "$ROOT/dist/shell-remote-x86_64"
 stage "$ROOT"/target/aarch64-unknown-linux-musl/release/shell-remote \
@@ -117,7 +130,16 @@ stage "$ROOT"/target/armv7-unknown-linux-musleabihf/release/shell-remote \
       "$ROOT/dist/shell-remote-armv7"
 stage "$ROOT"/target/x86_64-pc-windows-gnu/release/shell-remote.exe \
       "$ROOT/dist/shell-remote-x86_64.exe"
+# UI 二进制
+stage "$ROOT"/target/x86_64-unknown-linux-musl/release/shell-remote-ui \
+      "$ROOT/dist/shell-remote-ui-x86_64"
+stage "$ROOT"/target/aarch64-unknown-linux-musl/release/shell-remote-ui \
+      "$ROOT/dist/shell-remote-ui-aarch64"
+stage "$ROOT"/target/armv7-unknown-linux-musleabihf/release/shell-remote-ui \
+      "$ROOT/dist/shell-remote-ui-armv7"
+stage "$ROOT"/target/x86_64-pc-windows-gnu/release/shell-remote-ui.exe \
+      "$ROOT/dist/shell-remote-ui-x86_64.exe"
 
 echo "Built:"
 ls -lh "$ROOT/dist/"
-file "$ROOT"/dist/shell-remote-*
+file "$ROOT"/dist/shell-remote*

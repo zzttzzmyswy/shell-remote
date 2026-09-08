@@ -18,8 +18,8 @@ VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 TAG="v$VERSION"
 echo "== 发布 $TAG（版本源: Cargo.toml） =="
 
-if [ ! -f "dist/shell-remote-x86_64" ]; then
-  echo "dist/ 缺少产物，请先跑 tools/build-dist.sh"; exit 1
+if [ ! -f "dist/shell-remote-x86_64" ] || [ ! -f "dist/shell-remote-ui-x86_64" ]; then
+  echo "dist/ 缺少产物（需 CLI + UI 双二进制），请先跑 tools/build-dist.sh"; exit 1
 fi
 
 # 干净工作树才允许打 tag（防止发布未提交的改动）
@@ -31,7 +31,10 @@ git push origin "$TAG" -f
 
 TITLE="${GH_TITLE:-v$VERSION — shell-remote}"
 
-# 资产文件名即平台约定（与 install.sh / admin 升级 key 一致）
+# 资产文件名即平台约定（与 install.sh / admin 升级 key 一致）。
+# 每个平台两个二进制：
+#   shell-remote-<arch>      CLI（relay + agent 终端，lean）
+#   shell-remote-ui-<arch>   UI（agent 终端 + 桌面）
 gh release create "$TAG" \
   --title "$TITLE" \
   --notes "$(cat <<EOF
@@ -39,13 +42,21 @@ gh release create "$TAG" \
 
 版本号来自 Cargo.toml（$VERSION），与二进制内部自报版本一致。
 
-四平台二进制：Linux x86_64 / aarch64 / armv7 / Windows x86_64。
+四平台双二进制：
+- \`shell-remote-<arch>\`（CLI：relay + agent 仅终端转发，无桌面依赖）
+- \`shell-remote-ui-<arch>\`（UI：agent 终端 + 桌面转发）
+
+> 桌面转发的设备请改用 \`shell-remote-ui-*\` 二进制（安装/升级均按此文件名）。
 EOF
 )" \
   ./dist/shell-remote-x86_64 \
   ./dist/shell-remote-aarch64 \
   ./dist/shell-remote-armv7 \
-  ./dist/shell-remote-x86_64.exe
+  ./dist/shell-remote-x86_64.exe \
+  ./dist/shell-remote-ui-x86_64 \
+  ./dist/shell-remote-ui-aarch64 \
+  ./dist/shell-remote-ui-armv7 \
+  ./dist/shell-remote-ui-x86_64.exe
 
 echo "== 已发布: https://github.com/zzttzzmyswy/shell-remote/releases/tag/$TAG =="
 echo "== 自检: 二进制应报版本 v$VERSION =="

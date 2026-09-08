@@ -71,7 +71,8 @@ struct Transport {
     client: reqwest::Client,
     send_url: String,
     /// Server password captured at registration ("" when key-mode), used to
-    /// authenticate the desktop WS uplink socket.
+    /// authenticate the desktop WS uplink socket（仅 desktop feature 编译）。
+    #[cfg(feature = "desktop")]
     server_auth: String,
     events_rx: mpsc::UnboundedReceiver<String>,
     #[allow(dead_code)]
@@ -314,6 +315,7 @@ impl RelayClient {
             transport: Transport {
                 client: http_client,
                 send_url,
+                #[cfg(feature = "desktop")]
                 server_auth: fixed_key.unwrap_or_default(),
                 events_rx: rx,
                 last_event_id: None,
@@ -456,11 +458,13 @@ impl RelayClient {
     }
 
     /// The `--key` value used at registration ("" when unset). The desktop
-    /// WS uplink reuses it for socket authentication.
+    /// WS uplink reuses it for socket authentication（仅 desktop feature 编译）。
+    #[cfg(feature = "desktop")]
     pub(crate) fn insecure_tls(&self) -> bool {
         self.insecure_tls
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn server_auth(&self) -> &str {
         &self.transport.server_auth
     }
@@ -519,7 +523,10 @@ mod tests {
     fn test_build_capabilities_wayland_detection() {
         // Wayland 后端仅在编译 feature + WAYLAND_DISPLAY 可达时声明。
         std::env::remove_var("WAYLAND_DISPLAY");
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
         let off = build_capabilities();
+        #[cfg(not(all(target_os = "linux", feature = "wayland")))]
+        let _off = build_capabilities();
         std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
         let on = build_capabilities();
         std::env::remove_var("WAYLAND_DISPLAY");

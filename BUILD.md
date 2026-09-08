@@ -80,15 +80,27 @@ its plain counterpart), plus `int __libc_single_threaded = 1;` and
 
 ## Build All Architectures
 
+> v0.51.0 起拆分为两个二进制：
+> - **CLI**（`shell-remote`，relay + agent 仅终端）：`--no-default-features`，不含桌面依赖；
+> - **UI**（`shell-remote-ui`，agent 终端 + 桌面）：`--bin shell-remote-ui`，desktop feature 默认开启。
+
 ```bash
-# x86_64 (native)
-cargo build --release --target x86_64-unknown-linux-musl
+# x86_64 (native) —— CLI
+cargo build --release --target x86_64-unknown-linux-musl --no-default-features
+# x86_64 —— UI（桌面）
+cargo build --release --target x86_64-unknown-linux-musl --bin shell-remote-ui
 
-# aarch64
-CC=aarch64-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-musl
+# aarch64 —— CLI
+CC=aarch64-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-musl --no-default-features
+# aarch64 —— UI（需 musl.cc 真 musl 工具链，见上）
+CC=aarch64-linux-musl-gcc CXX=aarch64-linux-musl-g++ AR=aarch64-linux-musl-ar \
+  cargo build --release --target aarch64-unknown-linux-musl --bin shell-remote-ui
 
-# armv7
-CC=arm-linux-gnueabihf-gcc cargo build --release --target armv7-unknown-linux-musleabihf
+# armv7 —— CLI
+CC=arm-linux-gnueabihf-gcc cargo build --release --target armv7-unknown-linux-musleabihf --no-default-features
+# armv7 —— UI
+CC=arm-linux-musleabihf-gcc CXX=arm-linux-musleabihf-g++ AR=arm-linux-musleabihf-ar \
+  cargo build --release --target armv7-unknown-linux-musleabihf --bin shell-remote-ui
 ```
 
 ## Rename Binaries for Distribution
@@ -96,9 +108,14 @@ CC=arm-linux-gnueabihf-gcc cargo build --release --target armv7-unknown-linux-mu
 ```bash
 mkdir -p releases
 
+# CLI
 cp target/x86_64-unknown-linux-musl/release/shell-remote releases/shell-remote-x86_64
 cp target/aarch64-unknown-linux-musl/release/shell-remote releases/shell-remote-aarch64
 cp target/armv7-unknown-linux-musleabihf/release/shell-remote releases/shell-remote-armv7
+# UI
+cp target/x86_64-unknown-linux-musl/release/shell-remote-ui releases/shell-remote-ui-x86_64
+cp target/aarch64-unknown-linux-musl/release/shell-remote-ui releases/shell-remote-ui-aarch64
+cp target/armv7-unknown-linux-musleabihf/release/shell-remote-ui releases/shell-remote-ui-armv7
 
 # Verify they are static
 file releases/shell-remote-*
