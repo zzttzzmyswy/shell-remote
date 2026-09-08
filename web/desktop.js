@@ -978,12 +978,13 @@
         // 两位(3.0→02、4.0→04)，不是 level 号本身——Chrome 按 5 位 idx
         // (0-31) 校验, 写 "40" 会被拒。T=tier(M/H), DD=bit depth(08)。
         // 无 description。实测 ffmpeg：1080p30 的 av1C idx=8 → av01.*.08M.08。
-        // 单色（MYS-954 灰度）：mono=1 时 codec 串追加 .1.400（mono + chroma
-        // 4:0:0），与 av1C 位同步，解码端按单色输出，避免彩色玻璃色噪。
+        // 单色（MYS-954 灰度）：**不加** ".1.400" 后缀——Chrome WebCodecs
+        // 对带 mono/chroma 扩展段的 codec 串报 "Unknown or ambiguous codec
+        // name"（实测，AV1 开启灰度即触发）。AV1 序列头自带 mono 位，
+        // 解码器从码流自动识别单色，无需 codec 串标注。
         const tier = this._av1Tier ? 'H' : 'M';
-        let codec = 'av01.' + this._av1Profile + '.' +
+        const codec = 'av01.' + this._av1Profile + '.' +
           String(this._av1Level).padStart(2, '0') + tier + '.08';
-        if (this._av1Mono) codec += '.1.400';
         this._dec = new VideoDecoder({
           output: function(frame) { self._onDecoded(frame); },
           error: function(e) {
