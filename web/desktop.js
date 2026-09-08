@@ -43,7 +43,7 @@
       this._inputBound = false;
       this._dec = null;
       this._desc = null;          // avcC description (Uint8Array)
-      this._codecKind = null;     // 'h264' | 'vp9' | 'av1'（由 init 段确定）
+      this._codecKind = null;     // 'h264' | 'av1'（由 init 段确定）
       this._vpcProfile = 0;
       this._vpcLevel = 10;
       this._frames = [];          // decoded VideoFrames pending render
@@ -128,6 +128,7 @@
       this._p2pPc = null;        // RTCPeerConnection（协商失败/断开即置 null）
       this._p2pDc = null;        // RTCDataChannel
       this._p2pTimeout = null;   // 协商 5s 超时定时器
+      this._p2pWaitTimer = null; // P2P 前 3s 用户选择窗口定时器（MYS-954）
       this._p2pFallbackDone = false; // 本次 connect 是否已回退 relay（防双开 WS）
       // 阶段2 LAN 直连：agent 上报的同网段直连地址（"ip:port"）。
       // session.js 的 desktop:capabilities 处理写入；缺省/未开启 → []。
@@ -160,6 +161,7 @@
     skipP2P() {
       if (this.connected) return;
       this._markP2pRejected();
+      if (this._p2pWaitTimer) { clearTimeout(this._p2pWaitTimer); this._p2pWaitTimer = null; }
       if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
       if (this._p2pPc) {
         try { this._p2pPc.close(); } catch (e) {}
@@ -239,17 +241,18 @@
       return secure ? 'MSE (浏览器无 VideoDecoder)' : 'MSE (http 访问未启用 WebCodecs，用 https 可解锁原生解码)';
     }
 
-    // 当前编码方案：与解码同源，由 init 段的 codec box（av1C/vpcC/avcC）
+    // 当前编码方案：与解码同源，由 init 段的 codec box（av1C/avcC）
     // 判定。指标面板展示用（MYS-886：新增指标）。
     _encoderLabel() {
       if (!this._codecKind) return '-';
-      return { h264: 'H.264', vp9: 'VP9', av1: 'AV1' }[this._codecKind] || this._codecKind;
+      return { h264: 'H.264', av1: 'AV1' }[this._codecKind] || this._codecKind;
     }
 
     // 解码器错误计数（R2 己155/R3 丁155 黑名单）：30s 窗口内 >=3 次解码器
     // error → 判定当前 codec 在浏览器端不可解（黑名单），请求 agent 切换
-    // 下一个可用编码（av1→vp9→h264）。与 _scheduleDecodeRecover（重建流）
-    // 互补：重建治"参考链"，切 codec 治"解码器不支持该码流"。
+    // 下一个可用编码（av1→h264，MYS-954：VP8/VP9 已移除）。与
+    // _scheduleDecodeRecover（重建流）互补：重建治"参考链"，切 codec 治
+    // "解码器不支持该码流"。
     _onDecodeError(e) {
       const now = Date.now();
       if (now - this._decErrWindowStart > 30000) {
@@ -259,7 +262,7 @@
       this._decErrCount += 1;
       if (this._decErrCount < 3) return;
       this._decErrCount = 0; // 切换到下一档前重置（避免同窗口反复触发）
-      const codecs = ['av1', 'vp9', 'h264'];
+      const codecs = ['av1', 'h264'];
       if (!this._codecKind || codecs.indexOf(this._codecKind) < 0) return;
       const nextIdx = codecs.indexOf(this._codecKind) + 1;
       if (nextIdx >= codecs.length) return; // 已到 h264，不再可切
@@ -508,8 +511,25 @@
         return;
       }
       const self = this;
-      this._p2pCandidateCount = 0;
+      // MYS-954：P2P 前先给用户 3s 选择窗口（连接弹窗显示"放弃 P2P 走 Relay"
+      // 按钮）。期间 skipP2P() 可触发（_markP2pRejected + 关掉 _ws 则 _startWs）；
+      // 3s 后未选择则自动尝试 P2P。避免一进连接就连 P2P、用户没机会选 relay。
+      // skipP2P 若在窗口内触发（_p2pRejected=true），此处检查落 relay，不建 offer。
+      this._emitProgress('p2p', 'P2P 直连协商中（3 秒后开始）…');
       this._p2pStartAt = Date.now();
+      this._p2pCandidateCount = 0;
+      this._p2pWaitTimer = setTimeout(function() {
+        self._p2pWaitTimer = null;
+        if (self._p2pRejectedActive() || self.connected) { self._startWs(); return; }
+        self._beginP2pNegotiation();
+      }, 3000);
+    }
+
+    // P2P offer 协商主体（_startP2p 的 3s 选择窗口结束后执行；单独拆出便于
+    // skipP2P 在等待期干净地取消——直接 return 掉 _beginP2pNegotiation 调用）。
+    _beginP2pNegotiation() {
+      const self = this;
+      if (this._p2pRejectedActive() || this.connected) { this._startWs(); return; }
       this._emitProgress('p2p', 'P2P 直连协商中…');
       try {
         this._p2pPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
@@ -909,13 +929,13 @@
     }
 
     _handleMoov(body) {
-      // 找 codec 配置 box：先扫 avcC（H.264），再扫 vpcC（VP9），再扫 av1C（AV1）。
+      // 找 codec 配置 box：先扫 avcC（H.264），再扫 av1C（AV1）。
       //   avcC payload: [i+4]=1(version) [i+5..i+7]=profile/compat/level
-      //   vpcC payload: [i+4]=1(version) [i+5]=profile [i+6]=level [i+7]=bitDepth4|chroma3|range1
       //   av1C payload: [i+4]=0x81(marker+version) [i+5]=profile(3)|level(5)
       //     [i+6]=tier/high/twelve/mono/chroma_x/chroma_y/position [i+7]=delay
       // 之前误把 i（标签起点）当 payload 起算，codec 串取到 'v','c','C'
       // 变成 avc1.766343 非法——WebCodecs configure 报 Unknown codec name。
+      // MYS-954：VP8/VP9（vpcC）已移除，不再扫描。
       for (let i = 0; i + 8 <= body.length; i++) {
         if (body[i] === 0x61 && body[i+1] === 0x76 && body[i+2] === 0x63 && body[i+3] === 0x43) {
           const spsLen = (body[i+10] << 8) | body[i+11];
@@ -927,18 +947,6 @@
           this._initDecoder();
           return;
         }
-        if (body[i] === 0x76 && body[i+1] === 0x70 && body[i+2] === 0x63 && body[i+3] === 0x43) {
-          // vpcC 是 FullBox：version/flags(4B) 后才是 profile/level。
-          // 位置: [i+4]=version [i+5..i+7]=flags [i+8]=profile [i+9]=level
-          // VP8 与 VP9 共用 vpcC config record，靠 sample entry box 名区分
-          // （vp08 vs vp09）——扫 moov body 里的 vp08 判定。
-          this._desc = null; // VP9/VP8 无 description
-          this._vpcProfile = body[i+8];
-          this._vpcLevel = body[i+9];
-          this._codecKind = this._hasBoxType(body, 'vp08') ? 'vp8' : 'vp9';
-          this._initDecoder();
-          return;
-        }
         if (body[i] === 0x61 && body[i+1] === 0x76 && body[i+2] === 0x31 && body[i+3] === 0x43) {
           // av1C 是普通 box（非 FullBox），payload 从标签后 4 字节起。
           // [i+5]=seq_profile(3)|seq_level_idx_0(5)；codec 串 LL 直接用
@@ -947,6 +955,10 @@
           this._av1Profile = (body[i+5] >> 5) & 0x7; // seq_profile(3)
           this._av1Level = body[i+5] & 0x1f;         // seq_level_idx_0(5)
           this._av1Tier = (body[i+6] >> 7) & 0x1;    // seq_tier_0(1)
+          // mono 位（MYS-954 灰度）：av1C [i+6] 布局
+          // tier(1) high(1) twelve(1) mono(1) cx(1) cy(1) pos(2)。
+          // 码流是单色时信令必须同步，否则解码端按彩色 I420 输出垃圾色度。
+          this._av1Mono = (body[i+6] >> 4) & 0x1;    // monochrome(1)
           this._codecKind = 'av1';
           this._initDecoder();
           return;
@@ -966,9 +978,12 @@
         // 两位(3.0→02、4.0→04)，不是 level 号本身——Chrome 按 5 位 idx
         // (0-31) 校验, 写 "40" 会被拒。T=tier(M/H), DD=bit depth(08)。
         // 无 description。实测 ffmpeg：1080p30 的 av1C idx=8 → av01.*.08M.08。
+        // 单色（MYS-954 灰度）：mono=1 时 codec 串追加 .1.400（mono + chroma
+        // 4:0:0），与 av1C 位同步，解码端按单色输出，避免彩色玻璃色噪。
         const tier = this._av1Tier ? 'H' : 'M';
-        const codec = 'av01.' + this._av1Profile + '.' +
+        let codec = 'av01.' + this._av1Profile + '.' +
           String(this._av1Level).padStart(2, '0') + tier + '.08';
+        if (this._av1Mono) codec += '.1.400';
         this._dec = new VideoDecoder({
           output: function(frame) { self._onDecoded(frame); },
           error: function(e) {
@@ -985,46 +1000,7 @@
         this._codecStr = codec;
         return;
       }
-      if (this._codecKind === 'vp8') {
-        // VP8: WebCodecs 注册名为裸 "vp8"（vp08.PP.LL 是 ISOBMFF sample entry
-        // 名，VideoDecoder 不认 → Unknown codec name）。无 profile/level 组件。
-        const codec = 'vp8';
-        this._dec = new VideoDecoder({
-          output: function(frame) { self._onDecoded(frame); },
-          error: function(e) {
-            self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
-            self.setStatus('解码错误: ' + e.message, true);
-            self._onDecodeError(e);
-            self._scheduleDecodeRecover();
-          }
-        });
-        this._dec.configure({
-          codec: codec,
-          optimizeForLatency: true
-        });
-        this._codecStr = codec;
-        return;
-      }
-      if (this._codecKind === 'vp9') {
-        // VP9: codec 串 vp09.profile.level.bitdepth，无 description。
-        const codec = 'vp09.' + String(this._vpcProfile).padStart(2, '0') +
-          '.' + String(this._vpcLevel).padStart(2, '0') + '.08';
-        this._dec = new VideoDecoder({
-          output: function(frame) { self._onDecoded(frame); },
-          error: function(e) {
-            self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
-            self.setStatus('解码错误: ' + e.message, true);
-            self._onDecodeError(e);
-            self._scheduleDecodeRecover();
-          }
-        });
-        this._dec.configure({
-          codec: codec,
-          optimizeForLatency: true
-        });
-        this._codecStr = codec;
-        return;
-      }
+      // MYS-954：VP8/VP9 已移除，无 vp08/vp09 分支。
       // H.264: codec 串取 avcC 的 profile/compat/level（与码流一致才被接受）。
       const codec = 'avc1.' + hex(this._desc[1]) + hex(this._desc[2]) + hex(this._desc[3]);
       this._dec = new VideoDecoder({
@@ -1074,7 +1050,7 @@
               sawTrun = true;
               // first_sample_flags 高字节低 2 位 = sample_depends_on; 2=key, 1=delta。
               // 不能只看整字节非零(0x01=delta 的整字节也是非零 → 误判全 key,
-              // 每帧重建解码器+perf 崩)。见 verify_vp9_browser.js 的同样修正。
+              // 每帧重建解码器+perf 崩)。见 verify_browser.js 的同样修正。
               const sampleFlagsByte = d2[12];
               isKey = ((sampleFlagsByte & 0x03) === 0x02);
               const szPos = d2.length - 4;
@@ -1294,6 +1270,7 @@
       // LAN 探测/拉流在途时被显式断开：_startLan 的 fallback 连锁据此停住。
       this._lanCancelled = true;
       // P2P 会话清理（Task 3）：关 pc/dc、清协商超时、解除 __p2pTransport。
+      if (this._p2pWaitTimer) { clearTimeout(this._p2pWaitTimer); this._p2pWaitTimer = null; }
       if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
       if (this._p2pPc) { try { this._p2pPc.close(); } catch (e) {} this._p2pPc = null; }
       if (this._p2pDc) { try { this._p2pDc.onmessage = null; this._p2pDc.onclose = null; } catch (e) {} this._p2pDc = null; }

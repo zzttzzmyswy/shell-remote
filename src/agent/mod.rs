@@ -741,7 +741,7 @@ async fn run_session(
     // 会话结束 drop 时 LanDesktop 中止 server/feed 任务，端口释放供重连重新 bind。
     // 必须在 register 与 DesktopManager::new 之前：绑定端口/出口 IP 只有 spawn
     // 后才知道，注册消息的 lan_addr 与 desktop:capabilities.lan_addrs 都要它。
-    let lan_desktop = if desktop_cfg.lan_port != 0 {
+    let lan_desktop = std::sync::Arc::new(if desktop_cfg.lan_port != 0 {
         // Task 6 CORS 收窄 + final-review #4 fail-closed：LAN 无认证端点只放行
         // relay 同源页面读流。relay_url 解析失败 → LanDesktop::spawn 拒绝启动
         //（不 serve 通配），这里走到 Err 分支记日志、不开服务。
@@ -765,10 +765,10 @@ async fn run_session(
         }
     } else {
         None
-    };
+    });
     // 上报地址（"ip:port"，None = 未开启）：注册消息随 `lan_addr` 上报 relay，
     // 同时注入 DesktopManager 的 config（capabilities_json 的 lan_addrs）。
-    let lan_addr_report = lan_desktop.as_ref().map(|lan| lan.addr_report());
+    let lan_addr_report = lan_desktop.as_ref().as_ref().map(|lan| lan.addr_report());
 
     let mut client = RelayClient::connect_with_retry(
         relay_url,
@@ -1174,6 +1174,9 @@ async fn run_session(
     // Arc 引用计数使闭包与消息循环共享同一个投递口。
     let video_tx = p2p_state.video_tx.clone();
     let last_init = p2p_state.last_init.clone();
+    // LAN 投递口闭包专用 clone（Arc）：post_fn move 闭包持有它，外部消息
+    // 循环保留原 Arc 供重建时 clear_init —— 避免整个 Option 被 move 进闭包。
+    let lan_desktop_pf = lan_desktop.clone();
     let post_fn: crate::agent::desktop::PostFn = Arc::new(move |msg| {
         let t = msg["type"].as_str().unwrap_or("?").to_string();
         // fMP4 镜像投递：解析 desktop:video 的 base64 data（init=ftyp+moov /
@@ -1193,7 +1196,7 @@ async fn run_session(
                     // LAN 直连镜像（Task 4）：同源 fMP4 字节喂给本地 DesktopStream
                     // fan-out（init→set_init，frag→push_frag；关键帧标志取
                     // payload.key 或 flags=="key"，与 WS 二进制上行判定一致）。
-                    if let Some(lan) = lan_desktop.as_ref() {
+                    if let Some(lan) = lan_desktop_pf.as_ref() {
                         let is_init = kind == Some("init");
                         let is_key = is_init
                             || msg["payload"]["key"].as_bool().unwrap_or(false)
@@ -1818,6 +1821,13 @@ async fn run_session(
                                         .unwrap_or(0);
                                     tracing::info!(codec = %codec, "desktop:codec requested");
                                     let result = desktop.set_codec(&codec, post_fn.clone()).await;
+                                    // 重建竞态修复（MYS-954）：清空 LAN 缓存 init，
+                                    // 避免新 viewer 拿到旧 codec init + 新格式帧。
+                                    if result.is_ok() {
+                                        if let Some(lan) = lan_desktop.as_ref() {
+                                            lan.clear_init().await;
+                                        }
+                                    }
                                     let ack = Message {
                                         msg_type: "desktop:cmd-ack".to_string(),
                                         session_id: client.session_id.clone(),
@@ -1847,6 +1857,12 @@ async fn run_session(
                                         .unwrap_or(0);
                                     tracing::info!(sel_display = %sel_disp, "desktop:select-display requested");
                                     let result = desktop.select_display(&sel_disp, post_fn.clone()).await;
+                                    // 重建竞态修复（MYS-954）：清空 LAN 缓存 init。
+                                    if result.is_ok() {
+                                        if let Some(lan) = lan_desktop.as_ref() {
+                                            lan.clear_init().await;
+                                        }
+                                    }
                                     let ack = Message {
                                         msg_type: "desktop:cmd-ack".to_string(),
                                         session_id: client.session_id.clone(),
@@ -2020,6 +2036,13 @@ async fn run_session(
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0);
                                     let result = desktop.set_gray(enabled, post_fn.clone()).await;
+                                    // 重建竞态修复（MYS-954）：AV1 灰度切换会重建流
+                                    // （monochrome 变化），清空 LAN 缓存 init。
+                                    if result.is_ok() {
+                                        if let Some(lan) = lan_desktop.as_ref() {
+                                            lan.clear_init().await;
+                                        }
+                                    }
                                     let ack = Message {
                                         msg_type: "desktop:cmd-ack".to_string(),
                                         session_id: client.session_id.clone(),

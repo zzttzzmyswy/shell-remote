@@ -17,17 +17,17 @@ use std::os::raw::{c_int, c_uint};
 /// One encoded picture, shaped like [`crate::agent::desktop::encoder::EncodedFrame`].
 pub use crate::agent::desktop::encoder::EncodedFrame;
 
-/// AV1 realtime `cpu_used` 固定 5（MYS-954 实测结论：cpu_used 10→5 是
-/// 画质/码率的最大杠杆——同预算下码率减半、PSNR 反升 +1.1dB、SSIM +0.07，
-/// 首帧关键帧 PSNR 提升 +17dB；realtime 档下再开 intrabc/rect 等工具被
-/// speed 档绑定、无额外增量，故只降 speed 不开工具）。
+/// AV1 realtime `cpu_used` 固定 6（MYS-954 实测档位扫描 5-10：speed 6 是
+/// 带宽优先的最佳点——实际码率 436kbps（目标 1M 下省 56%，带宽是重要
+/// 限制），耗时 65ms/帧由 QoS 动态降帧兜底；speed 7-9 画质最高但码率
+/// 飙到 1.2-1.4M 超带宽预算，speed 10 画质崩塌（SSIM 0.50）。realtime
+/// 档下再开 intrabc/rect 等工具被 speed 档绑定、无额外增量，故只降
+/// speed 不开工具）。
 ///
 /// 原面积分档（对齐 rustdesk webrtc `get_cpu_speed`）在 1080p 给 10，
-/// 高 speed 优先保帧率但牺牲画质；统一降到 5 是"质量优先"的取舍——
-/// 单帧编码耗时约 3 倍（75-85ms vs 26ms），由上层 QoS 动态降帧兜底
-/// （10-20fps），换取低码率+清晰画面。
+/// 高 speed 优先保帧率但牺牲画质；固定 6 是"低码率+清晰"的取舍。
 pub fn av1_cpu_used(_w: u32, _h: u32) -> u32 {
-    5
+    6
 }
 
 /// AV1 superblock 档位（对齐 rustdesk `get_super_block_size`：≥4 线程且
@@ -166,7 +166,7 @@ impl AomEncoder {
             }
             // 低延迟实时档全套（对齐 rustdesk libs/scrap/src/common/aom.rs
             // webrtc 配置，MYS-886 卡顿修复）：
-            //   - cpu_used 固定 5（MYS-954 实测：speed 10→5 码率减半、画质
+            //   - cpu_used 固定 6（MYS-954 实测档位扫描：带宽优先选 6，见 av1_cpu_used）
             //     反升，是 realtime 档下画质/码率的唯一有效杠杆；工具被
             //     speed 档绑定，显式开启无增量，故不加工具）。
             //   - AOM_CONTENT_SCREEN：屏幕内容专用 tune（关闭电影类工具）
@@ -230,6 +230,23 @@ impl AomEncoder {
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_INTRA_DEFAULT_TX_ONLY as c_int, 1);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_DISABLE_TRELLIS_QUANT as c_int, 1);
             set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_MAX_REFERENCE_FRAMES as c_int, 3);
+            // 色彩信令（MYS-954 彩色玻璃修复）：libaom 默认 cp/tc/mc 全
+            // UNSPECIFIED → AV1 序列头 `color_description_present=0` → 浏览器
+            // 解码端按默认 BT.709 解释。但上游 capture 转换（color.rs）实际用
+            // **BT.601 limited**——信令与内容不匹配 → 彩色画面整体色偏/变调
+            // （灰阶保持、彩色变"蒙了层彩色玻璃"）。显式声明与转换一致：
+            //   matrix=BT.601（CICP 6）、color_range=studio(0/limited)、
+            //   primaries=BT.709（桌面 sRGB 内容近似）、transfer=SRGB。
+            // 另：chroma 采样是 2x2 左上（color.rs step_by(2)）→ COLOCATED(2)，
+            // 声明后解码端按同位重建，避免半像素色度偏移。
+            // 端到端验证（ffprobe）：color_range=tv、color_space=smpte170m
+            // （BT.601）、color_transfer=iec61966-2-1（sRGB）、primaries=bt709、
+            // chroma_location=topleft —— 与编码端完全一致。
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_MATRIX_COEFFICIENTS as c_int, aom_sys::aom_matrix_coefficients_AOM_CICP_MC_BT_601 as c_int);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_COLOR_RANGE as c_int, aom_sys::aom_color_range_AOM_CR_STUDIO_RANGE as c_int);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_COLOR_PRIMARIES as c_int, aom_sys::aom_color_primaries_AOM_CICP_CP_BT_709 as c_int);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_TRANSFER_CHARACTERISTICS as c_int, aom_sys::aom_transfer_characteristics_AOM_CICP_TC_SRGB as c_int);
+            set_ctl(&mut ctx, aom_sys::aome_enc_control_id_AV1E_SET_CHROMA_SAMPLE_POSITION as c_int, 2 /* AOM_CSP_COLOCATED */);
 
             Ok(Self {
                 ctx,
@@ -481,8 +498,15 @@ impl crate::agent::desktop::encoder::VideoEncoder for AomEncoder {
         // AV1: profile 0 (8-bit 4:2:0), level 与分辨率匹配 (按 luma 采样率):
         //   3.0(30) 覆盖 ≤720p30 (5.9M/s), 5.0(50) 覆盖 1080p30 (62.2M/s)。
         //   level → av1C seq_level_idx → codec 串 LL，由 mp4.rs 统一换算。
+        // monochrome（MYS-954 灰度）随编码器状态传递：码流是单色，信令
+        // （av1C mono 位 + codec 串）必须同步，否则解码端按彩色 I420 输出
+        // 垃圾色度 → "彩色玻璃"全屏色噪。
         let level = if self.height > 720 { 50 } else { 30 };
-        Some(crate::agent::desktop::mp4::VisualSample::Av1 { profile: 0, level })
+        Some(crate::agent::desktop::mp4::VisualSample::Av1 {
+            profile: 0,
+            level,
+            monochrome: self.monochrome,
+        })
     }
 }
 
@@ -491,17 +515,17 @@ mod tests {
     use super::*;
     use crate::agent::desktop::encoder::VideoEncoder;
 
-    /// cpu_used 固定 5（MYS-954 实测：speed 10→5 码率减半+画质反升，是
+    /// cpu_used 固定 6（MYS-954 实测档位扫描 5-10：带宽优先选 6，是
     /// realtime 档唯一有效杠杆；工具被 speed 绑定可不加）；superblock 仍按
     /// 面积/线程分档（#81，对齐 rustdesk get_super_block_size）。
     #[test]
     fn test_area_based_cpu_used_and_superblock() {
         // cpu_used 统一 5，与分辨率无关：
-        assert_eq!(av1_cpu_used(320, 180), 5);
-        assert_eq!(av1_cpu_used(640, 360), 5);
-        assert_eq!(av1_cpu_used(1920, 1080), 5);
-        assert_eq!(av1_cpu_used(640, 180), 5);
-        assert_eq!(av1_cpu_used(1080, 200), 5);
+        assert_eq!(av1_cpu_used(320, 180), 6);
+        assert_eq!(av1_cpu_used(640, 360), 6);
+        assert_eq!(av1_cpu_used(1920, 1080), 6);
+        assert_eq!(av1_cpu_used(640, 180), 6);
+        assert_eq!(av1_cpu_used(1080, 200), 6);
         // superblock：线程 ≥4 且 960×540 ≤ 面积 < 1920×1080 → 64x64
         let s64 = aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_64X64 as c_int;
         let dyn_ = aom_sys::aom_superblock_size_AOM_SUPERBLOCK_SIZE_DYNAMIC as c_int;
