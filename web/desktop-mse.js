@@ -227,11 +227,10 @@
           const profile = (u8[i + 5] >> 5) & 0x7;
           const level = u8[i + 5] & 0x1f;
           const tier = ((u8[i + 6] >> 7) & 0x1) ? 'H' : 'M';
-          // mono 位（MYS-954 灰度）：[i+6] tier(1) high(1) twelve(1) mono(1)
-          // cx(1) cy(1) pos(2)；mono=1 时 codec 串追加 .1.400 同步信令，
-          // 否则解码端按彩色 I420 输出垃圾色度 → 彩色玻璃色噪。
-          const mono = ((u8[i + 6] >> 4) & 0x1) ? '.1.400' : '';
-          return 'av01.' + profile + '.' + String(level).padStart(2, '0') + tier + '.08' + mono;
+          // mono 位（MYS-954 灰度）：**不加** ".1.400" 后缀——Chrome WebCodecs
+          // 对带 mono/chroma 扩展段的 codec 串报 "Unknown or ambiguous codec
+          // name"（实测）；AV1 序列头自带 mono 位，解码器从码流自动识别。
+          return 'av01.' + profile + '.' + String(level).padStart(2, '0') + tier + '.08';
         }
       }
       return null;

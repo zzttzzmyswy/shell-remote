@@ -55,19 +55,15 @@ impl Mp4Config {
                 };
                 format!("avc1.{:02X}{:02X}{:02X}", profile, compat, level)
             }
-            VisualSample::Av1 { profile, level, monochrome } => {
+            VisualSample::Av1 { profile, level, .. } => {
                 // AV1 codec string: av01.P.LLT.DD；P=profile, LL=seq_level_idx
                 // 的十进制两位（3.0→idx2→"02", 4.0→idx4→"04"），Chrome 按
                 // 5 位 idx(0-31) 校验, 写两位 level 号(30/40)会被拒。
-                // 单色（MYS-954）：追加 ".1.400"（mono=1 + chroma 4:0:0），让
-                // 浏览器按单色解码，避免色度平面缺失时输出垃圾 U/V → 全屏色噪。
-                let mono = if *monochrome { ".1.400" } else { "" };
-                format!(
-                    "av01.{}.{:02}M.08{}",
-                    profile,
-                    av1_level_to_idx(*level),
-                    mono
-                )
+                // 单色（MYS-954 灰度）：**不加** ".1.400" 后缀——Chrome
+                // WebCodecs 对带 mono/chroma 扩展段的 codec 串报 "Unknown or
+                // ambiguous codec name"（实测）；AV1 序列头自带 mono 位，
+                // 解码器从码流自动识别单色，无需 codec 串标注。
+                format!("av01.{}.{:02}M.08", profile, av1_level_to_idx(*level))
             }
         }
     }
@@ -736,8 +732,9 @@ mod tests {
         let c = cfg();
         assert_eq!(c.codec_string(), "avc1.42001F");
         assert_eq!(av1_cfg().codec_string(), "av01.0.04M.08");
-        // mono 流 codec 串追加 .1.400（mono=1 + chroma 4:0:0），解码端按单色解。
-        assert_eq!(av1_mono_cfg().codec_string(), "av01.0.04M.08.1.400");
+        // mono 流 codec 串不加 .1.400 后缀（Chrome WebCodecs 不认扩展段，
+        // AV1 序列头自带 mono 位），与彩色一致。
+        assert_eq!(av1_mono_cfg().codec_string(), "av01.0.04M.08");
     }
 
     #[test]
