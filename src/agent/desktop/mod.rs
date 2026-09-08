@@ -1529,7 +1529,9 @@ async fn run_desktop_pipeline(
                 encoder::target_bitrate(w0 as u32, h0 as u32, 0, cfg.quality)
             };
             let scale = qos_scale.load(O::Relaxed).clamp(100, 1000) as u64;
-            bandwidth.load(O::Relaxed).min(ceiling).max(cfg.min_bps).saturating_mul(scale) / 1000
+            effective_base_bps(bandwidth.load(O::Relaxed), ceiling, cfg.min_bps)
+                .saturating_mul(scale)
+                / 1000
         };
         br_guard.set_budget(guard_budget);
         if br_guard.on_frame(encoded.nalu.len(), frame_interval_ms) {
@@ -1602,7 +1604,7 @@ async fn run_desktop_pipeline(
             // QoS 码率缩放（rustdesk QoS 的 quality 维度，MYS-886 需求7-3）：
             // 弱网时把码率天花板压回网络可承受范围（1000‰ = 不缩放）。
             let scale = qos_scale.load(O::Relaxed).clamp(100, 1000) as u64;
-            let eff_base = bandwidth.load(O::Relaxed).min(ceiling).max(cfg.min_bps);
+            let eff_base = effective_base_bps(bandwidth.load(O::Relaxed), ceiling, cfg.min_bps);
             let eff_max = eff_base.saturating_mul(scale) / 1000;
             abr.set_ceiling(eff_max);
             let budget = (eff_max as f64 / 8.0 / cfg.fps).max(1.0);
@@ -1633,6 +1635,24 @@ fn avg_frame_bytes(byte_win: &VecDeque<u32>) -> f64 {
         return 0.0;
     }
     byte_win.iter().map(|&b| b as f64).sum::<f64>() / byte_win.len() as f64
+}
+
+/// ABR 天花板的基准码率（bps）：结合浏览器实测可用带宽 `bw`、编码器天花板
+/// `ceiling` 与配置下限 `min_bps`。
+///
+/// `bw == 0` 表示浏览器**尚未上报**可用带宽——这是 auto 模式（`max_bps=0`）下
+/// `bandwidth` 原子的初值（`set_bandwidth_bps` 一旦上报即保证 ≥1）。此前该
+/// 初值会让 `bw.min(ceiling).max(min_bps)` 落到 `min_bps`（≈80kbps），使桌面
+/// 流在**首个 `desktop:bitrate` 上报之前被压到地板码率**、白白糊几秒。这里
+/// 把"暂无估计"按 `ceiling` 处理（乐观起步，与 master 的内容优先/画质优先
+/// 取向一致；真弱网会在 1-3s 内被 RTT-QoS + 带宽 EMA 拉回）。有上报后按
+/// `min(bw, ceiling)` 收紧并 clamp 到 `[min_bps, ceiling]`（行为不变）。
+fn effective_base_bps(bw: u64, ceiling: u64, min_bps: u64) -> u64 {
+    if bw == 0 {
+        ceiling.max(min_bps)
+    } else {
+        bw.min(ceiling).max(min_bps)
+    }
 }
 
 /// 灰度模式：把 I420 的 UV 平面（色度）置中性 128，Y（亮度）保留。
@@ -2484,6 +2504,19 @@ mod tests {
         // 静止（帧均 ≤ 2KB）→ 长间隔（KF_QUIET_MS）
         assert_eq!(kf_interval_ms_for(KF_ACTIVE_BYTES_FRAME), KF_QUIET_MS);
         assert_eq!(kf_interval_ms_for(0.0), KF_QUIET_MS);
+    }
+
+    #[test]
+    fn test_effective_base_bps_cold_start_uses_ceiling() {
+        // bw==0（浏览器尚未上报，auto 模式初值）→ 用 ceiling，而非被 min_bps
+        // 地板卡住（冷启动不再糊几秒）。
+        assert_eq!(effective_base_bps(0, 2_000_000, 80_000), 2_000_000);
+        // 有上报后：min(bw, ceiling) 并 clamp 到 [min_bps, ceiling]（行为不变）。
+        assert_eq!(effective_base_bps(500_000, 2_000_000, 80_000), 500_000, "弱网估计收紧");
+        assert_eq!(effective_base_bps(9_000_000, 2_000_000, 80_000), 2_000_000, "不超天花板");
+        assert_eq!(effective_base_bps(10_000, 2_000_000, 80_000), 80_000, "不低于下限");
+        // 极端：ceiling < min_bps（超小分辨率）时 bw==0 仍不低于 min_bps。
+        assert_eq!(effective_base_bps(0, 50_000, 80_000), 80_000);
     }
 
     #[test]
