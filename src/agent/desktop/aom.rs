@@ -375,22 +375,38 @@ impl AomEncoder {
     /// av1_change_config → rc.worst/best_quality）。控件走 update_extra_cfg
     /// 的运行期 config 应用路径，**不重初始化 qmatrix**（v0.35 闪退是
     /// `aom_codec_enc_config_set` 的独立缺陷路径），每帧级调用安全。
-    /// 档位→QP：每档 +8（qindex 标度，AV1 45→55 已是重压缩档），封顶 55。
-    /// 0 档：恢复质量档默认 q 区间——经 `set_quality`（低频路径，与 QoS
-    /// ratio 切换同频；高频 config_set 才有 qmatrix 风险，档位切换 1 次/秒
-    /// 量级可接受）。
+    /// 档位→QP：从质量档基准 q_max 线性插值到 63（见
+    /// [`encoder::overshoot_qp_aom`]），每档单调、用满 [base,63]。
+    /// 0 档：只恢复质量档 q 区间、**保留 ABR 当前目标码率**，交回 CBR/ABR。
     pub fn set_overshoot_qp(&mut self, level: u32) {
         let level = level.min(super::BitrateGuard::MAX_LEVEL);
         if level == self.overshoot_level {
             return;
         }
         self.overshoot_level = level;
+        let (_, base_q_max) = crate::agent::desktop::encoder::calc_q_values_aom(self.quality);
         if level == 0 {
-            self.set_quality(self.quality);
+            // 释放：只把 q 区间恢复到质量档默认（解除 QUANTIZER_ONE_PASS 的
+            // min=max 钉死），**不重设 rc_target_bitrate**——旧实现走
+            // `set_quality` 会用 max_bps=0 重算满档 tier 码率，释放瞬间把目标
+            // 顶到满档、越过弱网/QoS 天花板直到下个 10 帧 ABR tick 才纠正
+            // （MYS-969 review）。目标码率交回 ABR（set_bitrate）拥有。
+            let (q_min, q_max) =
+                crate::agent::desktop::encoder::calc_q_values_aom(self.quality);
+            unsafe {
+                let src_ptr = self.ctx.config.enc as *const aom_sys::aom_codec_enc_cfg_t;
+                let mut cfg: aom_sys::aom_codec_enc_cfg_t = std::ptr::read(src_ptr);
+                cfg.rc_min_quantizer = q_min;
+                cfg.rc_max_quantizer = q_max;
+                aom_sys::aom_codec_enc_config_set(&mut self.ctx, &cfg);
+            }
             return;
         }
-        let (_, base_q_max) = crate::agent::desktop::encoder::calc_q_values_aom(self.quality);
-        let qp = (base_q_max + 8 * level as u32).min(55);
+        let qp = crate::agent::desktop::encoder::overshoot_qp_aom(
+            base_q_max,
+            level,
+            super::BitrateGuard::MAX_LEVEL,
+        );
         unsafe {
             set_ctl(
                 &mut self.ctx,

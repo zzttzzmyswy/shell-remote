@@ -1518,9 +1518,11 @@ async fn run_desktop_pipeline(
         // 低于预算 60% 稳住 → 逐档恢复。ABR（10 帧评估）与 QoS（3s ratio）
         // 是慢环，压不住 CBR 瞬时 overshoot——拖动复杂窗口实测码率冲
         // 4000kbps 顶满上行带宽 → 积压 → fps 塌 1。守卫在每个编码帧后评估。
-        // 帧间隔 = wall 时钟差（编码节拍随 fps/QoS 动态变化）。
-        let now_wall_g = std::time::Instant::now();
-        let frame_interval_ms = now_wall_g.duration_since(last_encode).as_secs_f64() * 1000.0;
+        // 帧间隔 = 两次编码开始之间的 wall 时钟差（`gap`，见上方 min_gap 节拍）。
+        // **不能**用 now-last_encode——那是本帧 encode+mux 耗时（远小于真实
+        // 帧距），会把约 2× 帧数塞进 1s 滑窗、把 actual_bps 高估到预算之上，
+        // 从而在码率其实达标时也无谓收紧 QP（MYS-969 review 修复）。
+        let frame_interval_ms = gap.as_secs_f64() * 1000.0;
         let guard_budget = {
             use std::sync::atomic::Ordering as O;
             let ceiling = if cfg.max_bps > 0 {

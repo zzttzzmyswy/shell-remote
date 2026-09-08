@@ -153,6 +153,27 @@ pub fn calc_q_values_aom(ratio: f32) -> (u32, u32) {
     (q_min, q_max)
 }
 
+/// AV1 BitrateGuard 收紧 QP 映射（qindex 0..=63 标度）：把 overshoot 档位
+/// `level`（1..=`max_level`）从质量档基准 `base_q_max` **线性插值到 AV1 量化
+/// 上限 63**（= [`calc_q_values_aom`] 的 q_max 高端）。
+///
+/// 旧实现是固定 `base_q_max + 8*level` 封顶 55——但"码率失控修复"把
+/// `calc_q_values_aom` 的 q_max 高端放开到 63 后，speed/balanced 的基准
+/// q_max 已达 54~56，`+8` 每档都撞 55：6 档的状态机退化成**只有 1 个有效档**
+/// （best 也只有 2 档），且释放时要从 level 6 空走回 0（每档 ≥10 帧 hold）≈2s
+/// 一直钉在 55 才恢复画质（MYS-969 review）。线性插值保证**每档单调、用满
+/// `[base_q_max, 63]` 区间**，重压缩能力对齐 RC 已放开的 63 上限。
+pub fn overshoot_qp_aom(base_q_max: u32, level: u32, max_level: u32) -> u32 {
+    const AV1_Q_CAP: u32 = 63;
+    let base = base_q_max.min(AV1_Q_CAP);
+    if level == 0 || max_level == 0 {
+        return base;
+    }
+    let level = level.min(max_level);
+    // 四舍五入的线性插值：base + round((63-base) * level / max_level)。
+    base + ((AV1_Q_CAP - base) * level + max_level / 2) / max_level
+}
+
 /// 目标码率（bps）：rustdesk 模型 `base_bitrate(w,h) × quality`（base 单位
 /// kbps，乘 1000 转 bps），用户 `--desktop-max-bitrate` 显式设值时作为
 /// 硬顶（max_bps>0）；0 = 自动跟随 rustdesk 模型。
@@ -269,6 +290,27 @@ mod tests {
         assert_eq!(base_bitrate(1920, 1080), 2073);
         assert_eq!(base_bitrate(1280, 720), 1000);
         assert_eq!(base_bitrate(640, 480), 400);
+    }
+
+    #[test]
+    fn test_overshoot_qp_aom_monotonic_and_uses_full_range() {
+        let max = 6u32;
+        // 每个质量档基准（speed≈56 / balanced≈54 / best≈42）都应：level 0 = 基准；
+        // 逐档严格单调递增；level=max 打满到 63（AV1 量化上限）。
+        for base in [56u32, 54, 42] {
+            assert_eq!(overshoot_qp_aom(base, 0, max), base, "level0 = 基准");
+            let mut prev = overshoot_qp_aom(base, 0, max);
+            for lvl in 1..=max {
+                let qp = overshoot_qp_aom(base, lvl, max);
+                assert!(qp > prev, "base={base} level{lvl}: {qp} 必须 > 前档 {prev}");
+                assert!(qp <= 63, "base={base} level{lvl}: {qp} 不得超过 63");
+                prev = qp;
+            }
+            assert_eq!(overshoot_qp_aom(base, max, max), 63, "满档打满到 63");
+        }
+        // 基准已 ≥63 的极端：clamp 到 63，不越界。
+        assert_eq!(overshoot_qp_aom(63, 3, max), 63);
+        assert_eq!(overshoot_qp_aom(70, 3, max), 63);
     }
 
     #[test]
