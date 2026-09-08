@@ -1,6 +1,6 @@
 [package]
 name = "shell-remote"
-version = "0.52.0"
+version = "0.53.0"
 edition = "2021"
 description = "Self-hosted collaborative remote SSH tool with MCP support"
 
@@ -18,7 +18,7 @@ path = "src/main.rs"
 [[bin]]
 name = "shell-remote-ui"
 path = "src/bin/shell-remote-ui.rs"
-required-features = ["desktop", "tui"]
+required-features = ["desktop", "tui", "gui"]
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
@@ -66,6 +66,10 @@ str0m = { version = "0.23.1", default-features = false, features = ["rust-crypto
 # 终端状态界面（TUI，仅 tui feature）：纯 Rust 终端渲染，无系统依赖，
 # 保持现有 musl 静态多架构交叉编译不变。UI 二进制 agent 模式带 TTY 时显示。
 ratatui = { version = "0.30", optional = true }
+# 原生窗口 GUI（eframe/egui，glow 渲染 + X11 纯 Rust 协议 x11rb）：
+# libxkbcommon/libGL 运行时 dlopen，产物保持 musl 全静态
+# （aarch64/armv7 需 -ldl 空 stub，见 tools/build-dist.sh）。
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11"], optional = true }
 
 [build-dependencies]
 pkg-config = "0.3"
@@ -97,7 +101,7 @@ windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics
 [features]
 # 默认带桌面：与旧版单一二进制行为一致（cargo build / cargo test 全量）。
 # CLI 二进制发布产物用 --no-default-features 构建 → 不编译任何桌面代码。
-default = ["desktop", "av1", "tui"]
+default = ["desktop", "av1", "tui", "gui"]
 # 桌面转发（UI 二进制）：X11/DXGI/GDI/wayland 捕获 + AV1/H264 软编 +
 # WebRTC P2P + LAN 直连。关闭时整个 src/agent/desktop、lan、p2p 不编译。
 desktop = ["dep:openh264-sys2", "dep:x11rb", "dep:enigo", "dep:str0m", "dep:windows-sys", "dep:windows"]
@@ -105,6 +109,8 @@ desktop = ["dep:openh264-sys2", "dep:x11rb", "dep:enigo", "dep:str0m", "dep:wind
 av1 = []
 # 终端状态界面（ratatui）：UI 二进制带 TTY 时渲染状态面板。
 tui = ["dep:ratatui"]
+# 原生窗口面板（eframe，仅 UI 二进制）。
+gui = ["dep:eframe", "tui"]
 # Wayland 原生捕获: portal + PipeWire（构建需 zbus/gstreamer 与系统的
 # xdg-desktop-portal；未启用时 --desktop-capture wayland 给出可操作错误）。
 # 桌面代码被 desktop feature 门控，wayland 依赖桌面编译。

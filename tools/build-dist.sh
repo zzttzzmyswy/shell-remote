@@ -81,9 +81,21 @@ for entry in "${PLATFORMS[@]}"; do
   # 中为 arm/aarch64 提供了内联 dmb 屏障实现（stub.o 已合入 libstdc++.a）。
   # 不链 -lgcc：musl libgcc 的 linux-atomic.o 与 rust compiler_builtins 在
   # arm 下存在 __sync_fetch_and_add_* 重复符号定义。
-  echo "-- $target: shell-remote-ui (desktop agent) --"
+
+  # UI 二进制的窗口 GUI（eframe）依赖 x11-dl/dlib 无条件 `-ldl`；musl 把 dl
+  # 并入 libc 无独立 libdl。x86_64 恰好自动兼容，aarch64/armv7 需要一个空
+  # libdl.a stub（与本文件的 glibc-cxx-stubs.c 同套路）。
+  GUI_LDL_ARG=""
+  if [[ "$target" == aarch64-* || "$target" == armv7-* ]]; then
+    printf '' > "$dir/dl_empty.c"
+    "$cc" -O2 -c "$dir/dl_empty.c" -o "$dir/dl_empty.o"
+    "$ar" rcs "$dir/libdl.a" "$dir/dl_empty.o"
+    GUI_LDL_ARG="-C link-arg=-L$dir"
+  fi
+
+  echo "-- $target: shell-remote-ui (desktop agent + window GUI) --"
   env CC="$cc" CXX="$cxx" AR="$ar" "${LIBXAOM_FLAGS[@]}" \
-      RUSTFLAGS="-C link-arg=-L$dir" \
+      RUSTFLAGS="-C link-arg=-L$dir $GUI_LDL_ARG" \
       cargo build --release --bin shell-remote-ui \
       --target "$target" --manifest-path "$ROOT/Cargo.toml"
 done
