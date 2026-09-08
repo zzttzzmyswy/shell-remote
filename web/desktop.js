@@ -216,7 +216,7 @@
       this._streamRetries += 1;
       const self = this;
       this.setStatus('等待桌面流就绪… (' + this._streamRetries + ')', false);
-      const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000);
+      const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
       setTimeout(function() { self.connect(); }, delay);
       return true;
     }
@@ -474,7 +474,7 @@
               self._streamRetries += 1;
               self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
               self.disconnect(false);
-              const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000);
+              const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
               setTimeout(function() { self.connect(); }, delay);
             } else {
               self.setStatus('桌面流已结束', true);
@@ -681,7 +681,7 @@
           this._streamRetries += 1;
           this.setStatus('桌面流重启… (' + this._streamRetries + ')', false);
           this.disconnect(false);
-          const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000);
+          const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
           setTimeout(function() { self.connect(); }, delay);
         } else {
           this.setStatus('桌面流已结束', true);
@@ -808,7 +808,7 @@
           self._streamRetries += 1;
           self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
           self.disconnect(false);
-          const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000);
+          const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
           setTimeout(function() { self.connect(); }, delay);
         } else if (self.connected) {
           self.setStatus('桌面流已结束', true);

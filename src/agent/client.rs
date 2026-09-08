@@ -146,6 +146,16 @@ fn next_retry_delay(is_rate_limited: bool, prev: Duration, max: Duration) -> Dur
     }
 }
 
+/// 在退避基值上叠加抖动，打散多 agent 的同步重连惊群（relay 重启 / 限流后
+/// 所有 agent 用相同确定性节奏会同时冲击 relay）。返回 `[base×0.5, base]` 内的
+/// 随机时长（**只向下抖**，从不超过退避上限/固定值），下限 1s。基值本身保持
+/// 确定、不把抖动喂回下一档指数。
+fn jittered(base: Duration) -> Duration {
+    use rand::Rng;
+    let factor = rand::thread_rng().gen_range(0.5f64..1.0);
+    Duration::from_secs_f64((base.as_secs_f64() * factor).max(1.0))
+}
+
 /// 解析 register 响应中的 `desktop_binary` 能力告知（R5 #41）：新 relay 带
 /// `desktop_binary: true` → agent WS 上行改发 binary desktop:video 帧；
 /// 缺省/非 bool → false（JSON+base64 兼容回退）。
@@ -417,13 +427,19 @@ impl RelayClient {
                         use_tokens = None;
                     }
                     delay = next_retry_delay(is_429, delay, max_delay);
+                    // 退避基值 `delay` 保持确定（喂回下一档指数），但**实际睡眠
+                    // 叠加抖动**打散惊群：relay 重启后所有 agent 若用相同确定性
+                    // 节奏会同时重连冲击 relay，429 固定 15s 尤其严重（所有被限流
+                    // 的 agent 精确 15s 后同时再撞）。见 [`jittered`]。
+                    let sleep_for = jittered(delay);
                     tracing::warn!(
-                        "Connection attempt {} failed: {}. Retrying in {:?}...",
+                        "Connection attempt {} failed: {}. Retrying in {:?} (base {:?})...",
                         attempt + 1,
                         msg,
+                        sleep_for,
                         delay
                     );
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(sleep_for).await;
                 }
             }
         }
@@ -644,5 +660,23 @@ mod tests {
         assert_eq!(next_retry_delay(false, Duration::from_secs(300), max), max);
         // 429 与指数互不干扰
         assert_eq!(next_retry_delay(true, Duration::from_secs(8), max), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_jittered_stays_within_half_to_full_and_floor() {
+        // 抖动只向下（[0.5×, 1×]），从不超过基值（不越退避上限）；下限 1s。
+        for &base_s in &[2u64, 8, 15, 60] {
+            let base = Duration::from_secs(base_s);
+            for _ in 0..500 {
+                let j = jittered(base);
+                assert!(j <= base, "jittered {j:?} 不得超过基值 {base:?}");
+                let floor = Duration::from_secs_f64((base.as_secs_f64() * 0.5).max(1.0));
+                assert!(j >= floor, "jittered {j:?} 不得低于下限 {floor:?}（base {base:?}）");
+            }
+        }
+        // base=1s：0.5×=0.5s 被 1s 下限顶回，恒为 1s。
+        for _ in 0..100 {
+            assert_eq!(jittered(Duration::from_secs(1)), Duration::from_secs(1));
+        }
     }
 }
