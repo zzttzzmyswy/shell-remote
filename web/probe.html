@@ -109,7 +109,7 @@ async function run(){
   const token = $('tok').value.trim() || 'testkey';
   log('UA: '+navigator.userAgent);
   log('MSE='+(typeof MediaSource!=='undefined')+' webcodecs='+(typeof VideoDecoder!=='undefined'));
-  const cands = ['avc1.42C028','avc1.42E01E','avc1.64001E','avc1.640028','vp09.00.10.08'];
+  const cands = ['avc1.42C028','avc1.42E01E','avc1.64001E','avc1.640028','av01.0.30M.08'];
   for (const c of cands) {
     log('isTypeSupported('+c+') = '+MediaSource.isTypeSupported('video/mp4; codecs="'+c+'"'));
   }

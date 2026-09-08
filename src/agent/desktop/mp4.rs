@@ -18,8 +18,15 @@ pub enum VisualSample {
     /// H.264: bare SPS/PPS NAL (no start code, no length prefix), carried in
     /// the `avcC` box.
     H264 { sps: Vec<u8>, pps: Vec<u8> },
-    /// AV1: profile / level (level is AV1 level_idx, carried in `av1C`).
-    Av1 { profile: u8, level: u8 },
+    /// AV1: profile / level (level is AV1 level_idx, carried in `av1C`)。
+    /// `monochrome`（MYS-954 灰度增强）：=true 时码流无色度平面，信令
+    /// （av1C mono 位 + codec 串）必须同步声明，否则解码器按彩色 4:2:0
+    /// 配置输出 VideoFrame，U/V 平面无数据 → 全屏色噪（"蒙了层彩色玻璃"）。
+    Av1 {
+        profile: u8,
+        level: u8,
+        monochrome: bool,
+    },
 }
 
 /// Parameters that describe the encoded stream (resolved from SPS/PPS or the
@@ -48,11 +55,19 @@ impl Mp4Config {
                 };
                 format!("avc1.{:02X}{:02X}{:02X}", profile, compat, level)
             }
-            VisualSample::Av1 { profile, level } => {
+            VisualSample::Av1 { profile, level, monochrome } => {
                 // AV1 codec string: av01.P.LLT.DD；P=profile, LL=seq_level_idx
                 // 的十进制两位（3.0→idx2→"02", 4.0→idx4→"04"），Chrome 按
                 // 5 位 idx(0-31) 校验, 写两位 level 号(30/40)会被拒。
-                format!("av01.{}.{:02}M.08", profile, av1_level_to_idx(*level))
+                // 单色（MYS-954）：追加 ".1.400"（mono=1 + chroma 4:0:0），让
+                // 浏览器按单色解码，避免色度平面缺失时输出垃圾 U/V → 全屏色噪。
+                let mono = if *monochrome { ".1.400" } else { "" };
+                format!(
+                    "av01.{}.{:02}M.08{}",
+                    profile,
+                    av1_level_to_idx(*level),
+                    mono
+                )
             }
         }
     }
@@ -209,7 +224,9 @@ fn avc1(cfg: &Mp4Config) -> Vec<u8> {
 fn sample_entry(cfg: &Mp4Config) -> Vec<u8> {
     match &cfg.sample {
         VisualSample::H264 { .. } => avc1(cfg),
-        VisualSample::Av1 { profile, level } => av01(cfg, *profile, *level),
+        VisualSample::Av1 { profile, level, monochrome } => {
+            av01(cfg, *profile, *level, *monochrome)
+        }
     }
 }
 
@@ -240,18 +257,31 @@ fn av1_level_to_idx(level: u8) -> u8 {
 ///   seq_tier_0(1) high_bitdepth(1) twelve_bit(1) monochrome(1)
 ///     chroma_subsampling_x(1) chroma_subsampling_y(1) chroma_sample_position(2)
 ///   reserved(3) initial_presentation_delay_present(1) reserved(4)
-fn av1c(profile: u8, level: u8) -> Vec<u8> {
+fn av1c(profile: u8, level: u8, monochrome: bool) -> Vec<u8> {
     let mut p = Vec::new();
     p.push(0x81); // marker=1, version=1
     p.push((profile << 5) | av1_level_to_idx(level)); // profile + level_idx
-    // 8-bit 4:2:0: tier=0 high=0 twelve=0 mono=0 x=1 y=1 pos=0
-    p.push(0b0000_1100);
+    // 8-bit 4:2:0: tier=0 high=0 twelve=0 mono=? x=1 y=1 pos=2（colocated）。
+    // chroma_sample_position=2 与编码端 2x2 左上采样一致（color.rs step_by(2)），
+    // 也与 AV1 序列头的 chroma_sample_position（AOM_CSP_COLOCATED=2）同步——
+    // 两侧信令一致，解码端按 colocated 重建，避免半像素色度偏移。
+    // mono=1（MYS-954 灰度）：码流无色度平面，av1C mono 位必须置 1 与
+    // 序列头一致，否则解码器按彩色 I420 输出 → 色度平面无数据 → 全屏色噪。
+    let mut flags = 0b0000_1010u8; // x=1 y=1 pos=2(10)
+    if monochrome {
+        flags |= 0b0001_0000; // monochrome=1
+        // mono 时 chroma_subsampling_x/y 与 sample_position 都应清 0
+        // （无色度可言）。布局：tier(1) high(1) twelve(1) mono(1)
+        // x(1) y(1) pos(2)→ x/y 是位 2-3，pos 是位 0-1。
+        flags &= !0b0000_1111;
+    }
+    p.push(flags);
     p.push(0); // no initial_presentation_delay
     box_of(b"av1C", &p)
 }
 
-fn av01(cfg: &Mp4Config, profile: u8, level: u8) -> Vec<u8> {
-    let av1c_box = av1c(profile, level);
+fn av01(cfg: &Mp4Config, profile: u8, level: u8, monochrome: bool) -> Vec<u8> {
+    let av1c_box = av1c(profile, level, monochrome);
     let mut p = Vec::new();
     p.extend_from_slice(&[0u8; 6]); // reserved
     p.extend_from_slice(&u16b(1)); // data_reference_index
@@ -638,7 +668,16 @@ mod tests {
             width: 320,
             height: 240,
             fps: 15.0,
-            sample: VisualSample::Av1 { profile: 0, level: 30 },
+            sample: VisualSample::Av1 { profile: 0, level: 30, monochrome: false },
+        }
+    }
+
+    fn av1_mono_cfg() -> Mp4Config {
+        Mp4Config {
+            width: 320,
+            height: 240,
+            fps: 15.0,
+            sample: VisualSample::Av1 { profile: 0, level: 30, monochrome: true },
         }
     }
 
@@ -685,7 +724,11 @@ mod tests {
         let pos = init.windows(4).position(|w| w == b"av1C").unwrap();
         assert_eq!(init[pos + 4], 0x81);
         assert_eq!(init[pos + 5], (0u8 << 5) | 4u8, "profile0 level30 -> seq_level_idx 4");
-        assert_eq!(init[pos + 6], 0b0000_1100, "4:2:0 8-bit");
+        assert_eq!(init[pos + 6], 0b0000_1010, "彩色 4:2:0 8-bit, chroma colocated(2)");
+        // mono 变体（MYS-954 灰度）：av1C mono 位必须置 1、chroma 位清 0。
+        let mono_init = mp4_init_segment(&av1_mono_cfg());
+        let mpos = mono_init.windows(4).position(|w| w == b"av1C").unwrap();
+        assert_eq!(mono_init[mpos + 6], 0b0001_0000, "mono=1, chroma_x/y=0");
     }
 
     #[test]
@@ -693,6 +736,8 @@ mod tests {
         let c = cfg();
         assert_eq!(c.codec_string(), "avc1.42001F");
         assert_eq!(av1_cfg().codec_string(), "av01.0.04M.08");
+        // mono 流 codec 串追加 .1.400（mono=1 + chroma 4:0:0），解码端按单色解。
+        assert_eq!(av1_mono_cfg().codec_string(), "av01.0.04M.08.1.400");
     }
 
     #[test]

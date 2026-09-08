@@ -248,12 +248,14 @@
         });
     }
 
-    // 灰度模式开关（弱网省带宽）：发送 desktop:gray，agent 编码前把色度
-    // 置中性，即时生效不重建流。
+    // 灰度模式开关（弱网省带宽）：发送 desktop:gray。AV1 下 monochrome 变化
+    // 会重建桌面流（agent set_gray → stop→start），故与编码切换一样置
+    // __codecSwitchPending，避免 desktop:stopped 误退桌面视图+误报"已关闭"。
     const grayToggle = document.getElementById('desktop-gray-toggle');
     if (grayToggle) {
         grayToggle.addEventListener('change', function() {
             if (!desktopEnabled || !window.shellRemote) return;
+            window.__codecSwitchPending = true;
             window.shellRemote.send('desktop:gray', { enabled: this.checked, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast(this.checked ? '已开启灰度模式（省带宽）' : '已关闭灰度模式', '');
         });

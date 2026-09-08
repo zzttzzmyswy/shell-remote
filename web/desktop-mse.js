@@ -207,33 +207,16 @@
       } catch (e) { /* remove 中断无害 */ }
     }
 
-    // 从 init 段 (ftyp/moov 内含 avcC / vpcC / av1C) 解析浏览器实际需要
+    // 从 init 段 (ftyp/moov 内含 avcC / av1C) 解析浏览器实际需要
     // 的 codec 串。OpenH264 输出的 SPS profile/level 可能与预设不同；解析
     // 到真实值后用它建 SourceBuffer，避免严格 MSE 因 codec 串与实际流不
-    // 匹配而拒播。VP9 → vp09.PP.LL.DD；AV1 → av01.P.LLT.DD。
+    // 匹配而拒播。AV1 → av01.P.LLT.DD。MYS-954：VP8/VP9（vpcC）已移除。
     _codecFromInit(buf) {
       const u8 = new Uint8Array(buf);
       const hex = (b) => b.toString(16).padStart(2, '0').toUpperCase();
       for (let i = 0; i + 8 <= u8.length; i++) {
         if (u8[i] === 0x61 && u8[i + 1] === 0x76 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) {
           return 'avc1.' + hex(u8[i + 5]) + hex(u8[i + 6]) + hex(u8[i + 7]);
-        }
-      }
-      for (let i = 0; i + 8 <= u8.length; i++) {
-        if (u8[i] === 0x76 && u8[i + 1] === 0x70 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) {
-          // vpcC 是 FullBox：version/flags(4B) 后才是 profile/level。
-          // VP8 与 VP9 共用 vpcC，靠 sample entry box 名（vp08/vp09）区分。
-          let isVp8 = false;
-          for (let j = 0; j + 4 <= u8.length; j++) {
-            if (u8[j] === 0x76 && u8[j + 1] === 0x70 && u8[j + 2] === 0x30 && u8[j + 3] === 0x38) {
-              isVp8 = true;
-              break;
-            }
-          }
-          const profile = u8[i + 8];
-          const level = u8[i + 9];
-          return (isVp8 ? 'vp08.' : 'vp09.') + String(profile).padStart(2, '0') + '.' +
-            String(level).padStart(2, '0') + '.08';
         }
       }
       for (let i = 0; i + 8 <= u8.length; i++) {
@@ -244,7 +227,11 @@
           const profile = (u8[i + 5] >> 5) & 0x7;
           const level = u8[i + 5] & 0x1f;
           const tier = ((u8[i + 6] >> 7) & 0x1) ? 'H' : 'M';
-          return 'av01.' + profile + '.' + String(level).padStart(2, '0') + tier + '.08';
+          // mono 位（MYS-954 灰度）：[i+6] tier(1) high(1) twelve(1) mono(1)
+          // cx(1) cy(1) pos(2)；mono=1 时 codec 串追加 .1.400 同步信令，
+          // 否则解码端按彩色 I420 输出垃圾色度 → 彩色玻璃色噪。
+          const mono = ((u8[i + 6] >> 4) & 0x1) ? '.1.400' : '';
+          return 'av01.' + profile + '.' + String(level).padStart(2, '0') + tier + '.08' + mono;
         }
       }
       return null;
@@ -253,12 +240,9 @@
     _resolveCodec(initBuf) {
       const actual = this._codecFromInit(initBuf);
       if (actual && this._codecSupported(actual)) return actual;
-      // fallback：默认串（优先 h264，再尝试 vp9/av1 高配置）
+      // fallback：默认串（优先 h264，再尝试 av1）。MYS-954：VP9 已移除。
       if (this._codecSupported(this.codec)) return this.codec;
       if (this._codecSupported('av01.0.30M.08')) return 'av01.0.30M.08';
-      if (this._codecSupported('vp09.02.10.08')) return 'vp09.02.10.08';
-      if (this._codecSupported('vp09.01.10.08')) return 'vp09.01.10.08';
-      if (this._codecSupported('vp09.00.10.08')) return 'vp09.00.10.08';
       if (this._codecSupported('avc1.64001E')) return 'avc1.64001E';
       if (this._codecSupported('avc1.42C028')) return 'avc1.42C028'; // 1080p level 4.0
       return this._codecSupported('avc1.640028') ? 'avc1.640028' : this.codec;

@@ -50,6 +50,8 @@ pub struct LanDesktop {
     /// [`LanState`]。恒为具体 relay 同源，**不可能**是 `"*"`——origin 解析
     /// 失败时 [`Self::spawn`] 直接拒绝启动，fail-closed）。
     allowed_origin: String,
+    /// 直连 fan-out（与 feed task 共享同一 Inner）：用于重建时清空缓存 init。
+    stream: DesktopStream,
     /// server 任务句柄：drop 时 abort，释放端口供重连重新 bind。
     _server: tokio::task::JoinHandle<()>,
     /// feed 消费任务句柄（drop 时 abort；正常路径 feed_tx 断开后自然退出）。
@@ -122,9 +124,18 @@ impl LanDesktop {
             bind_addr,
             feed_tx,
             allowed_origin: cors_origin,
+            stream,
             _server,
             _feed,
         })
+    }
+
+    /// 清空缓存的 init（MYS-954 重建竞态修复）：桌面流重建（切 codec / 切
+    /// 灰度 / 选屏）后调用，让新 viewer 的 `add_viewer` 不再拿到旧 codec 的
+    /// 缓存 init，改走 `wait_first_init` 等新 init —— 否则旧 init + 新格式帧
+    /// 不匹配，浏览器 AV1 解码偶发异常（切灰度/切编码可复现）。
+    pub async fn clear_init(&self) {
+        self.stream.clear_init().await;
     }
 
     /// 当前 LAN 流 CORS `Access-Control-Allow-Origin` 值（日志/复审观测用；

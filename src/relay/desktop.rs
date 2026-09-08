@@ -88,6 +88,15 @@ impl DesktopStream {
         self.broadcast_to_viewers(bytes).await;
     }
 
+    /// 清空缓存的 init（MYS-954 重建竞态修复）：agent 在 stop→start（切
+    /// codec / 切灰度 monochrome）时调用。否则新 viewer 的 `add_viewer`
+    /// 会立即拿到**旧 codec 的缓存 init**，随后新 codec 的 frag 到达 →
+    /// 解码器按旧 init 建 → AV1 解码异常（切灰度/切编码偶发复现的根因）。
+    /// 清空后新 viewer 走 `wait_first_init` 等到新 init 才收流。
+    pub async fn clear_init(&self) {
+        *self.inner.init.write().await = None;
+    }
+
     /// Forward one media fragment. `is_key` marks a random-access frame.
     ///
     /// 背压策略（对齐 rustdesk 丢旧保新）：channel 满时**不立即踢 viewer**，
