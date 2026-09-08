@@ -152,6 +152,26 @@ session: a1b2c3d4
 - `session:` — 8 位会话 ID（仅用于日志）
 - `rw:` / `ro:` — Token（浏览器登录或 MCP 调用使用）
 
+### UI Agent 终端状态面板（TUI）
+
+在**终端**（TTY）中运行 `shell-remote-ui agent`（非后台/systemd）时，自动显示实时状态面板：
+
+```
+┌ shell-remote-ui ─────────────────────────────────────────┐
+│状态: 已连接    会话 id: e2eui1    已运行: 00:12:34         │
+│Relay: https://relay.example.com                           │
+│延迟: 23 ms（经心跳 ping，每 15s 更新）                    │
+│ Token                                                    │
+│  rw: 0123…cdef                                            │
+│  ro: 4567…89ab                                            │
+└ [r] 刷新 token（会话 id 不变）   [q] / Ctrl-C 退出 ────────┘
+```
+
+- 展示：连接状态（启动中/连接中/已连接/重连中）、会话 id、token（rw/ro）、relay 地址、relay 延迟（心跳 RTT，约 15s 更新一次）、本次连接已运行时长。
+- **`r`**：手动刷新 token —— 重新注册换取新 token，**会话 id 保持不变**；旧 token 立即失效（已被新版顶替）。仅在非 `--key`（随机 token）模式下 token 才会变化；`--key` 模式下 token 即 key，固定不变。
+- **`q` / `Esc` / `Ctrl-C`**：干净退出（还原终端 → 请求 agent 停机，PTY 子进程由 drop 回收，不残留孤儿进程）。
+- 无 TTY（systemd/nohup/重定向）时自动保持原有 headless 行为，不渲染面板；此时业务日志若未设 `SR_LOG_DIR` 会默认落到 `~/.shell-remote/`（TUI 模式下防日志污染界面）。
+
 ### 浏览器访问
 
 打开 `http://<relay-ip>:3000`，输入服务器密码及 Token 即可连接。主区域为 xterm.js 终端，右侧为文件管理器。

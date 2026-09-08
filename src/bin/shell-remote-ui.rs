@@ -6,6 +6,7 @@
 // - 构建必须启用 desktop feature（`cargo build --bin shell-remote-ui` 或
 //   默认 features）；lean 构建（--no-default-features）时该 bin 被跳过。
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal as _;
 
 use shell_remote::{agent, proto::TokenType};
 
@@ -111,6 +112,23 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // stdout 为 TTY 时进入 TUI 模式：状态面板渲染占用 stdout。此时若未显式
+    // 指定 SR_LOG_DIR，默认把业务日志落到 ~/.shell-remote/（自动建目录），
+    // 避免日志刷屏污染界面；headless（无 TTY）保持原日志行为。
+    let tui_active = std::io::stdout().is_terminal();
+    if tui_active && std::env::var("SR_LOG_DIR").map(|d| d.trim().is_empty()).unwrap_or(true) {
+        let dir = std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".shell-remote"))
+            .unwrap_or_else(|_| std::path::PathBuf::from(".shell-remote"));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                std::env::set_var("SR_LOG_DIR", &dir);
+            }
+            Err(e) => {
+                eprintln!("WARN: 创建默认日志目录失败 {:?}: {e}", dir.display());
+            }
+        }
+    }
     shell_remote::install_panic_hook();
     // `_log_guard` 必须活到 main 末尾（drop 会关闭 non-blocking writer）。
     let _log_guard = shell_remote::init_logging();
@@ -150,6 +168,25 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let root = root.unwrap_or_else(agent::home_dir);
+            // 共享状态 + TUI：带 TTY 时启动状态面板（r=刷新token，q=退出）。
+            let agent_status = {
+                let st = shell_remote::status::AgentStatus::new(relay_url.clone());
+                if tui_active {
+                    let st2 = st.clone();
+                    std::thread::Builder::new()
+                        .name("sr-status-tui".into())
+                        .spawn(move || {
+                            if let Err(e) = shell_remote::tui::run(st2) {
+                                tracing::warn!("TUI exited with error: {e:?}");
+                            }
+                        })
+                        .expect("spawn TUI thread");
+                    tracing::info!("TUI status panel active");
+                } else {
+                    tracing::info!("stdout is not a TTY — running headless (status panel disabled)");
+                }
+                st
+            };
             let desktop_cfg = shell_remote::agent::desktop::DesktopConfig {
                 capture: desktop_capture,
                 codec: desktop_codec,
@@ -175,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 shell,
                 desired,
                 desktop_cfg,
+                Some(agent_status),
                 relay_insecure,
             )
             .await?;

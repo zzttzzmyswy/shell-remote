@@ -22,6 +22,8 @@ use std::time::Duration;
 use crate::agent::client::RelayClient;
 use crate::agent::shell::Shell;
 use crate::proto::{McpResultPayload, Message};
+#[cfg(feature = "tui")]
+use crate::status::AgentStatus;
 
 /// Returns the user's home directory, preferring `$HOME` (unix) and falling
 /// back to `%USERPROFILE%` (Windows). Used for the file-manager root default
@@ -92,6 +94,8 @@ async fn sender_loop(
     heartbeat: Duration,
     #[cfg(feature = "desktop")]
     desktop: Option<std::sync::Arc<crate::agent::desktop::DesktopManager>>,
+    #[cfg(feature = "tui")]
+    status: Option<AgentStatus>,
 ) {
     let mut pending: HashMap<String, Vec<u8>> = HashMap::new();
     let mut timer = tokio::time::interval(Duration::from_millis(16));
@@ -140,7 +144,14 @@ async fn sender_loop(
                     });
                 }
                 let ping = ping.to_string();
+                #[cfg(feature = "tui")]
+                let ping_sent_at = std::time::Instant::now();
                 post_raw(&client, &send_url, &ping).await;
+                // 心跳往返即 relay RTT：写入共享状态供 TUI 展示延迟。
+                #[cfg(feature = "tui")]
+                if let Some(st) = &status {
+                    st.set_latency_ms(ping_sent_at.elapsed().as_millis() as u64);
+                }
             }
         }
     }
@@ -683,6 +694,8 @@ pub async fn start(
     session_id: Option<String>,
     #[cfg(feature = "desktop")]
     desktop_cfg: crate::agent::desktop::DesktopConfig,
+    #[cfg(feature = "tui")]
+    status: Option<AgentStatus>,
     insecure_tls: bool,
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_secs(1);
@@ -690,22 +703,34 @@ pub async fn start(
     // Tokens obtained on the first successful registration; replayed on every
     // reconnect so the relay reuses them instead of minting new random ones.
     let mut cached_tokens: Option<Vec<(String, String)>> = None;
+    // 会话 id：优先用 CLI 指定的；刷新 token 时保留最近一次注册拿到的实际 id
+    //（未指定 --session-id 时首个随机 id 也保持不变，满足"不动会话 id"）。
+    #[cfg(feature = "tui")]
+    let mut effective_session_id = session_id;
+    #[cfg(not(feature = "tui"))]
+    let effective_session_id = session_id;
     // R5#11 会话级桌面状态：relay 重启/断线后自动恢复桌面流（跨 run_session
     // 重连传递"上次桌面是否在跑"）。
     #[cfg(feature = "desktop")]
     let mut desktop_want_running = false;
 
     loop {
+        #[cfg(feature = "tui")]
+        if let Some(st) = &status {
+            st.set_phase(crate::status::Phase::Connecting);
+        }
         match run_session(
             &relay_url,
             &key,
             &root,
             &token_type,
             &shell_path,
-            session_id.as_deref(),
+            effective_session_id.as_deref(),
             &mut cached_tokens,
             #[cfg(feature = "desktop")]
             &desktop_cfg,
+            #[cfg(feature = "tui")]
+            status.clone(),
             insecure_tls,
             #[cfg(feature = "desktop")]
             &mut desktop_want_running,
@@ -718,6 +743,35 @@ pub async fn start(
             Err(e) => {
                 tracing::warn!("Agent session error: {}, reconnecting in {:?}...", e, delay);
             }
+        }
+
+        // 手动刷新 token：清掉缓存 token → 下次注册走全新注册路径 →
+        // relay 为同一 session id 铸造新 token（旧会话被顶替）。延迟直接
+        // 用 1s 快速重连，session id 取最近一次实际 id 保持不变。
+        #[cfg(feature = "tui")]
+        if let Some(st) = &status {
+            if st.take_refresh() {
+                tracing::info!("token refresh: re-registering with same session id (new tokens)");
+                cached_tokens = None;
+                let cur = st.session_id();
+                if !cur.is_empty() {
+                    effective_session_id = Some(cur);
+                }
+                delay = Duration::from_secs(1);
+            }
+        }
+        // 手动停机（TUI q）：结束会话后正常退出进程。
+        #[cfg(feature = "tui")]
+        if let Some(st) = &status {
+            if st.take_shutdown() {
+                tracing::info!("shutdown requested by UI, exiting");
+                return Ok(());
+            }
+        }
+
+        #[cfg(feature = "tui")]
+        if let Some(st) = &status {
+            st.set_phase(crate::status::Phase::Reconnecting);
         }
         tokio::time::sleep(delay).await;
         delay = std::cmp::min(delay * 2, max_delay);
@@ -734,6 +788,8 @@ async fn run_session(
     cached_tokens: &mut Option<Vec<(String, String)>>,
     #[cfg(feature = "desktop")]
     desktop_cfg: &crate::agent::desktop::DesktopConfig,
+    #[cfg(feature = "tui")]
+    status: Option<AgentStatus>,
     insecure_tls: bool,
     // R5#11 会话级桌面状态：进入时若为 true（上次断线前桌面在跑）→ 自动
     // 恢复桌面流；退出时回写当前状态并停掉旧流（防孤儿 task 继续向已失效
@@ -817,6 +873,12 @@ async fn run_session(
         tracing::info!(session = %client.session_id, permission = %perm, "token: {}", token);
     }
 
+    // 把实际 session id 与 token 写入共享状态（TUI 展示；token 刷新后在此更新）。
+    #[cfg(feature = "tui")]
+    if let Some(st) = &status {
+        st.set_connected(&client.session_id, client.tokens.clone());
+    }
+
     // Outbound channel + background sender. The main loop must never block on
     // HTTP — otherwise high-volume terminal output starves input/command
     // processing (and MCP round-trips time out as "i/o error").
@@ -852,6 +914,8 @@ async fn run_session(
         Duration::from_secs(15),
         #[cfg(feature = "desktop")]
         Some(desktop.clone()),
+        #[cfg(feature = "tui")]
+        status.clone(),
     ));
     // Keep a control sender for spawned long-running tasks (e.g. mcp:exec).
     let task_control_tx = control_tx;
@@ -1337,9 +1401,35 @@ async fn run_session(
 
     let mut cleanup_tick = tokio::time::interval(Duration::from_secs(60));
     cleanup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // TUI 刷新/停机信号轮询。tokio::select! 是宏，无法在分支上 cfg，故 interval
+    // 恒建：tui 构建 500ms 轮询（r 键刷新 token、q 停机），lean 构建 1h（不生效）。
+    #[cfg(feature = "tui")]
+    let mut ui_poll = tokio::time::interval(Duration::from_millis(500));
+    #[cfg(not(feature = "tui"))]
+    let mut ui_poll = tokio::time::interval(Duration::from_secs(3600));
+    ui_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+                // 刷新 token / 停机：结束本次会话，由 start() 决定重连(刷新)
+                // 还是退出进程(停机)。二者都要求干净退出会话（回收 PTY）。
+                _ = ui_poll.tick() => {
+                    #[cfg(feature = "tui")]
+                    {
+                        if status.as_ref().map_or(false, AgentStatus::refresh_pending) {
+                            tracing::info!("token refresh requested — ending session to re-register (same session id)");
+                            break;
+                        }
+                        if status.as_ref().map_or(false, AgentStatus::shutdown_pending) {
+                            tracing::info!("shutdown requested — ending session");
+                            break;
+                        }
+                    }
+                    #[cfg(not(feature = "tui"))]
+                    {
+                        let _ = 0;
+                    }
+                }
                 _ = cleanup_tick.tick() => {
                     let now = std::time::Instant::now();
                     upload_reassembly.retain(|_, r| {
@@ -2775,6 +2865,8 @@ mod tests {
             std::time::Duration::from_millis(50),
             #[cfg(feature = "desktop")]
             None,
+            #[cfg(feature = "tui")]
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         drop(control_tx);
@@ -2832,6 +2924,8 @@ mod tests {
             output_rx,
             std::time::Duration::from_millis(50),
             Some(dm.clone()),
+            #[cfg(feature = "tui")]
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         drop(control_tx);
