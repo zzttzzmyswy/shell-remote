@@ -988,17 +988,35 @@
         this._dec = new VideoDecoder({
           output: function(frame) { self._onDecoded(frame); },
           error: function(e) {
+            // MYS-954 灰度报错诊断：把实际 codec 串 + 环境打进 console，
+            // 供"Unknown or ambiguous codec name"类问题定位（页面 error 条
+            // 只 setStatus 不打印，Console 无痕会让排查无从下手）。
+            console.error('[desktop-decode] AV1 decoder error:', e.message,
+              '| codec=', codec,
+              '| mono=', this._av1Mono, '| ua=', navigator.userAgent);
             self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
-            self.setStatus('解码错误: ' + e.message, true);
+            self.setStatus('解码错误: ' + e.message + ' (codec=' + codec + ')', true);
             self._onDecodeError(e);
             self._scheduleDecodeRecover();
           }
         });
-        this._dec.configure({
-          codec: codec,
-          optimizeForLatency: true
-        });
+        try {
+          this._dec.configure({
+            codec: codec,
+            optimizeForLatency: true
+          });
+        } catch (e) {
+          // 部分 Chrome 对非法/不支持的 codec 串在 configure 同步抛错（而非
+          // 异步 error 事件），不接住会变成 uncaught error 且页面无提示。
+          console.error('[desktop-decode] AV1 configure failed:', e.message,
+            '| codec=', codec, '| ua=', navigator.userAgent);
+          self.setStatus('解码错误: ' + e.message + ' (codec=' + codec + ')', true);
+          self._onDecodeError(e);
+          self._scheduleDecodeRecover();
+          return;
+        }
         this._codecStr = codec;
+        console.info('[desktop-decode] AV1 decoder init:', codec, 'mono=' + this._av1Mono);
         return;
       }
       // MYS-954：VP8/VP9 已移除，无 vp08/vp09 分支。
@@ -1007,17 +1025,32 @@
       this._dec = new VideoDecoder({
         output: function(frame) { self._onDecoded(frame); },
         error: function(e) {
+          console.error('[desktop-decode] H264 decoder error:', e.message,
+            '| codec=', codec,
+            '| desc=', this._desc ? Array.from(this._desc).map(b=>b.toString(16).padStart(2,'0')).join('') : 'null',
+            '| ua=', navigator.userAgent);
           self._decErr = true; // 下个关键帧自愈重建（见 _handleMdat）
-          self.setStatus('解码错误: ' + e.message, true);
+          self.setStatus('解码错误: ' + e.message + ' (codec=' + codec + ')', true);
           self._onDecodeError(e);
           self._scheduleDecodeRecover();
         }
       });
-      this._dec.configure({
-        codec: codec,
-        description: this._desc,
-        optimizeForLatency: true
-      });
+      try {
+        this._dec.configure({
+          codec: codec,
+          description: this._desc,
+          optimizeForLatency: true
+        });
+      } catch (e) {
+        console.error('[desktop-decode] H264 configure failed:', e.message,
+          '| codec=', codec,
+          '| desc=', this._desc ? Array.from(this._desc).map(b=>b.toString(16).padStart(2,'0')).join('') : 'null',
+          '| ua=', navigator.userAgent);
+        self.setStatus('解码错误: ' + e.message + ' (codec=' + codec + ')', true);
+        self._onDecodeError(e);
+        self._scheduleDecodeRecover();
+        return;
+      }
       this._codecStr = codec;
     }
 

@@ -143,6 +143,7 @@
           // 附上浏览器标识与当前 UA，便于远程定位是哪类内核拒绝解码。
           let ua = '';
           try { ua = ' UA=' + navigator.userAgent; } catch (e) {}
+          console.error('[desktop-decode] MSE SourceBuffer error | codec=', codec, ua);
           self.setStatus('MSE 解码错误: 浏览器无法解码该视频流 (codec=' + codec + ')' + ua, true);
         });
         // 追帧心跳（MYS-886 延迟修复）：_syncPlayhead 只挂在 updateend 上，
