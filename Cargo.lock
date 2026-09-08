@@ -3322,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "shell-remote"
-version = "0.50.2"
+version = "0.50.3"
 dependencies = [
  "anyhow",
  "async-stream",
