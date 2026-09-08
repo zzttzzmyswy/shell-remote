@@ -95,6 +95,7 @@
       if (!this._bpsTs) {
         this._bpsTs = now;
         this._bpsBytes = 0;
+        this._peakKbps = 0;
       }
       this._bpsBytes += bytes;
       const dt = (now - this._bpsTs) / 1000;
@@ -103,8 +104,18 @@
         this._lastKbps = kbps; // 指标面板展示当前值
         this._bpsTs = now;
         this._bpsBytes = 0;
-        if (kbps > 0 && window.shellRemote && window.shellRemote.send) {
-          window.shellRemote.send('desktop:bitrate', { kbps: kbps });
+        // 可用带宽估计（上报 agent 作码率天花板）：与 WebCodecs 路径
+        // （desktop.js）一致，用 EMA 平滑当前实测值而非上报瞬时吞吐——
+        // 瞬时值在静止屏≈0，会把 agent 的 ceiling 误压到地板；EMA 快速
+        // 跟跌、缓慢回升（升 0.1 / 降 0.5），对齐 rustdesk 带宽估计收敛方向。
+        if (this._peakKbps > 0) {
+          const a = kbps < this._peakKbps ? 0.5 : 0.1;
+          this._peakKbps = Math.round(this._peakKbps + (kbps - this._peakKbps) * a);
+        } else {
+          this._peakKbps = kbps;
+        }
+        if (this._peakKbps > 0 && window.shellRemote && window.shellRemote.send) {
+          window.shellRemote.send('desktop:bitrate', { kbps: this._peakKbps });
         }
       }
     }
