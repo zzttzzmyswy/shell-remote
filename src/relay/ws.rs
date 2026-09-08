@@ -349,41 +349,50 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             let is_mcp_rpc = proto_msg.msg_type != "fs:result"
                 && proto_msg.payload.get("_mcp_request_id").is_some();
             if !is_mcp_rpc {
-                let sse_sessions = state.sse_sessions.read().await;
-                let broadcast = state.agent_broadcast.read().await;
-                if let Some(channel_map) = broadcast.get(session_id) {
-                    let target_user = proto_msg
-                        .payload
-                        .get("_target_user_id")
-                        .and_then(|v| v.as_str());
-                    for (uid, sse_sid) in &channel_map.browser_sessions {
-                        if target_user.is_none_or(|t| t == uid.as_str()) {
-                            if let Some(tx) = sse_sessions.get(sse_sid) {
-                                // R5#29 控制消息优先级（腾位窗口）：lossy 数据
-                                // （terminal:output 等）维持 try_send 静默丢；
-                                // non-lossy 控制消息在 channel 满时给 100ms
-                                // 腾位窗口（浏览器消费端正在排空）——弱网/瞬间
-                                // 积压下控制消息不被数据挤掉；仍满才告警丢。
-                                if is_lossy_msg_type(&proto_msg.msg_type) {
-                                    deliver(tx, &proto_msg.msg_type, text_str.to_string());
-                                } else {
-                                    let tx_clone = tx.clone();
-                                    let msg = text_str.to_string();
-                                    if tokio::time::timeout(
-                                        std::time::Duration::from_millis(100),
-                                        tx_clone.send(msg),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        tracing::warn!(
-                                            "SSE control channel still full after 100ms; dropping non-lossy {} for a stuck browser",
-                                            proto_msg.msg_type
-                                        );
-                                    }
-                                }
-                            }
+                // 先在锁内收集目标 SSE 发送端快照（`tx.clone()` 是 Arc 级廉价
+                // 克隆），释放锁后再发送——**不在持有 sse_sessions/agent_broadcast
+                // 读锁期间 await send**。non-lossy 控制消息满时的 100ms 腾位窗口
+                // 若在锁内 await，会阻塞整个 agent 路由任务，且 tokio RwLock 写优先
+                // → 等写锁的 register/reconnect/reaper 全部排队 → relay 头阻塞
+                // （MYS-969 review 修复；此前违反 `deliver` 的"持锁不 await"契约）。
+                let targets: Vec<mpsc::Sender<String>> = {
+                    let sse_sessions = state.sse_sessions.read().await;
+                    let broadcast = state.agent_broadcast.read().await;
+                    match broadcast.get(session_id) {
+                        Some(channel_map) => {
+                            let target_user = proto_msg
+                                .payload
+                                .get("_target_user_id")
+                                .and_then(|v| v.as_str());
+                            channel_map
+                                .browser_sessions
+                                .iter()
+                                .filter(|(uid, _)| target_user.is_none_or(|t| t == uid.as_str()))
+                                .filter_map(|(_, sse_sid)| sse_sessions.get(sse_sid).cloned())
+                                .collect()
                         }
+                        None => Vec::new(),
+                    }
+                }; // sse_sessions / agent_broadcast 读锁在此释放
+                let lossy = is_lossy_msg_type(&proto_msg.msg_type);
+                for tx in targets {
+                    // R5#29 控制消息优先级（腾位窗口）：lossy 数据（terminal:output
+                    // 等）维持 try_send 静默丢；non-lossy 控制消息在 channel 满时给
+                    // 100ms 腾位窗口（浏览器消费端正在排空），仍满才告警丢。现在在
+                    // 锁外 await，单个卡住的浏览器不再阻塞路由与写锁。
+                    if lossy {
+                        deliver(&tx, &proto_msg.msg_type, text_str.to_string());
+                    } else if tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        tx.send(text_str.to_string()),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            "SSE control channel still full after 100ms; dropping non-lossy {} for a stuck browser",
+                            proto_msg.msg_type
+                        );
                     }
                 }
             }
