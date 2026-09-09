@@ -58,6 +58,11 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
 
+        /// 本机状态面板视图：auto（默认：有 DISPLAY/Windows 开原生窗口，否则
+        /// 有 TTY 开终端面板，两者皆无则 headless）/ window / tui / headless。
+        #[arg(long, default_value = "auto")]
+        view: String,
+
         /// Desktop capture backend: auto | dxgi | gdi | x11 | wayland | none.
         /// Windows: dxgi (Desktop Duplication, 60fps capable) with automatic
         /// GDI fallback; Linux: wayland portal (if built with --features
@@ -110,13 +115,61 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // stdout 为 TTY 时进入 TUI 模式：状态面板渲染占用 stdout。此时若未显式
-    // 指定 SR_LOG_DIR，默认把业务日志落到 ~/.shell-remote/（自动建目录），
-    // 避免日志刷屏污染界面；headless（无 TTY）保持原日志行为。
-    let tui_active = std::io::stdout().is_terminal();
-    if tui_active && std::env::var("SR_LOG_DIR").map(|d| d.trim().is_empty()).unwrap_or(true) {
+/// 本机状态面板视图。auto：有桌面（DISPLAY / Windows）→ window；否则有 TTY →
+/// tui；否则 headless。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    Auto,
+    Window,
+    Tui,
+    Headless,
+}
+
+impl View {
+    fn resolve(s: &str) -> Self {
+        match s {
+            "window" => View::Window,
+            "tui" => View::Tui,
+            "headless" => View::Headless,
+            _ => View::Auto,
+        }
+    }
+
+    fn effective(self) -> Self {
+        match self {
+            v @ (View::Window | View::Tui | View::Headless) => v,
+            View::Auto => {
+                if cfg!(windows)
+                    || std::env::var("DISPLAY")
+                        .map(|d| !d.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    View::Window
+                } else if std::io::stdout().is_terminal() {
+                    View::Tui
+                } else {
+                    View::Headless
+                }
+            }
+        }
+    }
+
+    fn is_interactive(self) -> bool {
+        matches!(self, View::Window | View::Tui)
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    let view = View::resolve(match &cli.command {
+        Command::Agent { view, .. } => view,
+    });
+    let view = view.effective();
+
+    // 交互视图（窗口/TUI）下业务日志默认落 ~/.shell-remote/，避免刷屏污染界面；
+    // headless（systemd/nohup）保持原 stderr 行为。
+    if view.is_interactive() && std::env::var("SR_LOG_DIR").map(|d| d.trim().is_empty()).unwrap_or(true) {
         let dir = std::env::var("HOME")
             .map(|h| std::path::PathBuf::from(h).join(".shell-remote"))
             .unwrap_or_else(|_| std::path::PathBuf::from(".shell-remote"));
@@ -133,10 +186,8 @@ async fn main() -> anyhow::Result<()> {
     // `_log_guard` 必须活到 main 末尾（drop 会关闭 non-blocking writer）。
     let _log_guard = shell_remote::init_logging();
 
-    let cli = Cli::parse();
-
     let version = env!("CARGO_PKG_VERSION");
-    tracing::info!("shell-remote-ui v{}", version);
+    tracing::info!("shell-remote-ui v{} (view={view:?})", version);
 
     match cli.command {
         Command::Agent {
@@ -147,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
             token_type,
             shell,
             session_id,
+            view: _,
             desktop_capture,
             desktop_codec,
             desktop_fps,
@@ -168,22 +220,36 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let root = root.unwrap_or_else(agent::home_dir);
-            // 共享状态 + TUI：带 TTY 时启动状态面板（r=刷新token，q=退出）。
+            // 共享状态 + 视图调度：window（原生窗口，主线程事件循环）/ tui（终端面板
+            // 线程）/ headless。三者共用同一 AgentStatus（状态/会话id/token/延迟 +
+            // 刷新/退出信号）。
             let agent_status = {
                 let st = shell_remote::status::AgentStatus::new(relay_url.clone());
-                if tui_active {
-                    let st2 = st.clone();
-                    std::thread::Builder::new()
-                        .name("sr-status-tui".into())
-                        .spawn(move || {
-                            if let Err(e) = shell_remote::tui::run(st2) {
-                                tracing::warn!("TUI exited with error: {e:?}");
-                            }
-                        })
-                        .expect("spawn TUI thread");
-                    tracing::info!("TUI status panel active");
-                } else {
-                    tracing::info!("stdout is not a TTY — running headless (status panel disabled)");
+                match view {
+                    View::Window => {
+                        // 窗口事件循环在下方主线程运行（winit 要求主线程创建）；
+                        // 这里只把 agent 放到 tokio 后台任务。
+                        tracing::info!("native window panel (main-thread event loop)");
+                    }
+                    View::Tui => {
+                        #[cfg(feature = "tui")]
+                        {
+                            let st2 = st.clone();
+                            std::thread::Builder::new()
+                                .name("sr-status-tui".into())
+                                .spawn(move || {
+                                    if let Err(e) = shell_remote::tui::run(st2) {
+                                        tracing::warn!("TUI exited with error: {e:?}");
+                                    }
+                                })
+                                .expect("spawn TUI thread");
+                            tracing::info!("TUI status panel active");
+                        }
+                    }
+                    View::Headless => {
+                        tracing::info!("headless mode (no status panel)");
+                    }
+                    View::Auto => unreachable!("effective() already resolved"),
                 }
                 st
             };
@@ -204,18 +270,46 @@ async fn main() -> anyhow::Result<()> {
                 lan_port: desktop_lan_port,
                 lan_addr: None, // 由 run_session 在 LanDesktop::spawn 后注入
             };
-            agent::start(
-                relay_url,
-                key,
-                root,
-                token_type.as_str().to_string(),
-                shell,
-                desired,
-                desktop_cfg,
-                Some(agent_status),
-                relay_insecure,
-            )
-            .await?;
+            // agent 在独立 std::thread + 专属 tokio runtime 上运行（agent::start 的
+            // future 含非 Send 的 PTY 句柄，不能 tokio::spawn 跨线程）；window 视图
+            // 把主线程让给 winit 事件循环（Linux 创建 EventLoop 必须在主线程）。
+            let status_for_agent = agent_status.clone();
+            let agent_thread = std::thread::Builder::new()
+                .name("sr-agent".into())
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?;
+                    rt.block_on(agent::start(
+                        relay_url,
+                        key,
+                        root,
+                        token_type.as_str().to_string(),
+                        shell,
+                        desired,
+                        desktop_cfg,
+                        Some(status_for_agent),
+                        relay_insecure,
+                    ))
+                })
+                .expect("spawn agent thread");
+
+            match view {
+                View::Window => {
+                    #[cfg(feature = "gui")]
+                    {
+                        if let Err(e) = shell_remote::gui::run(agent_status.clone()) {
+                            tracing::warn!("GUI exited with error: {e:?}");
+                        }
+                        // 窗口关闭/退出 → 请求 agent 停机并等它收尾（返回后进程退出）。
+                        agent_status.request_shutdown();
+                    }
+                    let _ = agent_thread.join();
+                }
+                View::Tui | View::Headless | View::Auto => {
+                    let _ = agent_thread.join();
+                }
+            }
         }
     }
 

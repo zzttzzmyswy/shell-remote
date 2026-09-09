@@ -172,6 +172,29 @@ session: a1b2c3d4
 - **`q` / `Esc` / `Ctrl-C`**：干净退出（还原终端 → 请求 agent 停机，PTY 子进程由 drop 回收，不残留孤儿进程）。
 - 无 TTY（systemd/nohup/重定向）时自动保持原有 headless 行为，不渲染面板；此时业务日志若未设 `SR_LOG_DIR` 会默认落到 `~/.shell-remote/`（TUI 模式下防日志污染界面）。
 
+### UI Agent 原生窗口面板（GUI，v0.53.0+）
+
+带桌面的设备（`DISPLAY` 已设置，或 Windows）运行 `shell-remote-ui agent` 时，自动打开**原生窗口**状态面板（egui/eframe），内容与 TUI 一致：状态/会话 id/token/relay 地址/relay 延迟/已运行时长，按钮"刷新 token（会话 id 不变）"与"退出"。
+
+```
+┌ shell-remote-ui ────────────────────────────────┐
+│ shell-remote-ui 状态                            │
+│ 状态：已连接    会话 id：e2eui1                  │
+│ Relay：https://relay.example.com                │
+│ 延迟：23 ms（经心跳 ping，每 15s 更新）          │
+│ 已运行：00:12:34                                │
+│ Token：                                        │
+│   rw: 0123…cdef                                 │
+│   ro: 4567…89ab                                 │
+│ [刷新 token（会话 id 不变）] [退出]             │
+└────────────────────────────────────────────────┘
+```
+
+- **视图自动选择**：有 `DISPLAY`（Linux 桌面环境）/Windows → 原生窗口；否则有 TTY → 终端面板；都无 → headless。可用 `--view <auto|window|tui|headless>` 强制指定。
+- **静态链接**：窗口 GUI 走 winit X11（纯 Rust 协议 x11rb），libxkbcommon/libGL 运行时 dlopen，二进制保持 **musl 全静态**（aarch64/armv7 构建脚本自动加空 `libdl.a` stub）。Windows 静态 exe 原生支持窗口。
+- 中文显示：自动发现系统 CJK 字体（Windows 微软雅黑 / Linux Noto CJK / WQY / 文鼎等，按常见路径与字体目录扫描）。
+- 无 `DISPLAY` 且无 TTY 时保持 headless；业务日志默认落 `~/.shell-remote/`。
+
 ### 浏览器访问
 
 打开 `http://<relay-ip>:3000`，输入服务器密码及 Token 即可连接。主区域为 xterm.js 终端，右侧为文件管理器。

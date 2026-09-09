@@ -6,6 +6,8 @@
 //! - `shell-remote-ui`（UI）：agent（终端 + 桌面转发），必须 `--features desktop`。
 
 pub mod agent;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod proto;
 pub mod relay;
 #[cfg(feature = "tui")]
