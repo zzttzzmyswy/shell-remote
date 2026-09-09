@@ -1,13 +1,13 @@
-use crate::proto::TokenType;
+// CLI 二进制：relay + agent（仅终端转发）。
+//
+// 与 UI 二进制（shell-remote-ui）的差别：
+// - 本二进制 agent 不暴露任何 --desktop-* 参数，desktop 能力恒为关闭
+//   （capture="none"，浏览器端不显示桌面按钮）。
+// - 发布产物建议用 `--no-default-features` lean 构建：不编译桌面代码
+//   （无 openh264/x11rb/enigo/str0m/AV1 等重依赖），便于快速交叉编译。
 use clap::{Parser, Subcommand};
 
-mod agent;
-#[cfg(test)]
-mod integration_test;
-mod proto;
-mod relay;
-mod web;
-mod tlsutil;
+use shell_remote::{agent, proto::TokenType, relay};
 
 #[derive(Parser)]
 #[command(name = "shell-remote", about = "Collaborative remote shell tool", version)]
@@ -85,7 +85,8 @@ enum Command {
         registration_rate_limit: usize,
     },
 
-    /// Run in agent mode (connects to a relay)
+    /// Run in agent mode (connects to a relay; terminal forwarding only —
+    /// desktop sharing lives in the `shell-remote-ui` binary)
     Agent {
         /// Relay 服务器地址（仅 http:// 或 https://；内部自动按
         /// http→ws / https→wss 用作视频上行，WS 不稳定时回退 http/https）
@@ -123,123 +124,14 @@ enum Command {
         /// relay rejects registration and the agent exits. Omit for a random id.
         #[arg(long)]
         session_id: Option<String>,
-
-        /// Desktop capture backend: auto | dxgi | gdi | x11 | wayland | none.
-        /// Windows: dxgi (Desktop Duplication, 60fps capable) with automatic
-        /// GDI fallback; Linux: wayland portal (if built with --features
-        /// wayland) then X11. `none` disables desktop sharing entirely.
-        #[arg(long, default_value = "auto")]
-        desktop_capture: String,
-
-        /// Desktop encoder codec: av1 (libaom, default) or h264 (OpenH264)。
-        /// MYS-954：VP8/VP9（libvpx）已移除。
-        #[arg(long, default_value = "av1")]
-        desktop_codec: String,
-
-        /// Desktop capture frame rate (30 balances latency vs smoothness;
-        /// 60 needs a strong CPU to keep encode time from inflating e2e).
-        #[arg(long, default_value_t = 30.0)]
-        desktop_fps: f64,
-
-        /// 抓帧独立上限（fps，R3 乙83 / R5#135）：限制 capture 线程产帧率，
-        /// 与编码 fps 解耦。0 = 不限制（默认，动态时全速抓帧由编码 min_gap
-        /// 跳帧）。设值则动态桌面抓帧也按此节流（省 X/DXGI 往返，低配 CPU
-        /// 友好）。静止桌面仍走 would-block 退避，不受此参数影响。
-        #[arg(long, default_value_t = 0.0)]
-        desktop_capture_fps: f64,
-
-        /// Maximum encode bitrate in kbps. 0 = 自动按 rustdesk 模型
-        /// （base_bitrate(分辨率) × 质量档，1080p balanced ≈1388kbps）。
-        /// 显式设值则作为硬顶（向 rustdesk 配置靠拢, MYS-886）。
-        #[arg(long, default_value_t = 0)]
-        desktop_max_bitrate: u64,
-
-        /// 编码质量档：speed / balanced / best（rustdesk BR_SPEED=0.5 /
-        /// BR_BALANCED=0.67 / BR_BEST=1.5，决定目标码率与 QP 区间）。
-        #[arg(long, default_value = "balanced")]
-        desktop_quality: String,
-
-        /// Minimum encode bitrate in kbps (static desktop ~80; dynamic raised by ABR).
-        #[arg(long, default_value_t = 80)]
-        desktop_min_bitrate: u64,
-
-        /// X11 display to capture (defaults to $DISPLAY).
-        #[arg(long)]
-        desktop_display: Option<String>,
-
-        /// LAN 直连桌面流监听端口（agent 本地 HTTP server，阶段2 基础）。
-        /// 0 = 不启动（默认，不开任何端口）；显式指定则同局域网浏览器可直连
-        /// `http://<agent-lan-ip>:<port>/agent/desktop/stream` 拉桌面流（绕开
-        /// relay 中转，浏览器同网段探测在后续阶段接入）。
-        #[arg(long, default_value_t = 0)]
-        desktop_lan_port: u16,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 崩溃诊断：任何 Rust panic 都留痕到 crash.log（含时间戳、pid、panic
-    // 消息、代码位置与 backtrace），避免 release 构建静默闪退无从排查
-    // （MYS-886 Windows agent 桌面闪退定位）。panic=unwind 下 hook 在 unwind
-    // 前调用，panic=abort 下在 abort 前调用——两种配置都能留下日志。
-    // 路径优先 SR_LOG_DIR（与日志轮转同目录），否则当前目录；append 模式
-    // 保留多次崩溃记录（此前 fs::write 覆盖只留最后一次，多闪退排查丢现场）。
-    let crash_path = std::env::var("SR_LOG_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(|d| std::path::PathBuf::from(d).join("crash.log"))
-        .unwrap_or_else(|| std::path::PathBuf::from("shell-remote-crash.log"));
-    std::panic::set_hook(Box::new(move |info| {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let bt = std::backtrace::Backtrace::force_capture();
-        let msg = format!(
-            "==== shell-remote panic ====\nat_unix_ms: {now_ms}\npid: {pid}\nthread: {}\nlocation: {:?}\ninfo: {}\nbacktrace:\n{bt}\n",
-            std::thread::current().name().unwrap_or("?").to_string(),
-            info.location(),
-            info.payload().downcast_ref::<&str>().copied().unwrap_or("(non-str payload)"),
-        );
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&crash_path)
-        {
-            let _ = f.write_all(msg.as_bytes());
-        }
-        eprintln!("{msg}");
-    }));
-    // 关闭 ANSI 颜色控制符: 在不支持色彩的终端(重定向/日志文件/Windows 旧终端)
-    // 里会产生大量转义序列垃圾。用户要求无法检测时直接关闭。
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
-    // 日志轮转（R3 己191 / R5#153）：设 `SR_LOG_DIR=<目录>` 时额外写入
-    // 滚动文件（每小时一个滚动文件，non-blocking，不阻塞业务线程）。
-    // 默认不设 = 只输出 stderr，行为与旧版完全一致。
+    shell_remote::install_panic_hook();
     // `_log_guard` 必须活到 main 末尾（drop 会关闭 non-blocking writer）。
-    let _log_guard = match std::env::var("SR_LOG_DIR") {
-        Ok(dir) if !dir.is_empty() => {
-            let file_appender = tracing_appender::rolling::hourly(&dir, "shell-remote.log");
-            let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(file_writer)
-                .with_env_filter(filter)
-                .init();
-            tracing::info!(dir = %dir, "log rotation enabled (hourly rolling file)");
-            Some(guard)
-        }
-        _ => {
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_env_filter(filter)
-                .init();
-            None
-        }
-    };
+    let _log_guard = shell_remote::init_logging();
 
     let cli = Cli::parse();
 
@@ -285,19 +177,10 @@ async fn main() -> anyhow::Result<()> {
             token_type,
             shell,
             session_id,
-            desktop_capture,
-            desktop_codec,
-            desktop_fps,
-            desktop_capture_fps,
-            desktop_max_bitrate,
-            desktop_quality,
-            desktop_min_bitrate,
-            desktop_display,
-            desktop_lan_port,
         } => {
             let desired = match session_id.as_deref() {
                 Some(s) => {
-                    if !crate::proto::is_valid_custom_session_id(s) {
+                    if !shell_remote::proto::is_valid_custom_session_id(s) {
                         tracing::error!("--session-id must be 5-20 ASCII alphanumeric chars");
                         anyhow::bail!("invalid --session-id");
                     }
@@ -306,34 +189,38 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let root = root.unwrap_or_else(agent::home_dir);
-            let desktop_cfg = crate::agent::desktop::DesktopConfig {
-                capture: desktop_capture,
-                codec: desktop_codec,
-                fps: desktop_fps,
-                capture_fps: desktop_capture_fps,
-                min_bps: desktop_min_bitrate * 1000,
-                max_bps: desktop_max_bitrate * 1000,
-                quality: match desktop_quality.as_str() {
-                    "speed" => crate::agent::desktop::encoder::QUALITY_SPEED,
-                    "best" => crate::agent::desktop::encoder::QUALITY_BEST,
-                    _ => crate::agent::desktop::encoder::QUALITY_BALANCED,
-                },
-                display: desktop_display,
-                monochrome: false,
-                lan_port: desktop_lan_port,
-                lan_addr: None, // 由 run_session 在 LanDesktop::spawn 后注入
-            };
-            agent::start(
-                relay_url,
-                key,
-                root,
-                token_type.as_str().to_string(),
-                shell,
-                desired,
-                desktop_cfg,
-                relay_insecure,
-            )
-            .await?;
+            #[cfg(feature = "desktop")]
+            {
+                // CLI 二进制 agent 恒为终端转发：desktop 能力强制关闭。
+                let desktop_cfg = shell_remote::agent::desktop::DesktopConfig {
+                    capture: "none".to_string(),
+                    ..Default::default()
+                };
+                agent::start(
+                    relay_url,
+                    key,
+                    root,
+                    token_type.as_str().to_string(),
+                    shell,
+                    desired,
+                    desktop_cfg,
+                    relay_insecure,
+                )
+                .await?;
+            }
+            #[cfg(not(feature = "desktop"))]
+            {
+                agent::start(
+                    relay_url,
+                    key,
+                    root,
+                    token_type.as_str().to_string(),
+                    shell,
+                    desired,
+                    relay_insecure,
+                )
+                .await?;
+            }
         }
     }
 

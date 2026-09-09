@@ -519,7 +519,7 @@ mod tests {
         // 与 push_frag 同一背压语义：drop rx 后 channel 满，try_send 失败
         // 只累计 drop_count 不立即移除；超过 MAX_CONSECUTIVE_DROPS 才踢。
         let st = DesktopStream::new();
-        let (vid, rx, _) = st.add_viewer().await;
+        let (_vid, rx, _) = st.add_viewer().await;
         drop(rx);
         // 先灌满 channel（它带 16 容量）——但未超阈值，viewer 保留。
         for i in 0..16u8 {

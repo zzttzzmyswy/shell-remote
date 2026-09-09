@@ -43,26 +43,47 @@
 
 ## 快速开始
 
+### 两个二进制：CLI 与 UI
+
+v0.51.0 起拆分为两个二进制，共享同一 relay 与协议：
+
+| 二进制 | 子命令 | 能力 | 典型用途 |
+|--------|--------|------|----------|
+| `shell-remote`（CLI，lean） | `relay` / `agent` | agent **仅终端转发**（PTY + 文件管理器 + MCP exec）；无任何桌面代码 | 自建 relay 服务器；NAS/云主机/无显示器设备的 headless agent；MCP 集成 |
+| `shell-remote-ui`（UI） | `agent` | **终端 + 桌面转发**（全部 `--desktop-*` 参数） | 需要共享真实桌面的设备 agent（SE7 等带桌面环境） |
+
+- CLI 二进制构建时不编译桌面代码（`--no-default-features`）：无 openh264/libaom/x11rb/str0m 依赖，release 体积约 **6-7 MB**（桌面版约 25 MB+），交叉编译更快。
+- 需要桌面共享的设备请下载并使用 `shell-remote-ui-<arch>`，安装/自升级均按该文件名提供。
+- 协议、relay、web UI 完全通用：两类 agent 可同时接入同一 relay。
+
 ### 下载预编译二进制
 
-[GitHub Releases](https://github.com/zzttzzmyswy/shell-remote/releases) 提供三种架构的 musl 静态编译二进制：
+[GitHub Releases](https://github.com/zzttzzmyswy/shell-remote/releases) 为每个平台提供两种 musl 静态编译二进制：
 
 ```bash
 # x86_64 (Intel/AMD)
 curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-x86_64 && chmod +x shell-remote-x86_64
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-ui-x86_64 && chmod +x shell-remote-ui-x86_64
 
 # aarch64 (ARM 64位, 树莓派4/5, 云服务器)
 curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-aarch64 && chmod +x shell-remote-aarch64
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-ui-aarch64 && chmod +x shell-remote-ui-aarch64
 
 # armv7 (ARM 32位, 树莓派2/3)
 curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-armv7 && chmod +x shell-remote-armv7
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-ui-armv7 && chmod +x shell-remote-ui-armv7
 ```
 
 ### 编译
 
 ```bash
 git clone https://github.com/zzttzzmyswy/shell-remote.git && cd shell-remote
+# CLI（relay + agent 终端；不含桌面代码）
 cargo build --release
+# UI（agent 终端 + 桌面）——desktop feature 默认开启，产物为 target/release/shell-remote-ui
+cargo build --release --bin shell-remote-ui
+# 纯终端可选：不编译任何桌面依赖（等价于 release 的 CLI 产物更小）
+cargo build --release --no-default-features
 ```
 
 ### 启动 Relay
@@ -77,10 +98,10 @@ cargo build --release
 | `--bind` | `0.0.0.0:3000` | 监听地址 |
 | `--auth` | 无默认值 | 服务器密码（必填） |
 | `--record-dir` | 无 | 终端会话录制目录（asciinema cast v2）；不设则不录制 |
-| `--download-dir` | 无 | 离线二进制分发目录：目录内按文件名（如 `shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`、`shell-remote-x86_64.exe`）放置各平台 agent 二进制，经 `/download/<文件名>` 对外提供；**安装脚本会优先从本 relay 下载**，GitHub 镜像仅作回退（适合内网/镜像受限环境） |
-| `--agent-upgrade-dir` | 无 | agent 自升级制品目录（`shell-remote-<arch>[.exe]`，可选 `shell-remote-<arch>.version` 标注版本）；不设则"设备"页升级功能不可用 |
+| `--download-dir` | 无 | 离线二进制分发目录：目录内按文件名（如 `shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`、`shell-remote-x86_64.exe`，以及同名的 `shell-remote-ui-*` 桌面版）放置各平台 agent 二进制，经 `/download/<文件名>` 对外提供；**安装脚本会优先从本 relay 下载**，GitHub 镜像仅作回退（适合内网/镜像受限环境） |
+| `--agent-upgrade-dir` | 无 | agent 自升级制品目录（`shell-remote-<arch>[.exe]` 与 `shell-remote-ui-<arch>[.exe]`，可选 `shell-remote-<arch>.version` 标注版本）；不设则"设备"页升级功能不可用 |
 
-### 启动 Agent
+### 启动 Agent（CLI，终端转发）
 
 ```bash
 ./shell-remote agent --relay-url https://<relay-ip>
@@ -94,11 +115,30 @@ cargo build --release
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
 | `--shell` | `/bin/bash` | Shell 路径 |
 | `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；**可重复使用**——新的 agent 用相同 ID 注册会顶替旧会话（旧 Token 失效），不再报冲突 |
+
+> CLI agent **不提供桌面转发**（无 `--desktop-*` 参数，能力上报 `available:false`，浏览器端不显示桌面按钮）。需要桌面共享请用 **shell-remote-ui**。
+
+### 启动 UI Agent（桌面共享）
+
+```bash
+./shell-remote-ui agent --relay-url https://<relay-ip>
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--relay-url` | `https://localhost:3000` | Relay 地址（HTTPS 或 HTTP，使用 SSE+POST 协议） |
+| `--key` | — | 固定鉴权密钥（不指定则随机生成临时 Token） |
+| `--root` | `$HOME` | 文件管理器默认目录 |
+| `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
+| `--shell` | `/bin/bash` | Shell 路径 |
+| `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；可重复使用 |
 | `--desktop-capture` | `auto` | 桌面捕获后端：`auto` / `dxgi` / `gdi` / `x11` / `wayland` / `none`（Windows 默认 DXGI Desktop Duplication，失败回退 GDI；`wayland` 需 `--features wayland` 构建且运行时存在 xdg-desktop-portal + PipeWire） |
-| `--desktop-codec` | `av1` | 桌面编码格式：`av1`（libaom）/ `vp9`（libvpx）/ `vp8` / `h264`（openh264）；初始化失败自动按 av1→vp9→vp8→h264 回退 |
+| `--desktop-codec` | `av1` | 桌面编码格式：`av1`（libaom）/ `h264`（openh264）；初始化失败自动按 av1→h264 回退 |
 | `--desktop-fps` | `30` | 桌面编码帧率上限（默认 30，QoS 内容驱动：静止 1fps、动态满帧） |
+| `--desktop-capture-fps` | `0` | 抓帧独立上限（fps）：0 = 不限速（编码 min_gap 跳帧兜底） |
 | `--desktop-max-bitrate` | `0`（自动） | 最大编码码率（kbps，0 = 自动按 base_bitrate×质量档） |
 | `--desktop-min-bitrate` | `80` | 最小编码码率（kbps，静态桌面足够；动态由 ABR 拉回） |
+| `--desktop-quality` | `balanced` | 编码质量档：`speed` / `balanced` / `best` |
 | `--desktop-display` | 平台默认 | Linux：X11 display（如 `:1`，默认取 `$DISPLAY`）；Windows：显示器枚举序号（`"0"`=主屏、`"1"`=第 2 块屏，MYS-954 多屏选屏，会话页显示器下拉运行时可切） |
 | `--desktop-lan-port` | `0` | LAN 直连桌面流监听端口（阶段2）。`0` = 不启用；非 0 时同网段浏览器直接 `http://agent-ip:port/agent/desktop/stream` 拉流，绕开 relay |
 
@@ -136,7 +176,7 @@ session: a1b2c3d4
 ### 桌面共享 CLI 示例
 
 ```bash
-./shell-remote agent --relay-url https://relay.example.com \
+./shell-remote-ui agent --relay-url https://relay.example.com \
   --desktop-capture auto --desktop-fps 30
 ```
 
@@ -178,7 +218,10 @@ shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx --shell powe
 ```bash
 rustup target add x86_64-pc-windows-gnu
 # 需 x86_64-w64-mingw32-gcc（mingw-w64）
+# CLI（终端）
 cargo build --release --target x86_64-pc-windows-gnu
+# UI（终端 + 桌面）
+cargo build --release --bin shell-remote-ui --target x86_64-pc-windows-gnu
 ```
 
 ### 功能对比
@@ -247,7 +290,7 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
 
 ## Agent 原子自升级
 
-Relay 加 `--agent-upgrade-dir <目录>` 启用；然后把新版本 agent 二进制放入该目录（命名与发布制品一致，见 `scripts/build-releases.sh`）：`shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`，Windows 为 `shell-remote-x86_64.exe`。可选写一个 `shell-remote-<arch>.version` 文件标注版本号（如 `0.19.0`），后台会把它显示为目标版本。
+Relay 加 `--agent-upgrade-dir <目录>` 启用；然后把新版本 agent 二进制放入该目录（命名与发布制品一致，见 `tools/build-dist.sh`）：CLI 为 `shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`，Windows 为 `shell-remote-x86_64.exe`；桌面版 UI agent 为对应的 `shell-remote-ui-<arch>[.exe]`。可选写一个 `shell-remote-<arch>.version` 文件标注版本号（如 `0.19.0`），后台会把它显示为目标版本。
 
 后台"设备"面板每台在线设备都有一个 **升级** 按钮，点击后：
 
