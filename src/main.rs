@@ -204,6 +204,8 @@ async fn main() -> anyhow::Result<()> {
                     shell,
                     desired,
                     desktop_cfg,
+                    #[cfg(feature = "tui")]
+                    None,
                     relay_insecure,
                 )
                 .await?;
@@ -217,6 +219,8 @@ async fn main() -> anyhow::Result<()> {
                     token_type.as_str().to_string(),
                     shell,
                     desired,
+                    #[cfg(feature = "tui")]
+                    None,
                     relay_insecure,
                 )
                 .await?;

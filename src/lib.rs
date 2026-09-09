@@ -8,6 +8,10 @@
 pub mod agent;
 pub mod proto;
 pub mod relay;
+#[cfg(feature = "tui")]
+pub mod status;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod web;
 pub mod tlsutil;
 
