@@ -109,14 +109,18 @@ cargo build --release --no-default-features
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--relay-url` | `https://localhost:3000` | Relay 地址（HTTPS 或 HTTP，使用 SSE+POST 协议） |
+| `--relay-url` | `http://localhost:3000` | Relay 地址（HTTPS 或 HTTP，使用 SSE+POST 协议） |
+| `--relay-insecure` | — | 信任自签证书（连自签 TLS 的 relay 时必填，否则 register 握手即失败） |
 | `--key` | — | 固定鉴权密钥（不指定则随机生成临时 Token） |
 | `--root` | `$HOME` | 文件管理器默认目录 |
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
-| `--shell` | `/bin/bash` | Shell 路径 |
+| `--shell` | `/bin/bash` | Shell 路径。注意该参数绑定了 `SHELL` 环境变量，在 systemd 下会被服务注入的 `SHELL`（该账户登录 shell）顶掉，需要固定时请显式传参 |
 | `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；**可重复使用**——新的 agent 用相同 ID 注册会顶替旧会话（旧 Token 失效），不再报冲突 |
 
 > CLI agent **不提供桌面转发**（无 `--desktop-*` 参数，能力上报 `available:false`，浏览器端不显示桌面按钮）。需要桌面共享请用 **shell-remote-ui**。
+
+> 要把 agent 装成**开机自启的 systemd 服务**（固定运行账户 / 固定 session-id 与 key /
+> 预置远端终端环境变量），见 [`deploy/systemd-agent/`](deploy/systemd-agent/)。
 
 ### 启动 UI Agent（桌面共享）
 
