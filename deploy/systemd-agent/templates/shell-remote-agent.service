@@ -1,0 +1,45 @@
+[Unit]
+Description=__SR_DESC__
+Documentation=https://sshx.zztweb.top/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 固定运行账户：远端终端里的 USER / HOME / LOGNAME 即此账户。
+# systemd 会为带 User= 的服务注入 HOME / USER / LOGNAME / SHELL。
+User=__SR_USER__
+Group=__SR_GROUP__
+
+# 所有可调配置集中在这里（0600 root:root）。改配置只需编辑该文件后
+# `systemctl restart __SR_SERVICE__`，不必动本 unit。
+EnvironmentFile=__SR_CONF__
+
+# systemd 会在 ExecStart 里做环境变量替换：
+#   ${VAR} —— 词内就地替换，变量未定义时替换为空串
+#   $VAR   —— 独立成词，按空白拆分成 0..N 个参数（空/未定义 = 0 个参数）
+# 下面 $SR_EXTRA_ARGS 依赖后者的“空则不传参”语义。
+#
+# ⚠️ --shell 必须显式给：该参数在 CLI 上绑定了 SHELL 环境变量，而 systemd 会为
+#    带 User= 的服务注入 SHELL=<该账户登录 shell>，不显式覆盖就会被它顶掉
+#    （例如账户登录 shell 是 zsh 时，远端终端会拿到 zsh 而不是默认的 bash）。
+ExecStart=__SR_BIN__ agent \
+    --relay-url=${SR_RELAY_URL} \
+    --session-id=${SR_SESSION_ID} \
+    --key=${SR_KEY} \
+    --token-type=${SR_TOKEN_TYPE} \
+    --shell=${SR_SHELL} \
+    --root=${SR_ROOT} \
+    $SR_EXTRA_ARGS
+
+# 固定 session-id 下重启是安全的：relay 会顶替旧会话（newest wins），不会 409。
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=__SR_SERVICE__
+
+[Install]
+WantedBy=multi-user.target
