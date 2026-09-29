@@ -84,10 +84,12 @@
     const tabListEl = document.getElementById('tab-list');
     const tabNewBtn = document.getElementById('tab-new-btn');
 
+    let toastTimer = null;
     function showToast(msg, cls) {
         toast.textContent = msg;
-        toast.className = 'toast ' + cls;
-        setTimeout(() => { toast.classList.add('hidden'); }, 3000);
+        toast.className = 'toast ' + cls; // className 重置，同时去掉 hidden
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => { toast.classList.add('hidden'); }, 3000);
     }
 
     // Join-ack watchdog: once connected, the agent must answer quickly
@@ -326,12 +328,77 @@
         window.shellRemote.send('desktop:start', {});
     });
 
+    // ── 有序合并的终端输入发送器：同一时刻最多 1 个 terminal:input POST ──
+    const INPUT_MAX_CHUNK = 64 * 1024;
+    const inputQueue = []; // {tab_id, text}
+    let inputInFlight = false;
+    let lastInputWarnAt = 0;
+
+    function utf8ToB64(text) {
+        const bytes = new TextEncoder().encode(text);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(bin);
+    }
+
+    function queueInput(tabId, text) {
+        // 只读用户：relay 必然 403，本地直接丢弃并提示（不误报为网络问题）
+        if (window.shellRemote.getPermission() === 'ro') {
+            const now = Date.now();
+            if (now - lastInputWarnAt > 5000) {
+                lastInputWarnAt = now;
+                showToast('只读访问：无法输入', 'warning');
+            }
+            return;
+        }
+        const last = inputQueue[inputQueue.length - 1];
+        if (last && last.tab_id === tabId) last.text += text;
+        else inputQueue.push({ tab_id: tabId, text: text });
+        flushInput();
+    }
+
+    function flushInput() {
+        if (inputInFlight || inputQueue.length === 0) return;
+        const head = inputQueue[0];
+        let text = head.text;
+        if (text.length > INPUT_MAX_CHUNK) {
+            let cut = INPUT_MAX_CHUNK;
+            // 避免在 UTF-16 代理对中间切开
+            const c = text.charCodeAt(cut - 1);
+            if (c >= 0xD800 && c <= 0xDBFF) cut--;
+            head.text = text.slice(cut);
+            text = text.slice(0, cut);
+        } else {
+            inputQueue.shift();
+        }
+        inputInFlight = true;
+        // 10s 超时：半开连接上的 POST 不能无限卡住后续输入
+        window.shellRemote.sendAsync('terminal:input', {
+            data: utf8ToB64(text), tab_id: head.tab_id
+        }, 10000).then((ok) => {
+            if (!ok) {
+                const now = Date.now();
+                if (now - lastInputWarnAt > 5000) {
+                    lastInputWarnAt = now;
+                    showToast('输入发送失败，网络不稳定', 'warning');
+                }
+            }
+        }).catch(() => {}).then(() => {
+            inputInFlight = false;
+            flushInput();
+        });
+    }
+
     function renderTabs() {
         tabListEl.innerHTML = '';
         tabs.forEach(t => {
             const el = document.createElement('div');
             el.className = 'tab-item' + (t.tab_id === activeTabId ? ' active' : '');
-            el.innerHTML = '<span>' + (t.title || 'Shell') + '</span>';
+            const label = document.createElement('span');
+            label.textContent = t.title || 'Shell';
+            el.appendChild(label);
             if (tabs.length > 1) {
                 const close = document.createElement('span');
                 close.className = 'tab-close';
@@ -354,8 +421,12 @@
 
     // ── ShellRemote event handlers ─────────────────────────────────────
 
+    // 每次 SSE (重新) 连接都会触发 join → tab_list → 输出重放。
+    let rejoinPending = false;
     window.shellRemote.on('connected', function(msg) {
+        rejoinPending = true;
         sessionNameEl.textContent = '已连接';
+        sessionNameEl.className = '';
         disconnectOverlay.classList.add('hidden');
         armJoinWatchdog();
         term.focus();
@@ -364,13 +435,7 @@
                 cols: cols, rows: rows, tab_id: activeTabId
             });
         });
-        term.onInput((data) => {
-            const bytes = new TextEncoder().encode(data);
-            const b64 = btoa(String.fromCharCode(...bytes));
-            window.shellRemote.send('terminal:input', {
-                data: b64, tab_id: activeTabId
-            });
-        });
+        term.onInput((data) => queueInput(activeTabId, data));
     });
 
     window.shellRemote.on('terminal:output', function(msg) {
@@ -390,8 +455,18 @@
     window.shellRemote.on('session:tab_list', function(msg) {
         clearJoinWatchdog();
         tabs = msg.payload.tabs || [];
-        if (!activeTabId && tabs.length > 0) {
-            activeTabId = tabs[0].tab_id;
+        // 重连后 agent 可能已换了一组 tab（如 shell 退出被重建）：当前 tab 不在
+        // 列表里就改用 agent 标记的活动 tab，否则输出被过滤、输入发往不存在的 tab。
+        if (tabs.length > 0 && !tabs.some(t => t.tab_id === activeTabId)) {
+            const agentActive = tabs.find(t => t.active);
+            activeTabId = (agentActive || tabs[0]).tab_id;
+            term.clear();
+        }
+        // (重新) join 后 agent 会紧接着重放各 tab 的缓冲输出：先清屏，避免与
+        // 断线前已显示的内容重复叠加。
+        if (rejoinPending) {
+            rejoinPending = false;
+            term.reset();
         }
         renderTabs();
         if (activeTabId) {
@@ -421,7 +496,7 @@
 
     window.shellRemote.on('session:users', function(msg) {
         clearJoinWatchdog();
-        onlineUsers = msg.payload.count || 0;
+        onlineUsers = (msg.payload || {}).count || 0;
         updateOnlineCount();
         // 重连成功（join 已应答）：若此前标记了重连降质 → 应用低码率档。
         if (window.__applyQualityOnJoin) window.__applyQualityOnJoin();
@@ -687,26 +762,34 @@
         desktopView.disconnect();
         showTerminalView();
         disconnectText.textContent = '设备连接中断，正在自动重连…';
+        sessionNameEl.textContent = '设备重连中…';
+        sessionNameEl.className = 'connecting';
         disconnectOverlay.classList.remove('hidden');
     });
 
     window.shellRemote.on('session:error', function(msg) {
         if (msg.payload && msg.payload.code === 'AGENT_NOT_CONNECTED') {
             showToast('设备未连接，正在自动重试…', 'error');
+        } else if (msg.payload && msg.payload.code === 'AUTH_PENDING') {
+            // relay 重启后 agent 重新注册前，密钥会短暂无效：保持页面并重试
+            showToast('服务端暂不认识该会话（可能刚重启），正在重试…', 'warning');
+            sessionNameEl.textContent = '等待会话恢复…';
+            sessionNameEl.className = 'connecting';
         }
     });
 
     window.shellRemote.on('error', function(msg) {
-        if (msg.payload.code === 'AUTH_INVALID_TOKEN') {
+        const p = msg.payload || {};
+        if (p.code === 'AUTH_INVALID_TOKEN') {
             showToast('密钥无效或已过期', 'error');
             setTimeout(() => window.location.href = '/', 2000);
-        } else if (msg.payload.code === 'AUTH_INVALID_PASSWORD') {
+        } else if (p.code === 'AUTH_INVALID_PASSWORD') {
             showToast('服务器密码错误', 'error');
             setTimeout(() => window.location.href = '/', 2000);
-        } else if (msg.payload.code === 'PERMISSION_DENIED') {
+        } else if (p.code === 'PERMISSION_DENIED') {
             showToast('权限不足：只读访问', 'error');
         } else {
-            showToast(msg.payload.message || '错误', 'error');
+            showToast(p.message || '错误', 'error');
         }
     });
 
@@ -718,17 +801,25 @@
     };
 
     document.getElementById('copy-token-btn').addEventListener('click', () => {
-        navigator.clipboard.writeText(token).then(() => {
-            showToast('密钥已复制', 'success');
-        }).catch(() => {
-            const input = document.createElement('input');
-            input.value = token;
-            document.body.appendChild(input);
-            input.select();
-            document.execCommand('copy');
-            document.body.removeChild(input);
-            showToast('密钥已复制', 'success');
-        });
+        const fallback = () => {
+            const ta = document.createElement('textarea');
+            ta.value = token;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            let ok = false;
+            try { ok = document.execCommand('copy'); } catch (e) {}
+            document.body.removeChild(ta);
+            showToast(ok ? '密钥已复制' : '复制失败，请手动复制', ok ? 'success' : 'error');
+        };
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(token).then(() => {
+                showToast('密钥已复制', 'success');
+            }).catch(fallback);
+        } else {
+            fallback();
+        }
     });
 
     document.getElementById('toggle-files-btn').addEventListener('click', () => {

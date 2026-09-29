@@ -170,14 +170,18 @@ class FileManager {
         xhr.onload = () => {
             this._uploadQueue = this._uploadQueue.filter(x => x !== q);
             this._renderUploaders();
-            if (xhr.status !== 200) {
+            if (xhr.status < 200 || xhr.status >= 300) {
                 console.error('Upload failed:', xhr.status, xhr.responseText);
+                this._showToast('上传失败: ' + file.name + ' (HTTP ' + xhr.status + ')');
+            } else {
+                this.loadDirectory(this.currentPath); // 刷新目录列表
             }
         };
         xhr.onerror = () => {
             this._uploadQueue = this._uploadQueue.filter(x => x !== q);
             this._renderUploaders();
             console.error('Upload network error');
+            this._showToast('上传失败: ' + file.name + ' (网络错误)');
         };
         xhr.open('POST', '/agent/upload?path=' + encodeURIComponent(fullPath) + '&token=' + encodeURIComponent(token));
         xhr.setRequestHeader('Authorization', 'Bearer ' + token);
@@ -302,10 +306,13 @@ class FileManager {
         }
         add('重命名', () => {
             const nn = prompt('新名称:', entry.name);
-            if (nn && nn !== entry.name) {
-                const np = entry.path.replace(/[^/]+$/, nn);
-                window.shellRemote.send('fs:rename', { from: entry.path, to: np });
+            if (nn === null || nn === entry.name) return;
+            if (!nn.trim() || nn.indexOf('/') !== -1) {
+                this._showToast('重命名失败: 名称不能为空或包含 /');
+                return;
             }
+            const np = entry.path.replace(/[^/]+$/, () => nn);
+            window.shellRemote.send('fs:rename', { from: entry.path, to: np });
         });
         add('删除', () => this.deletePath(entry.path), true);
 
@@ -326,7 +333,10 @@ class FileManager {
 
     _showToast(msg) {
         const t = document.getElementById('toast');
-        if (t) { t.textContent = msg; t.className = 'toast info'; t.classList.remove('hidden'); }
+        if (!t) return;
+        t.textContent = msg; t.className = 'toast info'; t.classList.remove('hidden');
+        clearTimeout(this._toastTimer);
+        this._toastTimer = setTimeout(() => { t.classList.add('hidden'); }, 4000);
     }
 
     _esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }

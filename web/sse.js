@@ -21,6 +21,13 @@
   var reconnectTimer = null;
   var reconnectDelay = 1000;      // grows on failure, resets on success
   var lastSessionError = null;    // dedup identical consecutive error toasts
+  // 401/403 容忍窗口：relay 重启后 agent 尚未重新注册时，旧 token 会短暂
+  // 被判无效。页面曾经连上过则先重试 AUTH_GRACE_MS 再退回登录页；从未连上
+  // （密钥本身填错）则立即退回。
+  var everConnected = false;
+  var authFailSince = 0;
+  var AUTH_GRACE_MS = 90000;
+  var lastPermWarnAt = 0;
   // R5#8 SSE 空闲看门狗：agent 下行 SSE 心跳 15s、relay 半开超时 60s。浏览器
   // 侧显式空闲计数（对齐 #8）：30s 无任何 SSE 事件即判死主动重连（relay 60s
   // 兜底的一半），弱网事件稀疏时更快检出半开连接。
@@ -45,13 +52,13 @@
   }
 
   function emit(type, obj) {
+    // 单个 handler 抛错不能跳过其余 handler，也不能杀掉 SSE pump
+    var call = function(fn) {
+      try { fn(obj); } catch (e) { console.error('SSE handler error (' + type + '):', e); }
+    };
     var hs = handlers[type];
-    if (hs) {
-      hs.slice().forEach(function(fn) { fn(obj); });
-    }
-    if (handlers['*']) {
-      handlers['*'].forEach(function(fn) { fn(obj); });
-    }
+    if (hs) hs.slice().forEach(call);
+    if (handlers['*']) handlers['*'].slice().forEach(call);
   }
 
   window.shellRemote = {
@@ -62,9 +69,14 @@
     off: function(type, fn) {
       if (handlers[type]) handlers[type] = handlers[type].filter(function(f) { return f !== fn; });
     },
-    send: function(type, payload) {
-      fetch('/agent/session/send', {
+    // Promise<boolean>：true 当且仅当 resp.ok；网络错误/超时 -> false，不抛。
+    // timeoutMs 可选：超时即 abort，避免半开连接上的 POST 永久挂起。
+    sendAsync: function(type, payload, timeoutMs) {
+      var ac = timeoutMs ? new AbortController() : null;
+      var timer = ac ? setTimeout(function() { ac.abort(); }, timeoutMs) : null;
+      return fetch('/agent/session/send', {
         method: 'POST',
+        signal: ac ? ac.signal : undefined,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           token: token,
@@ -72,12 +84,26 @@
           payload: payload || {}
         })
       }).then(function(resp) {
-        if (resp.status === 401 || resp.status === 403) {
-          window.location.href = '/';
+        // 401 由 SSE 通道统一处理（含 relay 重启容忍窗口），这里不跳转；
+        // 403 = 只读用户发了写操作，提示即可（此前会被直接踢回登录页）。
+        if (resp.status === 403) {
+          var now = Date.now();
+          if (now - lastPermWarnAt > 3000) {
+            lastPermWarnAt = now;
+            emit('error', { type: 'error', payload: { code: 'PERMISSION_DENIED' } });
+          }
         }
+        return resp.ok;
       }).catch(function(e) {
         console.warn('POST failed:', e.message);
+        return false;
+      }).then(function(ok) {
+        if (timer) clearTimeout(timer);
+        return ok;
       });
+    },
+    send: function(type, payload) {
+      window.shellRemote.sendAsync(type, payload); // fire-and-forget
     },
     getUserId: function() { return userId; },
     getPermission: function() { return permission; },
@@ -88,10 +114,11 @@
   function scheduleReconnect() {
     if (intentionalClose) return;
     if (reconnectTimer) return;
+    var wait = Math.max(500, reconnectDelay * (0.5 + Math.random() * 0.5)); // jitter
     reconnectTimer = setTimeout(function() {
       reconnectTimer = null;
       connectSSE();
-    }, reconnectDelay);
+    }, wait);
     reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   }
 
@@ -174,7 +201,19 @@
     }).then(function(resp) {
       if (!resp.ok || !resp.body) {
         if (resp.status === 401 || resp.status === 403) {
-          window.location.href = '/';
+          var now = Date.now();
+          if (!authFailSince) authFailSince = now;
+          if (!everConnected || now - authFailSince > AUTH_GRACE_MS) {
+            intentionalClose = true; // 不再重连
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            window.location.href = '/';
+            return;
+          }
+          if (lastSessionError !== 'AUTH_PENDING') {
+            lastSessionError = 'AUTH_PENDING';
+            emit('session:error', { payload: { code: 'AUTH_PENDING' } });
+          }
+          throw new Error('SSE HTTP ' + resp.status + ' (auth pending)');
         }
         return resp.json().catch(function() { return {}; }).then(function(data) {
           // Registered-but-unreachable agent: tell the UI (toast, dedup'd)
@@ -191,6 +230,9 @@
         });
       }
       lastSessionError = null;
+      everConnected = true;
+      authFailSince = 0;
+      lastSseAt = Date.now(); // 流打开即计时，只开流不发数据也会被空闲看门狗捕获
       var reader = resp.body.getReader();
       var decoder = new TextDecoder();
       // R5#8：SSE 流建立即启动空闲看门狗（惰性，仅一次）——30s 无任何
@@ -223,6 +265,27 @@
       scheduleReconnect();
     });
   }
+
+  // 网络恢复 / 页面回到前台：重置退避并尽快重连，避免双连
+  function kickReconnect() {
+    if (intentionalClose) return;
+    reconnectDelay = 1000;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      connectSSE();
+      return;
+    }
+    if (lastSseAt === 0) {
+      if (!controller) connectSSE();
+      return;
+    }
+    if (Date.now() - lastSseAt > SSE_IDLE_MS) checkSseIdle();
+  }
+  window.addEventListener('online', kickReconnect);
+  document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') kickReconnect();
+  });
 
   connectSSE();
 })();
