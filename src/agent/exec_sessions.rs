@@ -42,6 +42,19 @@ impl Clone for InnerSession {
     }
 }
 
+/// Keep only the last ~`max` bytes of `buf`, cutting on a char boundary
+/// (`String::drain` panics mid-character, e.g. on CJK output > 1MB).
+fn trim_front(buf: &mut String, max: usize) {
+    if buf.len() <= max {
+        return;
+    }
+    let mut keep_start = buf.len() - max;
+    while !buf.is_char_boundary(keep_start) {
+        keep_start += 1;
+    }
+    buf.drain(..keep_start);
+}
+
 pub struct ExecSessionManager {
     sessions: RwLock<HashMap<String, InnerSession>>,
     max_sessions: usize,
@@ -144,10 +157,7 @@ impl ExecSessionManager {
                                 let s = crate::agent::encoding::decode_bytes(&stdout_buf[..n]);
                                 let mut buf = output_buf_clone.lock().await;
                                 buf.push_str(&s);
-                                if buf.len() > MAX_OUTPUT_BUF {
-                                    let keep_start = buf.len() - MAX_OUTPUT_BUF;
-                                    buf.drain(0..keep_start);
-                                }
+                                trim_front(&mut buf, MAX_OUTPUT_BUF);
                                 last_activity = Instant::now();
                             }
                             Err(_) => { done = true; }
@@ -160,10 +170,7 @@ impl ExecSessionManager {
                                 let s = crate::agent::encoding::decode_bytes(&stderr_buf[..n]);
                                 let mut buf = output_buf_clone.lock().await;
                                 buf.push_str(&s);
-                                if buf.len() > MAX_OUTPUT_BUF {
-                                    let keep_start = buf.len() - MAX_OUTPUT_BUF;
-                                    buf.drain(0..keep_start);
-                                }
+                                trim_front(&mut buf, MAX_OUTPUT_BUF);
                                 last_activity = Instant::now();
                             }
                             Err(_) => { done = true; }
@@ -601,5 +608,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let result = mgr.close(&r.exec_id).await.unwrap();
         assert!(result.status == "exited" || result.status == "killed");
+    }
+
+    #[test]
+    fn test_trim_front_char_boundary() {
+        // "中" is 3 bytes: a byte-offset cut would land mid-character.
+        let mut s = "中".repeat(10);
+        trim_front(&mut s, 4);
+        assert_eq!(s, "中");
+        let mut short = String::from("abc");
+        trim_front(&mut short, 8);
+        assert_eq!(short, "abc");
     }
 }

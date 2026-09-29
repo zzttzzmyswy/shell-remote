@@ -83,6 +83,9 @@ impl Shell {
                     Err(_) => break,
                 }
             }
+            // Empty chunk = "this tab's shell exited" marker (reads never
+            // yield empty data), so the owner can reap/respawn the tab.
+            let _ = output_tx.send((tid, Vec::new()));
         });
 
         Ok(Self {

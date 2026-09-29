@@ -30,6 +30,8 @@ use crate::proto::Message;
 
 /// Overall download timeout — artifacts are single binaries, a few tens of MB.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// Max silence between body chunks of an upgrade download before it fails.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long to let the terminal `agent:upgrade_progress` POST flush before the
 /// process exits (the sender loop drains control messages asynchronously).
 const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(400);
@@ -125,7 +127,19 @@ async fn download_to_file(
     let mut stream = resp.bytes_stream();
     let mut written: u64 = 0;
     let mut last_pct = 0u64;
-    while let Some(chunk) = stream.next().await {
+    // DOWNLOAD_TIMEOUT only bounds the response headers; a body that stalls
+    // mid-transfer (weak link) must fail too, or `upgrade_in_progress` stays
+    // set and blocks every later upgrade.
+    loop {
+        let chunk = match tokio::time::timeout(DOWNLOAD_STALL_TIMEOUT, stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "download stalled: no data for {DOWNLOAD_STALL_TIMEOUT:?}"
+                ))
+            }
+        };
         let chunk = chunk.map_err(|e| anyhow::anyhow!("download stream error: {e}"))?;
         file.write_all(&chunk)
             .await
