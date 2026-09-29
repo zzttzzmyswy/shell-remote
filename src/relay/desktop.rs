@@ -114,18 +114,35 @@ impl DesktopStream {
         let mut congested = 0u32;
         for (id, ctx) in viewers.iter_mut() {
             if !ctx.key_ok && !is_key {
+                // Waiting for a key frame after a drop: skipped deltas still
+                // count toward dead-viewer detection while its queue is full.
+                if ctx.tx.capacity() == 0 {
+                    ctx.drop_count += 1;
+                    congested += 1;
+                    if ctx.drop_count >= MAX_CONSECUTIVE_DROPS {
+                        dead.push(id.clone());
+                    }
+                }
                 continue;
             }
-            ctx.key_ok = true;
             match ctx.tx.try_send(bytes.clone()) {
                 Ok(()) => {
+                    ctx.key_ok = true;
                     ctx.drop_count = 0;
                     // 带宽记账（#152）：只在真正投递时计数，丢帧不计（丢帧
                     // 本身由 drop_count 追踪）。
                     ctx.bytes += bytes.len() as u64;
                     ctx.frames += 1;
                 }
-                Err(_) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    dead.push(id.clone());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // A skipped frame breaks this viewer's reference chain:
+                    // later deltas would decode as corrupted blocks (花屏)
+                    // until the next IDR. Resume only from a key frame
+                    // (heartbeat IDR every 1.5–4.5s, see agent desktop).
+                    ctx.key_ok = false;
                     ctx.drop_count += 1;
                     congested += 1;
                     if ctx.drop_count >= MAX_CONSECUTIVE_DROPS {
@@ -516,31 +533,55 @@ mod tests {
 
     #[tokio::test]
     async fn test_dead_viewer_cleaned_on_broadcast() {
-        // 与 push_frag 同一背压语义：drop rx 后 channel 满，try_send 失败
-        // 只累计 drop_count 不立即移除；超过 MAX_CONSECUTIVE_DROPS 才踢。
+        // 接收端已 drop（channel Closed）= viewer 确定已离开，立即移除；
+        // 仅"缓冲满"才走 drop_count 容忍（见 test_burst_backpressure_*）。
         let st = DesktopStream::new();
         let (_vid, rx, _) = st.add_viewer().await;
         drop(rx);
-        // 先灌满 channel（它带 16 容量）——但未超阈值，viewer 保留。
-        for i in 0..16u8 {
-            st.push_frag(true, vec![i]).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        st.push_frag(true, vec![1]).await;
         assert_eq!(
             st.inner.viewers.read().await.len(),
-            1,
-            "buffer-full must NOT evict the viewer immediately (drop-old-keep-new)"
+            0,
+            "closed viewer must be evicted on the next push"
         );
-        // 长期失联：再推超过阈值次数的帧后，viewer 被移除。
-        for i in 0..(MAX_CONSECUTIVE_DROPS + 2) as u8 {
-            st.push_frag(true, vec![i]).await;
+    }
+
+    #[tokio::test]
+    async fn test_full_viewer_evicted_after_max_drops() {
+        // 缓冲长期满（viewer 卡死但连接未断）：跳过的 delta 也计入 drop_count，
+        // 超过 MAX_CONSECUTIVE_DROPS 后移除。
+        let st = DesktopStream::new();
+        let (_vid, _rx, _) = st.add_viewer().await;
+        st.push_frag(true, vec![0]).await;
+        for i in 0..(MAX_CONSECUTIVE_DROPS + 20) {
+            st.push_frag(false, vec![i as u8]).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
             st.inner.viewers.read().await.len(),
             0,
             "viewer stuck beyond MAX_CONSECUTIVE_DROPS must be evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn test_dropped_frame_regates_viewer_until_key() {
+        // 丢过一帧后，后续 delta 引用链已断（继续投递会花屏）：该 viewer
+        // 重新等待关键帧，关键帧之后恢复放行。
+        let st = DesktopStream::new();
+        let (_vid, mut rx, _) = st.add_viewer().await;
+        st.push_frag(true, vec![0]).await;
+        for i in 1..=16u8 {
+            st.push_frag(false, vec![i]).await; // 1..15 入队，16 被丢
+        }
+        for _ in 0..16 {
+            rx.recv().await.unwrap(); // 排空
+        }
+        st.push_frag(false, vec![17]).await;
+        assert!(rx.try_recv().is_err(), "delta after a drop must be gated");
+        st.push_frag(true, vec![18]).await;
+        st.push_frag(false, vec![19]).await;
+        assert_eq!(rx.recv().await.unwrap(), vec![18]);
+        assert_eq!(rx.recv().await.unwrap(), vec![19]);
     }
 
     #[tokio::test]

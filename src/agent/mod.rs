@@ -45,6 +45,139 @@ struct TabState {
     output_buf: Vec<u8>,
 }
 
+/// Per-tab replay buffer size (sent to a browser on join / tab switch).
+const TAB_REPLAY_BYTES: usize = 65536;
+
+/// Terminal tabs (PTYs) owned by [`start`] rather than by one relay session,
+/// so they survive reconnects: a network blip re-registers the agent but the
+/// user's shells and running commands keep going, and the browser's re-join
+/// replays each tab's buffered output. Shells are only killed when the agent
+/// process exits (or a tab is closed / its shell exits).
+struct Terminals {
+    tabs: HashMap<String, TabState>,
+    active_tab_id: String,
+    tab_counter: u32,
+    shell_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+    shell_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+}
+
+/// Spawn a new tab and make it active. Free function over the `Terminals`
+/// fields so `run_session` can call it on its destructured borrows.
+fn spawn_tab(
+    tabs: &mut HashMap<String, TabState>,
+    active_tab_id: &mut String,
+    tab_counter: &mut u32,
+    shell_tx: &tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+    shell_path: &str,
+) -> anyhow::Result<String> {
+    *tab_counter += 1;
+    let id = uuid::Uuid::new_v4().to_string();
+    let shell = Shell::spawn(80, 24, shell_path, &id, shell_tx.clone())?;
+    tabs.insert(
+        id.clone(),
+        TabState {
+            shell,
+            title: format!("Shell {}", tab_counter),
+            output_buf: Vec::new(),
+        },
+    );
+    *active_tab_id = id.clone();
+    Ok(id)
+}
+
+/// Drop a tab whose shell exited. Keeps at least one live tab (respawns when
+/// the last one exits) and repoints the active tab. Returns whether the tab
+/// set changed.
+fn reap_exited_tab(
+    tabs: &mut HashMap<String, TabState>,
+    active_tab_id: &mut String,
+    tab_counter: &mut u32,
+    shell_tx: &tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+    tab_id: &str,
+    shell_path: &str,
+) -> bool {
+    if tabs.remove(tab_id).is_none() {
+        return false; // already closed by the user
+    }
+    tracing::info!(tab = %tab_id, "shell exited, tab closed");
+    if tabs.is_empty() {
+        if let Err(e) = spawn_tab(tabs, active_tab_id, tab_counter, shell_tx, shell_path) {
+            tracing::error!("Failed to respawn shell after exit: {}", e);
+            active_tab_id.clear(); // next session start respawns (tabs empty)
+        }
+    } else if active_tab_id == tab_id {
+        *active_tab_id = tabs.keys().next().cloned().unwrap_or_default();
+    }
+    true
+}
+
+impl Terminals {
+    fn new() -> Self {
+        let (shell_tx, shell_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            tabs: HashMap::new(),
+            active_tab_id: String::new(),
+            tab_counter: 0,
+            shell_tx,
+            shell_rx,
+        }
+    }
+
+    fn spawn_tab(&mut self, shell_path: &str) -> anyhow::Result<String> {
+        spawn_tab(
+            &mut self.tabs,
+            &mut self.active_tab_id,
+            &mut self.tab_counter,
+            &self.shell_tx,
+            shell_path,
+        )
+    }
+
+    /// Append PTY output to the tab's bounded replay buffer. Returns false if
+    /// the tab no longer exists.
+    fn buffer_output(&mut self, tab_id: &str, data: &[u8]) -> bool {
+        let Some(ts) = self.tabs.get_mut(tab_id) else {
+            return false;
+        };
+        ts.output_buf.extend_from_slice(data);
+        if ts.output_buf.len() > TAB_REPLAY_BYTES {
+            let excess = ts.output_buf.len() - TAB_REPLAY_BYTES;
+            ts.output_buf.drain(..excess);
+        }
+        true
+    }
+
+    fn reap_exited(&mut self, tab_id: &str, shell_path: &str) -> bool {
+        reap_exited_tab(
+            &mut self.tabs,
+            &mut self.active_tab_id,
+            &mut self.tab_counter,
+            &self.shell_tx,
+            tab_id,
+            shell_path,
+        )
+    }
+
+    /// Await `fut` while keeping PTY output flowing into the replay buffers,
+    /// so a long reconnect gap neither blocks the shells nor queues unbounded
+    /// output in the channel.
+    async fn absorb_while<F: std::future::Future>(&mut self, shell_path: &str, fut: F) -> F::Output {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                r = &mut fut => return r,
+                Some((tab_id, data)) = self.shell_rx.recv() => {
+                    if data.is_empty() {
+                        self.reap_exited(&tab_id, shell_path);
+                    } else {
+                        self.buffer_output(&tab_id, &data);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// In-flight chunked-upload reassembly state. Holds the open destination file
 /// across chunk messages so each chunk's decoded bytes append in order; the
 /// last chunk flushes/closes and emits the fs:result reply.
@@ -85,6 +218,10 @@ impl Out {
 /// Also POSTs a lightweight `ping` every `heartbeat` so the outbound NAT
 /// mapping stays alive (strict NATs only refresh on agent→relay traffic) and a
 /// dead uplink shows up as repeating POST failures.
+/// Consecutive failed heartbeat POSTs (15s apart, each bounded by
+/// `POST_TIMEOUT`) after which the agent treats its uplink as dead.
+const UPLINK_DEAD_AFTER_HEARTBEAT_FAILURES: u32 = 3;
+
 async fn sender_loop(
     client: reqwest::Client,
     send_url: String,
@@ -92,6 +229,7 @@ async fn sender_loop(
     mut control_rx: tokio::sync::mpsc::Receiver<String>,
     mut output_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
     heartbeat: Duration,
+    uplink_dead: Arc<tokio::sync::Notify>,
     #[cfg(feature = "desktop")]
     desktop: Option<std::sync::Arc<crate::agent::desktop::DesktopManager>>,
     #[cfg(feature = "tui")]
@@ -102,6 +240,7 @@ async fn sender_loop(
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_tick = tokio::time::interval(heartbeat);
     heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat_failures: u32 = 0;
     loop {
         tokio::select! {
             biased;
@@ -146,7 +285,21 @@ async fn sender_loop(
                 let ping = ping.to_string();
                 #[cfg(feature = "tui")]
                 let ping_sent_at = std::time::Instant::now();
-                post_raw(&client, &send_url, &ping).await;
+                if post_raw(&client, &send_url, &ping).await {
+                    heartbeat_failures = 0;
+                } else {
+                    heartbeat_failures += 1;
+                    // Uplink (agent→relay) dead while the downlink SSE may
+                    // still look alive (half-open path, relay lost the
+                    // session): end the session so it re-registers.
+                    if heartbeat_failures == UPLINK_DEAD_AFTER_HEARTBEAT_FAILURES {
+                        tracing::warn!(
+                            "{} consecutive heartbeat POSTs failed — uplink considered dead, reconnecting",
+                            heartbeat_failures
+                        );
+                        uplink_dead.notify_one();
+                    }
+                }
                 // 心跳往返即 relay RTT：写入共享状态供 TUI 展示延迟。
                 #[cfg(feature = "tui")]
                 if let Some(st) = &status {
@@ -263,26 +416,38 @@ async fn flush_output(
     }
 }
 
-async fn post_raw(client: &reqwest::Client, send_url: &str, text: &str) {
+/// POST one message to the relay. Returns whether the relay accepted it
+/// (2xx); failures are logged. Bounded by [`client::POST_TIMEOUT`].
+async fn post_raw(client: &reqwest::Client, send_url: &str, text: &str) -> bool {
     let body = match serde_json::from_str::<serde_json::Value>(text) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("Failed to parse outgoing message: {}", e);
-            return;
+            return false;
         }
     };
-    match client.post(send_url).json(&body).send().await {
+    match client
+        .post(send_url)
+        .timeout(client::POST_TIMEOUT)
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             tracing::warn!(
                 "Agent POST failed ({}): {}",
                 status,
-                &body[..body.len().min(200)]
+                client::snippet(&body, 200)
             );
+            false
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("Agent POST send error: {}", e),
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("Agent POST send error: {}", e);
+            false
+        }
     }
 }
 
@@ -532,7 +697,23 @@ async fn stream_file_download(
         );
         // Independent POST (not via sender_loop) so terminal:output/mcp:result
         // are not starved by download chunks.
-        let _ = client.post(&send_url).json(&msg).send().await;
+        // A lost chunk must not leave a silent hole in the file: the relay
+        // streams chunks in arrival order without de-duplication, so we do
+        // not retry (a timed-out-but-delivered chunk would be duplicated) —
+        // abort instead and let the relay fail the download visibly.
+        let delivered = matches!(
+            client
+                .post(&send_url)
+                .timeout(client::POST_TIMEOUT)
+                .json(&msg)
+                .send()
+                .await,
+            Ok(ref r) if r.status().is_success()
+        );
+        if !delivered {
+            tracing::warn!("download chunk {} of {} not delivered — aborting {}", idx, total_chunks, path);
+            break;
+        }
         tokio::task::yield_now().await;
         idx += 1;
         if idx >= total_chunks || remaining == 0 || n == 0 {
@@ -699,7 +880,13 @@ pub async fn start(
     insecure_tls: bool,
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_secs(1);
-    let max_delay = Duration::from_secs(300);
+    // Same 60s cap as registration retries (client.rs, R5#9): a 300s cap made
+    // recovery after a flapping network take up to 5 minutes.
+    let max_delay = Duration::from_secs(60);
+    // A session that stayed up at least this long counts as healthy: the
+    // next reconnect starts again from 1s instead of the grown backoff.
+    const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+    let mut terminals = Terminals::new();
     // Tokens obtained on the first successful registration; replayed on every
     // reconnect so the relay reuses them instead of minting new random ones.
     let mut cached_tokens: Option<Vec<(String, String)>> = None;
@@ -719,6 +906,7 @@ pub async fn start(
         if let Some(st) = &status {
             st.set_phase(crate::status::Phase::Connecting);
         }
+        let session_started = std::time::Instant::now();
         match run_session(
             &relay_url,
             &key,
@@ -734,6 +922,7 @@ pub async fn start(
             insecure_tls,
             #[cfg(feature = "desktop")]
             &mut desktop_want_running,
+            &mut terminals,
         )
         .await
         {
@@ -753,6 +942,9 @@ pub async fn start(
             if st.take_refresh() {
                 tracing::info!("token refresh: re-registering with same session id (new tokens)");
                 cached_tokens = None;
+                // Refresh revokes the old tokens: do not hand the running
+                // shells and their replay history to the new token holders.
+                terminals.tabs.clear();
                 let cur = st.session_id();
                 if !cur.is_empty() {
                     effective_session_id = Some(cur);
@@ -773,7 +965,13 @@ pub async fn start(
         if let Some(st) = &status {
             st.set_phase(crate::status::Phase::Reconnecting);
         }
-        tokio::time::sleep(delay).await;
+        if session_started.elapsed() >= HEALTHY_SESSION {
+            delay = Duration::from_secs(1);
+        }
+        let sleep_for = client::jittered(delay);
+        terminals
+            .absorb_while(&shell_path, tokio::time::sleep(sleep_for))
+            .await;
         delay = std::cmp::min(delay * 2, max_delay);
     }
 }
@@ -796,6 +994,7 @@ async fn run_session(
     // 的 relay 连接发帧）。
     #[cfg(feature = "desktop")]
     desktop_want_running: &mut bool,
+    terminals: &mut Terminals,
 ) -> anyhow::Result<()> {
     // Validate the root directory BEFORE registering with the relay. A bad
     // root must fail fast without minting a session — otherwise the relay
@@ -846,7 +1045,7 @@ async fn run_session(
     #[cfg(feature = "desktop")]
     let lan_addr_report = lan_desktop.as_ref().as_ref().map(|lan| lan.addr_report());
 
-    let mut client = RelayClient::connect_with_retry(
+    let connect = RelayClient::connect_with_retry(
         relay_url,
         key.clone(),
         token_type,
@@ -858,8 +1057,8 @@ async fn run_session(
         lan_addr_report.clone(),
         #[cfg(not(feature = "desktop"))]
         None,
-    )
-    .await?;
+    );
+    let mut client = terminals.absorb_while(shell_path, connect).await?;
 
     // Cache the tokens the moment registration succeeds — before anything
     // later in this function can bail (e.g. shell spawn failure). On the next
@@ -905,13 +1104,15 @@ async fn run_session(
     // 驱动任务，desktop:stop / 二次 offer / 会话结束 时回收。
     #[cfg(feature = "desktop")]
     let p2p_state = crate::agent::p2p::P2pState::default();
-    tokio::spawn(sender_loop(
+    let uplink_dead = Arc::new(tokio::sync::Notify::new());
+    let sender_task = tokio::spawn(sender_loop(
         client.http_client().clone(),
         client.send_url().to_string(),
         client.session_id.clone(),
         control_rx,
         output_rx,
         Duration::from_secs(15),
+        uplink_dead.clone(),
         #[cfg(feature = "desktop")]
         Some(desktop.clone()),
         #[cfg(feature = "tui")]
@@ -1329,8 +1530,6 @@ async fn run_session(
 
     let exec_sessions = crate::agent::exec_sessions::ExecSessionManager::new();
 
-    let (shell_tx, mut shell_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
-
     let is_readonly = token_type == "ro";
 
     // Only one self-upgrade may run per session; the flag is held by the whole
@@ -1345,20 +1544,20 @@ async fn run_session(
         .ok()
         .and_then(|p| p.canonicalize().ok());
 
-    let first_tab_id = uuid::Uuid::new_v4().to_string();
-    let mut tabs: HashMap<String, TabState> = HashMap::new();
-    let mut active_tab_id = first_tab_id.clone();
-    let mut tab_counter: u32 = 1;
-
-    let initial_shell = Shell::spawn(80, 24, shell_path, &first_tab_id, shell_tx.clone())?;
-    tabs.insert(
-        first_tab_id.clone(),
-        TabState {
-            shell: initial_shell,
-            title: "Shell 1".to_string(),
-            output_buf: Vec::new(),
-        },
-    );
+    // Tabs persist across reconnects (see `Terminals`); only the very first
+    // session (or one after every shell exited) spawns the initial shell.
+    if terminals.tabs.is_empty() {
+        terminals.spawn_tab(shell_path)?;
+    } else {
+        tracing::info!(tabs = terminals.tabs.len(), "resuming existing shells after reconnect");
+    }
+    let Terminals {
+        tabs,
+        active_tab_id,
+        tab_counter,
+        shell_tx,
+        shell_rx,
+    } = terminals;
 
     fn build_tab_infos(tabs: &HashMap<String, TabState>, active: &str) -> Vec<serde_json::Value> {
         tabs.iter()
@@ -1375,7 +1574,7 @@ async fn run_session(
     let tab_msg = Message {
         msg_type: "session:tab_list".to_string(),
         session_id: client.session_id.clone(),
-        payload: serde_json::json!({ "tabs": build_tab_infos(&tabs, &active_tab_id) }),
+        payload: serde_json::json!({ "tabs": build_tab_infos(tabs, active_tab_id) }),
     };
     out.control(tab_msg).await;
 
@@ -1411,6 +1610,9 @@ async fn run_session(
 
     loop {
         tokio::select! {
+                _ = uplink_dead.notified() => {
+                    break;
+                }
                 // 刷新 token / 停机：结束本次会话，由 start() 决定重连(刷新)
                 // 还是退出进程(停机)。二者都要求干净退出会话（回收 PTY）。
                 _ = ui_poll.tick() => {
@@ -1443,11 +1645,27 @@ async fn run_session(
                 }
                 shell_output = shell_rx.recv() => {
                     match shell_output {
+                        Some((tab_id, data)) if data.is_empty() => {
+                            // Shell exited: reap (respawning the last tab) and
+                            // tell browsers about the new tab set.
+                            if reap_exited_tab(tabs, active_tab_id, tab_counter, shell_tx, &tab_id, shell_path) {
+                                out.control(Message {
+                                    msg_type: "session:tab_list".to_string(),
+                                    session_id: client.session_id.clone(),
+                                    payload: serde_json::json!({ "tabs": build_tab_infos(tabs, active_tab_id) }),
+                                }).await;
+                                out.control(Message {
+                                    msg_type: "session:tab_switched".to_string(),
+                                    session_id: client.session_id.clone(),
+                                    payload: serde_json::json!({ "tab_id": active_tab_id }),
+                                }).await;
+                            }
+                        }
                         Some((tab_id, data)) => {
                             if let Some(ts) = tabs.get_mut(&tab_id) {
                                 ts.output_buf.extend_from_slice(&data);
-                                if ts.output_buf.len() > 65536 {
-                                    let excess = ts.output_buf.len() - 65536;
+                                if ts.output_buf.len() > TAB_REPLAY_BYTES {
+                                    let excess = ts.output_buf.len() - TAB_REPLAY_BYTES;
                                     ts.output_buf.drain(..excess);
                                 }
                             }
@@ -1512,18 +1730,12 @@ async fn run_session(
                                 }
 
                                 "session:tab_create" => {
-                                    tab_counter += 1;
-                                    let new_id = uuid::Uuid::new_v4().to_string();
-                                    let title = format!("Shell {}", tab_counter);
-
-                                    match Shell::spawn(80, 24, shell_path, &new_id, shell_tx.clone()) {
-                                        Ok(shell) => {
-                                            tabs.insert(new_id.clone(), TabState { shell, title, output_buf: Vec::new() });
-                                            active_tab_id = new_id.clone();
+                                    match spawn_tab(tabs, active_tab_id, tab_counter, shell_tx, shell_path) {
+                                        Ok(_) => {
                                             let tab_msg = Message {
             msg_type: "session:tab_list".to_string(),
             session_id: client.session_id.clone(),
-            payload: serde_json::json!({ "tabs": build_tab_infos(&tabs, &active_tab_id) }),
+            payload: serde_json::json!({ "tabs": build_tab_infos(tabs, active_tab_id) }),
         };
         out.control(tab_msg).await;
                                             let sw_msg_inner = Message {
@@ -1545,13 +1757,13 @@ async fn run_session(
                                         continue;
                                     }
                                     tabs.remove(&tab_id);
-                                    if active_tab_id == tab_id {
-                                        active_tab_id = tabs.keys().next().cloned().unwrap_or_default();
+                                    if *active_tab_id == tab_id {
+                                        *active_tab_id = tabs.keys().next().cloned().unwrap_or_default();
                                     }
                                     let tab_msg = Message {
             msg_type: "session:tab_list".to_string(),
             session_id: client.session_id.clone(),
-            payload: serde_json::json!({ "tabs": build_tab_infos(&tabs, &active_tab_id) }),
+            payload: serde_json::json!({ "tabs": build_tab_infos(tabs, active_tab_id) }),
         };
         out.control(tab_msg).await;
 
@@ -1567,7 +1779,7 @@ async fn run_session(
                                     let tab_id = msg.payload["tab_id"].as_str().unwrap_or("").to_string();
                                     let target_user = msg.payload["_user_id"].as_str().map(|s| s.to_string());
                                     if tabs.contains_key(&tab_id) {
-                                        active_tab_id = tab_id.clone();
+                                        *active_tab_id = tab_id.clone();
                                         let sw_msg = Message {
                                             msg_type: "session:tab_switched".to_string(),
                                             session_id: client.session_id.clone(),
@@ -1576,7 +1788,7 @@ async fn run_session(
                                         out.control(sw_msg).await;
 
                                         // Replay buffered output, routed to requesting user only
-                                        if let Some(ts) = tabs.get(&active_tab_id) {
+                                        if let Some(ts) = tabs.get(active_tab_id.as_str()) {
                                             if !ts.output_buf.is_empty() {
                                                 let text = crate::agent::encoding::decode_bytes(&ts.output_buf);
                                                 let encoded = fs::encode_b64(text.as_bytes());
@@ -1833,22 +2045,28 @@ async fn run_session(
                                     let tab_msg = Message {
                                         msg_type: "session:tab_list".to_string(),
                                         session_id: client.session_id.clone(),
-                                        payload: serde_json::json!({ "tabs": build_tab_infos(&tabs, &active_tab_id) }),
+                                        payload: serde_json::json!({ "tabs": build_tab_infos(tabs, active_tab_id) }),
                                     };
                                     out.control(tab_msg).await;
 
-                                    // Replay buffered output AFTER tab_list so JS knows activeTabId
-                                    for (tid, ts) in &tabs {
+                                    // Replay buffered output AFTER tab_list so JS knows activeTabId.
+                                    // Routed to the joining user only: other viewers
+                                    // already show this output and would see it twice.
+                                    for (tid, ts) in tabs.iter() {
                                         if !ts.output_buf.is_empty() {
                                             let text = crate::agent::encoding::decode_bytes(&ts.output_buf);
                                             let encoded = fs::encode_b64(text.as_bytes());
+                                            let mut replay_payload = serde_json::json!({
+                                                "data": encoded,
+                                                "tab_id": tid
+                                            });
+                                            if !user_id.is_empty() {
+                                                replay_payload["_target_user_id"] = serde_json::json!(user_id);
+                                            }
                                             let replay_msg = Message {
                                                 msg_type: "terminal:output".to_string(),
                                                 session_id: client.session_id.clone(),
-                                                payload: serde_json::json!({
-                                                    "data": encoded,
-                                                    "tab_id": tid
-                                                }),
+                                                payload: replay_payload,
                                             };
                                             out.control(replay_msg).await;
                                         }
@@ -2344,7 +2562,8 @@ async fn run_session(
     }
 
     exec_sessions.shutdown_all().await;
-    tabs.clear(); // Drop all tabs - shells kill child processes via Drop
+    // Tabs are deliberately kept (owned by `start`): shells survive the
+    // reconnect and are replayed to browsers on re-join.
 
     // R5#11 会话退出：记录桌面是否在跑（供重连恢复），并停止当前流——
     // run_desktop_loop 是 tokio::spawn 的孤儿 task（desktop drop 不停它），
@@ -2360,6 +2579,11 @@ async fn run_session(
         }
         crate::agent::p2p::shutdown(&p2p_state).await;
     }
+
+    // The sender only exits once every control sender is dropped; spawned
+    // tasks may still hold clones, and on a dead uplink it may sit in a POST.
+    // Its session is over either way.
+    sender_task.abort();
 
     // Tokens were already cached into `cached_tokens` right after registration,
     // so `start` can replay them on reconnect — nothing to return here.
@@ -2470,6 +2694,78 @@ async fn execute_command(cmd: &str, timeout_ms: u64, shell: &str) -> (String, St
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn test_sender_loop_signals_dead_uplink_after_failed_heartbeats() {
+        // Relay keeps rejecting heartbeats (uplink broken / session lost)
+        // → sender_loop must signal run_session to reconnect.
+        let app = axum::Router::new().route(
+            "/agent/send",
+            axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let (_output_tx, output_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(64);
+        let dead = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(sender_loop(
+            reqwest::Client::new(),
+            format!("http://127.0.0.1:{}/agent/send", port),
+            "sess1".to_string(),
+            control_rx,
+            output_rx,
+            std::time::Duration::from_millis(30),
+            dead.clone(),
+            #[cfg(feature = "desktop")]
+            None,
+            #[cfg(feature = "tui")]
+            None,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), dead.notified())
+            .await
+            .expect("dead uplink must be signalled");
+        task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_terminals_survive_and_buffer_during_reconnect_gap() {
+        // PTYs are owned by `start` (not one relay session): while the agent
+        // is between sessions, shell output keeps landing in the replay buffer.
+        let mut t = Terminals::new();
+        let id = t.spawn_tab("/bin/sh").unwrap();
+        t.tabs.get_mut(&id).unwrap().shell.write_input(b"echo gap-marker\n").unwrap();
+        t.absorb_while("/bin/sh", tokio::time::sleep(Duration::from_millis(800)))
+            .await;
+        let buf = String::from_utf8_lossy(&t.tabs[&id].output_buf).to_string();
+        assert!(buf.contains("gap-marker"), "output buffered while disconnected: {buf:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_terminals_respawn_after_last_shell_exits() {
+        // The only shell exiting must not leave a dead, persisted tab: it is
+        // reaped and a fresh shell takes its place.
+        let mut t = Terminals::new();
+        let id = t.spawn_tab("/bin/sh").unwrap();
+        t.tabs.get_mut(&id).unwrap().shell.write_input(b"exit\n").unwrap();
+        t.absorb_while("/bin/sh", async {
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert_eq!(t.tabs.len(), 1);
+        assert!(!t.tabs.contains_key(&id), "exited tab replaced");
+        assert!(t.tabs.contains_key(&t.active_tab_id));
+    }
+
+    #[test]
+    fn test_buffer_output_bounded() {
+        let mut t = Terminals::new();
+        assert!(!t.buffer_output("missing", b"x"));
+    }
     use super::*;
 
     #[cfg(feature = "desktop")]
@@ -2863,6 +3159,7 @@ mod tests {
             control_rx,
             output_rx,
             std::time::Duration::from_millis(50),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "desktop")]
             None,
             #[cfg(feature = "tui")]
@@ -2923,6 +3220,7 @@ mod tests {
             control_rx,
             output_rx,
             std::time::Duration::from_millis(50),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
             Some(dm.clone()),
             #[cfg(feature = "tui")]
             None,

@@ -8,7 +8,7 @@ use crate::proto::Message as ProtoMessage;
 
 /// How long the relay→agent SSE may be silent before the agent treats the
 /// connection as dead and reconnects. The relay sends an SSE keep-alive
-/// comment every ~15s, so this is a comfortable multiple of that.
+/// comment every 5s (relay/ws.rs), so this is a comfortable multiple of that.
 const AGENT_SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Read SSE chunks from the relay, forward each `data:` payload to `tx`, and
@@ -24,9 +24,12 @@ pub(crate) async fn pump_sse_events<S, B, E>(
     S: tokio_stream::Stream<Item = Result<B, E>> + Unpin,
     B: AsRef<[u8]>,
 {
-    let mut buf = String::new();
+    // Buffer raw bytes and only decode complete events: a multi-byte UTF-8
+    // character split across two network chunks (common on weak links with
+    // small TCP segments) would otherwise decode as two U+FFFD.
+    let mut buf: Vec<u8> = Vec::new();
     let mut event_count: u64 = 0;
-    loop {
+    'outer: loop {
         let next_chunk = tokio::time::timeout(idle_timeout, stream.next());
         let chunk = match next_chunk.await {
             Ok(Some(Ok(bytes))) => bytes,
@@ -44,11 +47,11 @@ pub(crate) async fn pump_sse_events<S, B, E>(
                 break;
             }
         };
-        let text = String::from_utf8_lossy(chunk.as_ref());
-        buf.push_str(&text);
-        while let Some(pos) = buf.find("\n\n") {
-            let event_str = buf[..pos].to_string();
-            buf = buf[pos + 2..].to_string();
+        buf.extend_from_slice(chunk.as_ref());
+        let mut start = 0;
+        while let Some(pos) = find_event_end(&buf[start..]) {
+            let event_str = String::from_utf8_lossy(&buf[start..start + pos]).into_owned();
+            start += pos + 2;
             for line in event_str.lines() {
                 if let Some(data) = line.strip_prefix("data:") {
                     event_count += 1;
@@ -59,12 +62,41 @@ pub(crate) async fn pump_sse_events<S, B, E>(
                             data.trim()
                         );
                     }
-                    let _ = tx.send(data.trim().to_string());
+                    // Receiver gone (session ended) → stop reading so the GET
+                    // connection is released instead of idling on keep-alives.
+                    if tx.send(data.trim().to_string()).is_err() {
+                        break 'outer;
+                    }
                 }
             }
         }
+        buf.drain(..start);
     }
     tracing::debug!("agent SSE stream ended, {} events received", event_count);
+}
+
+/// Byte offset of the first `\n\n` event terminator, if any.
+fn find_event_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+/// Per-request timeout for agent→relay POSTs (register, results, output,
+/// heartbeat). Without it a half-open uplink blocks the sender forever: the
+/// heartbeat stops, the bounded channels fill and the main loop stalls while
+/// the downlink SSE still looks healthy. Not applied to the long-lived SSE GET.
+pub(crate) const POST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Truncate `s` to at most `max` bytes on a char boundary (log snippets of
+/// untrusted bodies must never panic on multi-byte text).
+pub(crate) fn snippet(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 struct Transport {
@@ -78,6 +110,14 @@ struct Transport {
     #[allow(dead_code)]
     last_event_id: Option<u64>,
     _task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Transport {
+    // The SSE reader is a detached task; abort it with the session so a
+    // session that ends for a non-SSE reason does not leak the GET connection.
+    fn drop(&mut self) {
+        self._task.abort();
+    }
 }
 
 /// 构建注册时声明的能力集（R5#44 capability 协商）：codec 按编译 feature
@@ -151,7 +191,7 @@ fn next_retry_delay(is_rate_limited: bool, prev: Duration, max: Duration) -> Dur
 /// 所有 agent 用相同确定性节奏会同时冲击 relay）。返回 `[base×0.5, base]` 内的
 /// 随机时长（**只向下抖**，从不超过退避上限/固定值），下限 1s。基值本身保持
 /// 确定、不把抖动喂回下一档指数。
-fn jittered(base: Duration) -> Duration {
+pub(crate) fn jittered(base: Duration) -> Duration {
     use rand::Rng;
     let factor = rand::thread_rng().gen_range(0.5f64..1.0);
     Duration::from_secs_f64((base.as_secs_f64() * factor).max(1.0))
@@ -190,15 +230,18 @@ impl RelayClient {
         let http_base = base;
         let send_url = format!("{}/agent/send", http_base);
 
-        let http_client = if insecure_tls {
+        // connect_timeout bounds dialing a dead/unroutable relay; TCP
+        // keepalive lets the OS notice a silently dropped path on the
+        // long-lived SSE GET too. No client-wide total timeout: the SSE GET
+        // and upgrade downloads are long-lived, POSTs set POST_TIMEOUT.
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30));
+        if insecure_tls {
             crate::tlsutil::install_rustls_provider();
-            reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .context("Failed to build HTTP client (insecure TLS)")?
-        } else {
-            reqwest::Client::new()
-        };
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let http_client = builder.build().context("Failed to build HTTP client")?;
 
         // Best-effort host probe (CPU model, arch, OS, …) reported with every
         // registration so the admin device panel reflects the current host.
@@ -247,6 +290,7 @@ impl RelayClient {
 
         let resp = http_client
             .post(&send_url)
+            .timeout(POST_TIMEOUT)
             .json(&register_msg)
             .send()
             .await
@@ -266,7 +310,7 @@ impl RelayClient {
             format!(
                 "Failed to parse register response (status {}): {}",
                 status,
-                &body_text[..body_text.len().min(500)]
+                snippet(&body_text, 500)
             )
         })?;
 
@@ -288,6 +332,12 @@ impl RelayClient {
                 .send()
                 .await
             {
+                Ok(resp) if !resp.status().is_success() => {
+                    // e.g. 404 after a relay restart: end now so the session
+                    // re-registers, instead of pumping an error body.
+                    tracing::warn!("agent SSE rejected (HTTP {})", resp.status());
+                    return;
+                }
                 Ok(resp) => {
                     let status = resp.status();
                     let ct = resp
@@ -685,5 +735,40 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(jittered(Duration::from_secs(1)), Duration::from_secs(1));
         }
+    }
+
+    #[tokio::test]
+    async fn test_pump_sse_events_utf8_split_across_chunks() {
+        // "中" (e4 b8 ad) split between two network chunks must survive intact.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let stream = tokio_stream::iter(vec![
+            Ok::<_, std::io::Error>(b"data: {\"d\":\"\xe4\xb8".to_vec()),
+            Ok(b"\xad\"}\n\n".to_vec()),
+        ]);
+        pump_sse_events(stream, tx, std::time::Duration::from_secs(60)).await;
+        assert_eq!(rx.recv().await.as_deref(), Some("{\"d\":\"中\"}"));
+    }
+
+    #[tokio::test]
+    async fn test_pump_sse_events_stops_when_receiver_dropped() {
+        // Session gone → the pump must return even though the stream would
+        // keep delivering (otherwise the GET connection leaks).
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        drop(rx);
+        let stream = tokio_stream::iter(vec![Ok::<_, std::io::Error>(b"data: a\n\n".as_slice())])
+            .chain(tokio_stream::pending());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pump_sse_events(stream, tx, std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect("pump must stop once the receiver is gone");
+    }
+
+    #[test]
+    fn test_snippet_char_boundary() {
+        assert_eq!(snippet("abc", 8), "abc");
+        assert_eq!(snippet("密钥密钥", 8), "密钥"); // 8 falls inside the 3rd char
+        assert_eq!(snippet("abcdefghij", 8), "abcdefgh");
     }
 }

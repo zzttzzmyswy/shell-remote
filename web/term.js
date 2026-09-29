@@ -8,10 +8,12 @@ class TerminalManager {
             fontSize: 14,
             fontFamily: "'Sarasa Term SC', 'Sarasa Mono SC', 'Noto Sans Mono CJK SC', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
             theme: {
-                background: '#1e1e1e',
-                foreground: '#d4d4d4',
-                cursor: '#d4d4d4',
-                selectionBackground: '#264f78',
+                // 与页面 --bg-primary / --accent 同色系（style.css）
+                background: '#0b0f17',
+                foreground: '#d8deea',
+                cursor: '#8ca4ff',
+                cursorAccent: '#0b0f17',
+                selectionBackground: 'rgba(109, 140, 255, 0.35)',
                 black: '#000000',
                 red: '#cd3131',
                 green: '#0dbc79',
@@ -104,5 +106,10 @@ class TerminalManager {
 
     clear() {
         this.term.clear();
+    }
+
+    // 清屏并清空回滚区（重连重放缓冲输出前用，避免内容重复）
+    reset() {
+        this.term.reset();
     }
 }

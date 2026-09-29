@@ -163,12 +163,16 @@ const CONN_LOG_CAP: usize = 500;
 
 pub struct RateLimiter {
     attempts: HashMap<String, Vec<Instant>>,
+    prune_at: usize,
 }
+
+const RATE_LIMIT_PRUNE_MIN: usize = 10_000;
 
 impl RateLimiter {
     pub fn new() -> Self {
         Self {
             attempts: HashMap::new(),
+            prune_at: RATE_LIMIT_PRUNE_MIN,
         }
     }
 
@@ -176,6 +180,14 @@ impl RateLimiter {
     pub fn check(&mut self, key: &str, max_per_window: usize, window: Duration) -> bool {
         let now = Instant::now();
         let cutoff = now - window;
+        // Keys are client-influenced (X-Forwarded-For, session id): drop
+        // expired ones once the map grows so it cannot grow without bound.
+        // The threshold doubles after each prune so a flood of live keys
+        // costs amortized O(1), not an O(n) sweep on every call.
+        if self.attempts.len() > self.prune_at {
+            self.attempts.retain(|_, v| v.last().is_some_and(|t| *t > cutoff));
+            self.prune_at = (self.attempts.len() * 2).max(RATE_LIMIT_PRUNE_MIN);
+        }
         let entry = self.attempts.entry(key.to_string()).or_default();
         entry.retain(|t| *t > cutoff);
         if entry.len() >= max_per_window {

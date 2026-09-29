@@ -3,12 +3,13 @@
 use axum::http::HeaderMap;
 
 /// Constant-time string comparison for passwords/secrets
+/// Both sides are hashed first so the comparison time does not depend on the
+/// secret's length either (an early length check leaks it).
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    use sha2::{Digest, Sha256};
+    let (ha, hb) = (Sha256::digest(a.as_bytes()), Sha256::digest(b.as_bytes()));
     let mut diff = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
+    for (x, y) in ha.iter().zip(hb.iter()) {
         diff |= x ^ y;
     }
     diff == 0
