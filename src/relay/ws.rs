@@ -34,6 +34,12 @@ fn is_lossy_msg_type(t: &str) -> bool {
     )
 }
 
+/// First ≤8 bytes of a token for audit logs, cut on a char boundary (fixed
+/// `--key` values may be non-ASCII; a byte slice would panic the handler).
+fn token_prefix(token: &str) -> &str {
+    crate::agent::client::snippet(token, 8)
+}
+
 /// Non-blocking delivery to a bounded SSE channel. Never awaits, so it is safe
 /// to call while holding a read lock. On overflow, lossy types are dropped
 /// silently and everything else is dropped with a warning — the alternative
@@ -601,7 +607,8 @@ pub async fn agent_ws_send_handler(
     // R5#22 WS/HTTP 限流等价：WS uplink 与 HTTP `/agent/events` 共享 per-IP
     // 连接频率配额（ev: 30/min）——agent 无法切通道绕过限流。长连接建立
     // 时检查一次即可（agent 正常不断连，30/min 裕量充足）。
-    if !agent_conn_rate_ok(&state, &headers).await {
+    let session_param = params.get("session").map(String::as_str).unwrap_or("");
+    if !agent_conn_rate_ok(&state, &headers, session_param).await {
         return (StatusCode::TOO_MANY_REQUESTS, "WS uplink rate limited").into_response();
     }
     let session_id = match params.get("session") {
@@ -1270,17 +1277,30 @@ pub async fn upgrade_blob_handler(
 // ── Agent SSE handler (GET, for HTTP-mode agent receive) ─────────────
 
 /// agent 上行通道（HTTP SSE `/agent/events` 与 WS uplink）共享的连接频率
-/// 限流（R5#22 WS/HTTP 等价）：per-IP `ev:` 配额 30/min。返回 false = 超限
-/// （调用方回 429）。**同一 key 让 WS 与 HTTP 共用配额**——agent 无法通过
-/// 切换通道绕过连接频率限制（防恶意快速重连耗尽资源）。
-async fn agent_conn_rate_ok(state: &Arc<SharedState>, headers: &axum::http::HeaderMap) -> bool {
+/// 限流（R5#22 WS/HTTP 等价）：per-(IP, session) `ev:` 配额 30/min。返回
+/// false = 超限（调用方回 429）。**同一 key 让 WS 与 HTTP 共用配额**——agent
+/// 无法通过切换通道绕过连接频率限制（防恶意快速重连耗尽资源）。
+///
+/// key 带 session：仅按 IP 计数时，同一出口 IP（NAT / 反代未带
+/// X-Forwarded-For 时全部落到 "unknown"）后的所有 agent 共享 30/min——relay
+/// 重启后 >30 个 agent 同时重连，超出的 SSE 全被 429，会话反复断开（MYS-1766
+/// 40 agent 并发冒烟复现）。单个 agent 的重连频率仍受 30/min 约束。
+async fn agent_conn_rate_ok(
+    state: &Arc<SharedState>,
+    headers: &axum::http::HeaderMap,
+    session: &str,
+) -> bool {
     let client_ip = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
+    let window = std::time::Duration::from_secs(60);
     let mut rl = state.rate_limiter.write().await;
-    rl.check(&format!("ev:{client_ip}"), 30, std::time::Duration::from_secs(60))
+    // `session` is caller-supplied and checked before auth: a coarse per-IP
+    // cap stops minting a fresh bucket per made-up session id.
+    rl.check(&format!("ev:{client_ip}"), 600, window)
+        && rl.check(&format!("ev:{client_ip}:{session}"), 30, window)
 }
 
 /// R5#12：SSE 建立/重建时补发的桌面状态快照事件字符串。从 `desktop_states`
@@ -1300,7 +1320,8 @@ pub async fn agent_events_handler(
     headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !agent_conn_rate_ok(&state, &headers).await {
+    let session_param = params.get("session").map(String::as_str).unwrap_or("");
+    if !agent_conn_rate_ok(&state, &headers, session_param).await {
         return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
@@ -1466,7 +1487,7 @@ pub async fn browser_sse_handler(
     state
         .log_conn(
             &session_id,
-            &token[..token.len().min(8)],
+            token_prefix(&token),
             perm_str,
             "connect",
         )
@@ -1554,7 +1575,7 @@ pub async fn browser_sse_handler(
     let uid_clone = user_id.clone();
     let _sse_sid_clone = sse_sid.clone();
     let perm_clone = perm_str.to_string();
-    let token_prefix_clone = token[..token.len().min(8)].to_string();
+    let token_prefix_clone = token_prefix(&token).to_string();
 
     // connected event data
     let connected_data = json!({
@@ -2501,12 +2522,20 @@ mod tests {
         };
         let headers = mk("10.0.0.9");
         for _ in 0..30 {
-            assert!(agent_conn_rate_ok(&state, &headers).await, "窗口内 30 次应放行");
+            assert!(agent_conn_rate_ok(&state, &headers, "s1").await, "窗口内 30 次应放行");
         }
-        assert!(!agent_conn_rate_ok(&state, &headers).await, "第 31 次应超限（HTTP/WS 同配额）");
+        assert!(!agent_conn_rate_ok(&state, &headers, "s1").await, "第 31 次应超限（HTTP/WS 同配额）");
         // 不同 IP 独立配额，不受影响。
         let other = mk("10.0.0.10");
-        assert!(agent_conn_rate_ok(&state, &other).await, "不同 IP 独立配额");
+        assert!(agent_conn_rate_ok(&state, &other, "s1").await, "不同 IP 独立配额");
+        // 同一出口 IP 后的其它 agent（不同 session）不被挤占。
+        assert!(agent_conn_rate_ok(&state, &headers, "s2").await, "同 IP 不同 session 独立配额");
+        // 但 session 由调用方提供：同一 IP 伪造大量 session 仍受 per-IP 总配额约束。
+        let flood = mk("10.0.0.77");
+        for i in 0..600 {
+            assert!(agent_conn_rate_ok(&state, &flood, &format!("f{i}")).await);
+        }
+        assert!(!agent_conn_rate_ok(&state, &flood, "f-new").await, "per-IP 总配额 600/min");
     }
 
     #[tokio::test]
