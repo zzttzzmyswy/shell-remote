@@ -10,7 +10,9 @@
 <body class="session-page">
     <div id="toolbar">
         <div class="toolbar-left">
-            <span id="session-name">会话</span>
+            <span class="toolbar-brand">shell-remote</span>
+            <span class="toolbar-divider"></span>
+            <span id="session-name" class="connecting">连接中…</span>
             <span id="online-count" class="badge">0 在线</span>
         </div>
         <div class="toolbar-right">
@@ -61,10 +63,10 @@
             <div id="desktop-status" class="desktop-status"></div>
             <div id="desktop-clip-panel" class="desktop-metrics hidden">
                 <div class="metrics-title">剪贴板同步 <span class="metrics-hint">(纯文本)</span></div>
-                <textarea id="desktop-clip-text" rows="5" style="width:100%;box-sizing:border-box;background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:4px;font-size:12px;padding:6px;" placeholder="粘贴或编辑文本…"></textarea>
-                <div style="display:flex;gap:6px;margin-top:6px;">
-                    <button id="clip-to-remote-btn" class="btn btn-small" style="flex:1">→ 远端</button>
-                    <button id="clip-from-remote-btn" class="btn btn-small" style="flex:1">远端 → 本机</button>
+                <textarea id="desktop-clip-text" class="clip-textarea" rows="5" placeholder="粘贴或编辑文本…"></textarea>
+                <div class="clip-actions">
+                    <button id="clip-to-remote-btn" class="btn btn-small">→ 远端</button>
+                    <button id="clip-from-remote-btn" class="btn btn-small">远端 → 本机</button>
                 </div>
             </div>
             <div id="desktop-metrics" class="desktop-metrics hidden">

@@ -15,17 +15,17 @@
 
     <!-- Connect Section -->
     <div class="connect-container">
+        <div class="brand-mark" aria-hidden="true">&gt;_</div>
         <h1>shell-remote</h1>
-        <p class="subtitle">远程协作终端</p>
+        <p class="subtitle">远程协作终端 · 文件 · 桌面</p>
         <div class="connect-form">
-            <label for="auth-input">服务器密码</label>
-            <input type="password" id="auth-input" placeholder="服务器访问密码..." autocomplete="off">
             <label for="token-input">会话密钥</label>
             <input type="text" id="token-input" placeholder="粘贴会话密钥..." autocomplete="off">
             <div class="button-row">
                 <button id="connect-btn" class="btn btn-primary">连接</button>
             </div>
             <div id="connect-error" class="error-message hidden"></div>
+            <p class="connect-hint">密钥由 agent 启动时输出（rw 读写 / ro 只读）</p>
         </div>
     </div>
 
@@ -118,13 +118,31 @@
                 'win-dl':    '& ([scriptblock]::Create((irm ' + host + '/agent/install.ps1))) --download-only'
             };
             var cmd = cmds[id];
-            navigator.clipboard.writeText(cmd).then(function() {
+            var done = function() {
                 var code = document.getElementById(id);
                 var btn = code.parentElement.querySelector('.copy-btn');
                 btn.textContent = 'copied!';
                 btn.classList.add('copied');
                 setTimeout(function() { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 2000);
-            });
+            };
+            var fallback = function() {
+                // 非安全上下文（http）无 navigator.clipboard：隐藏 textarea + execCommand
+                var ta = document.createElement('textarea');
+                ta.value = cmd;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                var ok = false;
+                try { ok = document.execCommand('copy'); } catch (e) {}
+                document.body.removeChild(ta);
+                if (ok) done();
+            };
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(cmd).then(done).catch(fallback);
+            } else {
+                fallback();
+            }
         }
     </script>
 </body>
