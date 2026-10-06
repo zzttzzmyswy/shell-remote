@@ -115,7 +115,7 @@ async function typeUntilWritten(page, name, ms) {
     const page = await browser.newPage();
     page.on('pageerror', (e) => log('pageerror:', e.message));
     await page.goto(`http://127.0.0.1:${RELAY_PORT}/`);
-    await page.evaluate((t) => sessionStorage.setItem('shell-remote-token', t), token);
+    await page.evaluate(([t, a]) => { sessionStorage.setItem('shell-remote-token', t); sessionStorage.setItem('shell-remote-auth', a); }, [token, 'e2e-pass']);
     await page.goto(`http://127.0.0.1:${RELAY_PORT}/session`);
     await page.waitForSelector('.tab-item', { timeout: 20000 });
     const pid0 = await typeUntilWritten(page, 'pid0', 20000);

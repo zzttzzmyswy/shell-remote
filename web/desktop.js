@@ -767,7 +767,8 @@
       }
       const self = this;
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = proto + '//' + location.host + '/agent/desktop/ws?token=' + encodeURIComponent(token);
+      const url = proto + '//' + location.host + '/agent/desktop/ws?token=' + encodeURIComponent(token)
+        + '&auth=' + encodeURIComponent(sessionStorage.getItem('shell-remote-auth') || '');
       let ws;
       try { ws = new WebSocket(url); } catch (e) {
         this._startFetch();
@@ -835,7 +836,7 @@
       const self = this;
 
       fetch('/agent/desktop/stream', {
-        headers: { 'Authorization': 'Bearer ' + token }
+        headers: window.shellRemoteAuthHeaders({ 'Authorization': 'Bearer ' + token })
       }).then(function(resp) {
         if (controller.signal.aborted) return null;
         if (!resp.ok || !resp.body) {

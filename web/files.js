@@ -185,6 +185,8 @@ class FileManager {
         };
         xhr.open('POST', '/agent/upload?path=' + encodeURIComponent(fullPath) + '&token=' + encodeURIComponent(token));
         xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+        const pw = sessionStorage.getItem('shell-remote-auth');
+        if (pw) xhr.setRequestHeader('X-Auth', pw);
         xhr.send(file);
     }
 

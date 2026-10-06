@@ -233,9 +233,43 @@ mod integration_tests {
         // ── 3. Browser connects via SSE+POST ──────────────────
         // Token travels in the Authorization header (not the query string),
         // matching the browser client in web/sse.js.
+        // Server password (--auth) gates the web client too; it is a separate
+        // secret from the session token. Missing/wrong → 401 AUTH_INVALID_PASSWORD
+        // (checked before the token, so a valid token alone is not enough).
+        for bad in [None, Some("wrong-pw")] {
+            let mut req = client
+                .get(format!("{}/agent/session/sse", relay_url))
+                .header("Authorization", format!("Bearer {}", rw_token))
+                .header("Accept", "text/event-stream");
+            if let Some(pw) = bad {
+                req = req.header("x-auth", pw);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 401, "browser SSE without server password");
+            let v: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(v["error"], "AUTH_INVALID_PASSWORD");
+        }
+        let resp = client
+            .post(format!("{}/agent/session/send", relay_url))
+            .json(&json!({"type":"terminal:input","session_id":session_id,"token":rw_token,"payload":{"data":"x"}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "browser POST without server password");
+        // The admin-page password must NOT be accepted as the server password.
         let resp = client
             .get(format!("{}/agent/session/sse", relay_url))
             .header("Authorization", format!("Bearer {}", rw_token))
+            .header("x-auth", rw_token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "session token is not the server password");
+
+        let resp = client
+            .get(format!("{}/agent/session/sse", relay_url))
+            .header("Authorization", format!("Bearer {}", rw_token))
+            .header("x-auth", server_auth)
             .header("Accept", "text/event-stream")
             .send()
             .await
@@ -249,6 +283,7 @@ mod integration_tests {
 
         let resp = client
             .post(format!("{}/agent/session/send", relay_url))
+            .header("x-auth", server_auth)
             .json(&json!({
                 "type": "terminal:input",
                 "session_id": session_id,

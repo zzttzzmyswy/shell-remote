@@ -1420,6 +1420,9 @@ pub async fn browser_sse_handler(
     headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if !crate::relay::auth::server_password_ok(&state, &headers, params.get("auth")).await {
+        return crate::relay::auth::invalid_password_response();
+    }
     // Prefer the Authorization header so tokens don't land in access logs via
     // the query string; fall back to ?token= for backward compatibility.
     let token = match crate::relay::auth::extract_token_from_headers_or_query(
@@ -1671,8 +1674,12 @@ pub async fn browser_sse_handler(
 
 pub async fn browser_send_handler(
     State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    if !crate::relay::auth::server_password_ok(&state, &headers, None).await {
+        return crate::relay::auth::invalid_password_response();
+    }
     // 防毒包（MYS-886 对齐项 R3丙94）：单条控制消息上限 8MB，超过直接拒绝，
     // 防止异常/恶意客户端把整个内存拖进 JSON 路由。
     let raw_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
@@ -2842,7 +2849,7 @@ mod tests {
     async fn test_browser_send_missing_token() {
         let state = make_state("");
         let body = json!({"type": "terminal:input", "payload": {}});
-        let resp = browser_send_handler(State(state), Json(body))
+        let resp = browser_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
             .await
             .into_response();
         assert_eq!(resp.status(), 401);
@@ -2854,7 +2861,7 @@ mod tests {
         let state = make_state("");
         let big = "x".repeat(9 * 1024 * 1024);
         let body = json!({"type": "terminal:input", "payload": {"data": big}});
-        let resp = browser_send_handler(State(state), Json(body))
+        let resp = browser_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
             .await
             .into_response();
         assert_eq!(resp.status(), 413);
@@ -2873,7 +2880,7 @@ mod tests {
             .await
             .insert(sid.clone(), ChannelMap::new());
         let body = json!({"token": token, "type": "terminal:input", "payload": {}});
-        let resp = browser_send_handler(State(state), Json(body))
+        let resp = browser_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
             .await
             .into_response();
         assert_eq!(resp.status(), 403);
@@ -2994,7 +3001,7 @@ mod tests {
             .insert(sid.clone(), ChannelMap::new());
         let body =
             json!({"token": tokens[0].0, "type": "terminal:input", "payload": {"data": "ls"}});
-        let resp = browser_send_handler(State(state), Json(body))
+        let resp = browser_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
             .await
             .into_response();
         assert_eq!(resp.status(), 202);
