@@ -15,6 +15,45 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Server password (`--auth`, changeable at runtime via the admin page) gate
+/// for browser-facing endpoints. NOT the admin-page login (`--admin-user` /
+/// `--admin-pass`) and NOT the per-session token — three separate secrets.
+///
+/// Supplied via the `X-Auth` header (same as MCP) or, where headers cannot be
+/// set (WebSocket upgrade), the `auth` query parameter. An empty configured
+/// password disables the check (consistent with the agent/MCP paths).
+pub async fn server_password_ok(
+    state: &crate::relay::SharedState,
+    headers: &HeaderMap,
+    query_auth: Option<&String>,
+) -> bool {
+    let expected = state.server_auth.read().await;
+    if expected.is_empty() {
+        return true;
+    }
+    let supplied = headers
+        .get("x-auth")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .or(query_auth.map(String::as_str))
+        .unwrap_or("");
+    constant_time_eq(supplied, &expected)
+}
+
+/// 401 body shared by all browser endpoints so the web client can tell a
+/// wrong server password apart from an invalid session token.
+pub fn invalid_password_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({
+            "error": "AUTH_INVALID_PASSWORD",
+            "message": "Invalid server password"
+        })),
+    )
+        .into_response()
+}
+
 pub fn extract_token_from_query(query: &str) -> Option<String> {
     if query.is_empty() {
         return None;
@@ -177,6 +216,23 @@ mod tests {
     fn test_extract_token_from_headers_or_query_both_missing() {
         let headers = HeaderMap::new();
         assert_eq!(extract_token_from_headers_or_query(&headers, None), None);
+    }
+
+    #[tokio::test]
+    async fn test_server_password_gate() {
+        let state = crate::relay::SharedState::new(
+            "pw1".to_string(), 1024, None, String::new(), String::new(), None,
+        );
+        let mut h = HeaderMap::new();
+        assert!(!server_password_ok(&state, &h, None).await, "missing password rejected");
+        h.insert("x-auth", "bad".parse().unwrap());
+        assert!(!server_password_ok(&state, &h, None).await, "wrong header rejected");
+        h.insert("x-auth", "pw1".parse().unwrap());
+        assert!(server_password_ok(&state, &h, None).await, "header accepted");
+        let q = "pw1".to_string();
+        assert!(server_password_ok(&state, &HeaderMap::new(), Some(&q)).await, "query accepted");
+        *state.server_auth.write().await = String::new();
+        assert!(server_password_ok(&state, &HeaderMap::new(), None).await, "empty password disables gate");
     }
 
     #[test]

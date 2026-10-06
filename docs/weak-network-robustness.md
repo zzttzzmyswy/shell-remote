@@ -98,6 +98,16 @@ agent  ──POST(/agent/send) + WS(/agent/ws/send，仅桌面视频)───�
 | 低 | 文件操作未限制在 `--root` 内 | 与现有测试预期一致（允许 `..`），属设计选择；如需沙箱，应在 canonicalize 后校验前缀。 |
 | 低 | Windows 上 shell 退出检测 | ConPTY 读端在子进程退出后未必 EOF，退出的标签页不会被自动回收（与旧版一致）。 |
 
+## 5.1 三个独立凭据（v0.54.1 补充）
+
+| 凭据 | 配置 | 保护对象 | 传递方式 |
+|---|---|---|---|
+| 服务器密码 | relay `--auth`（管理后台可在线修改） | Web 页面（SSE/发送/上传/桌面流）、MCP、agent 注册 | `X-Auth` 请求头（WebSocket 用 `?auth=`） |
+| 会话密钥 | agent `--key` / 随机 token | 单个会话的终端/文件/桌面 | `Authorization: Bearer` |
+| 管理后台账号密码 | relay `--admin-user/--admin-pass` | 管理后台 | Cookie 登录 |
+
+v0.53.1 起登录页虽有"服务器密码"输入框，但前端从未发送、浏览器接口也不校验，Web 页面实际只靠会话密钥；v0.54.0 误删了该输入框，v0.54.1 补上真实校验：浏览器接口先验服务器密码（失败返回 `AUTH_INVALID_PASSWORD`），再验会话密钥。验证见 `tools/verify_web_password.js`。
+
 ## 6. 复现与回归
 
 ```bash
@@ -111,4 +121,7 @@ BIN=./target/debug/shell-remote node tools/verify_weaknet_resume.js
 
 # 多 agent 高频并发注册冒烟（40 agent：冷启动 / relay 重启 / 5×10 抖动 / 20s 保持）
 BIN=./target/debug/shell-remote tools/concurrent_register_smoke.sh
+
+# 服务器密码守卫（登录流程 + MCP，需 playwright）
+BIN=./target/debug/shell-remote node tools/verify_web_password.js
 ```

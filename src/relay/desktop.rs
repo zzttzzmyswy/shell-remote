@@ -272,6 +272,9 @@ pub async fn stream_handler(
     headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    if !crate::relay::auth::server_password_ok(&state, &headers, params.get("auth")).await {
+        return crate::relay::auth::invalid_password_response();
+    }
     let token =
         match crate::relay::auth::extract_token_from_headers_or_query(&headers, params.get("token")) {
             Some(t) => t,
@@ -385,6 +388,9 @@ pub async fn ws_downlink_handler(
     Query(params): Query<HashMap<String, String>>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
+    if !crate::relay::auth::server_password_ok(&state, &headers, params.get("auth")).await {
+        return crate::relay::auth::invalid_password_response();
+    }
     let token =
         match crate::relay::auth::extract_token_from_headers_or_query(&headers, params.get("token")) {
             Some(t) => t,
@@ -708,6 +714,26 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_stream_handler_requires_server_password() {
+        // A valid session token is not enough when --auth is set: the server
+        // password (X-Auth header) is checked first and reported distinctly.
+        let state = Arc::new(crate::relay::SharedState::new(
+            "srv-pw".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        state.sessions.register(Some("dk".into()), "both", Some("dsess".into())).await.unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer dk".parse().unwrap());
+        let resp = stream_handler(State(state.clone()), h.clone(), Query(HashMap::new())).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("AUTH_INVALID_PASSWORD"));
+        // Correct password passes the gate (then 404: no desktop stream yet).
+        h.insert("x-auth", "srv-pw".parse().unwrap());
+        let resp = stream_handler(State(state), h, Query(HashMap::new())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

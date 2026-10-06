@@ -272,7 +272,7 @@
 
       const self = this;
       fetch('/agent/desktop/stream', {
-        headers: { 'Authorization': 'Bearer ' + token }
+        headers: window.shellRemoteAuthHeaders({ 'Authorization': 'Bearer ' + token })
       }).then(function(resp) {
         if (controller.signal.aborted) return null;
         if (!resp.ok || !resp.body) {

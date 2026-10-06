@@ -565,6 +565,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upload_handler_requires_server_password() {
+        // Valid session token but no/wrong server password → 401 before any
+        // upload work; correct password gets past the gate (then 404 path).
+        let state = Arc::new(SharedState::new(
+            "srv-pw".to_string(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        let reg = state.sessions.register(Some("up-key".into()), "both", None).await;
+        let _ = reg;
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "/tmp/x".to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", "Bearer up-key".parse().unwrap());
+        let r = upload_handler(State(state.clone()), headers.clone(), Query(params.clone()), axum::body::Body::empty()).await;
+        assert_eq!(r.unwrap_err(), StatusCode::UNAUTHORIZED, "no server password");
+        headers.insert("x-auth", "nope".parse().unwrap());
+        let r = upload_handler(State(state.clone()), headers.clone(), Query(params.clone()), axum::body::Body::empty()).await;
+        assert_eq!(r.unwrap_err(), StatusCode::UNAUTHORIZED, "wrong server password");
+        headers.insert("x-auth", "srv-pw".parse().unwrap());
+        let r = upload_handler(State(state), headers, Query(params), axum::body::Body::empty()).await;
+        assert_ne!(r.err(), Some(StatusCode::UNAUTHORIZED), "correct password passes the gate");
+    }
+
+    #[tokio::test]
     async fn test_upload_handler_unauthorized_no_token() {
         let state = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
         let headers = HeaderMap::new();
@@ -986,6 +1009,9 @@ pub async fn upload_handler(
         }
     }
 
+    if !crate::relay::auth::server_password_ok(&state, &headers, None).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let token =
         crate::relay::auth::extract_token_from_headers_or_query(&headers, params.get("token"))
             .ok_or(StatusCode::UNAUTHORIZED)?;

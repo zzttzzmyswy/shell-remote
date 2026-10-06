@@ -16,6 +16,27 @@
   var userId = null;
   var handlers = {};
 
+  // 服务器密码（relay --auth），登录页写入 sessionStorage。所有浏览器请求都带
+  // X-Auth 头；与会话密钥（Authorization: Bearer）是两个独立的凭据。
+  function authHeaders(extra) {
+    var h = extra || {};
+    var pw = sessionStorage.getItem('shell-remote-auth');
+    if (pw) h['X-Auth'] = pw;
+    return h;
+  }
+  window.shellRemoteAuthHeaders = authHeaders;
+  // 服务器密码被拒：清掉并回登录页提示（不再重连）。
+  function rejectPassword() {
+    intentionalClose = true;
+    sessionStorage.removeItem('shell-remote-auth');
+    window.location.href = '/?err=password';
+  }
+  function isPasswordRejection(resp) {
+    return resp.status === 401 && resp.clone().json()
+      .then(function(d) { return d && d.error === 'AUTH_INVALID_PASSWORD'; })
+      .catch(function() { return false; });
+  }
+
   var controller = null;          // AbortController for the active fetch
   var intentionalClose = false;   // true when we deliberately stop the stream
   var reconnectTimer = null;
@@ -77,14 +98,20 @@
       return fetch('/agent/session/send', {
         method: 'POST',
         signal: ac ? ac.signal : undefined,
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           token: token,
           type: type,
           payload: payload || {}
         })
       }).then(function(resp) {
-        // 401 由 SSE 通道统一处理（含 relay 重启容忍窗口），这里不跳转；
+        if (resp.status === 401) {
+          return Promise.resolve(isPasswordRejection(resp)).then(function(bad) {
+            if (bad) rejectPassword();
+            return false;
+          });
+        }
+        // 401 的会话密钥失效由 SSE 通道统一处理（含 relay 重启容忍窗口）；
         // 403 = 只读用户发了写操作，提示即可（此前会被直接踢回登录页）。
         if (resp.status === 403) {
           var now = Date.now();
@@ -192,14 +219,23 @@
 
     fetch('/agent/session/sse', {
       method: 'GET',
-      headers: {
+      headers: authHeaders({
         'Authorization': 'Bearer ' + token,
         'Accept': 'text/event-stream',
         'Cache-Control': 'no-cache'
-      },
+      }),
       signal: localController.signal
     }).then(function(resp) {
       if (!resp.ok || !resp.body) {
+        if (resp.status === 401 && !everConnected) {
+          // 先区分是服务器密码错还是会话密钥错
+          return Promise.resolve(isPasswordRejection(resp)).then(function(bad) {
+            intentionalClose = true;
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            if (bad) { rejectPassword(); return; }
+            window.location.href = '/?err=token';
+          });
+        }
         if (resp.status === 401 || resp.status === 403) {
           var now = Date.now();
           if (!authFailSince) authFailSince = now;
