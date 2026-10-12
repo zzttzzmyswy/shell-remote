@@ -191,6 +191,25 @@ async fn process_mcp_request(
     url_token: Option<String>,
     body: &Value,
 ) -> Option<Value> {
+    process_mcp_request_with_grace(state, url_token, body, MCP_WAIT_GRACE).await
+}
+
+/// Extra time the relay waits beyond the agent's own `timeout_ms`.
+///
+/// The relay used to wait exactly `timeout_ms`, so it always won the race
+/// against the agent's own timeout: the caller got a generic "request timed
+/// out" and the agent's real answer (`Command timed out after Ns`, plus any
+/// output produced before the deadline) was dropped, leaving the AI unable to
+/// tell "command timed out" from "agent disconnected". Waiting a little longer
+/// lets the agent's answer arrive and be reported as a normal result.
+const MCP_WAIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn process_mcp_request_with_grace(
+    state: &Arc<SharedState>,
+    url_token: Option<String>,
+    body: &Value,
+    wait_grace: std::time::Duration,
+) -> Option<Value> {
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     // Per JSON-RPC 2.0, a request without an `id` is a notification and the
@@ -226,7 +245,18 @@ async fn process_mcp_request(
                 "tools": [
                     {
                         "name": "shell_remote",
-                        "description": "Execute a shell command on the remote machine; returns stdout, stderr, exit code.\n\nFILE TRANSFER (bytes bypass LLM context — use for files of any size):\n  upload:   curl -T <localfile> -H \"X-SR-Token: <token>\" <origin>/agent/mcp/put?path=<remotepath>\n  download: curl -H \"X-SR-Token: <token>\" <origin>/agent/mcp/get?path=<remotepath> -o <localfile>
+                        "description": "Execute a shell command on the remote machine; returns stdout, stderr, exit code.
+
+WINDOWS / SHELL SELECTION:
+  `shell` picks the interpreter on Windows (ignored on Unix): \"auto\" (default) = \"powershell\" when PowerShell is available, otherwise cmd; \"powershell\" prefers PowerShell; \"cmd\" forces cmd.exe.
+  On Windows the default shell is PowerShell, falling back to cmd.exe only when PowerShell is missing. Write PowerShell syntax: PowerShell 5.1 has no `&&` or `||`, so separate statements with `;`. For cmd-only syntax (`dir /b`, `%VAR%`, `&`) pass shell:\"cmd\" instead of nesting `powershell -Command \"...\"`.
+  `cwd` sets the working directory; on Windows it defaults to the agent root. Output is decoded as UTF-8, falling back to GBK.
+
+READING THE RESULT:
+  A non-zero exit code is reported as a trailing `[exit code: N]` line; with no output at all you get `Exit code: N`. A non-zero code is not a tool error (`grep` returning 1 is normal).
+  Every call is a fresh process: `cd` and environment changes do not persist across calls. `Command timed out after Ns` means the command hit timeout_ms; `no response from agent` means the agent itself never answered (it may be disconnected or busy).
+
+FILE TRANSFER (bytes bypass LLM context — use for files of any size):\n  upload:   curl -T <localfile> -H \"X-SR-Token: <token>\" <origin>/agent/mcp/put?path=<remotepath>\n  download: curl -H \"X-SR-Token: <token>\" <origin>/agent/mcp/get?path=<remotepath> -o <localfile>
 <origin> is this MCP server's origin (scheme://host:port, the base of /agent/mcp). <token> is the same session token used for this tool; upload needs read-write, download allows read-only.\nPATH: absolute paths are used as-is on the remote filesystem; relative paths resolve under the agent root (--root). Use an absolute path unless you mean the agent root.\nDownload supports HTTP Range (e.g. `-H \"Range: bytes=1000-\"`) for resumable downloads; a `bytes=-n` suffix range is not supported and returns the full file. Errors return proper status codes: 404 missing file, 400 directory/bad path, 403 permission, 401 bad token. Upload size is capped by the deployment's reverse proxy (commonly 50m–100m); see README.",
                         "inputSchema": {
                             "type": "object",
@@ -234,8 +264,8 @@ async fn process_mcp_request(
                                 "token": {"type": "string", "description": "shell_remote token for authentication (session token shown at agent startup)"},
                                 "cmd": {"type": "string", "description": "The shell command to execute on the remote machine"},
                                 "timeout_ms": {"type": "number", "description": "Optional timeout in milliseconds (default 30s)"},
-                                "shell": {"type": "string", "enum": ["auto", "powershell", "cmd"], "default": "auto", "description": "Optional shell to run the command in (Windows only; ignored on Unix). Defaults to auto: on Windows the command runs in PowerShell when it is available, otherwise cmd. Use \"cmd\" to force cmd even when PowerShell exists."},
-                                "cwd": {"type": "string", "description": "Optional working directory for the command. Defaults to the agent root."}
+                                "shell": {"type": "string", "enum": ["auto", "powershell", "cmd"], "default": "auto", "description": "Optional shell to run the command in (Windows only; ignored on Unix). Defaults to auto: on Windows the command runs in PowerShell when it is available, otherwise cmd. Use \"cmd\" to force cmd even when PowerShell exists, e.g. for cmd-only syntax such as `dir /b`, `%VAR%` or `&`."},
+                                "cwd": {"type": "string", "description": "Optional working directory for the command. Defaults to the agent root (on Windows that is the agent's --root, so relative paths resolve under it rather than under C:\\windows\\system32). A `cd` inside the command does not persist to the next call."}
                             },
                             "required": ["token", "cmd"]
                         }
@@ -364,7 +394,12 @@ async fn process_mcp_request(
                 }
             }
 
-            let timeout_dur = std::time::Duration::from_millis(timeout_ms_val);
+            // Wait `timeout_ms` plus a grace period: the agent applies the same
+            // `timeout_ms` to the command, so waiting exactly that long would
+            // make the relay's timeout fire first and swallow the agent's own
+            // answer. Only when the grace expires too is the agent genuinely
+            // unreachable.
+            let timeout_dur = std::time::Duration::from_millis(timeout_ms_val) + wait_grace;
             let started = std::time::Instant::now();
             match tokio::time::timeout(timeout_dur, rx).await {
                 Ok(Ok(result)) => {
@@ -386,6 +421,16 @@ async fn process_mcp_request(
                     }
                     if text.is_empty() {
                         text = format!("Exit code: {}", exit_code);
+                    } else if exit_code != 0 {
+                        // A failing command that still produced output (the
+                        // common case on Windows: `findstr`, `dir` on a missing
+                        // file) used to hide its exit code entirely, so the AI
+                        // could not tell success from failure. Append it as a
+                        // footer. `isError` deliberately stays unset: a non-zero
+                        // exit code is a command result, not a tool failure
+                        // (MCP clients treat isError as "the tool broke", which
+                        // would mislabel `grep` returning 1).
+                        text.push_str(&format!("\n[exit code: {}]", exit_code));
                     }
                     json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":text.trim()}]}})
                 }
@@ -396,7 +441,8 @@ async fn process_mcp_request(
                         state, &session_id, token, permission, cmd, timeout_ms_val,
                         duration_ms, "timeout", None, "", "",
                     );
-                    json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Error: Request timed out or agent disconnected"}],"isError":true}})
+                    let waited_secs = timeout_dur.as_secs();
+                    json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":format!("Error: no response from agent within {}s (agent may be disconnected or busy)", waited_secs)}],"isError":true}})
                 }
             }
         }
@@ -747,12 +793,7 @@ mod tests {
     async fn register_with_agent(
         state: &Arc<SharedState>,
     ) -> (String, mpsc::Receiver<String>) {
-        let r = state.sessions.register(None, "rw", None).await.unwrap();
-        let token = r.tokens[0].0.clone();
-        let (atx, arx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);
-        let mut cm = crate::relay::ChannelMap::new();
-        cm.agent = Some(atx);
-        state.agent_broadcast.write().await.insert(r.session_id.clone(), cm);
+        let (_sid, token, arx) = register_with_agent_full(state).await;
         (token, arx)
     }
 
@@ -866,6 +907,186 @@ mod tests {
         let payload = next_mcp_exec_payload(&mut arx).await;
         assert!(payload.get("shell").is_none(), "empty shell must be omitted, got {payload}");
         assert!(payload.get("cwd").is_none(), "empty cwd must be omitted, got {payload}");
+    }
+
+    /// Register a rw session with a connected agent and return
+    /// `(session_id, token, rx)` — `rx` yields the raw messages the relay pushes
+    /// to the agent.
+    async fn register_with_agent_full(
+        state: &Arc<SharedState>,
+    ) -> (String, String, mpsc::Receiver<String>) {
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let token = r.tokens[0].0.clone();
+        let (atx, arx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);
+        let mut cm = crate::relay::ChannelMap::new();
+        cm.agent = Some(atx);
+        state.agent_broadcast.write().await.insert(r.session_id.clone(), cm);
+        (r.session_id, token, arx)
+    }
+
+    /// Drive one `tools/call` end to end against a scripted agent.
+    ///
+    /// `reply` gets the `mcp:exec` payload the relay sent the agent and returns
+    /// the `mcp:result` payload to answer with — or `None` to stay silent (the
+    /// "agent never answered" case). `grace` is the relay's extra wait, injected
+    /// so timeout tests finish in milliseconds instead of the production 5s.
+    async fn call_with_scripted_agent<F, Fut>(
+        state: &Arc<SharedState>,
+        args: Value,
+        grace: std::time::Duration,
+        reply: F,
+    ) -> Value
+    where
+        F: FnOnce(Value) -> Fut,
+        Fut: std::future::Future<Output = Option<Value>>,
+    {
+        let (session_id, token, mut arx) = register_with_agent_full(state).await;
+        let mut args = args;
+        args["token"] = json!(token);
+        let body = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+                          "params":{"name":"shell_remote","arguments": args}});
+
+        let task = {
+            let state = state.clone();
+            tokio::spawn(
+                async move { process_mcp_request_with_grace(&state, None, &body, grace).await },
+            )
+        };
+
+        let payload = next_mcp_exec_payload(&mut arx).await;
+        if let Some(mut result) = reply(payload.clone()).await {
+            result["_mcp_request_id"] = payload["_mcp_request_id"].clone();
+            let msg = json!({
+                "type": "mcp:result",
+                "session_id": session_id,
+                "payload": result
+            })
+            .to_string();
+            crate::relay::ws::route_agent_message(state, &session_id, &msg).await;
+        }
+        task.await
+            .unwrap()
+            .expect("tools/call must always produce a response")
+    }
+
+    /// The text of a `tools/call` result content block.
+    fn result_text(r: &Value) -> &str {
+        r["result"]["content"][0]["text"].as_str().unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_nonzero_exit_appends_footer() {
+        // A failing command that still produced output used to hide its exit
+        // code, so the AI could not tell success from failure.
+        let state = make_state();
+        let r = call_with_scripted_agent(
+            &state,
+            json!({"cmd": "findstr nope file.txt"}),
+            MCP_WAIT_GRACE,
+            |_| async { Some(json!({"stdout":"x","stderr":"","exit_code":2})) },
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(text.starts_with('x'), "got {text:?}");
+        assert!(text.ends_with("[exit code: 2]"), "got {text:?}");
+        // A non-zero exit code is a command result, not a tool failure:
+        // `grep` returning 1 must not be reported as isError.
+        assert_ne!(r["result"]["isError"], json!(true), "got {r}");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_zero_exit_has_no_footer() {
+        let state = make_state();
+        let r = call_with_scripted_agent(
+            &state,
+            json!({"cmd": "echo hi"}),
+            MCP_WAIT_GRACE,
+            |_| async { Some(json!({"stdout":"hi","stderr":"","exit_code":0})) },
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(text, "hi", "exit code 0 must stay noise-free");
+        assert!(!text.contains("exit code"), "got {text:?}");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_empty_output_keeps_legacy_exit_code_line() {
+        // Pre-existing behaviour: with no stdout/stderr at all, the exit code
+        // is the whole answer.
+        let state = make_state();
+        let r = call_with_scripted_agent(
+            &state,
+            json!({"cmd": "exit 5"}),
+            MCP_WAIT_GRACE,
+            |_| async { Some(json!({"stdout":"","stderr":"","exit_code":5})) },
+        )
+        .await;
+        assert_eq!(result_text(&r), "Exit code: 5");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_result_arriving_after_timeout_ms_is_not_an_error() {
+        // The agent applies `timeout_ms` to the command too, so its own timeout
+        // answer lands *after* that deadline. The relay must still report it
+        // rather than replacing it with a generic "no response" error.
+        let state = make_state();
+        let r = call_with_scripted_agent(
+            &state,
+            json!({"cmd": "sleep 10", "timeout_ms": 100}),
+            std::time::Duration::from_secs(2),
+            |_| async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Some(json!({
+                    "stdout": "",
+                    "stderr": "Command timed out after 0s",
+                    "exit_code": -1
+                }))
+            },
+        )
+        .await;
+        assert_ne!(r["result"]["isError"], json!(true), "got {r}");
+        let text = result_text(&r);
+        assert!(
+            text.contains("Command timed out after"),
+            "the agent's own timeout reason must survive, got {text:?}"
+        );
+        assert!(text.ends_with("[exit code: -1]"), "got {text:?}");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_silent_agent_reports_no_response() {
+        // Only when even the grace period expires is the agent genuinely
+        // unreachable — and that must read differently from a command timeout.
+        let state = make_state();
+        let r = call_with_scripted_agent(
+            &state,
+            json!({"cmd": "echo hi", "timeout_ms": 100}),
+            std::time::Duration::from_millis(100),
+            |_| async { None },
+        )
+        .await;
+        assert_eq!(r["result"]["isError"], json!(true), "got {r}");
+        let text = result_text(&r);
+        assert!(text.contains("no response from agent"), "got {text:?}");
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_description_documents_windows_usage() {
+        // The AI discovers the Windows rules (default shell, `&&` limitation,
+        // how to read exit codes) only from the tool description.
+        let state = make_state();
+        let r = mcp_send_and_recv(
+            &state,
+            HashMap::new(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let desc = r["result"]["tools"][0]["description"].as_str().unwrap();
+        for needle in ["powershell", "cmd", "cwd", "[exit code"] {
+            assert!(desc.contains(needle), "description lacks {needle:?}: {desc}");
+        }
+        assert!(desc.contains("&&"), "must warn about PowerShell 5.1 `&&`: {desc}");
+        assert!(desc.contains("Exit code:"), "must document the empty-output form: {desc}");
     }
 
     #[tokio::test]
