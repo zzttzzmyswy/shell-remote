@@ -233,7 +233,9 @@ async fn process_mcp_request(
                             "properties": {
                                 "token": {"type": "string", "description": "shell_remote token for authentication (session token shown at agent startup)"},
                                 "cmd": {"type": "string", "description": "The shell command to execute on the remote machine"},
-                                "timeout_ms": {"type": "number", "description": "Optional timeout in milliseconds (default 30s)"}
+                                "timeout_ms": {"type": "number", "description": "Optional timeout in milliseconds (default 30s)"},
+                                "shell": {"type": "string", "enum": ["auto", "powershell", "cmd"], "default": "auto", "description": "Optional shell to run the command in (Windows only; ignored on Unix). Defaults to auto: on Windows the command runs in PowerShell when it is available, otherwise cmd. Use \"cmd\" to force cmd even when PowerShell exists."},
+                                "cwd": {"type": "string", "description": "Optional working directory for the command. Defaults to the agent root."}
                             },
                             "required": ["token", "cmd"]
                         }
@@ -269,6 +271,18 @@ async fn process_mcp_request(
             // have no cmd to log.
             let cmd = arguments.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
             let requested_timeout_ms = arguments.get("timeout_ms").and_then(|v| v.as_u64());
+            // MYS-2114: optional shell selector + working directory, forwarded
+            // to the agent verbatim. Absent (or empty) → field omitted from the
+            // payload, so a call that doesn't use them is byte-identical to the
+            // pre-MYS-2114 message and old agents keep working.
+            let shell = arguments
+                .get("shell")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let cwd = arguments
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
 
             let (session_id, permission) = match state.sessions.authenticate(token).await {
                 Some(r) => r,
@@ -295,11 +309,17 @@ async fn process_mcp_request(
             }
 
             let mcp_req_id = Uuid::new_v4().to_string();
-            let payload = json!({
+            let mut payload = json!({
                 "cmd": cmd,
                 "timeout_ms": timeout_ms_val,
                 "_mcp_request_id": mcp_req_id
             });
+            if let Some(shell) = shell {
+                payload["shell"] = json!(shell);
+            }
+            if let Some(cwd) = cwd {
+                payload["cwd"] = json!(cwd);
+            }
 
             let proto_msg = ProtoMessage {
                 msg_type: "mcp:exec".to_string(),
@@ -720,6 +740,132 @@ mod tests {
         .await;
         assert_eq!(r["error"]["code"], -32601);
         assert_eq!(r["id"], "req-42");
+    }
+
+    /// Register a rw session with a connected agent channel and return
+    /// `(token, rx)` — `rx` yields the raw messages the relay pushes to the agent.
+    async fn register_with_agent(
+        state: &Arc<SharedState>,
+    ) -> (String, mpsc::Receiver<String>) {
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let token = r.tokens[0].0.clone();
+        let (atx, arx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);
+        let mut cm = crate::relay::ChannelMap::new();
+        cm.agent = Some(atx);
+        state.agent_broadcast.write().await.insert(r.session_id.clone(), cm);
+        (token, arx)
+    }
+
+    /// POST a raw JSON-RPC body and return the (ignored) HTTP status, without
+    /// waiting for an SSE reply — used when the agent is expected to answer.
+    async fn mcp_post_no_wait(state: &Arc<SharedState>, body: Value) {
+        let (tx, _rx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);
+        let sid = uuid::Uuid::new_v4().to_string();
+        state.sse_sessions.write().await.insert(sid.clone(), tx);
+        let mut p = HashMap::new();
+        p.insert("sessionId".to_string(), sid);
+        let resp = messages_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Query(p),
+            axum::Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+    }
+
+    /// Pull the next `mcp:exec` message from the agent channel as its payload.
+    async fn next_mcp_exec_payload(rx: &mut mpsc::Receiver<String>) -> Value {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("relay must push an mcp:exec message to the agent")
+            .expect("agent channel must stay open");
+        let msg: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(msg["type"], "mcp:exec");
+        msg["payload"].clone()
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_schema_exposes_shell_and_cwd() {
+        // MYS-2114: the AI agent must be able to discover the new selectors.
+        let state = make_state();
+        let r = mcp_send_and_recv(
+            &state,
+            HashMap::new(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let props = &r["result"]["tools"][0]["inputSchema"]["properties"];
+        assert_eq!(
+            props["shell"]["enum"],
+            json!(["auto", "powershell", "cmd"]),
+            "shell must be an enum of auto/powershell/cmd, got {props}"
+        );
+        assert_eq!(
+            props["shell"]["default"], "auto",
+            "shell must default to auto (PowerShell when available), got {props}"
+        );
+        assert!(props["shell"]["type"] == "string");
+        // The description must document the auto default + fallback, since that
+        // is what tells the agent how to request cmd explicitly.
+        let desc = props["shell"]["description"].as_str().unwrap();
+        assert!(desc.contains("PowerShell"), "got {desc:?}");
+        assert!(desc.contains("cmd"), "got {desc:?}");
+        assert_eq!(props["cwd"]["type"], "string");
+        // The new fields are optional: required must stay ["token","cmd"].
+        assert_eq!(
+            r["result"]["tools"][0]["inputSchema"]["required"],
+            json!(["token", "cmd"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_forwards_shell_and_cwd_to_agent() {
+        let state = make_state();
+        let (token, mut arx) = register_with_agent(&state).await;
+        mcp_post_no_wait(&state, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"shell_remote",
+            "arguments":{"token":token,"cmd":"echo hi","shell":"powershell","cwd":"C:\\Users\\me"}
+        }})).await;
+
+        let payload = next_mcp_exec_payload(&mut arx).await;
+        assert_eq!(payload["cmd"], "echo hi");
+        assert_eq!(payload["shell"], "powershell");
+        assert_eq!(payload["cwd"], "C:\\Users\\me");
+        assert!(payload["_mcp_request_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_omits_shell_and_cwd_when_absent() {
+        // Backward compatibility: a call that doesn't use the new arguments
+        // must produce the same payload as before (fields absent, not null) so
+        // an older agent parses it unchanged.
+        let state = make_state();
+        let (token, mut arx) = register_with_agent(&state).await;
+        mcp_post_no_wait(&state, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"shell_remote",
+            "arguments":{"token":token,"cmd":"echo hello"}
+        }})).await;
+
+        let payload = next_mcp_exec_payload(&mut arx).await;
+        assert_eq!(payload["cmd"], "echo hello");
+        assert!(payload.get("shell").is_none(), "got {payload}");
+        assert!(payload.get("cwd").is_none(), "got {payload}");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_treats_empty_shell_and_cwd_as_absent() {
+        let state = make_state();
+        let (token, mut arx) = register_with_agent(&state).await;
+        mcp_post_no_wait(&state, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"shell_remote",
+            "arguments":{"token":token,"cmd":"echo hello","shell":"","cwd":""}
+        }})).await;
+
+        let payload = next_mcp_exec_payload(&mut arx).await;
+        assert!(payload.get("shell").is_none(), "empty shell must be omitted, got {payload}");
+        assert!(payload.get("cwd").is_none(), "empty cwd must be omitted, got {payload}");
     }
 
     #[tokio::test]

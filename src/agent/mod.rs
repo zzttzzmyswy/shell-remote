@@ -1980,6 +1980,25 @@ async fn run_session(
                                 "mcp:exec" => {
                                     let cmd = msg.payload["cmd"].as_str().unwrap_or("").to_string();
                                     let timeout_ms = msg.payload["timeout_ms"].as_u64().unwrap_or(30_000);
+                                    // MYS-2114: optional shell selector + working
+                                    // directory. Absent fields keep the pre-existing
+                                    // behaviour (shell from `--shell`, inherited cwd).
+                                    let shell_override = msg.payload["shell"]
+                                        .as_str()
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| s.to_string());
+                                    let cwd = msg.payload["cwd"]
+                                        .as_str()
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| s.to_string());
+                                    // Windows: absent `cwd` defaults to the agent
+                                    // root (same base as file-transfer relative
+                                    // paths) — an agent started as a service
+                                    // inherits C:\windows\system32, where no
+                                    // relative path resolves. Unix keeps
+                                    // inheriting the agent's cwd, unchanged.
+                                    #[cfg(windows)]
+                                    let cwd = cwd.or_else(|| Some(root.to_string()));
                                     let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
                                     let session_id = client.session_id.clone();
                                     let ctrl_tx = task_control_tx.clone();
@@ -1987,7 +2006,8 @@ async fn run_session(
                                     // Spawn so a long-running command cannot freeze the main loop
                                     // (which would otherwise starve input and MCP round-trips).
                                     tokio::spawn(async move {
-                                        let (stdout, stderr, exit_code) = execute_command(&cmd, timeout_ms, &shell).await;
+                                        let (stdout, stderr, exit_code) =
+                                            execute_command(&cmd, timeout_ms, &shell, shell_override.as_deref(), cwd.as_deref()).await;
                                         let result = McpResultPayload { stdout, stderr, exit_code };
                                         let mut payload = serde_json::to_value(&result).unwrap();
                                         if let (Some(req_id), serde_json::Value::Object(ref mut map)) =
@@ -2590,8 +2610,142 @@ async fn run_session(
     Ok(())
 }
 
+/// Which Windows shell a `shell_remote` command runs under.
+///
+/// Deliberately *not* cfg-gated: the invocation builder below is pure, so the
+/// Windows quoting logic stays unit-testable on Linux (the Windows exec path
+/// itself can't run in CI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinShell {
+    Cmd,
+    PowerShell,
+}
+
+/// Pick the shell for a Windows MCP command.
+///
+/// Pure (takes the probe result rather than doing it) so the decision table is
+/// unit-testable on Linux, where PowerShell can't be probed at all.
+///
+/// - `cmd` → always cmd, even when PowerShell is available.
+/// - `powershell`/`pwsh` → PowerShell when available, otherwise **cmd** without
+///   erroring: a command that fails to run is worse than one that runs in the
+///   fallback shell.
+/// - `auto`, absent, or unrecognised → PowerShell when available, else cmd.
+///
+/// The MCP path deliberately ignores `--shell`: its default is `cmd.exe`, so
+/// it cannot distinguish "operator chose cmd" from "defaulted to cmd". It only
+/// drives the interactive PTY terminal.
+pub fn pick_windows_shell(requested: Option<&str>, ps_path: Option<PathBuf>) -> WinShell {
+    // Only `cmd` overrides the preference; `powershell`/`pwsh`/`auto`/absent/
+    // unrecognised all mean "PowerShell if we have one" — an explicit request
+    // for a missing PowerShell degrades to cmd rather than failing.
+    let wants_cmd = matches!(requested.map(str::trim), Some(s) if s.eq_ignore_ascii_case("cmd"));
+    if !wants_cmd && ps_path.is_some() {
+        WinShell::PowerShell
+    } else {
+        WinShell::Cmd
+    }
+}
+
+/// Locate a PowerShell executable on Windows, preferring the system-shipped
+/// Windows PowerShell 5.1 over a separately installed pwsh 7.
+///
+/// Order: `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, then
+/// `powershell.exe` on PATH, then `pwsh.exe` on PATH. Cached in a `OnceLock`:
+/// the probe touches the filesystem and the answer cannot change in a way that
+/// matters for a process's lifetime.
+#[cfg(not(unix))]
+fn find_powershell() -> Option<PathBuf> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            // 1. System Windows PowerShell 5.1 — present on every stock install.
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                let p = Path::new(&root)
+                    .join("System32")
+                    .join("WindowsPowerShell")
+                    .join("v1.0")
+                    .join("powershell.exe");
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+            // 2. PATH, preferring powershell.exe (5.1) over pwsh.exe (7).
+            let path = std::env::var_os("PATH")?;
+            for exe in ["powershell.exe", "pwsh.exe"] {
+                for dir in std::env::split_paths(&path) {
+                    let candidate = dir.join(exe);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+/// Render a PowerShell script as `-EncodedCommand`'s value: base64 of the
+/// script encoded in UTF-16LE. Shipping the whole script encoded sidesteps
+/// cmd/PowerShell quote, `$` and `%` parsing entirely — the root cause of
+/// MYS-2114 defect 1 (nested `powershell -Command "..."` was the worst case).
+///
+/// The script forces UTF-8 console output so the agent's `encoding::decode_bytes`
+/// (UTF-8 first, GBK fallback) renders non-ASCII output correctly, and appends
+/// an explicit `$LASTEXITCODE` propagation because `-EncodedCommand` otherwise
+/// reports PowerShell's own exit status rather than the command's.
+///
+/// Head and tail are separated from the user's command by **newlines**, not
+/// `;`: a `;` after a command ending in a `#` comment (`echo 1 # c`) sits on the
+/// commented-out remainder of that line and is swallowed, so `$LASTEXITCODE`
+/// would never be propagated. A newline terminates the comment and keeps the
+/// tail on its own line regardless of what the command ends with.
+pub fn encode_powershell_command(cmd: &str) -> String {
+    let script = format!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\n{}\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}",
+        cmd
+    );
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    crate::agent::fs::encode_b64(&utf16le)
+}
+
+/// Build `(program, raw_args)` for a Windows command. `raw_args` is the
+/// command-line fragment to append verbatim via `Command::raw_arg`; Rust's
+/// default Windows argument escaping would rewrite every `"` as `\"`, which
+/// cmd.exe and PowerShell then take literally.
+///
+/// - Cmd: `/D /S /C "<cmd>"` — `/S` makes cmd strip only the outermost quote
+///   pair and keep inner quotes intact, `/D` skips AutoRun scripts (which
+///   would otherwise echo into stdout).
+/// - PowerShell: the encoded script from [`encode_powershell_command`], run on
+///   `ps_exe` when one was probed, else on the bare `powershell.exe` name.
+pub fn build_windows_invocation(shell: WinShell, ps_exe: Option<&Path>, cmd: &str) -> (String, String) {
+    match shell {
+        WinShell::Cmd => ("cmd.exe".to_string(), format!("/D /S /C \"{}\"", cmd)),
+        WinShell::PowerShell => {
+            let exe = ps_exe
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "powershell.exe".to_string());
+            (
+                exe,
+                format!(
+                    "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}",
+                    encode_powershell_command(cmd)
+                ),
+            )
+        }
+    }
+}
+
 #[cfg(unix)]
-async fn execute_command(cmd: &str, timeout_ms: u64, _shell: &str) -> (String, String, i32) {
+async fn execute_command(
+    cmd: &str,
+    timeout_ms: u64,
+    _shell: &str,
+    _shell_override: Option<&str>,
+    cwd: Option<&str>,
+) -> (String, String, i32) {
     let cmd = cmd.to_string();
     let timeout = std::time::Duration::from_millis(timeout_ms);
 
@@ -2607,29 +2761,27 @@ async fn execute_command(cmd: &str, timeout_ms: u64, _shell: &str) -> (String, S
         .map(|s| s.success())
         .unwrap_or(false);
 
-    let output = if has_script {
-        tokio::process::Command::new("script")
-            .arg("-q")
-            .arg("-c")
-            .arg(&cmd)
-            .arg("/dev/null")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
+    let mut command = if has_script {
+        let mut c = tokio::process::Command::new("script");
+        c.arg("-q").arg("-c").arg(&cmd).arg("/dev/null");
+        c
     } else {
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(&cmd);
+        c
     };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Explicit `cwd` only: when absent the child keeps inheriting the agent's
+    // directory, exactly as before MYS-2114.
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        command.current_dir(dir);
+    }
 
-    let result = tokio::time::timeout(timeout, output).await;
+    let result = tokio::time::timeout(timeout, command.output()).await;
 
     match result {
         Ok(Ok(out)) => {
@@ -2651,26 +2803,70 @@ async fn execute_command(cmd: &str, timeout_ms: u64, _shell: &str) -> (String, S
     }
 }
 
+/// Kill a Windows process *tree* on timeout. `kill_on_drop` only reaches the
+/// direct child (cmd.exe/powershell.exe), so its children (`ping -n 60`, a
+/// detached build, …) would outlive the tool call; `taskkill /T` walks them.
 #[cfg(not(unix))]
-async fn execute_command(cmd: &str, timeout_ms: u64, shell: &str) -> (String, String, i32) {
+async fn kill_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    // Bounded: a wedged taskkill must not outlive the tool call either.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .arg("/T")
+            .arg("/F")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+}
+
+#[cfg(not(unix))]
+async fn execute_command(
+    cmd: &str,
+    timeout_ms: u64,
+    _shell_path: &str,
+    shell_override: Option<&str>,
+    cwd: Option<&str>,
+) -> (String, String, i32) {
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    let lower = shell.to_ascii_lowercase();
-    let mut command = if lower.contains("powershell") || lower.contains("pwsh") {
-        let mut c = tokio::process::Command::new(shell);
-        c.arg("-NoProfile").arg("-Command").arg(cmd);
-        c
-    } else {
-        let mut c = tokio::process::Command::new("cmd.exe");
-        c.arg("/c").arg(cmd);
-        c
-    };
+    // PowerShell is the MCP default on Windows; `--shell` plays no part here.
+    let ps_path = find_powershell();
+    let shell = pick_windows_shell(shell_override, ps_path.clone());
+    let (program, raw_args) = build_windows_invocation(shell, ps_path.as_deref(), cmd);
+
+    let mut command = tokio::process::Command::new(program);
+    command.raw_arg(raw_args);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        // Deliberately *not* kill_on_drop: dropping the `wait_with_output`
+        // future on timeout would kill only the direct child and orphan its
+        // children *before* `taskkill /T` can walk the tree. The timeout arm
+        // below owns the kill instead.
+        .kill_on_drop(false);
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        command.current_dir(dir);
+    }
 
-    let result = tokio::time::timeout(timeout, command.output()).await;
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                String::new(),
+                format!("Failed to execute command: {}", e),
+                -1,
+            )
+        }
+    };
+    let pid = child.id();
+
+    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
     match result {
         Ok(Ok(out)) => {
@@ -2684,11 +2880,14 @@ async fn execute_command(cmd: &str, timeout_ms: u64, shell: &str) -> (String, St
             format!("Failed to execute command: {}", e),
             -1,
         ),
-        Err(_) => (
-            String::new(),
-            format!("Command timed out after {}s", timeout_ms / 1000),
-            -1,
-        ),
+        Err(_) => {
+            kill_process_tree(pid).await;
+            (
+                String::new(),
+                format!("Command timed out after {}s", timeout_ms / 1000),
+                -1,
+            )
+        }
     }
 }
 
@@ -3247,5 +3446,321 @@ mod tests {
             ping["kpi"]["active"].is_boolean() && ping["kpi"]["bp_count"].is_u64(),
             "heartbeat KPI must carry active/bp_count (R5#25/#16 admin 可见), got {ping:?}"
         );
+    }
+
+    /// End-to-end check of the real Windows exec path against a live cmd.exe.
+    /// Only compiles on Windows targets; run it under wine with the
+    /// x86_64-pc-windows-gnu test binary (there is no Windows CI runner).
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn test_execute_command_windows_preserves_quotes() {
+        // Defect 1: `"` used to arrive as `\"` because Rust escaped the arg.
+        let (out, err, code) = execute_command(
+            "echo \"quoted\"", 10_000, "cmd.exe", Some("cmd"), None,
+        )
+        .await;
+        assert_eq!(code, 0, "stderr={err}");
+        assert!(
+            out.contains("\"quoted\""),
+            "quotes must survive cmd.exe, got {out:?} (stderr={err:?})"
+        );
+        assert!(
+            !out.contains("\\\""),
+            "output must not contain escaped quotes, got {out:?}"
+        );
+
+        // The other commands from the MYS-2114 report: `%`, `&` and a pipe all
+        // used to break because the whole line was over-escaped.
+        let (out, err, code) =
+            execute_command("echo 100%done & echo a | find /i \"a\"", 10_000, "cmd.exe", Some("cmd"), None).await;
+        assert_eq!(code, 0, "stderr={err}");
+        assert!(out.contains("100%done"), "got {out:?} (stderr={err:?})");
+        assert!(out.contains("a"), "pipe must run, got {out:?} (stderr={err:?})");
+        assert!(
+            !err.contains("\\"),
+            "no stray backslash-escaping in stderr, got {err:?}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn test_execute_command_windows_cmd_honours_cwd() {
+        // Defect 3: the agent service inherits C:\windows\system32, so a
+        // relative path only works if `cwd` is actually applied.
+        let dir = std::env::temp_dir();
+        let (out, err, code) = execute_command(
+            "echo %CD%", 10_000, "cmd.exe", Some("cmd"), Some(&dir.to_string_lossy()),
+        )
+        .await;
+        assert_eq!(code, 0, "stderr={err}");
+        // cmd prints the path in Windows form; compare case-insensitively and
+        // separator-insensitively rather than assuming backslashes.
+        let norm = |s: &str| s.trim().replace('/', "\\").to_ascii_lowercase();
+        let want = norm(&dir.to_string_lossy());
+        assert!(
+            !want.is_empty() && norm(&out).ends_with(want.trim_end_matches('\\')),
+            "cwd must be applied: want suffix {want:?}, got {out:?} (stderr={err:?})"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn test_execute_command_windows_ignores_shell_path() {
+        // 【用户变更】The MCP path must not consult `--shell`: its default is
+        // cmd.exe, so it cannot express an explicit choice. Passing a
+        // *PowerShell* `--shell` with `shell: "cmd"` must still run cmd (here
+        // `%CD%` expands and quotes survive — both are cmd semantics).
+        let (out, err, code) = execute_command(
+            "echo %CD%", 10_000, "powershell.exe", Some("cmd"), None,
+        )
+        .await;
+        assert_eq!(code, 0, "stderr={err}");
+        assert!(
+            !out.trim().is_empty() && !out.contains('%'),
+            "shell:cmd must win over --shell=powershell.exe, got {out:?} (stderr={err:?})"
+        );
+
+        // And the reverse: `--shell=cmd.exe` with `shell: "auto"` must not force
+        // cmd — it resolves solely from find_powershell().
+        let expected = pick_windows_shell(None, find_powershell());
+        let (_, _, code) = execute_command(
+            "Write-Output x", 30_000, "cmd.exe", Some("auto"), None,
+        )
+        .await;
+        if expected == WinShell::Cmd {
+            // cmd has no Write-Output: a non-zero exit proves cmd was used.
+            assert_ne!(code, 0, "auto without PowerShell must fall back to cmd");
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn test_execute_command_windows_powershell_override() {
+        // Defect 2: an explicit `shell: "powershell"` must reach PowerShell
+        // regardless of `--shell`. Script construction is unit-tested
+        // separately; this checks the exec wiring.
+        //
+        // Wine ships a *stub* powershell.exe that swallows -EncodedCommand and
+        // prints nothing, so probe first and skip rather than fail there.
+        // A real Windows host always runs the probe.
+        let (probe, _, _) = execute_command(
+            "Write-Output probe-ok", 30_000, "cmd.exe", Some("powershell"), None,
+        )
+        .await;
+        if !probe.contains("probe-ok") {
+            eprintln!(
+                "SKIP: no functional PowerShell in this environment (probe output {probe:?}) — \
+                 wine's powershell.exe is a stub; validated on a real Windows host instead"
+            );
+            return;
+        }
+        // Non-ASCII + `$` + quotes are exactly what nested
+        // `powershell -Command "..."` used to mangle.
+        let (out, err, code) = execute_command(
+            "Write-Output \"a b\"; Write-Output \"$($null)中文\"",
+            30_000,
+            "cmd.exe",
+            Some("powershell"),
+            None,
+        )
+        .await;
+        assert_eq!(code, 0, "stderr={err}");
+        assert!(out.contains("a b"), "got {out:?} (stderr={err:?})");
+        assert!(out.contains("中文"), "UTF-8 output must survive, got {out:?}");
+    }
+
+    // ── MYS-2114: Windows command invocation (pure, runs on Linux) ──────────
+
+    /// Decode the `-EncodedCommand` payload back into the PowerShell script.
+    fn decode_encoded_command(raw_args: &str) -> String {
+        let b64 = raw_args
+            .split(" -EncodedCommand ")
+            .nth(1)
+            .expect("-EncodedCommand must be present");
+        let bytes = crate::agent::fs::decode_b64(b64).expect("payload must be valid base64");
+        assert_eq!(bytes.len() % 2, 0, "UTF-16LE payload must be even-length");
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16(&units).expect("payload must be valid UTF-16")
+    }
+
+    #[test]
+    fn test_build_windows_invocation_cmd_preserves_command_verbatim() {
+        // Defect 1 regression: every one of these was mangled by Rust's Windows
+        // arg escaping (`"` → `\"`). raw_args must carry the command untouched,
+        // wrapped in exactly one `/D /S /C "<cmd>"`.
+        for cmd in [
+            "echo \"quoted\"",
+            "python -c \"print('x')\"",
+            "echo 100%done",
+            "echo a & echo b",
+            "tasklist | find /i \"ping\"",
+            "powershell -NoProfile -Command \"$x = 1; echo $x\"",
+            "echo 中文 ok",
+        ] {
+            let (program, raw_args) = build_windows_invocation(WinShell::Cmd, None, cmd);
+            assert_eq!(program, "cmd.exe");
+            assert_eq!(
+                raw_args,
+                format!("/D /S /C \"{}\"", cmd),
+                "cmd raw_args must be verbatim for {cmd:?}"
+            );
+            assert!(
+                !raw_args.contains("\\\""),
+                "raw_args must not contain escaped quotes for {cmd:?}: {raw_args}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_windows_invocation_powershell_roundtrips_script() {
+        for cmd in [
+            "Write-Output \"hello world\"",
+            "Get-ChildItem -Path 'C:\\Program Files'",
+            "Write-Output \"$env:USERPROFILE\"",
+            "Write-Output 'it''s'",
+            "Write-Output 中文",
+        ] {
+            let (program, raw_args) = build_windows_invocation(
+                WinShell::PowerShell,
+                Some(Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")),
+                cmd,
+            );
+            assert!(program.ends_with("powershell.exe"), "got {program}");
+            for flag in [
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy Bypass",
+                "-EncodedCommand",
+            ] {
+                assert!(raw_args.contains(flag), "missing {flag} in {raw_args}");
+            }
+            let script = decode_encoded_command(&raw_args);
+            assert!(
+                script.starts_with(
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\n"
+                ),
+                "script must force UTF-8 output first, got {script:?}"
+            );
+            assert!(
+                script.contains(cmd),
+                "command must survive encoding verbatim: {cmd:?} not in {script:?}"
+            );
+            // Newline-separated, so a trailing `#` comment in the user's command
+            // cannot swallow the exit-code propagation.
+            assert!(
+                script.ends_with("\nif ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }"),
+                "script must propagate $LASTEXITCODE on its own line, got {script:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_powershell_encoded_command_is_utf16le_base64() {
+        // Non-ASCII must survive: the payload is UTF-16LE, not UTF-8 or GBK.
+        let (_, raw_args) = build_windows_invocation(
+            WinShell::PowerShell,
+            Some(Path::new("pwsh.exe")),
+            "echo 中文",
+        );
+        assert_eq!(decode_encoded_command(&raw_args), format!(
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\necho 中文\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
+        ));
+    }
+
+    #[test]
+    fn test_pick_windows_shell_auto_prefers_powershell_then_falls_back() {
+        // 【用户变更】auto (the default) uses PowerShell when it is available.
+        let ps = Some(PathBuf::from("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+        assert_eq!(pick_windows_shell(None, ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("auto"), ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("AUTO"), ps.clone()), WinShell::PowerShell);
+        // No PowerShell → cmd.
+        assert_eq!(pick_windows_shell(None, None), WinShell::Cmd);
+        assert_eq!(pick_windows_shell(Some("auto"), None), WinShell::Cmd);
+    }
+
+    #[test]
+    fn test_pick_windows_shell_explicit_requests() {
+        let ps = Some(PathBuf::from("pwsh.exe"));
+        // Explicit `cmd` forces cmd even when PowerShell is available.
+        assert_eq!(pick_windows_shell(Some("cmd"), ps.clone()), WinShell::Cmd);
+        assert_eq!(pick_windows_shell(Some("CMD"), ps.clone()), WinShell::Cmd);
+        assert_eq!(pick_windows_shell(Some(" cmd "), ps.clone()), WinShell::Cmd);
+        // Explicit powershell/pwsh uses it when available…
+        assert_eq!(pick_windows_shell(Some("powershell"), ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("pwsh"), ps.clone()), WinShell::PowerShell);
+        // …and falls back to cmd (no error) when it is not.
+        assert_eq!(pick_windows_shell(Some("powershell"), None), WinShell::Cmd);
+        assert_eq!(pick_windows_shell(Some("pwsh"), None), WinShell::Cmd);
+        // Blank / unrecognised values behave like auto, not like an error.
+        assert_eq!(pick_windows_shell(Some(""), ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("bash"), ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("bash"), None), WinShell::Cmd);
+    }
+
+    #[test]
+    fn test_powershell_trailing_comment_does_not_swallow_exit_code() {
+        // A command ending in a `#` comment used to swallow the `;`-joined
+        // `$LASTEXITCODE` tail on the same line, so the real exit code was
+        // never propagated. The tail must sit on its own line.
+        let (_, raw_args) = build_windows_invocation(
+            WinShell::PowerShell,
+            Some(Path::new("powershell.exe")),
+            "echo 1 # c",
+        );
+        let script = decode_encoded_command(&raw_args);
+        assert_eq!(
+            script,
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\necho 1 # c\nif ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }"
+        );
+        // The `$LASTEXITCODE` line is its own line, not part of the comment.
+        let tail_line = script.lines().last().unwrap();
+        assert_eq!(tail_line, "if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }");
+        assert!(
+            !script.contains("# c;if"),
+            "the comment must not swallow the tail on the same line, got {script:?}"
+        );
+        // Regression guard for the same hazard on the head: the encoding setup
+        // lines are newline-separated too, so a leading `#` in the user's
+        // command cannot comment them out either.
+        assert!(
+            script.lines().nth(1).unwrap().starts_with("$OutputEncoding="),
+            "head must be newline-separated too, got {script:?}"
+        );
+    }
+
+    #[test]
+    fn test_pick_windows_shell_unrecognised_values_behave_like_auto() {
+        // Explicitly covered per review: unknown strings are `auto`, not errors.
+        let ps = Some(PathBuf::from("powershell.exe"));
+        for v in ["auto", "AUTO", "", "bash", "sh", "cmd.exe", "powershell.exe"] {
+            if v.eq_ignore_ascii_case("cmd") {
+                continue;
+            }
+            assert_eq!(
+                pick_windows_shell(Some(v), ps.clone()),
+                WinShell::PowerShell,
+                "unrecognised {v:?} must behave like auto when PowerShell exists"
+            );
+            assert_eq!(
+                pick_windows_shell(Some(v), None),
+                WinShell::Cmd,
+                "unrecognised {v:?} must fall back to cmd without PowerShell"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_windows_invocation_powershell_uses_probed_exe() {
+        // The probed path is run as-is; with no probe result the bare name is
+        // used so the OS resolves it from PATH.
+        let probed = PathBuf::from("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        let (program, _) = build_windows_invocation(WinShell::PowerShell, Some(&probed), "echo hi");
+        assert_eq!(program, probed.to_string_lossy());
+        let (program, _) = build_windows_invocation(WinShell::PowerShell, None, "echo hi");
+        assert_eq!(program, "powershell.exe");
     }
 }
