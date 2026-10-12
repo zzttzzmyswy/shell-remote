@@ -234,7 +234,7 @@ async fn process_mcp_request(
                                 "token": {"type": "string", "description": "shell_remote token for authentication (session token shown at agent startup)"},
                                 "cmd": {"type": "string", "description": "The shell command to execute on the remote machine"},
                                 "timeout_ms": {"type": "number", "description": "Optional timeout in milliseconds (default 30s)"},
-                                "shell": {"type": "string", "enum": ["auto", "powershell", "cmd"], "default": "auto", "description": "Optional shell to run the command in (Windows only; ignored on Unix). Defaults to auto: PowerShell when available, otherwise cmd."},
+                                "shell": {"type": "string", "enum": ["auto", "powershell", "cmd"], "default": "auto", "description": "Optional shell to run the command in (Windows only; ignored on Unix). Defaults to auto: on Windows the command runs in PowerShell when it is available, otherwise cmd. Use \"cmd\" to force cmd even when PowerShell exists."},
                                 "cwd": {"type": "string", "description": "Optional working directory for the command. Defaults to the agent root."}
                             },
                             "required": ["token", "cmd"]
@@ -807,6 +807,11 @@ mod tests {
             "shell must default to auto (PowerShell when available), got {props}"
         );
         assert!(props["shell"]["type"] == "string");
+        // The description must document the auto default + fallback, since that
+        // is what tells the agent how to request cmd explicitly.
+        let desc = props["shell"]["description"].as_str().unwrap();
+        assert!(desc.contains("PowerShell"), "got {desc:?}");
+        assert!(desc.contains("cmd"), "got {desc:?}");
         assert_eq!(props["cwd"]["type"], "string");
         // The new fields are optional: required must stay ["token","cmd"].
         assert_eq!(

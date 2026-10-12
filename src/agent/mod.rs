@@ -2695,9 +2695,15 @@ fn find_powershell() -> Option<PathBuf> {
 /// (UTF-8 first, GBK fallback) renders non-ASCII output correctly, and appends
 /// an explicit `$LASTEXITCODE` propagation because `-EncodedCommand` otherwise
 /// reports PowerShell's own exit status rather than the command's.
+///
+/// Head and tail are separated from the user's command by **newlines**, not
+/// `;`: a `;` after a command ending in a `#` comment (`echo 1 # c`) sits on the
+/// commented-out remainder of that line and is swallowed, so `$LASTEXITCODE`
+/// would never be propagated. A newline terminates the comment and keeps the
+/// tail on its own line regardless of what the command ends with.
 pub fn encode_powershell_command(cmd: &str) -> String {
     let script = format!(
-        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;{};if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}",
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\n{}\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}",
         cmd
     );
     let utf16le: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
@@ -3634,17 +3640,19 @@ mod tests {
             let script = decode_encoded_command(&raw_args);
             assert!(
                 script.starts_with(
-                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;"
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\n"
                 ),
-                "script must force UTF-8 output first, got {script}"
+                "script must force UTF-8 output first, got {script:?}"
             );
             assert!(
                 script.contains(cmd),
                 "command must survive encoding verbatim: {cmd:?} not in {script:?}"
             );
+            // Newline-separated, so a trailing `#` comment in the user's command
+            // cannot swallow the exit-code propagation.
             assert!(
-                script.ends_with(";if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }"),
-                "script must propagate $LASTEXITCODE, got {script}"
+                script.ends_with("\nif ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }"),
+                "script must propagate $LASTEXITCODE on its own line, got {script:?}"
             );
         }
     }
@@ -3658,7 +3666,7 @@ mod tests {
             "echo 中文",
         );
         assert_eq!(decode_encoded_command(&raw_args), format!(
-            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;echo 中文;if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\necho 中文\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
         ));
     }
 
@@ -3691,6 +3699,58 @@ mod tests {
         assert_eq!(pick_windows_shell(Some(""), ps.clone()), WinShell::PowerShell);
         assert_eq!(pick_windows_shell(Some("bash"), ps.clone()), WinShell::PowerShell);
         assert_eq!(pick_windows_shell(Some("bash"), None), WinShell::Cmd);
+    }
+
+    #[test]
+    fn test_powershell_trailing_comment_does_not_swallow_exit_code() {
+        // A command ending in a `#` comment used to swallow the `;`-joined
+        // `$LASTEXITCODE` tail on the same line, so the real exit code was
+        // never propagated. The tail must sit on its own line.
+        let (_, raw_args) = build_windows_invocation(
+            WinShell::PowerShell,
+            Some(Path::new("powershell.exe")),
+            "echo 1 # c",
+        );
+        let script = decode_encoded_command(&raw_args);
+        assert_eq!(
+            script,
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\necho 1 # c\nif ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }"
+        );
+        // The `$LASTEXITCODE` line is its own line, not part of the comment.
+        let tail_line = script.lines().last().unwrap();
+        assert_eq!(tail_line, "if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }");
+        assert!(
+            !script.contains("# c;if"),
+            "the comment must not swallow the tail on the same line, got {script:?}"
+        );
+        // Regression guard for the same hazard on the head: the encoding setup
+        // lines are newline-separated too, so a leading `#` in the user's
+        // command cannot comment them out either.
+        assert!(
+            script.lines().nth(1).unwrap().starts_with("$OutputEncoding="),
+            "head must be newline-separated too, got {script:?}"
+        );
+    }
+
+    #[test]
+    fn test_pick_windows_shell_unrecognised_values_behave_like_auto() {
+        // Explicitly covered per review: unknown strings are `auto`, not errors.
+        let ps = Some(PathBuf::from("powershell.exe"));
+        for v in ["auto", "AUTO", "", "bash", "sh", "cmd.exe", "powershell.exe"] {
+            if v.eq_ignore_ascii_case("cmd") {
+                continue;
+            }
+            assert_eq!(
+                pick_windows_shell(Some(v), ps.clone()),
+                WinShell::PowerShell,
+                "unrecognised {v:?} must behave like auto when PowerShell exists"
+            );
+            assert_eq!(
+                pick_windows_shell(Some(v), None),
+                WinShell::Cmd,
+                "unrecognised {v:?} must fall back to cmd without PowerShell"
+            );
+        }
     }
 
     #[test]
