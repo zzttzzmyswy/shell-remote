@@ -2621,25 +2621,69 @@ pub enum WinShell {
     PowerShell,
 }
 
-/// Pick the shell for a Windows command. An explicit `shell` tool argument
-/// wins (`"cmd"` / `"powershell"` / `"pwsh"`); anything else — absent, empty or
-/// unrecognised — falls back to the historical `--shell` path sniffing, so the
-/// pre-MYS-2114 behaviour is preserved for callers that never send the field.
-pub fn resolve_win_shell(shell_override: Option<&str>, shell_path: &str) -> WinShell {
-    if let Some(s) = shell_override.map(str::trim) {
-        if s.eq_ignore_ascii_case("powershell") || s.eq_ignore_ascii_case("pwsh") {
-            return WinShell::PowerShell;
-        }
-        if s.eq_ignore_ascii_case("cmd") {
-            return WinShell::Cmd;
-        }
-    }
-    let lower = shell_path.to_ascii_lowercase();
-    if lower.contains("powershell") || lower.contains("pwsh") {
+/// Pick the shell for a Windows MCP command.
+///
+/// Pure (takes the probe result rather than doing it) so the decision table is
+/// unit-testable on Linux, where PowerShell can't be probed at all.
+///
+/// - `cmd` → always cmd, even when PowerShell is available.
+/// - `powershell`/`pwsh` → PowerShell when available, otherwise **cmd** without
+///   erroring: a command that fails to run is worse than one that runs in the
+///   fallback shell.
+/// - `auto`, absent, or unrecognised → PowerShell when available, else cmd.
+///
+/// The MCP path deliberately ignores `--shell`: its default is `cmd.exe`, so
+/// it cannot distinguish "operator chose cmd" from "defaulted to cmd". It only
+/// drives the interactive PTY terminal.
+pub fn pick_windows_shell(requested: Option<&str>, ps_path: Option<PathBuf>) -> WinShell {
+    // Only `cmd` overrides the preference; `powershell`/`pwsh`/`auto`/absent/
+    // unrecognised all mean "PowerShell if we have one" — an explicit request
+    // for a missing PowerShell degrades to cmd rather than failing.
+    let wants_cmd = matches!(requested.map(str::trim), Some(s) if s.eq_ignore_ascii_case("cmd"));
+    if !wants_cmd && ps_path.is_some() {
         WinShell::PowerShell
     } else {
         WinShell::Cmd
     }
+}
+
+/// Locate a PowerShell executable on Windows, preferring the system-shipped
+/// Windows PowerShell 5.1 over a separately installed pwsh 7.
+///
+/// Order: `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, then
+/// `powershell.exe` on PATH, then `pwsh.exe` on PATH. Cached in a `OnceLock`:
+/// the probe touches the filesystem and the answer cannot change in a way that
+/// matters for a process's lifetime.
+#[cfg(not(unix))]
+fn find_powershell() -> Option<PathBuf> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            // 1. System Windows PowerShell 5.1 — present on every stock install.
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                let p = Path::new(&root)
+                    .join("System32")
+                    .join("WindowsPowerShell")
+                    .join("v1.0")
+                    .join("powershell.exe");
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+            // 2. PATH, preferring powershell.exe (5.1) over pwsh.exe (7).
+            let path = std::env::var_os("PATH")?;
+            for exe in ["powershell.exe", "pwsh.exe"] {
+                for dir in std::env::split_paths(&path) {
+                    let candidate = dir.join(exe);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        })
+        .clone()
 }
 
 /// Render a PowerShell script as `-EncodedCommand`'s value: base64 of the
@@ -2669,19 +2713,16 @@ pub fn encode_powershell_command(cmd: &str) -> String {
 ///   pair and keep inner quotes intact, `/D` skips AutoRun scripts (which
 ///   would otherwise echo into stdout).
 /// - PowerShell: the encoded script from [`encode_powershell_command`], run on
-///   `ps_exe` when that already points at a powershell/pwsh binary.
-pub fn build_windows_invocation(shell: WinShell, ps_exe: &str, cmd: &str) -> (String, String) {
+///   `ps_exe` when one was probed, else on the bare `powershell.exe` name.
+pub fn build_windows_invocation(shell: WinShell, ps_exe: Option<&Path>, cmd: &str) -> (String, String) {
     match shell {
         WinShell::Cmd => ("cmd.exe".to_string(), format!("/D /S /C \"{}\"", cmd)),
         WinShell::PowerShell => {
-            let lower = ps_exe.to_ascii_lowercase();
-            let exe = if lower.contains("powershell") || lower.contains("pwsh") {
-                ps_exe
-            } else {
-                "powershell.exe"
-            };
+            let exe = ps_exe
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "powershell.exe".to_string());
             (
-                exe.to_string(),
+                exe,
                 format!(
                     "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}",
                     encode_powershell_command(cmd)
@@ -2782,13 +2823,15 @@ async fn kill_process_tree(pid: Option<u32>) {
 async fn execute_command(
     cmd: &str,
     timeout_ms: u64,
-    shell_path: &str,
+    _shell_path: &str,
     shell_override: Option<&str>,
     cwd: Option<&str>,
 ) -> (String, String, i32) {
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    let shell = resolve_win_shell(shell_override, shell_path);
-    let (program, raw_args) = build_windows_invocation(shell, shell_path, cmd);
+    // PowerShell is the MCP default on Windows; `--shell` plays no part here.
+    let ps_path = find_powershell();
+    let shell = pick_windows_shell(shell_override, ps_path.clone());
+    let (program, raw_args) = build_windows_invocation(shell, ps_path.as_deref(), cmd);
 
     let mut command = tokio::process::Command::new(program);
     command.raw_arg(raw_args);
@@ -3456,9 +3499,39 @@ mod tests {
 
     #[cfg(not(unix))]
     #[tokio::test]
+    async fn test_execute_command_windows_ignores_shell_path() {
+        // 【用户变更】The MCP path must not consult `--shell`: its default is
+        // cmd.exe, so it cannot express an explicit choice. Passing a
+        // *PowerShell* `--shell` with `shell: "cmd"` must still run cmd (here
+        // `%CD%` expands and quotes survive — both are cmd semantics).
+        let (out, err, code) = execute_command(
+            "echo %CD%", 10_000, "powershell.exe", Some("cmd"), None,
+        )
+        .await;
+        assert_eq!(code, 0, "stderr={err}");
+        assert!(
+            !out.trim().is_empty() && !out.contains('%'),
+            "shell:cmd must win over --shell=powershell.exe, got {out:?} (stderr={err:?})"
+        );
+
+        // And the reverse: `--shell=cmd.exe` with `shell: "auto"` must not force
+        // cmd — it resolves solely from find_powershell().
+        let expected = pick_windows_shell(None, find_powershell());
+        let (_, _, code) = execute_command(
+            "Write-Output x", 30_000, "cmd.exe", Some("auto"), None,
+        )
+        .await;
+        if expected == WinShell::Cmd {
+            // cmd has no Write-Output: a non-zero exit proves cmd was used.
+            assert_ne!(code, 0, "auto without PowerShell must fall back to cmd");
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
     async fn test_execute_command_windows_powershell_override() {
         // Defect 2: an explicit `shell: "powershell"` must reach PowerShell
-        // even though `--shell` is cmd.exe. Script construction is unit-tested
+        // regardless of `--shell`. Script construction is unit-tested
         // separately; this checks the exec wiring.
         //
         // Wine ships a *stub* powershell.exe that swallows -EncodedCommand and
@@ -3521,7 +3594,7 @@ mod tests {
             "powershell -NoProfile -Command \"$x = 1; echo $x\"",
             "echo 中文 ok",
         ] {
-            let (program, raw_args) = build_windows_invocation(WinShell::Cmd, "cmd.exe", cmd);
+            let (program, raw_args) = build_windows_invocation(WinShell::Cmd, None, cmd);
             assert_eq!(program, "cmd.exe");
             assert_eq!(
                 raw_args,
@@ -3544,8 +3617,12 @@ mod tests {
             "Write-Output 'it''s'",
             "Write-Output 中文",
         ] {
-            let (program, raw_args) = build_windows_invocation(WinShell::PowerShell, "powershell.exe", cmd);
-            assert_eq!(program, "powershell.exe");
+            let (program, raw_args) = build_windows_invocation(
+                WinShell::PowerShell,
+                Some(Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")),
+                cmd,
+            );
+            assert!(program.ends_with("powershell.exe"), "got {program}");
             for flag in [
                 "-NoProfile",
                 "-NonInteractive",
@@ -3575,37 +3652,55 @@ mod tests {
     #[test]
     fn test_powershell_encoded_command_is_utf16le_base64() {
         // Non-ASCII must survive: the payload is UTF-16LE, not UTF-8 or GBK.
-        let (_, raw_args) = build_windows_invocation(WinShell::PowerShell, "pwsh.exe", "echo 中文");
+        let (_, raw_args) = build_windows_invocation(
+            WinShell::PowerShell,
+            Some(Path::new("pwsh.exe")),
+            "echo 中文",
+        );
         assert_eq!(decode_encoded_command(&raw_args), format!(
             "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;echo 中文;if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
         ));
     }
 
     #[test]
-    fn test_powershell_uses_configured_ps_exe_else_falls_back() {
-        // An explicit powershell/pwsh path from `--shell` is honoured; a
-        // non-PowerShell path (cmd.exe) falls back to the default.
-        let (program, _) = build_windows_invocation(WinShell::PowerShell, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "echo hi");
-        assert!(program.ends_with("powershell.exe"), "got {program}");
-        let (program, _) = build_windows_invocation(WinShell::PowerShell, "pwsh.exe", "echo hi");
-        assert_eq!(program, "pwsh.exe");
-        let (program, _) = build_windows_invocation(WinShell::PowerShell, "cmd.exe", "echo hi");
-        assert_eq!(program, "powershell.exe");
+    fn test_pick_windows_shell_auto_prefers_powershell_then_falls_back() {
+        // 【用户变更】auto (the default) uses PowerShell when it is available.
+        let ps = Some(PathBuf::from("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+        assert_eq!(pick_windows_shell(None, ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("auto"), ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("AUTO"), ps.clone()), WinShell::PowerShell);
+        // No PowerShell → cmd.
+        assert_eq!(pick_windows_shell(None, None), WinShell::Cmd);
+        assert_eq!(pick_windows_shell(Some("auto"), None), WinShell::Cmd);
     }
 
     #[test]
-    fn test_resolve_win_shell_override_and_fallback() {
-        // Explicit override wins, case-insensitively.
-        assert_eq!(resolve_win_shell(Some("cmd"), "powershell.exe"), WinShell::Cmd);
-        assert_eq!(resolve_win_shell(Some("CMD"), "powershell.exe"), WinShell::Cmd);
-        assert_eq!(resolve_win_shell(Some("powershell"), "cmd.exe"), WinShell::PowerShell);
-        assert_eq!(resolve_win_shell(Some("pwsh"), "cmd.exe"), WinShell::PowerShell);
-        // Absent/blank/unknown override → historical `--shell` sniffing.
-        assert_eq!(resolve_win_shell(None, "cmd.exe"), WinShell::Cmd);
-        assert_eq!(resolve_win_shell(Some(""), "cmd.exe"), WinShell::Cmd);
-        assert_eq!(resolve_win_shell(Some("bash"), "cmd.exe"), WinShell::Cmd);
-        assert_eq!(resolve_win_shell(None, "powershell.exe"), WinShell::PowerShell);
-        assert_eq!(resolve_win_shell(None, "C:\\Program Files\\PowerShell\\7\\pwsh.exe"), WinShell::PowerShell);
-        assert_eq!(resolve_win_shell(Some("bogus"), "pwsh.exe"), WinShell::PowerShell);
+    fn test_pick_windows_shell_explicit_requests() {
+        let ps = Some(PathBuf::from("pwsh.exe"));
+        // Explicit `cmd` forces cmd even when PowerShell is available.
+        assert_eq!(pick_windows_shell(Some("cmd"), ps.clone()), WinShell::Cmd);
+        assert_eq!(pick_windows_shell(Some("CMD"), ps.clone()), WinShell::Cmd);
+        assert_eq!(pick_windows_shell(Some(" cmd "), ps.clone()), WinShell::Cmd);
+        // Explicit powershell/pwsh uses it when available…
+        assert_eq!(pick_windows_shell(Some("powershell"), ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("pwsh"), ps.clone()), WinShell::PowerShell);
+        // …and falls back to cmd (no error) when it is not.
+        assert_eq!(pick_windows_shell(Some("powershell"), None), WinShell::Cmd);
+        assert_eq!(pick_windows_shell(Some("pwsh"), None), WinShell::Cmd);
+        // Blank / unrecognised values behave like auto, not like an error.
+        assert_eq!(pick_windows_shell(Some(""), ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("bash"), ps.clone()), WinShell::PowerShell);
+        assert_eq!(pick_windows_shell(Some("bash"), None), WinShell::Cmd);
+    }
+
+    #[test]
+    fn test_build_windows_invocation_powershell_uses_probed_exe() {
+        // The probed path is run as-is; with no probe result the bare name is
+        // used so the OS resolves it from PATH.
+        let probed = PathBuf::from("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        let (program, _) = build_windows_invocation(WinShell::PowerShell, Some(&probed), "echo hi");
+        assert_eq!(program, probed.to_string_lossy());
+        let (program, _) = build_windows_invocation(WinShell::PowerShell, None, "echo hi");
+        assert_eq!(program, "powershell.exe");
     }
 }

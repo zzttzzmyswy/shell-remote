@@ -234,7 +234,7 @@ async fn process_mcp_request(
                                 "token": {"type": "string", "description": "shell_remote token for authentication (session token shown at agent startup)"},
                                 "cmd": {"type": "string", "description": "The shell command to execute on the remote machine"},
                                 "timeout_ms": {"type": "number", "description": "Optional timeout in milliseconds (default 30s)"},
-                                "shell": {"type": "string", "enum": ["cmd", "powershell"], "description": "Optional shell to run the command in (Windows only; ignored on Unix). Defaults to the agent's configured shell."},
+                                "shell": {"type": "string", "enum": ["auto", "powershell", "cmd"], "default": "auto", "description": "Optional shell to run the command in (Windows only; ignored on Unix). Defaults to auto: PowerShell when available, otherwise cmd."},
                                 "cwd": {"type": "string", "description": "Optional working directory for the command. Defaults to the agent root."}
                             },
                             "required": ["token", "cmd"]
@@ -799,8 +799,12 @@ mod tests {
         let props = &r["result"]["tools"][0]["inputSchema"]["properties"];
         assert_eq!(
             props["shell"]["enum"],
-            json!(["cmd", "powershell"]),
-            "shell must be an enum of cmd/powershell, got {props}"
+            json!(["auto", "powershell", "cmd"]),
+            "shell must be an enum of auto/powershell/cmd, got {props}"
+        );
+        assert_eq!(
+            props["shell"]["default"], "auto",
+            "shell must default to auto (PowerShell when available), got {props}"
         );
         assert!(props["shell"]["type"] == "string");
         assert_eq!(props["cwd"]["type"], "string");
