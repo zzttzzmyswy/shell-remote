@@ -1130,10 +1130,13 @@
   //   1. 上一轮还没跑完（请求在途）→ 本轮直接跳过，避免请求堆积；
   //   2. 用户正在交互（输入框/下拉框有焦点，或打开了对话框/弹窗）→ 跳过，
   //      否则重绘会打断输入、把下拉框弹回、把正在读的弹窗内容换掉。
-  // 手动操作（切 tab、点刷新、保存）走 refreshNow()，不受交互条件限制。
+  // 手动操作（切 tab、点刷新、保存、踢人、重新生成令牌、升级）也调 refresh()，
+  // 但**不会**被在途请求丢掉：请求进行中再来的 refresh 会合并成一个「待跑」
+  // 标记，本轮结束后立刻补跑一次，用户看到的结果不会滞后一个 5s 周期。
   let timer = null;
   let lastOverview = null;
   let refreshInFlight = false;
+  let refreshQueued = false;
 
   function startRefresh() { if (!timer) timer = setInterval(tickRefresh, 5000); }
   function stopRefresh() { if (timer) { clearInterval(timer); timer = null; } }
@@ -1148,31 +1151,36 @@
     return a.isContentEditable === true;
   }
 
+  // 周期刷新：请求在途或用户正在交互时跳过本轮。
   async function tickRefresh() {
-    if (refreshInFlight) return;      // 有请求在途：跳过本轮
-    if (userIsBusy()) return;         // 用户正在交互：跳过本轮
+    if (refreshInFlight) return;
+    if (userIsBusy()) return;
     await refresh();
   }
 
   async function refresh() {
-    if (refreshInFlight) return;
+    if (refreshInFlight) { refreshQueued = true; return; }
     refreshInFlight = true;
     try {
-      let o;
-      try { o = await api('/api/overview'); }
-      catch (_) { return; }
-      lastOverview = o;
-      renderOverview(o);
-      renderSessions(o.sessions || []);
-      // Upgrade eligibility shapes the devices table's row buttons/status, so
-      // the artifacts list is fetched before the devices table is rebuilt.
-      await refreshUpgradeArtifacts();
-      await refreshBandwidth();
-      renderDevices(o.sessions || []);
-      renderConnLog(o.conn_log || []);
-      refreshRecordings();
+      do {
+        refreshQueued = false;
+        let o;
+        try { o = await api('/api/overview'); }
+        catch (_) { return; }
+        lastOverview = o;
+        renderOverview(o);
+        renderSessions(o.sessions || []);
+        // Upgrade eligibility shapes the devices table's row buttons/status, so
+        // the artifacts list is fetched before the devices table is rebuilt.
+        await refreshUpgradeArtifacts();
+        await refreshBandwidth();
+        renderDevices(o.sessions || []);
+        renderConnLog(o.conn_log || []);
+        refreshRecordings();
+      } while (refreshQueued);
     } finally {
       refreshInFlight = false;
+      refreshQueued = false;
     }
   }
 

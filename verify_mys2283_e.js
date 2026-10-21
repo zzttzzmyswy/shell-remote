@@ -464,6 +464,23 @@ async function main() {
     });
     check('失焦后刷新恢复运行（概览数值已渲染）', refreshedAfterBlur.length > 0, refreshedAfterBlur);
 
+    // 刷新并发控制：把 /api/overview 拖慢到 6s（> 5s 周期），观察 12s 内
+    // 不会出现请求叠加（同一时刻最多 1 个在途）。这是「有请求在途时跳过本轮」
+    // 的直接证据。
+    let overviewInFlight = 0, overviewMaxConcurrent = 0, overviewCalls = 0;
+    await admin.route('**/api/overview', async (route) => {
+      overviewCalls++;
+      overviewInFlight++;
+      overviewMaxConcurrent = Math.max(overviewMaxConcurrent, overviewInFlight);
+      await sleep(6000);
+      overviewInFlight--;
+      await route.continue();
+    });
+    await sleep(13000);
+    check('周期刷新不会叠加请求（同一时刻最多 1 个 /api/overview 在途）',
+      overviewMaxConcurrent <= 1, `calls=${overviewCalls} maxConcurrent=${overviewMaxConcurrent}`);
+    await admin.unroute('**/api/overview');
+
     // 重新生成 token → secret 对话框（只读输入框 + 复制按钮）
     await admin.click('.tab-btn[data-tab="sessions"]');
     await sleep(600);
