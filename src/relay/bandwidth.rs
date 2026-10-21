@@ -223,7 +223,7 @@ impl TokenBucket {
             return;
         }
         // 快路径：没人在排队时才走，避免插队。
-        if self.waiters.load(Ordering::SeqCst) == 0 && self.try_acquire(n) {
+        if self.waiters.load(Ordering::SeqCst) == 0 && self.try_take(n, false) {
             return;
         }
         self.acquire_queued(n).await;
@@ -286,7 +286,17 @@ impl TokenBucket {
     }
 
     /// 非等待获取：够则扣减并返回 true；不够返回 false 且**不扣减**。
+    ///
+    /// `n` 大于桶容量（如低限速下的视频关键帧）时，桶满即放行并借贷
+    /// （tokens 变负），否则这类帧永远无法通过——关键帧过不去，后续 delta
+    /// 也都在等关键帧，桌面画面会永久冻结。借贷由后续帧偿还，均速仍受限。
     pub fn try_acquire(&self, n: usize) -> bool {
+        self.try_take(n, true)
+    }
+
+    /// `borrow`：超过桶容量的请求在桶满时放行并借贷（仅 `try_acquire`）；
+    /// `acquire` 的快路径不借贷，大请求走排队按速率等待。
+    fn try_take(&self, n: usize, borrow: bool) -> bool {
         if n == 0 {
             return true;
         }
@@ -300,8 +310,10 @@ impl TokenBucket {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = Instant::now();
-        refill(&mut st, rate, now, burst_for(rate));
-        if st.tokens >= n as f64 {
+        let cap = burst_for(rate);
+        refill(&mut st, rate, now, cap);
+        let need = if borrow { (n as f64).min(cap) } else { n as f64 };
+        if st.tokens >= need {
             st.tokens -= n as f64;
             drop(st);
             self.account(n);
@@ -640,6 +652,22 @@ mod tests {
         // 失败不扣减：剩下一半额度仍可用。
         assert!(b.try_acquire(burst / 2));
         assert_eq!(b.total_bytes(), burst as u64, "失败的 try_acquire 不计入流量");
+    }
+
+    /// 大于桶容量的帧（低限速下的视频关键帧）：桶满即放行并借贷，
+    /// 借贷还清、桶重新填满前不再放行——不能永久拒绝，否则画面冻结。
+    #[tokio::test(start_paused = true)]
+    async fn try_acquire_oversized_frame_passes_when_bucket_full() {
+        let b = bucket(1000); // burst = 64KiB
+        let frame = 100 * 1024;
+        assert!(b.try_acquire(frame), "桶满时超大帧必须放行");
+        assert!(!b.try_acquire(frame), "借贷未还清前不得再放行");
+        // 欠 36KiB + 填满 64KiB = 100KiB @ 1000B/s ≈ 102.4s
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert!(!b.try_acquire(frame), "桶未满前不得放行");
+        tokio::time::advance(std::time::Duration::from_secs(43)).await;
+        assert!(b.try_acquire(frame), "桶重新填满后再次放行");
+        assert_eq!(b.total_bytes(), 2 * frame as u64);
     }
 
     /// 验收 2.4：单次 acquire 超过 burst 不能死锁。
