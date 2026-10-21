@@ -32,7 +32,13 @@ pub use crate::relay::file_transfer::BULK_CHANNEL_CAPACITY;
 pub struct ChannelMap {
     pub agent: Option<mpsc::Sender<String>>,
     pub agent_bulk: Option<mpsc::Sender<String>>,
+    /// `user_id → sse_sid`（浏览器事件流）。
     pub browser_sessions: HashMap<String, String>,
+    /// `user_id → (sse_sid, 建立该流所用的 token)`。token 用于凭证变更
+    /// （revoke / regenerate / 降权）时精确断开受影响的浏览器流——没有它
+    /// 只能踢掉整个会话的所有浏览器，或干脆不断开（旧行为：吊销后流仍在
+    /// 收数据）。
+    pub browser_tokens: HashMap<String, (String, String)>,
 }
 
 #[allow(dead_code)]
@@ -42,6 +48,7 @@ impl ChannelMap {
             agent: None,
             agent_bulk: None,
             browser_sessions: HashMap::new(),
+            browser_tokens: HashMap::new(),
         }
     }
 }
@@ -65,6 +72,10 @@ pub struct SharedState {
     /// 下多台 agent 同时注册/断线重连不至于被 429 拒掉（曾因 10/min 的
     /// 过紧默认让正常部署注册失败）。防 DoS 的最低保护仍保留。
     pub registration_rate_limit_per_min: std::sync::atomic::AtomicUsize,
+    /// `--strict-agent-auth`：开启后拒绝所有未携带 `X-SR-Agent-Token` 的
+    /// agent 上行（`/agent/events`、`/agent/ws/send`、`/agent/send`）。默认
+    /// 关闭以兼容存量旧版 agent，升级完成后可开启。
+    pub strict_agent_auth: std::sync::atomic::AtomicBool,
     pub max_upload_size: u64,
     pub sse_sessions: RwLock<HashMap<String, mpsc::Sender<String>>>,
     /// Admin panel config. `admin_path` is `None` when `--admin-path` is
@@ -278,6 +289,7 @@ impl SharedState {
             agent_event_buffers: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter::new()),
             registration_rate_limit_per_min: std::sync::atomic::AtomicUsize::new(120),
+            strict_agent_auth: std::sync::atomic::AtomicBool::new(false),
             max_upload_size,
             sse_sessions: RwLock::new(HashMap::new()),
             admin_path,
@@ -303,6 +315,12 @@ impl SharedState {
     pub fn set_registration_rate_limit(&self, per_min: usize) {
         self.registration_rate_limit_per_min
             .store(per_min, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 开关 `--strict-agent-auth`（启动时由 CLI 写入；测试可直接调用）。
+    pub fn set_strict_agent_auth(&self, strict: bool) {
+        self.strict_agent_auth
+            .store(strict, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Append an access-audit entry (bounded). Non-blocking; used on the
@@ -333,6 +351,25 @@ impl SharedState {
             .or_insert_with(EventBuffer::new)
             .push(msg.to_string())
     }
+}
+
+/// 统一清理某个 sid 在**所有** per-session map 中的条目。
+///
+/// 会话消失（空闲回收 / admin kick / 注册驱逐旧会话）时必须走这里：单个
+/// 位置各清一部分，漏掉的那张表就会随会话数单调增长（曾出现
+/// `kpi_history`、`desktop_proto` 等永久残留）。`sessions`、`agent_broadcast`
+/// 和 `pending_mcp` 由调用方按各自语义处理（它们不是纯 per-session 表），
+/// 这里只清按 sid 索引的遥测/状态缓存。
+pub async fn remove_session_state(state: &SharedState, sid: &str) {
+    state.kpi_history.write().await.remove(sid);
+    state.desktop_proto.write().await.remove(sid);
+    state.desktop_states.write().await.remove(sid);
+    state.last_congest_notify.write().await.remove(sid);
+    state.last_kpi_alert.write().await.remove(sid);
+    state.agent_upgrades.write().await.remove(sid);
+    state.desktop_streams.write().await.remove(sid);
+    state.last_activity.write().await.remove(sid);
+    state.agent_event_buffers.write().await.remove(sid);
 }
 
 use axum::body::Body;
@@ -997,14 +1034,10 @@ pub async fn upload_handler(
     Query(params): Query<HashMap<String, String>>,
     body: axum::body::Body,
 ) -> Result<axum::http::StatusCode, axum::http::StatusCode> {
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+    let client_ip = crate::relay::auth::client_ip(&headers);
     {
         let mut rl = state.rate_limiter.write().await;
-        if !rl.check(&client_ip, 20, std::time::Duration::from_secs(60)) {
+        if !rl.check(&format!("up:{client_ip}"), 20, std::time::Duration::from_secs(60)) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
     }
@@ -1277,6 +1310,7 @@ pub async fn start(
     tls_key: Option<String>,
     tls_disabled: bool,
     registration_rate_limit: usize,
+    strict_agent_auth: bool,
 ) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -1336,6 +1370,10 @@ pub async fn start(
         .filter(|d| !d.is_empty())
         .map(std::path::PathBuf::from);
     st.set_registration_rate_limit(registration_rate_limit);
+    st.set_strict_agent_auth(strict_agent_auth);
+    if strict_agent_auth {
+        tracing::info!("strict agent auth enabled — agents without X-SR-Agent-Token are rejected");
+    }
     let state = Arc::new(st);
 
     // Agent self-upgrade artifacts: `--agent-upgrade-dir` stages binaries
@@ -1493,13 +1531,9 @@ pub async fn start(
                         .write()
                         .await
                         .remove(&session_id);
-                    state_clone.last_activity.write().await.remove(&session_id);
-                    // Drop the replay buffer so reaped sessions don't leak memory.
-                    state_clone
-                        .agent_event_buffers
-                        .write()
-                        .await
-                        .remove(&session_id);
+                    // 所有按 sid 索引的状态表统一清理（遥测/桌面/事件缓冲等），
+                    // 否则漏掉的表会随会话数单调增长。
+                    remove_session_state(&state_clone, &session_id).await;
                     // Flush + close the recording file, if any.
                     if let Some(rec) = &state_clone.recorder {
                         rec.close(&session_id);

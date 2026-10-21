@@ -226,6 +226,8 @@ async fn sender_loop(
     client: reqwest::Client,
     send_url: String,
     session_id: String,
+    // 上行身份令牌（`X-SR-Agent-Token`），空串 = 不携带（旧 relay / 无 token）。
+    agent_token: String,
     mut control_rx: tokio::sync::mpsc::Receiver<String>,
     mut output_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
     heartbeat: Duration,
@@ -246,8 +248,8 @@ async fn sender_loop(
             biased;
             ctrl = control_rx.recv() => match ctrl {
                 Some(s) => {
-                    flush_output(&client, &send_url, &session_id, &mut pending).await;
-                    post_raw(&client, &send_url, &s).await;
+                    flush_output(&client, &send_url, &agent_token, &session_id, &mut pending).await;
+                    post_raw(&client, &send_url, &agent_token, &s).await;
                 }
                 None => break,
             },
@@ -256,7 +258,7 @@ async fn sender_loop(
                 None => break,
             },
             _ = timer.tick() => {
-                flush_output(&client, &send_url, &session_id, &mut pending).await;
+                flush_output(&client, &send_url, &agent_token, &session_id, &mut pending).await;
             }
             _ = heartbeat_tick.tick() => {
                 // 心跳扩展（R5#150）：桌面启用时附带运行态 KPI，relay/admin
@@ -285,7 +287,7 @@ async fn sender_loop(
                 let ping = ping.to_string();
                 #[cfg(feature = "tui")]
                 let ping_sent_at = std::time::Instant::now();
-                if post_raw(&client, &send_url, &ping).await {
+                if post_raw(&client, &send_url, &agent_token, &ping).await {
                     heartbeat_failures = 0;
                 } else {
                     heartbeat_failures += 1;
@@ -308,7 +310,7 @@ async fn sender_loop(
             }
         }
     }
-    flush_output(&client, &send_url, &session_id, &mut pending).await;
+    flush_output(&client, &send_url, &agent_token, &session_id, &mut pending).await;
 }
 
 /// 当前进程 RSS（KB）。读 `/proc/self/statm` 第 2 字段（resident pages）
@@ -392,6 +394,7 @@ fn self_cpu_temp() -> f64 {
 async fn flush_output(
     client: &reqwest::Client,
     send_url: &str,
+    agent_token: &str,
     session_id: &str,
     pending: &mut HashMap<String, Vec<u8>>,
 ) {
@@ -411,14 +414,21 @@ async fn flush_output(
             payload: serde_json::json!({ "data": encoded, "tab_id": tab_id }),
         };
         if let Ok(s) = serde_json::to_string(&msg) {
-            post_raw(client, send_url, &s).await;
+            post_raw(client, send_url, agent_token, &s).await;
         }
     }
 }
 
 /// POST one message to the relay. Returns whether the relay accepted it
 /// (2xx); failures are logged. Bounded by [`client::POST_TIMEOUT`].
-async fn post_raw(client: &reqwest::Client, send_url: &str, text: &str) -> bool {
+/// `agent_token` 非空时附带 `X-SR-Agent-Token`（relay 据此确认这条上行属于
+/// 该会话；旧 relay 忽略该头）。
+async fn post_raw(
+    client: &reqwest::Client,
+    send_url: &str,
+    agent_token: &str,
+    text: &str,
+) -> bool {
     let body = match serde_json::from_str::<serde_json::Value>(text) {
         Ok(v) => v,
         Err(e) => {
@@ -426,8 +436,7 @@ async fn post_raw(client: &reqwest::Client, send_url: &str, text: &str) -> bool 
             return false;
         }
     };
-    match client
-        .post(send_url)
+    match client::with_agent_token(client.post(send_url), agent_token)
         .timeout(client::POST_TIMEOUT)
         .json(&body)
         .send()
@@ -462,11 +471,30 @@ fn kind_for_io(e: &std::io::Error) -> &'static str {
     }
 }
 
+/// 构造 WS 升级请求，附带 `X-SR-Agent-Token`（relay 侧 WS 上行路径据此
+/// 判定身份）。`token` 为空时与直接传 URL 等价。
+fn ws_request(url: &str, token: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url
+        .into_client_request()
+        .expect("ws_url is a well-formed ws:// URL built above");
+    if !token.is_empty() {
+        if let Ok(v) = token.parse() {
+            req.headers_mut().insert(
+                crate::agent::client::AGENT_TOKEN_HEADER,
+                v,
+            );
+        }
+    }
+    req
+}
+
 /// Post a single error `fs:result` (correlated by `_mcp_request_id`) for a
 /// failed download; `kind` categorizes the failure for HTTP status mapping.
 async fn post_fs_err(
     client: &reqwest::Client,
     send_url: &str,
+    agent_token: &str,
     session_id: &str,
     path: &str,
     mcp_request_id: &Option<String>,
@@ -479,7 +507,7 @@ async fn post_fs_err(
     });
     let msg = serde_json::json!({"type":"fs:result","session_id":session_id,"payload":payload})
         .to_string();
-    post_raw(client, send_url, &msg).await;
+    post_raw(client, send_url, agent_token, &msg).await;
 }
 
 /// Build a chunked `fs:result` payload envelope for a single download chunk.
@@ -528,6 +556,7 @@ fn build_download_chunk_payload(
 async fn stream_file_download(
     client: reqwest::Client,
     send_url: String,
+    agent_token: String,
     session_id: String,
     root: PathBuf,
     path: String,
@@ -546,6 +575,7 @@ async fn stream_file_download(
             post_fs_err(
                 &client,
                 &send_url,
+                &agent_token,
                 &session_id,
                 &path,
                 &mcp_request_id,
@@ -567,6 +597,7 @@ async fn stream_file_download(
             post_fs_err(
                 &client,
                 &send_url,
+                &agent_token,
                 &session_id,
                 &path,
                 &mcp_request_id,
@@ -584,6 +615,7 @@ async fn stream_file_download(
         post_fs_err(
             &client,
             &send_url,
+            &agent_token,
             &session_id,
             &path,
             &mcp_request_id,
@@ -605,6 +637,7 @@ async fn stream_file_download(
             post_fs_err(
                 &client,
                 &send_url,
+                &agent_token,
                 &session_id,
                 &path,
                 &mcp_request_id,
@@ -626,6 +659,7 @@ async fn stream_file_download(
             post_fs_err(
                 &client,
                 &send_url,
+                &agent_token,
                 &session_id,
                 &path,
                 &mcp_request_id,
@@ -668,6 +702,7 @@ async fn stream_file_download(
                     post_fs_err(
                         &client,
                         &send_url,
+                        &agent_token,
                         &session_id,
                         &path,
                         &mcp_request_id,
@@ -702,8 +737,7 @@ async fn stream_file_download(
         // not retry (a timed-out-but-delivered chunk would be duplicated) —
         // abort instead and let the relay fail the download visibly.
         let delivered = matches!(
-            client
-                .post(&send_url)
+            client::with_agent_token(client.post(&send_url), &agent_token)
                 .timeout(client::POST_TIMEOUT)
                 .json(&msg)
                 .send()
@@ -1109,6 +1143,7 @@ async fn run_session(
         client.http_client().clone(),
         client.send_url().to_string(),
         client.session_id.clone(),
+        client.agent_token(),
         control_rx,
         output_rx,
         Duration::from_secs(15),
@@ -1175,6 +1210,9 @@ async fn run_session(
             .to_string();
         let sid = client.session_id.clone();
         let server_auth = client.server_auth().to_string();
+        // 上行身份令牌：HTTP 批量与 WS 两条路径都带（relay 侧 `Denied` 时
+        // 直接 401，不会再退回「带错 token 等于没带」的旧行为）。
+        let agent_token = client.agent_token();
         // R5 #41：relay 是否支持 desktop:video 二进制上行（register 响应
         // `desktop_binary: true`）。老 relay → false，WS 路径保持 JSON+base64。
         let desktop_binary = client.desktop_binary;
@@ -1207,8 +1245,7 @@ async fn run_session(
                     u.push_str(&server_auth);
                 }
                 u
-            };
-            let mut ws: Option<
+            };            let mut ws: Option<
                 tokio_tungstenite::WebSocketStream<
                     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
                 >,
@@ -1297,7 +1334,7 @@ async fn run_session(
                     match tokio::time::timeout(
                         Duration::from_secs(3),
                         tokio_tungstenite::connect_async_tls_with_config(
-                            &ws_url,
+                            ws_request(&ws_url, &agent_token),
                             None,
                             true,
                             if insecure_tls {
@@ -1447,7 +1484,9 @@ async fn run_session(
                 // 弱网/大帧时允许更长发送窗口，避免误判断连触发回退（MYS-886）。
                 let send_outcome = tokio::time::timeout(
                     Duration::from_secs(12),
-                    pc.post(format!("{base}/agent/send")).json(&batch).send(),
+                    client::with_agent_token(pc.post(format!("{base}/agent/send")), &agent_token)
+                        .json(&batch)
+                        .send(),
                 )
                 .await;
                 match send_outcome {
@@ -1838,6 +1877,7 @@ async fn run_session(
                                     // can't block the main loop (terminal input).
                                     let client_req = client.http_client().clone();
                                     let send_url = client.send_url().to_string();
+                                    let agent_token = client.agent_token();
                                     let sid = client.session_id.clone();
                                     let root_clone = root_path.clone();
                                     // Register a cancel token for this correlation_id so the
@@ -1851,6 +1891,7 @@ async fn run_session(
                                     tokio::spawn(stream_file_download(
                                         client_req,
                                         send_url,
+                                        agent_token,
                                         sid,
                                         root_clone,
                                         path,
@@ -2912,6 +2953,7 @@ mod tests {
             reqwest::Client::new(),
             format!("http://127.0.0.1:{}/agent/send", port),
             "sess1".to_string(),
+            String::new(),
             control_rx,
             output_rx,
             std::time::Duration::from_millis(30),
@@ -3355,6 +3397,7 @@ mod tests {
             client,
             url,
             "sess1".to_string(),
+            String::new(),
             control_rx,
             output_rx,
             std::time::Duration::from_millis(50),
@@ -3416,6 +3459,7 @@ mod tests {
             client,
             url,
             "sess1".to_string(),
+            String::new(),
             control_rx,
             output_rx,
             std::time::Duration::from_millis(50),

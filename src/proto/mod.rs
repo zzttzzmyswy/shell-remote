@@ -211,16 +211,18 @@ impl TokenType {
 }
 
 pub fn requires_write(msg_type: &str) -> bool {
+    // 只读会话（`--token-type ro` / 后台降权的 token）允许发送的类型。
+    //
+    // 只列**浏览器确实会发、且不改动远端状态**的类型：
+    // - `fs:mkdir` 会创建目录，属写操作 → 不在表内；
+    // - `terminal:output` / `fs:result` / `mcp:result` / `mcp:exec_result` 是
+    //   agent→relay 方向的回包，浏览器从不发送（已 grep `web/` 确认），
+    //   列在只读白名单里等于给只读 token 开了一条伪造结果回包的口子。
     let read_only_types = [
-        "terminal:output",
         "session:users",
         "session:tab_list",
-        "fs:result",
         "fs:list",
         "fs:read",
-        "fs:mkdir",
-        "mcp:result",
-        "mcp:exec_result",
         "mcp:exec_list",
         // R5 授权细化：只读观看会话允许的桌面**只读**操作——关键帧请求
         // （弱网/丢帧恢复）、TestDelay 探针（只读网络测量）、剪贴板读取。
@@ -388,12 +390,16 @@ mod tests {
         assert!(requires_write("terminal:input"));
         assert!(requires_write("fs:write"));
         assert!(requires_write("fs:delete"));
-        assert!(!requires_write("terminal:output"));
+        assert!(requires_write("fs:mkdir"), "创建目录是写操作（只读 token 不得创建目录）");
+        // agent→relay 的回包类型不属于浏览器可发集合 → 非只读（fail-closed）。
+        assert!(requires_write("terminal:output"));
+        assert!(requires_write("fs:result"));
+        assert!(requires_write("mcp:result"));
+        assert!(requires_write("mcp:exec_result"));
         assert!(requires_write("session:join")); // unknown type → fail-closed → requires write
         assert!(!requires_write("fs:list"));
         assert!(!requires_write("fs:read"));
         assert!(!requires_write("session:users"));
-        assert!(!requires_write("mcp:result"));
         // R5 授权细化：只读桌面操作允许（ro 观看可 reqkey 恢复/TestDelay 测量/
         // 剪贴板读取）；控制类仍要求写。
         assert!(!requires_write("desktop:reqkey"));

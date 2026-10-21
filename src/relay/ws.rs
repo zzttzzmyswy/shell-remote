@@ -60,6 +60,38 @@ pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) {
     }
 }
 
+/// 带超时的下载事件投递（5s）。返回 false = 超时或通道关闭，调用方应放弃
+/// 该下载并通知 agent 停发。超时而非无限 await 是这里的关键：一个不消费
+/// 的浏览器不能把 agent 的整条上行路由拖住。
+async fn send_download_event(
+    tx: &mpsc::Sender<crate::relay::file_transfer::DownloadEvent>,
+    ev: crate::relay::file_transfer::DownloadEvent,
+) -> bool {
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), tx.send(ev)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// 通知 agent 停止某个下载（复用 file_transfer 既有的 `fs:read_cancel` 路径，
+/// 走 per-session bulk 子通道，不挤占交互消息）。
+async fn cancel_download(state: &Arc<SharedState>, session_id: &str, cid: &str) {
+    let bulk = state
+        .agent_broadcast
+        .read()
+        .await
+        .get(session_id)
+        .and_then(|cm| cm.agent_bulk.clone());
+    if let Some(bulk) = bulk {
+        let proto = json!({
+            "type": "fs:read_cancel",
+            "session_id": session_id,
+            "payload": { "_mcp_request_id": cid }
+        });
+        crate::relay::file_transfer::deliver_bulk(&bulk, proto.to_string()).await;
+    }
+}
+
 /// 阶段2 LAN 直连：解析注册消息的 `lan_addr` 字段（agent 本地桌面流 HTTP
 /// 端点地址 "ip:port"）。缺省/空串/非字符串 → None（老版本 agent 或未开启
 /// `--desktop-lan-port`，兼容）。
@@ -80,6 +112,23 @@ fn kpi_anomalous(active: bool, fps: u32) -> bool {
 // ── Shared agent message routing ─────────────────────────────────────
 
 pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, text_str: &str) {
+    // 未注册的 sid 直接丢弃：下面各分支都会 `entry(sid).or_default()` 写
+    // `kpi_history` / `desktop_proto` / `desktop_streams` 等按 sid 索引的表，
+    // 让任意 sid 通过就会凭空造出永不清除的条目（内存单调增长）。
+    // 空 sid 同样拒绝（旧代码会把它当合法 key 写进表里）。
+    if session_id.is_empty()
+        || !state
+            .agent_broadcast
+            .read()
+            .await
+            .contains_key(session_id)
+    {
+        tracing::warn!(
+            session = %session_id,
+            "route_agent_message: unregistered session — dropped"
+        );
+        return;
+    }
     // Agent 心跳（15s）格式特殊：`{"type":"ping","session_id":...,"kpi":{...}}`
     // **没有 payload 字段**，严格的 [`ProtoMessage`] 反序列化会因
     // `missing field 'payload'` 失败（真实心跳现即如此）。因此在严格解析
@@ -459,88 +508,125 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 .get("_mcp_request_id")
                 .and_then(|v| v.as_str())
             {
-                let sink_opt = state.download_streams.write().await.remove(cid);
-                if let Some(mut sink) = sink_opt {
+                // 关键：**不在锁内 await，也不把 sink 移出 map 后再 await**。
+                // 旧实现先 `remove` 再 `send().await`，又把 sink 放回去；一旦
+                // 浏览器侧不消费（下载卡住），这个 await 会把该 agent 的整条
+                // 上行路由一起阻塞（终端输出和其它会话的帧全停）。
+                // 现在持锁 clone 出 sender 并就地更新计数/活跃时间，释放锁后
+                // 带 5s 超时投递；超时或通道关闭 → 移除该下载并通知 agent 停发。
+                let tx = {
+                    let mut streams = state.download_streams.write().await;
                     let success = proto_msg
                         .payload
                         .get("success")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    if !success {
-                        let kind = proto_msg
-                            .payload
-                            .get("kind")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("other")
-                            .to_string();
-                        let err = proto_msg
-                            .payload
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("download error")
-                            .to_string();
-                        let _ = sink
-                            .tx
-                            .send(crate::relay::file_transfer::DownloadEvent::Error {
-                                kind,
-                                msg: err,
-                            })
-                            .await;
-                    } else if let Some(content) =
-                        proto_msg.payload.get("content").and_then(|v| v.as_str())
-                    {
-                        if let Some(bytes) = crate::agent::fs::decode_b64(content) {
-                            sink.bytes += bytes.len() as u64;
-                            let file_size =
-                                proto_msg.payload.get("file_size").and_then(|v| v.as_u64());
-                            let _ = sink
-                                .tx
-                                .send(crate::relay::file_transfer::DownloadEvent::Chunk {
-                                    data: bytes,
-                                    file_size,
-                                })
-                                .await;
-                            // Detect last chunk: is_last field (Task 6) or chunk_index+1 >= total_chunks.
-                            let chunk_index = proto_msg
-                                .payload
-                                .get("chunk_index")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            let total_chunks = proto_msg
-                                .payload
-                                .get("total_chunks")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(1);
-                            let is_last = proto_msg
-                                .payload
-                                .get("is_last")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                                || chunk_index + 1 >= total_chunks;
-                            if is_last {
-                                let _ = sink
-                                    .tx
-                                    .send(crate::relay::file_transfer::DownloadEvent::End)
-                                    .await;
-                                // sink dropped → removed from download_streams
-                            } else {
-                                sink.last_activity = std::time::Instant::now();
-                                state
-                                    .download_streams
-                                    .write()
-                                    .await
-                                    .insert(cid.to_string(), sink);
+                    match streams.get_mut(cid) {
+                        Some(sink) => {
+                            if success {
+                                if let Some(n) = proto_msg
+                                    .payload
+                                    .get("content")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(crate::agent::fs::decode_b64)
+                                    .map(|b| b.len() as u64)
+                                {
+                                    sink.bytes += n;
+                                }
                             }
-                        } else {
-                            let _ = sink
-                                .tx
-                                .send(crate::relay::file_transfer::DownloadEvent::Error {
-                                    kind: "other".to_string(),
-                                    msg: "base64 decode failed".to_string(),
-                                })
-                                .await;
-                            // sink dropped → removed from download_streams (error terminates)
+                            sink.last_activity = std::time::Instant::now();
+                            Some(sink.tx.clone())
                         }
+                        None => None,
+                    }
+                };
+                if let Some(tx) = tx {
+                    let success = proto_msg
+                        .payload
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    // 组装本次要投递的事件序列（空 = 无需投递）。
+                    let mut events: Vec<crate::relay::file_transfer::DownloadEvent> = Vec::new();
+                    let mut terminal = false;
+                    if !success {
+                        events.push(crate::relay::file_transfer::DownloadEvent::Error {
+                            kind: proto_msg
+                                .payload
+                                .get("kind")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("other")
+                                .to_string(),
+                            msg: proto_msg
+                                .payload
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("download error")
+                                .to_string(),
+                        });
+                        terminal = true;
+                    } else if let Some(bytes) = proto_msg
+                        .payload
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::agent::fs::decode_b64)
+                    {
+                        let file_size = proto_msg
+                            .payload
+                            .get("file_size")
+                            .and_then(|v| v.as_u64());
+                        // 末块判定：is_last 字段，或 chunk_index+1 >= total_chunks。
+                        let chunk_index = proto_msg
+                            .payload
+                            .get("chunk_index")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let total_chunks = proto_msg
+                            .payload
+                            .get("total_chunks")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1);
+                        let last = proto_msg
+                            .payload
+                            .get("is_last")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                            || chunk_index + 1 >= total_chunks;
+                        events.push(crate::relay::file_transfer::DownloadEvent::Chunk {
+                            data: bytes,
+                            file_size,
+                        });
+                        if last {
+                            events.push(crate::relay::file_transfer::DownloadEvent::End);
+                            terminal = true;
+                        }
+                    } else {
+                        events.push(crate::relay::file_transfer::DownloadEvent::Error {
+                            kind: "other".to_string(),
+                            msg: "base64 decode failed".to_string(),
+                        });
+                        terminal = true;
+                    }
+
+                    let mut stalled = false;
+                    for ev in events {
+                        if !send_download_event(&tx, ev).await {
+                            stalled = true;
+                            break;
+                        }
+                    }
+                    // 终态或投递失败 → 从 map 移除；失败时通知 agent 停发，
+                    // 否则它会继续把整个文件读完、再逐块超时 5s 地卡下去。
+                    if stalled || terminal {
+                        state.download_streams.write().await.remove(cid);
+                    }
+                    if stalled {
+                        tracing::warn!(
+                            session = %session_id,
+                            cid = %cid,
+                            "download sink stalled >5s — download aborted and agent asked to stop"
+                        );
+                        cancel_download(&state, session_id, cid).await;
                     }
                 }
             }
@@ -615,25 +701,39 @@ pub async fn agent_ws_send_handler(
         Some(s) if !s.is_empty() => s.clone(),
         _ => return (StatusCode::BAD_REQUEST, "missing ?session=").into_response(),
     };
-    // Registered session OR server password. A not-yet-registered session id
-    // is rejected so an unauthenticated client cannot inject messages.
-    let registered = state.agent_broadcast.read().await.contains_key(&session_id);
-    if !registered {
-        let auth = params
-            .get("auth")
-            .map(|s| s.as_str())
-            .or_else(|| {
-                headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "))
-            })
-            .unwrap_or("");
-        let server_auth = state.server_auth.read().await.clone();
-        if !server_auth.is_empty()
-            && !crate::relay::auth::constant_time_eq(auth, &server_auth)
-        {
-            return (StatusCode::UNAUTHORIZED, "Invalid server password").into_response();
+    // agent 身份校验（P0）：与 `/agent/events` 同语义。`Verified` 直接放行
+    // （已证明是该会话主人，无需再验服务器口令）；`Denied` 一律 401。
+    match crate::relay::auth::agent_auth(&state, &session_id, &headers).await {
+        crate::relay::auth::AgentAuth::Verified => {}
+        crate::relay::auth::AgentAuth::Denied => {
+            tracing::warn!(
+                session = %session_id,
+                "agent WS uplink denied — missing or mismatched X-SR-Agent-Token"
+            );
+            return (StatusCode::UNAUTHORIZED, "Invalid agent token").into_response();
+        }
+        crate::relay::auth::AgentAuth::Legacy => {
+            // Registered session OR server password. A not-yet-registered session
+            // id is rejected so an unauthenticated client cannot inject messages.
+            let registered = state.agent_broadcast.read().await.contains_key(&session_id);
+            if !registered {
+                let auth = params
+                    .get("auth")
+                    .map(|s| s.as_str())
+                    .or_else(|| {
+                        headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.strip_prefix("Bearer "))
+                    })
+                    .unwrap_or("");
+                let server_auth = state.server_auth.read().await.clone();
+                if !server_auth.is_empty()
+                    && !crate::relay::auth::constant_time_eq(auth, &server_auth)
+                {
+                    return (StatusCode::UNAUTHORIZED, "Invalid server password").into_response();
+                }
+            }
         }
     }
     ws.on_upgrade(move |socket| handle_agent_ws_uplink(state, session_id, socket))
@@ -669,14 +769,30 @@ async fn handle_agent_ws_uplink(
                             .insert(session_id.clone(), Instant::now());
                         // Single object (normal case); tolerate an array for
                         // symmetry with the batch HTTP transport.
+                        //
+                        // 消息**必须**属于本连接自己的 sid（P1 越权修复）：
+                        // 此前按消息体里的 `session_id` 路由，任何已注册的
+                        // agent 都能替他会话伪造终端输出/桌面流（并顺带把
+                        // 录像文件写到别的目录）。与连接 sid 不符的直接丢弃。
                         if text.trim_start().starts_with('[') {
                             if let Ok(items) =
                                 serde_json::from_str::<Vec<Value>>(&text)
                             {
                                 for m in items {
-                                    let sid = m["session_id"].as_str().unwrap_or("").to_string();
+                                    let sid = m["session_id"]
+                                        .as_str()
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or(&session_id);
+                                    if sid != session_id {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            claimed = %sid,
+                                            "agent WS uplink: message session_id mismatch — dropped"
+                                        );
+                                        continue;
+                                    }
                                     let t = serde_json::to_string(&m).unwrap_or_default();
-                                    route_agent_message(&state, &sid, &t).await;
+                                    route_agent_message(&state, &session_id, &t).await;
                                 }
                             }
                         } else {
@@ -686,7 +802,15 @@ async fn handle_agent_ws_uplink(
                                     v["session_id"].as_str().map(|s| s.to_string())
                                 })
                                 .unwrap_or_else(|| session_id.clone());
-                            route_agent_message(&state, &sid, &text).await;
+                            if sid != session_id {
+                                tracing::warn!(
+                                    session = %session_id,
+                                    claimed = %sid,
+                                    "agent WS uplink: message session_id mismatch — dropped"
+                                );
+                                continue;
+                            }
+                            route_agent_message(&state, &session_id, &text).await;
                         }
                     }
                     Some(Ok(Message::Ping(p))) => {
@@ -811,6 +935,30 @@ pub async fn agent_send_handler(
         if messages.is_empty() {
             return axum::http::StatusCode::OK.into_response();
         }
+        // agent 身份校验（P0）：批量通道与单条通道同语义。
+        // 带 token → 必须有效，且每条的 `session_id` 都必须属于该 token。
+        // 无 token → 严格模式 401；否则视为旧版 agent，逐条回退到
+        // 「已注册会话 / 服务器口令」校验。
+        let token_owner = match crate::relay::auth::agent_token(&headers) {
+            Some(t) => match state.sessions.authenticate(t).await {
+                Some((sid, _)) => Some(sid),
+                None => {
+                    tracing::warn!("agent /agent/send batch denied — invalid X-SR-Agent-Token");
+                    return (axum::http::StatusCode::UNAUTHORIZED, "Invalid agent token")
+                        .into_response();
+                }
+            },
+            None => {
+                if state
+                    .strict_agent_auth
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return (axum::http::StatusCode::UNAUTHORIZED, "Agent token required")
+                        .into_response();
+                }
+                None
+            }
+        };
         // 认证与单条路径共用：每个 batch 元素都带 session_id，任意一个不
         // 属于已知会话则拒绝整个 batch（防未认证注入）。
         for m in messages {
@@ -837,6 +985,17 @@ pub async fn agent_send_handler(
         }
         for m in messages {
             let sid = m["session_id"].as_str().unwrap_or("").to_string();
+            // 令牌主人只能为**自己**的会话发消息。
+            if let Some(ref owner) = token_owner {
+                if &sid != owner {
+                    tracing::warn!(
+                        claimed = %sid,
+                        owner = %owner,
+                        "agent /agent/send batch: session_id does not belong to this token — dropped"
+                    );
+                    continue;
+                }
+            }
             let text = serde_json::to_string(m).unwrap_or_default();
             state.last_activity.write().await.insert(sid.clone(), Instant::now());
             route_agent_message(&state, &sid, &text).await;
@@ -849,11 +1008,7 @@ pub async fn agent_send_handler(
     // agent:register is allowed without server auth (agents use keys for identity)
     if msg_type == "agent:register" {
         // Rate limit registrations per client IP to prevent session-flooding DoS.
-        let client_ip = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
+        let client_ip = crate::relay::auth::client_ip(&headers);
         {
             let mut rl = state.rate_limiter.write().await;
             let limit = state
@@ -909,6 +1064,35 @@ pub async fn agent_send_handler(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
+        // 注册抢占防护（P0）：同 id 的会话**当前有在线 agent** 时，请求必须
+        // 证明归属（fixed key 相同，或缓存 token 仍属于该会话），否则返回
+        // 409。离线会话仍可直接接管（agent 崩溃后重启的正常路径）。
+        // 判据必须用「在线」而非「存在」：会话条目在 agent 断线后仍保留
+        // （供浏览器重连），把它当成在线会把正常重启也拒掉。
+        if let Some(ref sid) = desired_session_id {
+            let online = crate::relay::auth::agent_online(&state, sid).await;
+            if online
+                && !state
+                    .sessions
+                    .can_reclaim(
+                        sid,
+                        body["key"].as_str(),
+                        cached_tokens.as_deref(),
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    session = %sid,
+                    "agent:register rejected — session has a live agent and the request proved no ownership"
+                );
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(json!({"error": "SESSION_ID_IN_USE"})),
+                )
+                    .into_response();
+            }
+        }
+
         let register_result = if let Some(ct) = cached_tokens {
             state
                 .sessions
@@ -924,6 +1108,7 @@ pub async fn agent_send_handler(
                 .register(fixed_key.clone(), token_type.as_str(), desired_session_id)
                 .await
         };
+
         let (session_id, tokens, evicted) = match register_result {
             Ok(r) => (r.session_id, r.tokens, r.evicted),
             Err(crate::relay::session::RegisterError::InvalidId) => {
@@ -1000,6 +1185,15 @@ pub async fn agent_send_handler(
                 .or_insert_with(ChannelMap::new);
         }
 
+        // 注册即视为活跃：否则会话在收到第一条终端输出前没有 last_activity
+        // 条目，空闲回收器永远看不到它（曾经注册后静默的会话永不回收，
+        // 可耗尽 MAX_SESSIONS）。
+        state
+            .last_activity
+            .write()
+            .await
+            .insert(session_id.clone(), Instant::now());
+
         // Store the agent's best-effort host probe (CPU model, arch, OS, …).
         // Older agents omit `device` entirely → stays None; a malformed object
         // is ignored rather than failing the registration.
@@ -1035,15 +1229,56 @@ pub async fn agent_send_handler(
     }
 
     // All other message types require server auth, unless they carry a valid session_id
+    let session_id = body["session_id"].as_str().unwrap_or("").to_string();
+    if session_id.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, "Missing session_id").into_response();
+    }
+
+    // agent 身份校验（P0），在服务器口令之前：
+    // - 带了 token 且有效但属于**别的会话** → 丢弃并 warn（消息不可信，
+    //   但请求本身认证通过，不回 401）；
+    // - 带了 token 但无效 → 401；
+    // - 无 token 时严格模式 401，否则按旧版 agent 处理（沿用下方「服务器
+    //   口令 / 已注册会话」校验）。
+    if let Some(tok) = crate::relay::auth::agent_token(&headers) {
+        match state.sessions.authenticate(tok).await {
+            Some((owner, _)) => {
+                if owner != session_id {
+                    tracing::warn!(
+                        claimed = %session_id,
+                        owner = %owner,
+                        "agent /agent/send: token belongs to another session — dropped"
+                    );
+                    return axum::http::StatusCode::OK.into_response();
+                }
+            }
+            None => {
+                tracing::warn!(
+                    session = %session_id,
+                    "agent /agent/send denied — invalid X-SR-Agent-Token"
+                );
+                return (axum::http::StatusCode::UNAUTHORIZED, "Invalid agent token")
+                    .into_response();
+            }
+        }
+    } else if state
+        .strict_agent_auth
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            session = %session_id,
+            "agent /agent/send denied — --strict-agent-auth requires X-SR-Agent-Token"
+        );
+        return (axum::http::StatusCode::UNAUTHORIZED, "Agent token required").into_response();
+    }
+
     let server_auth = state.server_auth.read().await.clone();
     if !server_auth.is_empty() {
-        let session_for_auth = body["session_id"].as_str().unwrap_or("");
-        let has_valid_session = if !session_for_auth.is_empty() {
-            let broadcasts = state.agent_broadcast.read().await;
-            broadcasts.contains_key(session_for_auth)
-        } else {
-            false
-        };
+        let has_valid_session = state
+            .agent_broadcast
+            .read()
+            .await
+            .contains_key(&session_id);
         if !has_valid_session {
             let auth_header = headers
                 .get("authorization")
@@ -1063,9 +1298,19 @@ pub async fn agent_send_handler(
         }
     }
 
-    let session_id = body["session_id"].as_str().unwrap_or("").to_string();
-    if session_id.is_empty() {
-        return (axum::http::StatusCode::BAD_REQUEST, "Missing session_id").into_response();
+    // 消息的 session_id 必须是已注册会话（未知 sid 丢弃：不得为不存在的
+    // 会话新建任何 per-session 状态条目）。
+    if !state
+        .agent_broadcast
+        .read()
+        .await
+        .contains_key(&session_id)
+    {
+        tracing::warn!(
+            session = %session_id,
+            "agent /agent/send: unregistered session_id — dropped"
+        );
+        return axum::http::StatusCode::OK.into_response();
     }
 
     let text_str = serde_json::to_string(&body).unwrap_or_default();
@@ -1160,6 +1405,14 @@ impl Drop for AgentEventsCleanup {
                             existed = removed.is_some(),
                             "desktop stream removed on agent disconnect"
                         );
+                        // agent 已下线：桌面必然不在运行。把状态显式置 false，
+                        // 否则浏览器（重新）建立 SSE 时拿到的快照仍是
+                        // running=true，会去连一个已被移除的桌面流。
+                        state
+                            .desktop_states
+                            .write()
+                            .await
+                            .insert(session_id.clone(), false);
                         state.agent_upgrades.write().await.remove(&session_id);
                         // No newer connection replaced this one → the agent is
                         // genuinely gone. Tell every connected browser so it can
@@ -1290,11 +1543,7 @@ async fn agent_conn_rate_ok(
     headers: &axum::http::HeaderMap,
     session: &str,
 ) -> bool {
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+    let client_ip = crate::relay::auth::client_ip(headers);
     let window = std::time::Duration::from_secs(60);
     let mut rl = state.rate_limiter.write().await;
     // `session` is caller-supplied and checked before auth: a coarse per-IP
@@ -1337,6 +1586,37 @@ pub async fn agent_events_handler(
         }
     }
 
+    // agent 身份校验（P0）。旧版 agent 不带 `X-SR-Agent-Token`：仅在非严格
+    // 模式下放行，并且**不得顶替在线 agent**（否则知道 sid 就能劫持浏览器
+    // 输入、上传块和 mcp:exec）。带正确 token 视为同一 agent 重连，直接覆盖。
+    match crate::relay::auth::agent_auth(&state, &session_id, &headers).await {
+        crate::relay::auth::AgentAuth::Verified => {}
+        crate::relay::auth::AgentAuth::Denied => {
+            tracing::warn!(
+                session = %session_id,
+                "agent /agent/events denied — missing or mismatched X-SR-Agent-Token"
+            );
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"error": "AGENT_AUTH_REQUIRED"})),
+            )
+                .into_response();
+        }
+        crate::relay::auth::AgentAuth::Legacy => {
+            if crate::relay::auth::agent_online(&state, &session_id).await {
+                tracing::warn!(
+                    session = %session_id,
+                    "legacy agent /agent/events rejected — a live agent already owns this session"
+                );
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    axum::Json(json!({"error": "AGENT_ALREADY_CONNECTED"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let last_event_id: Option<u64> = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -1357,15 +1637,9 @@ pub async fn agent_events_handler(
     let sid_clone = session_id.clone();
 
     let stream = async_stream::stream! {
-        // R5#12：SSE 首次连接/断线重建时，立即补发当前桌面运行状态快照。
-        // 首连无 last_event_id、或事件缓冲已过期时，浏览器仍能据此恢复视图
-        // （running=true → 进入桌面观看；false → 退回终端），不再依赖历史
-        // 事件恰好还在缓冲里。快照未入 EventBuffer，每次握手现读现发。
-        if let Some(snapshot) = desktop_state_snapshot(&state_clone, &sid_clone).await {
-            yield Ok::<_, Infallible>(
-                axum::response::sse::Event::default().data(snapshot)
-            );
-        }
+        // 注意：`desktop:state` 快照只发给**浏览器**（见 browser_sse_handler）。
+        // 这里是 agent 的下行通道，agent 自己就是桌面状态的来源，把它发回给
+        // agent 既是无用流量，也会让 agent 把自己发出的状态当成远端指令。
         if let Some(last_id) = last_event_id {
             let buffers = state_clone.agent_event_buffers.read().await;
             if let Some(buf) = buffers.get(&sid_clone) {
@@ -1414,6 +1688,84 @@ pub async fn agent_events_handler(
 }
 
 // ── Browser SSE handler ────────────────────────────────────────────
+
+/// 凭证变更（吊销 / 重新生成 / 降权）后断开受影响的浏览器事件流（A7）。
+///
+/// 只按 token 精确匹配：`browser_tokens` 记录了每条浏览器 SSE 建立时用的
+/// token，命中即把它的 sender 从 `sse_sessions` 移除——sender 一消失，
+/// 该响应的 `ReceiverStream` 立即结束，浏览器侧会按既有逻辑重连（重连时
+/// 拿新 token / 新权限）。不命中其它浏览器不受影响。
+///
+/// `tokens = None` 表示断开该会话的**全部**浏览器流（token 已被整体轮换，
+/// 没有哪条流还持有有效凭证）。返回断开的流数量。
+pub async fn disconnect_browser_streams(
+    state: &Arc<SharedState>,
+    sid: &str,
+    tokens: Option<&[String]>,
+) -> usize {
+    let sse_sids: Vec<String> = {
+        let mut broadcast = state.agent_broadcast.write().await;
+        let Some(cm) = broadcast.get_mut(sid) else {
+            return 0;
+        };
+        let matched: Vec<(String, String)> = cm
+            .browser_tokens
+            .iter()
+            .filter(|(_, (_, tok))| match tokens {
+                Some(list) => list.iter().any(|t| t == tok),
+                None => true,
+            })
+            .map(|(uid, (sse_sid, _))| (uid.clone(), sse_sid.clone()))
+            .collect();
+        for (uid, _) in &matched {
+            cm.browser_sessions.remove(uid);
+            cm.browser_tokens.remove(uid);
+        }
+        matched.into_iter().map(|(_, sse_sid)| sse_sid).collect()
+    };
+    if sse_sids.is_empty() {
+        return 0;
+    }
+    let mut sse = state.sse_sessions.write().await;
+    let mut closed = 0;
+    for s in &sse_sids {
+        if sse.remove(s).is_some() {
+            closed += 1;
+        }
+    }
+    if closed > 0 {
+        tracing::info!(
+            session = %sid,
+            closed,
+            "browser SSE streams closed after credential change"
+        );
+    }
+    closed
+}
+
+/// 凭证变更后结束该会话的桌面下行流（A7 的桌面部分）。
+///
+/// `DesktopStream` 里没有 token 信息（`desktop.rs` 属并行卡 B，本卡不改），
+/// 无法按 token 精确断开某个 viewer，所以这里对整条流下手：
+/// 移除 `desktop_streams[sid]` 并把 `desktop_states[sid]` 置 false。
+/// 移除后 basestream 的 Arc 不再收到 agent 帧（下一帧会在 map 里新建一条新
+/// 流），已有 viewer 的 `rx` 在 `/agent/desktop/stream` 侧 12s 空闲超时后
+/// 自然结束、`/agent/desktop/ws` 侧同样因 `rx.recv()` 返回 None 而关闭，
+/// 浏览器随既有的重连逻辑用新凭证重新拉流。代价是最长 12s 的收敛延迟。
+pub async fn end_desktop_streams(state: &Arc<SharedState>, sid: &str) {
+    let removed = state.desktop_streams.write().await.remove(sid);
+    state
+        .desktop_states
+        .write()
+        .await
+        .insert(sid.to_string(), false);
+    if removed.is_some() {
+        tracing::info!(
+            session = %sid,
+            "desktop stream ended after credential change"
+        );
+    }
+}
 
 pub async fn browser_sse_handler(
     State(state): State<Arc<SharedState>>,
@@ -1500,6 +1852,8 @@ pub async fn browser_sse_handler(
         let mut broadcast = state.agent_broadcast.write().await;
         if let Some(cm) = broadcast.get_mut(&session_id) {
             cm.browser_sessions.insert(user_id.clone(), sse_sid.clone());
+            cm.browser_tokens
+                .insert(user_id.clone(), (sse_sid.clone(), token.clone()));
         }
     }
 
@@ -1579,6 +1933,9 @@ pub async fn browser_sse_handler(
     let _sse_sid_clone = sse_sid.clone();
     let perm_clone = perm_str.to_string();
     let token_prefix_clone = token_prefix(&token).to_string();
+    let token_clone = token.clone();
+    let state_snapshot_clone = state.clone();
+    let sid_snapshot = session_id.clone();
 
     // connected event data
     let connected_data = json!({
@@ -1605,6 +1962,7 @@ pub async fn browser_sse_handler(
                     let mut broadcast = s.agent_broadcast.write().await;
                     if let Some(cm) = broadcast.get_mut(&sid) {
                         cm.browser_sessions.remove(&uid);
+                        cm.browser_tokens.remove(&uid);
                         cm.browser_sessions.len()
                     } else {
                         0
@@ -1651,6 +2009,15 @@ pub async fn browser_sse_handler(
         yield Ok::<_, Infallible>(axum::response::sse::Event::default()
             .event("connected")
             .data(serde_json::to_string(&connected_data).unwrap_or_default()));
+
+        // R5#12：浏览器 SSE 建立/重建后立即补发当前桌面运行状态快照（首连
+        // 无 last_event_id、或历史事件已被缓冲淘汰时，仍能恢复视图：
+        // running=true → 进入桌面观看；false → 退回终端）。快照不入
+        // EventBuffer，每次握手现读现发。**只发给浏览器**——发给 agent
+        // 属于错对象（A10）。
+        if let Some(snapshot) = desktop_state_snapshot(&state_snapshot_clone, &sid_snapshot).await {
+            yield Ok::<_, Infallible>(axum::response::sse::Event::default().data(snapshot));
+        }
 
         let mut inner_stream = stream;
         while let Some(msg) = tokio_stream::StreamExt::next(&mut inner_stream).await {
@@ -1817,6 +2184,8 @@ mod tests {
         let state = make_state("");
         let r = state.sessions.register(None, "rw", None).await.unwrap();
         let sid = r.session_id.clone();
+        // route_agent_message 只路由已注册会话（需 agent_broadcast 条目）。
+        insert_channel_map(&state, &sid).await;
 
         assert!(
             desktop_state_snapshot(&state, &sid).await.is_none(),
@@ -2056,6 +2425,8 @@ mod tests {
         let state = make_state("");
         let r = state.sessions.register(None, "rw", None).await.unwrap();
         let sid = r.session_id.clone();
+        // route_agent_message 只路由已注册会话（需 agent_broadcast 条目）。
+        insert_channel_map(&state, &sid).await;
         for _ in 0..2 {
             let frag = serde_json::json!({
                 "type": "desktop:video",
@@ -2079,6 +2450,8 @@ mod tests {
         let state = make_state("");
         let r = state.sessions.register(None, "rw", None).await.unwrap();
         let sid = r.session_id.clone();
+        // route_agent_message 只路由已注册会话（需 agent_broadcast 条目）。
+        insert_channel_map(&state, &sid).await;
         for seq in [1u64, 3u64] {
             let frag = serde_json::json!({
                 "type": "desktop:video",
@@ -2101,6 +2474,8 @@ mod tests {
         let state = make_state("");
         let r = state.sessions.register(None, "rw", None).await.unwrap();
         let sid = r.session_id.clone();
+        // route_agent_message 只路由已注册会话（需 agent_broadcast 条目）。
+        insert_channel_map(&state, &sid).await;
         let started = serde_json::json!({
             "type": "desktop:started",
             "session_id": sid,
@@ -2268,6 +2643,7 @@ mod tests {
     #[tokio::test]
     async fn test_route_agent_message_samples_ping_kpi() {
         let state = make_state("");
+        insert_channel_map(&state, "sid1").await;
         let msg = json!({
             "type": "ping",
             "session_id": "sid1",
@@ -2317,6 +2693,7 @@ mod tests {
     #[tokio::test]
     async fn test_kpi_history_caps_and_drops_oldest() {
         let state = make_state("");
+        insert_channel_map(&state, "s").await;
         let cap = crate::relay::KPI_HISTORY_CAP;
         for _ in 0..(cap + 5) {
             let msg =
@@ -2425,6 +2802,7 @@ mod tests {
     async fn test_route_agent_message_download_chunk_pushes_to_sink() {
         use crate::relay::file_transfer::{DownloadEvent, DownloadSink};
         let state = make_state("");
+        insert_channel_map(&state, "sid1").await;
         let (tx, mut rx) = mpsc::channel(16);
         state.download_streams.write().await.insert(
             "dl-1".to_string(),
@@ -2457,6 +2835,7 @@ mod tests {
     async fn test_route_agent_message_download_bad_b64_sends_error() {
         use crate::relay::file_transfer::{DownloadEvent, DownloadSink};
         let state = make_state("");
+        insert_channel_map(&state, "sid1").await;
         let (tx, mut rx) = mpsc::channel(16);
         state.download_streams.write().await.insert(
             "dl-bad".to_string(),
@@ -2887,6 +3266,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_browser_send_readonly_cannot_mkdir() {
+        // A6：`fs:mkdir` 已移出只读白名单——只读 token 不得创建目录。
+        let state = make_state("");
+        let r = state.sessions.register(None, "ro", Some("rofs01".to_string())).await.unwrap();
+        let sid = r.session_id.clone();
+        let token = r.tokens[0].0.clone();
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert(sid, ChannelMap::new());
+        let body = json!({"token": token, "type": "fs:mkdir", "payload": {"path": "/tmp/x"}});
+        let resp = browser_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 403, "read-only token must not create directories");
+    }
+
+    #[tokio::test]
+    async fn test_browser_send_readonly_cannot_forge_agent_types() {
+        // A6：`terminal:output` / `fs:result` / `mcp:result` / `mcp:exec_result`
+        // 是 agent→relay 的回包，浏览器从不发送，已移出只读白名单。
+        let state = make_state("");
+        let r = state.sessions.register(None, "ro", Some("rofg01".to_string())).await.unwrap();
+        let sid = r.session_id.clone();
+        let token = r.tokens[0].0.clone();
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert(sid, ChannelMap::new());
+        for ty in ["terminal:output", "fs:result", "mcp:result", "mcp:exec_result"] {
+            let body = json!({"token": token, "type": ty, "payload": {"data": "eA=="}});
+            let resp = browser_send_handler(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(body),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), 403, "ro token must not send {ty}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_agent_send_register_with_custom_id() {
         let state = make_state("");
         let body = json!({"type":"agent:register","token_type":"rw","session_id":"mydev01"});
@@ -3253,5 +3677,643 @@ mod tests {
             "cleanup from a stale stream must not clear the newer channel"
         );
         assert!(cm.agent_bulk.is_some());
+    }
+
+    // ── agent 身份校验（A2 / A3 / A4 / A8 / A9 / A10）───────────────
+
+    /// 起一个带 token 已注册、且「在线」（有未关闭的 agent 通道）的会话。
+    async fn online_session(
+        state: &Arc<SharedState>,
+        sid: &str,
+    ) -> (mpsc::Receiver<String>, String) {
+        let r = state
+            .sessions
+            .register(None, "rw", Some(sid.to_string()))
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let mut cm = ChannelMap::new();
+        cm.agent = Some(tx);
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert(sid.to_string(), cm);
+        (rx, r.tokens[0].0.clone())
+    }
+
+    fn token_header(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            crate::relay::auth::AGENT_TOKEN_HEADER,
+            token.parse().unwrap(),
+        );
+        h
+    }
+
+    fn events_params(sid: &str) -> Query<HashMap<String, String>> {
+        let mut p = HashMap::new();
+        p.insert("session".to_string(), sid.to_string());
+        Query(p)
+    }
+
+    #[tokio::test]
+    async fn test_agent_events_legacy_conflicts_with_online_agent() {
+        // 不带 token 且该会话已有在线 agent → 409（不能顶替在线 agent）。
+        let state = make_state("");
+        let (_rx, _token) = online_session(&state, "live01").await;
+        let resp = agent_events_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            events_params("live01"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 409, "legacy must not hijack a live agent");
+    }
+
+    #[tokio::test]
+    async fn test_agent_events_wrong_token_returns_401() {
+        let state = make_state("");
+        let (_rx, _token) = online_session(&state, "live02").await;
+        let resp = agent_events_handler(
+            State(state),
+            token_header("not-a-real-token"),
+            events_params("live02"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 401, "wrong token must be denied, not treated as legacy");
+    }
+
+    #[tokio::test]
+    async fn test_agent_events_correct_token_returns_200() {
+        let state = make_state("");
+        let (_rx, token) = online_session(&state, "live03").await;
+        let resp = agent_events_handler(
+            State(state),
+            token_header(&token),
+            events_params("live03"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 200, "the session's own token may reconnect");
+    }
+
+    #[tokio::test]
+    async fn test_agent_events_legacy_allowed_when_agent_offline() {
+        // 旧版 agent 在会话无在线 agent 时仍可连接（兼容路径）。
+        let state = make_state("");
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert("off01".to_string(), ChannelMap::new());
+        let resp = agent_events_handler(
+            State(state),
+            axum::http::HeaderMap::new(),
+            events_params("off01"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_strict_agent_auth_rejects_events_and_send() {
+        // --strict-agent-auth：不带头的 /agent/events 与 /agent/send 都 401。
+        let state = make_state("");
+        state.set_strict_agent_auth(true);
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert("strict01".to_string(), ChannelMap::new());
+
+        let resp = agent_events_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            events_params("strict01"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 401, "strict mode must reject tokenless /agent/events");
+
+        let body = json!({"type":"terminal:output","session_id":"strict01","payload":{"data":"eA=="}});
+        let resp = agent_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 401, "strict mode must reject tokenless /agent/send");
+    }
+
+    #[tokio::test]
+    async fn test_register_conflicts_when_id_held_by_live_agent() {
+        // 同 id + 有在线 agent + 无归属凭据 → 409 SESSION_ID_IN_USE。
+        let state = make_state("");
+        let (_rx, _token) = online_session(&state, "taken01").await;
+        let body = json!({"type":"agent:register","token_type":"rw","session_id":"taken01"});
+        let resp = agent_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 409);
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["error"], "SESSION_ID_IN_USE");
+    }
+
+    #[tokio::test]
+    async fn test_register_same_fixed_key_reclaims_live_session() {
+        // fixed key 相同即证明归属 → 允许接管（agent 重启的正常路径）。
+        let state = make_state("");
+        let r = state
+            .sessions
+            .register(Some("key-A".to_string()), "rw", Some("keyed01".to_string()))
+            .await
+            .unwrap();
+        let (_tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let mut cm = ChannelMap::new();
+        cm.agent = Some(_tx);
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert("keyed01".to_string(), cm);
+        let _ = rx;
+        assert!(crate::relay::auth::agent_online(&state, "keyed01").await);
+
+        let body = json!({
+            "type":"agent:register","token_type":"rw",
+            "key":"key-A","session_id":"keyed01"
+        });
+        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200, "matching --key proves ownership");
+        let _ = r;
+    }
+
+    #[tokio::test]
+    async fn test_register_cached_token_reclaims_live_session() {
+        // 缓存 token 命中同样证明归属（自动重连），且 evicted=true。
+        let state = make_state("");
+        let (_rx, token) = online_session(&state, "cached01").await;
+        let body = json!({
+            "type":"agent:register",
+            "session_id":"cached01",
+            "tokens":[{"token": token, "permission": "rw"}]
+        });
+        let resp = agent_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200, "cached token proves ownership");
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["evicted"], true);
+    }
+
+    #[tokio::test]
+    async fn test_register_offline_session_can_be_taken_over() {
+        // agent 离线（无在线通道）时同 id 重注册保持旧行为：直接接管。
+        let state = make_state("");
+        state.sessions
+            .register(None, "rw", Some("idle01".to_string()))
+            .await
+            .unwrap();
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert("idle01".to_string(), ChannelMap::new());
+        let body = json!({"type":"agent:register","token_type":"rw","session_id":"idle01"});
+        let resp = agent_send_handler(State(state), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_register_writes_last_activity() {
+        // 注册即写 last_activity，否则静默会话永不被空闲回收。
+        let state = make_state("");
+        let body = json!({"type":"agent:register","token_type":"rw","session_id":"actv01"});
+        let _ = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert!(
+            state.last_activity.read().await.contains_key("actv01"),
+            "registration must seed last_activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_rejects_token_for_other_session() {
+        // 令牌主人只能给自己的会话发消息：用 A 的 token 发 session_id=B 的
+        // 消息必须被丢弃（不能投递到 B 的浏览器）。
+        let state = make_state("");
+        let (_rx_a, token_a) = online_session(&state, "sessAA").await;
+        let _rx_b = {
+            let r = state
+                .sessions
+                .register(None, "rw", Some("sessBB".to_string()))
+                .await
+                .unwrap();
+            let _ = r;
+            let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(tx);
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .insert("sessBB".to_string(), cm);
+            rx
+        };
+        let mut rx_b = _rx_b;
+        let body = json!({
+            "type":"terminal:output","session_id":"sessBB",
+            "payload":{"data":"Zm9yZ2Vk"}
+        });
+        let resp = agent_send_handler(State(state.clone()), token_header(&token_a), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200, "request accepted, message dropped");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "A's token must not inject output into B's session"
+        );
+        let _ = (state, token_a);
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_rejects_unknown_session_id() {
+        // 未注册 sid → 丢弃，且不得为该 sid 建任何 per-session 状态条目。
+        let state = make_state("");
+        let body = json!({"type":"terminal:output","session_id":"ghost01","payload":{"data":"eA=="}});
+        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            state.kpi_history.read().await.is_empty()
+                && state.desktop_proto.read().await.is_empty()
+                && state.desktop_streams.read().await.is_empty(),
+            "unregistered sid must not create state rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_agent_message_drops_unregistered_session() {
+        // route_agent_message 遇到未注册 sid 直接返回（旧行为会凭空建条目）。
+        let state = make_state("");
+        let msg = json!({
+            "type": "ping", "session_id": "nope01",
+            "kpi": {"running": true, "fps": 30}
+        })
+        .to_string();
+        route_agent_message(&state, "nope01", &msg).await;
+        assert!(state.kpi_history.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_download_sink_full_does_not_block_agent_uplink() {
+        // A8：浏览器不消费下载块时，agent 上行不得被卡住——其它消息仍须
+        // 正常路由（旧实现把所有上行堵在这个 await 上）。
+        let state = make_state("");
+        let r = state
+            .sessions
+            .register(None, "rw", Some("dlblk1".to_string()))
+            .await
+            .unwrap();
+        let sid = r.session_id;
+        // 容量 1 的 sink：先填满，之后每次 send 都会等 5s 超时。
+        use crate::relay::file_transfer::DownloadEvent;
+        let (sink_tx, _sink_rx) = mpsc::channel::<DownloadEvent>(1);
+        state.download_streams.write().await.insert(
+            "dl-full".to_string(),
+            crate::relay::file_transfer::DownloadSink {
+                tx: sink_tx,
+                last_activity: Instant::now(),
+                bytes: 0,
+            },
+        );
+        // 让 sink 先满
+        {
+            let mut ds = state.download_streams.write().await;
+            let sink = ds.get_mut("dl-full").unwrap();
+            let _ = sink.tx.try_send(DownloadEvent::Chunk {
+                data: vec![0u8; 8],
+                file_size: None,
+            });
+        }
+        let _agent_rx = {
+            let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .entry(sid.clone())
+                .or_insert_with(ChannelMap::new)
+                .agent = Some(tx);
+            rx
+        };
+        let mut browser_rx = add_browser(&state, &sid, "brow-dl").await;
+
+        // 一个会被卡住的下载块
+        let chunk = json!({
+            "type":"fs:result","session_id":sid,
+            "payload":{"success":true,"content":"aGk=","path":"/x",
+            "chunk_index":0,"total_chunks":2,"_mcp_request_id":"dl-full"}
+        })
+        .to_string();
+        let st = state.clone();
+        let sid_c = sid.clone();
+        let blocker = tokio::spawn(async move {
+            route_agent_message(&st, &sid_c, &chunk).await;
+        });
+        // 卡住的这段时间里，终端输出必须仍能送达浏览器。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let out = json!({"type":"terminal:output","session_id":sid,"payload":{"data":"b2s="}})
+            .to_string();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            route_agent_message(&state, &sid, &out),
+        )
+        .await
+        .expect("terminal output must not be blocked by a stuck download sink");
+        // fs:result 本身也在广播白名单里，浏览器会先收到它；继续排空直到
+        // 拿到 terminal:output。
+        let mut got = String::new();
+        for _ in 0..4 {
+            let m = tokio::time::timeout(std::time::Duration::from_secs(2), browser_rx.recv())
+                .await
+                .expect("browser must receive terminal output while the sink is stalled")
+                .unwrap();
+            if m.contains("terminal:output") {
+                got = m;
+                break;
+            }
+        }
+        assert!(got.contains("terminal:output"), "got: {got}");
+        // 5s 超时后卡住的调用也应结束
+        tokio::time::timeout(std::time::Duration::from_secs(8), blocker)
+            .await
+            .expect("stalled sink send must time out rather than block forever")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_desktop_state_snapshot_sent_to_browser_not_agent() {
+        // A10：desktop:state 快照只发给浏览器；agent 下行不再收到它。
+        let state = make_state("");
+        let r = state
+            .sessions
+            .register(None, "rw", Some("snap01".to_string()))
+            .await
+            .unwrap();
+        let sid = r.session_id.clone();
+        let token = r.tokens[0].0.clone();
+        let (agent_tx, mut agent_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        {
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(agent_tx);
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .insert(sid.clone(), cm);
+        }
+        // agent 报 desktop:started → desktop_states[sid] = true
+        let started = json!({"type":"desktop:started","session_id":sid,"payload":{}}).to_string();
+        route_agent_message(&state, &sid, &started).await;
+        // 清掉 agent 侧刚才可能收到的广播（started 属 broadcast_types）
+        while agent_rx.try_recv().is_ok() {}
+
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), token);
+        let resp = browser_sse_handler(State(state.clone()), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        // 浏览器流里应能读到 desktop:state
+        use tokio_stream::StreamExt as _;
+        let mut body = resp.into_body().into_data_stream();
+        let mut saw_state = false;
+        for _ in 0..10 {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    let text = String::from_utf8_lossy(&chunk);
+                    if text.contains("desktop:state") {
+                        saw_state = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_state, "browser SSE must carry the desktop:state snapshot");
+        drop(body);
+        // agent 侧不应收到 desktop:state
+        while let Ok(m) = agent_rx.try_recv() {
+            assert!(
+                !m.contains("desktop:state"),
+                "desktop:state must not be sent to the agent: {m}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_revoke_closes_browser_stream_using_that_token() {
+        // A7：吊销 token 后，用该 token 建立的浏览器 SSE 必须结束。
+        let state = make_state("");
+        let r = state
+            .sessions
+            .register(None, "both", Some("revk01".to_string()))
+            .await
+            .unwrap();
+        let sid = r.session_id.clone();
+        let rw = r.tokens[0].0.clone();
+        let ro = r.tokens[1].0.clone();
+        let (agent_tx, _agent_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        {
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(agent_tx);
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .insert(sid.clone(), cm);
+        }
+        // 两条浏览器流：rw 与 ro 各一条
+        let mut params_rw = HashMap::new();
+        params_rw.insert("token".to_string(), rw.clone());
+        let resp_rw = browser_sse_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Query(params_rw),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp_rw.status(), 200);
+        let mut params_ro = HashMap::new();
+        params_ro.insert("token".to_string(), ro.clone());
+        let resp_ro = browser_sse_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Query(params_ro),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp_ro.status(), 200);
+
+        let closed = disconnect_browser_streams(&state, &sid, Some(std::slice::from_ref(&rw))).await;
+        assert_eq!(closed, 1, "only the stream that used the revoked token closes");
+        let cm = state.agent_broadcast.read().await;
+        let cm = cm.get(&sid).unwrap();
+        assert_eq!(cm.browser_sessions.len(), 1, "the ro stream must survive");
+    }
+
+    #[tokio::test]
+    async fn test_regenerate_closes_all_browser_streams() {
+        let state = make_state("");
+        let r = state
+            .sessions
+            .register(None, "rw", Some("regen1".to_string()))
+            .await
+            .unwrap();
+        let sid = r.session_id.clone();
+        let token = r.tokens[0].0.clone();
+        let (agent_tx, _agent_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        {
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(agent_tx);
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .insert(sid.clone(), cm);
+        }
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), token);
+        let resp = browser_sse_handler(State(state.clone()), axum::http::HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        // 轮换后旧 token 全失效 → 全部断开
+        let closed = disconnect_browser_streams(&state, &sid, None).await;
+        assert_eq!(closed, 1);
+        assert!(state
+            .agent_broadcast
+            .read()
+            .await
+            .get(&sid)
+            .unwrap()
+            .browser_sessions
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_remove_session_state_clears_all_maps() {
+        // A9：回收/kick 后各 per-session map 中不再有该 sid。
+        let state = make_state("");
+        let sid = "clean01";
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert(sid.to_string(), ChannelMap::new());
+        state.last_activity.write().await.insert(sid.to_string(), Instant::now());
+        state.kpi_history.write().await.insert(sid.to_string(), Default::default());
+        state.desktop_proto.write().await.insert(sid.to_string(), (1, 2, 3, 4));
+        state.desktop_states.write().await.insert(sid.to_string(), true);
+        state
+            .last_congest_notify
+            .write()
+            .await
+            .insert(sid.to_string(), Instant::now());
+        state.last_kpi_alert.write().await.insert(sid.to_string(), Instant::now());
+        state
+            .agent_upgrades
+            .write()
+            .await
+            .insert(sid.to_string(), json!({"p": 1}));
+        state
+            .desktop_streams
+            .write()
+            .await
+            .insert(sid.to_string(), crate::relay::desktop::DesktopStream::new());
+        let _ = state.buffer_agent_event(sid, "{}").await;
+
+        crate::relay::remove_session_state(&state, sid).await;
+
+        assert!(state.last_activity.read().await.get(sid).is_none());
+        assert!(state.kpi_history.read().await.get(sid).is_none());
+        assert!(state.desktop_proto.read().await.get(sid).is_none());
+        assert!(state.desktop_states.read().await.get(sid).is_none());
+        assert!(state.last_congest_notify.read().await.get(sid).is_none());
+        assert!(state.last_kpi_alert.read().await.get(sid).is_none());
+        assert!(state.agent_upgrades.read().await.get(sid).is_none());
+        assert!(state.desktop_streams.read().await.get(sid).is_none());
+        assert!(state.agent_event_buffers.read().await.get(sid).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_end_desktop_streams_clears_state() {
+        // A7 桌面部分：凭证变更后桌面下行流必须结束（否则旧流继续推帧）。
+        let state = make_state("");
+        let sid = "desk01";
+        state
+            .desktop_streams
+            .write()
+            .await
+            .insert(sid.to_string(), crate::relay::desktop::DesktopStream::new());
+        state.desktop_states.write().await.insert(sid.to_string(), true);
+        end_desktop_streams(&state, sid).await;
+        assert!(state.desktop_streams.read().await.get(sid).is_none());
+        assert_eq!(
+            state.desktop_states.read().await.get(sid),
+            Some(&false),
+            "browsers must see desktop as stopped after the stream is torn down"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_disconnect_marks_desktop_stopped() {
+        // agent 断线后 desktop_states 应显式置 false（否则浏览器重建 SSE
+        // 时拿到的快照仍是 running=true）。
+        let state = make_state("");
+        let sid = "dcstate1";
+        let (tx, _rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (bulk_tx, _bulk_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        {
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(tx.clone());
+            cm.agent_bulk = Some(bulk_tx.clone());
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .insert(sid.to_string(), cm);
+        }
+        state.desktop_states.write().await.insert(sid.to_string(), true);
+        drop(AgentEventsCleanup {
+            tx,
+            bulk_tx,
+            state: state.clone(),
+            session_id: sid.to_string(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            state.desktop_states.read().await.get(sid),
+            Some(&false),
+            "agent disconnect must mark desktop stopped"
+        );
     }
 }

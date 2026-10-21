@@ -83,6 +83,13 @@ enum Command {
         /// 保护仍保留。默认 120/min。
         #[arg(long, default_value_t = 120)]
         registration_rate_limit: usize,
+
+        /// Reject every agent uplink (`/agent/events`, `/agent/ws/send`,
+        /// `/agent/send`) that does not carry `X-SR-Agent-Token`.
+        /// 默认关闭以兼容存量旧版 agent；全部 agent 升级到 v0.56.0+ 后
+        /// 可开启。开启后旧版 agent 无法注册上行（会被 401 拒绝）。
+        #[arg(long)]
+        strict_agent_auth: bool,
     },
 
     /// Run in agent mode (connects to a relay; terminal forwarding only —
@@ -152,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
             tls_key,
             no_tls,
             registration_rate_limit,
+            strict_agent_auth,
         } => {
             relay::start(
                 bind,
@@ -166,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
                 tls_key,
                 no_tls,
                 registration_rate_limit,
+                strict_agent_auth,
             )
             .await?;
         }

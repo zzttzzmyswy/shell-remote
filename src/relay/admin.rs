@@ -87,8 +87,24 @@ pub async fn admin_page_handler(State(_state): State<Arc<SharedState>>) -> Respo
 
 pub async fn login_handler(
     State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    // 登录限流（A11）：5 次/分钟/IP，超出直接 429，且不在限流窗口内校验
+    // 口令（避免暴力破解把 CPU 花在 constant_time_eq 上）。key 用
+    // `client_ip`（XFF 取最后一跳），伪造 XFF 无法无限换桶。
+    {
+        let ip = crate::relay::auth::client_ip(&headers);
+        let mut rl = state.rate_limiter.write().await;
+        if !rl.check(&format!("admin:{ip}"), 5, std::time::Duration::from_secs(60)) {
+            tracing::warn!(ip = %ip, "admin login rate limited");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"ok": false, "error": "too many login attempts"})),
+            )
+                .into_response();
+        }
+    }
     let user = body["user"].as_str().unwrap_or("");
     let pass = body["pass"].as_str().unwrap_or("");
     if constant_time_eq(user, &state.admin_user) && constant_time_eq(pass, &state.admin_pass) {
@@ -280,8 +296,9 @@ pub async fn kick_handler(
     }
     // Invalidate all session tokens.
     state.sessions.remove(&sid).await;
-    state.agent_event_buffers.write().await.remove(&sid);
-    state.last_activity.write().await.remove(&sid);
+    // 统一清理所有按 sid 索引的状态表（KPI 历史、桌面状态/流、升级状态、
+    // 空闲时间、事件缓冲）。此前只清了 2 张，其余随 kick 次数单调增长。
+    crate::relay::remove_session_state(&state, &sid).await;
     if let Some(rec) = &state.recorder {
         rec.close(&sid);
     }
@@ -304,7 +321,21 @@ pub async fn revoke_handler(
         )
             .into_response();
     }
+    let sid_before = state.sessions.session_of_token(&token).await;
     let ok = state.sessions.revoke_token(&token).await;
+    // A7：用该 token 建立的浏览器流必须立刻断开——否则吊销后它继续收
+    // 终端输出/桌面帧（token 已失效但流还活着）。
+    if ok {
+        if let Some(sid) = sid_before {
+            crate::relay::ws::disconnect_browser_streams(
+                &state,
+                &sid,
+                Some(std::slice::from_ref(&token)),
+            )
+            .await;
+            crate::relay::ws::end_desktop_streams(&state, &sid).await;
+        }
+    }
     Json(json!({"ok": ok})).into_response()
 }
 
@@ -326,6 +357,10 @@ pub async fn regenerate_handler(
     }
     match state.sessions.regenerate_session(&sid).await {
         Some(tokens) => {
+            // A7：旧 token 全部作废 → 该会话所有浏览器流断开，让它们用新
+            // token 重连（旧流不可能自动换 token）。
+            crate::relay::ws::disconnect_browser_streams(&state, &sid, None).await;
+            crate::relay::ws::end_desktop_streams(&state, &sid).await;
             let t: Vec<Value> = tokens
                 .iter()
                 .map(|(tok, p)| json!({"token": tok, "permission": perm_str(p)}))
@@ -357,10 +392,25 @@ pub async fn permission_handler(
         )
             .into_response();
     }
+    let sid_before = state.sessions.session_of_token(&token).await;
     let ok = state
         .sessions
         .set_token_permission(&token, parse_perm(perm))
         .await;
+    // A7：降权（rw→ro）后，已建立的浏览器流仍按旧权限在用（它能继续发
+    // 写类消息）。断开让浏览器拿新权限重连；升权也一并断开，语义一致
+    // 且更简单（两者都是「这条流的权限已不再准确」）。
+    if ok {
+        if let Some(sid) = sid_before {
+            crate::relay::ws::disconnect_browser_streams(
+                &state,
+                &sid,
+                Some(std::slice::from_ref(&token)),
+            )
+            .await;
+            crate::relay::ws::end_desktop_streams(&state, &sid).await;
+        }
+    }
     Json(json!({"ok": ok})).into_response()
 }
 
@@ -756,7 +806,7 @@ mod tests {
     async fn test_login_success_sets_cookie() {
         let state = state_with_admin("admin", "s3cret");
         let body = Json(json!({"user": "admin", "pass": "s3cret"}));
-        let resp = login_handler(State(state.clone()), body).await;
+        let resp = login_handler(State(state.clone()), HeaderMap::new(), body).await;
         assert_eq!(resp.status(), 200);
         let set_cookie = resp
             .headers()
@@ -771,8 +821,30 @@ mod tests {
     async fn test_login_wrong_password() {
         let state = state_with_admin("admin", "s3cret");
         let body = Json(json!({"user": "admin", "pass": "wrong"}));
-        let resp = login_handler(State(state), body).await;
+        let resp = login_handler(State(state), HeaderMap::new(), body).await;
         assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_login_rate_limited_after_five_per_minute() {
+        // A11：同一 IP 6 次/分钟 → 第 6 次 429（与是否口令正确无关）。
+        let state = state_with_admin("admin", "s3cret");
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "7.7.7.7".parse().unwrap());
+        let body = Json(json!({"user": "admin", "pass": "wrong"}));
+        for i in 1..=5 {
+            let resp = login_handler(State(state.clone()), h.clone(), body.clone()).await;
+            assert_eq!(resp.status(), 401, "attempt {i} should be a normal auth failure");
+        }
+        let resp = login_handler(State(state.clone()), h.clone(), body.clone()).await;
+        assert_eq!(resp.status(), 429, "6th attempt in the window must be rate limited");
+
+        // 正确口令 + 另一个 IP 不受影响
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-forwarded-for", "8.8.8.8".parse().unwrap());
+        let ok = Json(json!({"user": "admin", "pass": "s3cret"}));
+        let resp = login_handler(State(state), h2, ok).await;
+        assert_eq!(resp.status(), 200, "other clients keep working");
     }
 
     #[tokio::test]
@@ -1484,6 +1556,7 @@ mod tests {
                 agent: Some(tx.clone()),
                 agent_bulk: None,
                 browser_sessions: std::collections::HashMap::new(),
+                browser_tokens: std::collections::HashMap::new(),
             },
         );
 
@@ -1565,6 +1638,7 @@ mod tests {
                 agent: Some(tx),
                 agent_bulk: None,
                 browser_sessions: std::collections::HashMap::new(),
+                browser_tokens: std::collections::HashMap::new(),
             },
         );
         let r = agent_upgrade_handler(
