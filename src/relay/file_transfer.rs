@@ -363,6 +363,12 @@ pub async fn get_handler(
                     }
                 };
                 // Send first_bytes.
+                //
+                // 下行带宽（MYS-2287）：每块**先**过 `acquire` 再发，形成端到端
+                // 背压——客户端读得慢 / 限速生效时，这里慢下来，`body_tx` 变满，
+                // agent 上行的 sink 投递随之变慢，最终 agent 自己降低发送速度。
+                // 可靠流绝不能丢块（丢了文件就坏了），所以用等待式而不是丢帧。
+                state_c.bandwidth.down.acquire(first_bytes.len()).await;
                 if body_tx.send(Ok(first_bytes)).await.is_err() {
                     let _ = state_c.download_streams.write().await.remove(&cid_c);
                     send_cancel().await;
@@ -409,6 +415,9 @@ pub async fn get_handler(
                                 }
                                 continue;
                             }
+                            // 下行带宽（MYS-2287）：每块发送前先取令牌，可靠流
+                            // 用等待式（背压），不丢块。
+                            state_c.bandwidth.down.acquire(b.len()).await;
                             if body_tx.send(Ok(b)).await.is_err() {
                                 let _ = state_c.download_streams.write().await.remove(&cid_c);
                                 send_cancel().await;
@@ -590,7 +599,12 @@ pub async fn put_handler(
         let mut stream_done = false;
         while carry.len() < CHUNK_SIZE {
             match reader.next().await {
-                Some(Ok(b)) => carry.extend_from_slice(&b),
+                Some(Ok(b)) => {
+                    // 上行带宽（MYS-2287）：读到多少就记多少，等待式产生背压——
+                    // 客户端（浏览器/MCP）上传会被限速，数据一块不丢。
+                    state.bandwidth.up.acquire(b.len()).await;
+                    carry.extend_from_slice(&b)
+                }
                 Some(Err(_)) | None => {
                     stream_done = true;
                     break;

@@ -74,6 +74,11 @@ cargo build --release
 | `--record-dir` | none | Directory to record terminal sessions (asciinema cast v2); unset disables |
 | `--download-dir` | none | Offline binary distribution directory: place per-platform agent binaries by file name (e.g. `shell-remote-x86_64`, `shell-remote-aarch64`, `shell-remote-armv7`, `shell-remote-x86_64.exe`), served at `/download/<name>`. The install scripts download from this relay **first**, falling back to GitHub mirrors — for intranet / restricted networks |
 | `--agent-upgrade-dir` | none | Directory with staged agent upgrade artifacts (`shell-remote-<arch>[.exe]`, optional `shell-remote-<arch>.version` companion); unset disables the upgrade button |
+| `--bandwidth-down-mbps` | `0` (unlimited) | Relay-wide **downlink** (relay egress) cap in Mbit/s. Priority: same field in the settings file > this flag > unlimited. Changes made in the admin panel's Settings → Bandwidth limit section take effect immediately and are written back to the settings file |
+| `--bandwidth-up-mbps` | `0` (unlimited) | Relay-wide **uplink** (relay ingress) cap in Mbit/s, same priority rules |
+| `--settings-file` | `~/.shell-remote/relay-settings.json` | Persistence file for the bandwidth settings (JSON). Every admin save writes a temp file and renames it over the target (atomic); a missing or corrupt file is treated as "not configured" and the CLI values apply |
+
+**How the limiter behaves**: file transfers, upgrade blobs and binary downloads are throttled by waiting (slower, never lossy); desktop video drops frames when tokens run out and reports `desktop:congested` (limiter drops never count toward evicting a viewer, and the agent lowers its bitrate); interactive traffic (terminal, control) is only accounted, never waited on, so responsiveness is unaffected.
 
 ### Start Agent
 

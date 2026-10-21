@@ -94,6 +94,8 @@ pub async fn sse_handler(
         };
         let mut rx_stream = rx_stream;
         while let Some(msg) = tokio_stream::StreamExt::next(&mut rx_stream).await {
+            // MCP SSE 是交互通道（JSON-RPC 响应），只记账不等待（MYS-2287）。
+            state.bandwidth.down.consume(msg.len());
             yield Ok::<_, Infallible>(Event::default().event("message").data(msg));
         }
     };
@@ -373,11 +375,11 @@ FILE TRANSFER (bytes bypass LLM context — use for files of any size):\n  uploa
                 };
                 match agent_tx_option {
                     Some(agent_tx) => {
-                        crate::relay::ws::deliver(
-                            &agent_tx,
-                            "mcp:exec",
-                            serde_json::to_string(&proto_msg).unwrap_or_default(),
-                        );
+                        // relay 出站（MYS-2287）：mcp:exec 是交互命令，只记账
+                        // 不等待——限速不该让 AI 的每条命令都变慢。
+                        let text = serde_json::to_string(&proto_msg).unwrap_or_default();
+                        state.bandwidth.down.consume(text.len());
+                        crate::relay::ws::deliver(&agent_tx, "mcp:exec", text);
                     }
                     None => {
                         state.pending_mcp.write().await.remove(&mcp_req_id);

@@ -238,6 +238,8 @@ pub async fn overview_handler(
         "recording_enabled": state.recorder.is_some(),
         "mcp_audit_enabled": state.recorder.is_some(),
         "conn_log": conn_log,
+        // 概览页的带宽卡片（MYS-2287）：与 GET /api/bandwidth 的 `stats` 同构。
+        "bandwidth": state.bandwidth.stats().to_json(),
     }))
     .into_response()
 }
@@ -453,6 +455,113 @@ fn q_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
+// ── 带宽限制（MYS-2287）─────────────────────────────────────────────
+
+/// `GET {ap}/api/bandwidth`：当前生效速率 + 来源 + 实时统计。
+pub async fn get_bandwidth_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    Json(state.bandwidth.to_json().await).into_response()
+}
+
+/// 校验一个 admin 提交的 Mbps 值：必须是有限数且落在 `0..=MAX_MBPS`。
+/// `null`/缺失按"不改这一项"处理（返回 `Ok(None)`）。
+fn parse_mbps(v: Option<&Value>) -> Result<Option<f64>, &'static str> {
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = v.as_f64() else {
+        return Err("must be a number");
+    };
+    if !n.is_finite() || n.is_nan() {
+        return Err("must be a finite number");
+    }
+    if !(0.0..=crate::relay::bandwidth::MAX_MBPS).contains(&n) {
+        return Err("out of range");
+    }
+    Ok(Some(n))
+}
+
+/// `POST {ap}/api/bandwidth`，body `{"down_mbps": f64, "up_mbps": f64}`。
+///
+/// 校验通过后**立即**改内存里的令牌桶（即时生效），再持久化到
+/// `--settings-file`。持久化失败仍回 500，但内存值保留，并在响应体里带上
+/// `warning` 让前端提示"已生效但重启会丢"。
+pub async fn set_bandwidth_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let down = match parse_mbps(body.get("down_mbps")) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": format!("down_mbps {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let up = match parse_mbps(body.get("up_mbps")) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": format!("up_mbps {e}")})),
+            )
+                .into_response()
+        }
+    };
+    if down.is_none() && up.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "missing down_mbps/up_mbps"})),
+        )
+            .into_response();
+    }
+    // 未提供的方向保持当前值。
+    let new_down = down.unwrap_or_else(|| state.bandwidth.down_mbps());
+    let new_up = up.unwrap_or_else(|| state.bandwidth.up_mbps());
+    state.bandwidth.set_mbps(new_down, new_up);
+    // 后台改过的值就是"当前生效值"，来源不再代表它（仍记录为 admin 时刻的
+    // 来源，便于排查"这个数从哪来"）。这里把来源标成 file —— 改动会被写成
+    // settings 文件，重启后即以文件为准，与实际情况一致。
+    let mut warning: Option<String> = None;
+    match state.bandwidth.persist().await {
+        Ok(()) => {
+            state
+                .bandwidth
+                .set_sources(
+                    crate::relay::bandwidth::RateSource::File,
+                    crate::relay::bandwidth::RateSource::File,
+                )
+                .await;
+        }
+        Err(e) => {
+            warning = Some(format!("已生效，但写入设置文件失败：{e}"));
+            tracing::warn!(error = %e, "bandwidth settings persist failed (in-memory value kept)");
+        }
+    }
+    let mut resp = state.bandwidth.to_json().await;
+    if let Some(w) = warning {
+        resp["ok"] = json!(true);
+        resp["warning"] = json!(w);
+    } else {
+        resp["ok"] = json!(true);
+    }
+    Json(resp).into_response()
+}
+
 /// List recorded files (terminal `.cast` sessions + MCP `.audit.jsonl`
 /// commands), newest first, paginated. Requires `--record-dir`; an empty list
 /// when recording is disabled. Accepts `page` (1-based, default 1) and
@@ -524,13 +633,18 @@ pub async fn recording_content_handler(
     let Some(path) = rec.recording_path(name) else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid file"}))).into_response();
     };
+    // 录像内容下载同样走整体下行限速（MYS-2287）。录像文件通常不大，但
+    // 一次拖多个历史录像同样是可观的出站带宽。
     match tokio::fs::read_to_string(&path).await {
-        Ok(text) => (
-            StatusCode::OK,
-            [("content-type", "text/plain; charset=utf-8")],
-            text,
-        )
-            .into_response(),
+        Ok(text) => {
+            state.bandwidth.down.acquire(text.len()).await;
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain; charset=utf-8")],
+                text,
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("not found: {}", e)})),
@@ -1649,5 +1763,176 @@ mod tests {
         .await;
         assert_eq!(r.status(), 404);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 带宽限制 admin API（MYS-2287 验收 3.2）──────────────────────
+
+    /// 建一个带 admin 会话 + settings 文件的 state（模拟一次 relay 启动）。
+    async fn bandwidth_state(settings: &std::path::Path) -> (Arc<SharedState>, HeaderMap) {
+        let state = state_with_admin("admin", "s3cret");
+        state
+            .admin_sessions
+            .write()
+            .await
+            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
+        crate::relay::bandwidth::apply_startup_rates(
+            &state.bandwidth,
+            settings.to_path_buf(),
+            None,
+            None,
+        )
+        .await;
+        (state, cookie_headers("tok"))
+    }
+
+
+    #[tokio::test]
+    async fn test_bandwidth_get_post_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("relay-settings.json");
+        let (state, hdr) = bandwidth_state(&settings).await;
+
+        // 初始：不限，来源 default。
+        let got = body_json(get_bandwidth_handler(State(state.clone()), hdr.clone()).await).await;
+        assert_eq!(got["down_mbps"], 0.0);
+        assert_eq!(got["up_mbps"], 0.0);
+        assert_eq!(got["source"]["down"], "default");
+        assert!(got["stats"]["down_bps_1s"].is_u64());
+
+        // POST 8 / 2 → 返回值与 GET 一致。
+        let set = body_json(
+            set_bandwidth_handler(
+                State(state.clone()),
+                hdr.clone(),
+                Json(json!({"down_mbps": 8.0, "up_mbps": 2.0})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(set["ok"], true);
+        assert_eq!(set["down_mbps"], 8.0);
+        assert_eq!(set["up_mbps"], 2.0);
+        assert_eq!(set["source"]["down"], "file");
+        assert!(set.get("warning").is_none(), "正常写入不应带 warning");
+
+        let got2 = body_json(get_bandwidth_handler(State(state.clone()), hdr).await).await;
+        assert_eq!(got2["down_mbps"], 8.0);
+        assert_eq!(got2["up_mbps"], 2.0);
+        assert_eq!(got2["source"]["down"], "file");
+        // 内存里即时生效：令牌桶速率就是 1MB/s / 250KB/s。
+        assert_eq!(state.bandwidth.down.rate(), 1_000_000);
+        assert_eq!(state.bandwidth.up.rate(), 250_000);
+
+        // settings 文件内容正确。
+        let text = std::fs::read_to_string(&settings).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["bandwidth_down_mbps"], 8.0);
+        assert_eq!(v["bandwidth_up_mbps"], 2.0);
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_rejects_invalid_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("relay-settings.json");
+        let (state, hdr) = bandwidth_state(&settings).await;
+        state.bandwidth.set_mbps(8.0, 8.0);
+
+        for bad in [
+            json!({"down_mbps": -1.0, "up_mbps": 1.0}),
+            json!({"down_mbps": 100_001.0, "up_mbps": 1.0}),
+            json!({"down_mbps": "8", "up_mbps": 1.0}),
+            json!({"down_mbps": 1.0, "up_mbps": -0.5}),
+            json!({}), // 两个方向都缺
+        ] {
+            let resp =
+                set_bandwidth_handler(State(state.clone()), hdr.clone(), Json(bad.clone())).await;
+            assert_eq!(resp.status(), 400, "非法值应返回 400：{bad}");
+        }
+        // 非法请求不得改动已生效的值，也不得写文件。
+        assert_eq!(state.bandwidth.down_mbps(), 8.0);
+        assert!(
+            !settings.exists(),
+            "被拒绝的请求不应写出 settings 文件"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_requires_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = bandwidth_state(&dir.path().join("s.json")).await;
+        let no_cookie = HeaderMap::new();
+        let r = get_bandwidth_handler(State(state.clone()), no_cookie.clone()).await;
+        assert_eq!(r.status(), 401);
+        let r = set_bandwidth_handler(
+            State(state),
+            no_cookie,
+            Json(json!({"down_mbps": 1.0, "up_mbps": 1.0})),
+        )
+        .await;
+        assert_eq!(r.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_survives_restart() {
+        // 验收 3.2 最后一条：POST 后"重启"（重新构造 state 并读文件），值保持。
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("relay-settings.json");
+        let (state, hdr) = bandwidth_state(&settings).await;
+        set_bandwidth_handler(
+            State(state.clone()),
+            hdr,
+            Json(json!({"down_mbps": 12.5, "up_mbps": 3.0})),
+        )
+        .await;
+        drop(state);
+
+        // 模拟重启：新 state，同一 settings 文件。
+        let (restarted, hdr2) = bandwidth_state(&settings).await;
+        let got =
+            body_json(get_bandwidth_handler(State(restarted.clone()), hdr2).await).await;
+        assert_eq!(got["down_mbps"], 12.5, "重启后下行值应保持");
+        assert_eq!(got["up_mbps"], 3.0, "重启后上行值应保持");
+        assert_eq!(got["source"]["down"], "file");
+        assert_eq!(restarted.bandwidth.down.rate(), 1_562_500);
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_persist_failure_keeps_memory_value() {
+        // 写文件失败（路径不可写）时：仍 500 + warning，但内存值保留并生效。
+        let dir = tempfile::tempdir().unwrap();
+        // 把 settings "目录"指到一个普通文件上 → create_dir_all 必失败。
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let settings = blocker.join("relay-settings.json");
+        let (state, hdr) = bandwidth_state(&settings).await;
+        let resp = set_bandwidth_handler(
+            State(state.clone()),
+            hdr,
+            Json(json!({"down_mbps": 5.0, "up_mbps": 5.0})),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["down_mbps"], 5.0, "内存值仍应生效");
+        assert!(
+            body["warning"].as_str().is_some_and(|w| !w.is_empty()),
+            "写文件失败必须给出 warning，实际 {body}"
+        );
+        assert_eq!(state.bandwidth.down.rate(), 625_000, "内存值已生效");
+    }
+
+    #[tokio::test]
+    async fn test_overview_includes_bandwidth_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, hdr) = bandwidth_state(&dir.path().join("s.json")).await;
+        state.bandwidth.down.consume(1234);
+        state.bandwidth.up.consume(567);
+        state.bandwidth.count_dropped_frame(3);
+        let body = body_json(overview_handler(State(state), hdr).await).await;
+        let bw = &body["bandwidth"];
+        assert_eq!(bw["down_total_bytes"], 1234);
+        assert_eq!(bw["up_total_bytes"], 567);
+        assert_eq!(bw["dropped_frames"], 3);
+        assert!(bw["throttled_waits"].is_u64());
+        assert!(bw["down_bps_10s"].is_u64());
     }
 }

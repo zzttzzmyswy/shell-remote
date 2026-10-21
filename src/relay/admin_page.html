@@ -222,6 +222,12 @@
     <div class="card"><div class="k" data-i18n="card_browsers">Browsers</div><div class="v" id="cBrowsers">—</div></div>
     <div class="card"><div class="k" data-i18n="card_uptime">Uptime</div><div class="v" id="cUptime">—</div></div>
     <div class="card"><div class="k" data-i18n="card_version">Version</div><div class="v" id="cVersion">—</div></div>
+    <div class="card"><div class="k" data-i18n="card_bw_down">Downlink</div><div class="v" id="cBwDown">—</div></div>
+    <div class="card"><div class="k" data-i18n="card_bw_up">Uplink</div><div class="v" id="cBwUp">—</div></div>
+  </div>
+  <div class="panel" style="margin-top:22px;">
+    <h2 data-i18n="bw_title">Bandwidth limit</h2>
+    <div class="muted" id="bwSummary" style="font-size:12px; line-height:1.9;">—</div>
   </div>
   </section>
 
@@ -354,6 +360,20 @@
       <button class="btn btn-primary btn-sm" id="srvUpdate" data-i18n="update">Update</button>
     </div>
     <div class="err" id="srvErr"></div>
+  </div>
+  <div class="panel">
+    <h2 data-i18n="bw_title">Bandwidth limit</h2>
+    <div class="muted" style="margin-bottom:10px; font-size:12px;" data-i18n="bw_hint">Applies to the whole relay. 0 = unlimited. Changes take effect immediately and are saved across restarts.</div>
+    <div class="srv-row">
+      <label for="bwDown" style="min-width:110px;" data-i18n="bw_down">Downlink Mbps</label>
+      <input id="bwDown" type="number" min="0" max="100000" step="0.1" class="srv-input" inputmode="decimal">
+      <label for="bwUp" style="min-width:96px;" data-i18n="bw_up">Uplink Mbps</label>
+      <input id="bwUp" type="number" min="0" max="100000" step="0.1" class="srv-input" inputmode="decimal">
+      <button class="btn btn-primary btn-sm" id="bwSave" data-i18n="save">Save</button>
+    </div>
+    <div class="muted" id="bwEffective" style="margin-top:10px; font-size:12px;"></div>
+    <div class="muted" id="bwSaved" style="font-size:12px; color:var(--green);"></div>
+    <div class="err" id="bwErr"></div>
   </div>
   <div class="panel">
     <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
@@ -546,7 +566,27 @@
       upg_stage_verifying: "校验中",
       upg_stage_installing: "安装重启中",
       upg_failed: "升级失败",
-      upg_done_suffix: "已升级 "
+      upg_done_suffix: "已升级 ",
+      // 带宽限制（MYS-2287）
+      bw_title: "带宽限制",
+      save: "保存",
+      bw_hint: "作用于整个 relay。0 = 不限制。保存后立即生效，并写入设置文件（重启后保持）。",
+      bw_down: "下行 Mbps",
+      bw_up: "上行 Mbps",
+      card_bw_down: "下行速率",
+      card_bw_up: "上行速率",
+      bw_effective: "当前生效：下行 {down} / 上行 {up}（来源：{down_src} / {up_src}）",
+      bw_src_file: "设置文件",
+      bw_src_cli: "命令行",
+      bw_src_default: "默认（不限）",
+      bw_unlimited: "不限",
+      bw_stats: "限速等待 {waits} 次 · 限速丢帧 {drops} 帧 · 累计下行 {down_total} / 上行 {up_total}",
+      bw_cap: "已设置上限：下行 {down} / 上行 {up}",
+      bw_10s: "10s 均值：下行 {down} / 上行 {up}",
+      bw_saved: "带宽设置已保存。",
+      bw_saved_local: "已生效，但写入设置文件失败：{err}",
+      bw_save_failed: "保存失败：",
+      bw_invalid: "请输入 0 到 100000 之间的数字。"
     },
     en: {
       app_title: "shell-remote admin",
@@ -680,7 +720,27 @@
       upg_stage_verifying: "verifying",
       upg_stage_installing: "installing",
       upg_failed: "upgrade failed",
-      upg_done_suffix: "upgraded "
+      upg_done_suffix: "upgraded ",
+      // Bandwidth limit (MYS-2287)
+      bw_title: "Bandwidth limit",
+      save: "Save",
+      bw_hint: "Applies to the whole relay. 0 = unlimited. Changes take effect immediately and persist across restarts.",
+      bw_down: "Downlink Mbps",
+      bw_up: "Uplink Mbps",
+      card_bw_down: "Downlink",
+      card_bw_up: "Uplink",
+      bw_effective: "In effect: down {down} / up {up} (source: {down_src} / {up_src})",
+      bw_src_file: "settings file",
+      bw_src_cli: "CLI",
+      bw_src_default: "default (unlimited)",
+      bw_unlimited: "unlimited",
+      bw_stats: "Throttled waits {waits} · frames dropped by limiter {drops} · total down {down_total} / up {up_total}",
+      bw_cap: "Configured cap: down {down} / up {up}",
+      bw_10s: "10s average: down {down} / up {up}",
+      bw_saved: "Bandwidth settings saved.",
+      bw_saved_local: "Applied, but writing the settings file failed: {err}",
+      bw_save_failed: "Save failed: ",
+      bw_invalid: "Enter a number between 0 and 100000."
     }
   };
 
@@ -717,6 +777,8 @@
       renderDevices(lastOverview.sessions || []);
       renderConnLog(lastOverview.conn_log || []);
     }
+    // 带宽区块的文案依赖当前语言，切语言后重绘（不重新请求）。
+    renderBandwidthEffective(lastBandwidth);
     refreshRecordings();
   }
   function applyStaticI18n() {
@@ -796,6 +858,8 @@
     if (!btn) return;
     applyTab(btn.dataset.tab);
     if (btn.dataset.tab === 'devices' && lastOverview) renderDevices(lastOverview.sessions || []);
+    // 切到设置页时立刻拿一次带宽值，避免显示上一次刷新后的旧值。
+    if (btn.dataset.tab === 'settings') refreshBandwidth();
   });
 
   // --- API ---
@@ -870,6 +934,7 @@
     // Upgrade eligibility shapes the devices table's row buttons/status, so
     // the artifacts list is fetched before the devices table is rebuilt.
     await refreshUpgradeArtifacts();
+    await refreshBandwidth();
     renderDevices(o.sessions || []);
     renderConnLog(o.conn_log || []);
     refreshRecordings();
@@ -990,6 +1055,8 @@
     $('verBadge').textContent = 'v' + (o.version ?? '?');
     $('upBadge').textContent = t('uptime_prefix') + fmtUptime(o.uptime_seconds);
     $('recBadge').classList.toggle('hidden', !o.recording_enabled);
+    // 带宽卡片（MYS-2287）：实时速率 + 上限 + 限流统计，随 5s 刷新更新。
+    renderBandwidthCard(o);
   }
 
   // --- Sessions table ---
@@ -1522,6 +1589,122 @@
       $('srvVal').textContent = '••••••••'; srvShown = false; renderSrvButton();
       alert(t('pw_updated'));
     } catch (e) { $('srvErr').textContent = t('srv_update_failed') + e.message; }
+  });
+
+  // --- Bandwidth limit (MYS-2287) ---
+  let lastBandwidth = null;
+
+  function srcLabel(s) {
+    if (s === 'file') return t('bw_src_file');
+    if (s === 'cli') return t('bw_src_cli');
+    return t('bw_src_default');
+  }
+
+  // 吞吐显示：≥1 MB/s 用 MB/s，其余用 KB/s（1 位小数）。
+  function fmtThroughput(bps) {
+    const v = Number(bps) || 0;
+    if (v >= 1000 * 1000) return (v / (1000 * 1000)).toFixed(1) + ' MB/s';
+    return (v / 1000).toFixed(1) + ' KB/s';
+  }
+
+  function fmtMbps(mbps) {
+    const v = Number(mbps) || 0;
+    if (!v) return t('bw_unlimited');
+    return (v % 1 === 0 ? String(v) : v.toFixed(1)) + ' Mbps';
+  }
+
+  function fmtBytes(n) {
+    const v = Number(n) || 0;
+    if (v >= 1024 * 1024 * 1024) return (v / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+    if (v >= 1024 * 1024) return (v / (1024 * 1024)).toFixed(1) + ' MB';
+    if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
+    return v + ' B';
+  }
+
+  // 概览卡片：实时上下行速率（旁边是已设置的上限）+ 限流统计。
+  function renderBandwidthCard(o) {
+    const st = o.bandwidth || {};
+    // 上限来自 /api/bandwidth（refresh 里同步拉取），实时值来自 /api/overview。
+    const lim = lastBandwidth || {};
+    const downCap = lim.down_mbps;
+    const upCap = lim.up_mbps;
+
+    $('cBwDown').textContent = fmtThroughput(st.down_bps_1s);
+    $('cBwUp').textContent = fmtThroughput(st.up_bps_1s);
+
+    const capText = t('bw_cap')
+      .replace('{down}', fmtMbps(downCap))
+      .replace('{up}', fmtMbps(upCap));
+    const summary = $('bwSummary');
+    summary.textContent = '';
+    const l1 = document.createElement('div');
+    l1.textContent = capText;
+    const l2 = document.createElement('div');
+    l2.textContent = t('bw_stats')
+      .replace('{waits}', String(st.throttled_waits ?? 0))
+      .replace('{drops}', String(st.dropped_frames ?? 0))
+      .replace('{down_total}', fmtBytes(st.down_total_bytes))
+      .replace('{up_total}', fmtBytes(st.up_total_bytes));
+    const l3 = document.createElement('div');
+    l3.textContent = t('bw_10s')
+      .replace('{down}', fmtThroughput(st.down_bps_10s))
+      .replace('{up}', fmtThroughput(st.up_bps_10s));
+    summary.appendChild(l1);
+    summary.appendChild(l2);
+    summary.appendChild(l3);
+  }
+
+  // 设置面板底部的"当前生效值及来源"。
+  function renderBandwidthEffective(bw) {
+    const el = $('bwEffective');
+    if (!bw) { el.textContent = ''; return; }
+    el.textContent = t('bw_effective')
+      .replace('{down}', fmtMbps(bw.down_mbps))
+      .replace('{up}', fmtMbps(bw.up_mbps))
+      .replace('{down_src}', srcLabel((bw.source || {}).down))
+      .replace('{up_src}', srcLabel((bw.source || {}).up));
+  }
+
+  async function refreshBandwidth() {
+    let bw;
+    try { bw = await api('/api/bandwidth'); } catch (_) { return; }
+    lastBandwidth = bw;
+    renderBandwidthEffective(bw);
+    // 用户正在输入时不覆盖输入框（每 5s 刷新会打断编辑）。
+    const active = document.activeElement;
+    if (active !== $('bwDown')) $('bwDown').value = bw.down_mbps;
+    if (active !== $('bwUp')) $('bwUp').value = bw.up_mbps;
+    if (lastOverview) renderBandwidthCard(lastOverview);
+  }
+
+  $('bwSave').addEventListener('click', async () => {
+    $('bwErr').textContent = '';
+    const parseVal = (raw) => {
+      if (raw === '' || raw === null) return 0;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : NaN;
+    };
+    const down = parseVal($('bwDown').value);
+    const up = parseVal($('bwUp').value);
+    if (Number.isNaN(down) || Number.isNaN(up) || down < 0 || up < 0 || down > 100000 || up > 100000) {
+      $('bwErr').textContent = t('bw_invalid');
+      return;
+    }
+    try {
+      const r = await api('/api/bandwidth', { method: 'POST', body: { down_mbps: down, up_mbps: up } });
+      lastBandwidth = r;
+      renderBandwidthEffective(r);
+      if (lastOverview) renderBandwidthCard(lastOverview);
+      if (r && r.warning) {
+        $('bwErr').textContent = t('bw_saved_local').replace('{err}', r.warning);
+      } else {
+        $('bwErr').textContent = '';
+        $('bwSaved').textContent = t('bw_saved');
+        setTimeout(() => { $('bwSaved').textContent = ''; }, 3000);
+      }
+    } catch (e) {
+      $('bwErr').textContent = t('bw_save_failed') + e.message;
+    }
   });
 
   // --- Player (asciinema cast v2 replay via xterm.js) ---

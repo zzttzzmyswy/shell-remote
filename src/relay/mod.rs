@@ -6,6 +6,7 @@ pub mod session;
 pub mod ws;
 pub mod admin;
 pub mod recorder;
+pub mod bandwidth;
 pub mod desktop;
 pub mod file_transfer;
 
@@ -125,6 +126,9 @@ pub struct SharedState {
     /// 由 `route_agent_message` 拦截 `ping` 消息时采样心跳 payload 的 `kpi`
     /// 字段。容量到顶丢弃最旧（FIFO）。
     pub kpi_history: RwLock<HashMap<String, std::collections::VecDeque<AgentKpiSample>>>,
+    /// relay 整体带宽限制（MYS-2287）：上下行两个令牌桶 + 实时吞吐统计 +
+    /// settings 持久化。进程级单例，与 session 无关；`Arc` 让各接入点直接持有。
+    pub bandwidth: Arc<bandwidth::BandwidthLimiter>,
 }
 
 /// Agent 心跳采样的一帧桌面 KPI（`agent/mod.rs sender_loop` 心跳 payload 的
@@ -307,6 +311,7 @@ impl SharedState {
             agent_upgrades: RwLock::new(HashMap::new()),
             upgrade_dir: RwLock::new(None),
             kpi_history: RwLock::new(HashMap::new()),
+            bandwidth: Arc::new(bandwidth::BandwidthLimiter::new()),
         }
     }
 
@@ -1330,6 +1335,8 @@ pub async fn upload_handler(
             drop(file);
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
+        // 上行带宽（MYS-2287）：等待式背压（可靠流，不丢数据）。
+        state.bandwidth.up.acquire(chunk.len()).await;
         use tokio::io::AsyncWriteExt;
         file.write_all(&chunk).await.map_err(|e| {
             tracing::error!("Upload temp write failed for {}: {}", path, e);
@@ -1424,6 +1431,9 @@ pub async fn upload_handler(
         .to_string();
         // Backpressure: if the agent can't keep up, await rather than drop —
         // dropping a file chunk would silently corrupt the upload.
+        // 下行记账（MYS-2287）：这条消息走交互通道，等待式限速会拖慢终端；
+        // 真正的下行背压由 agent_events_handler 的 bulk 分支产生，这里只记账。
+        state.bandwidth.down.consume(msg.len());
         if agent_tx.send(msg).await.is_err() {
             send_ok = false; // agent gone
             break;
@@ -1535,19 +1545,52 @@ pub async fn download_handler(
         .into_response();
     }
     let path = dir.join(&filename);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => axum::response::Response::builder()
-            .status(axum::http::StatusCode::OK)
-            .header(
-                axum::http::header::CONTENT_TYPE,
-                "application/octet-stream",
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => {
+            return (axum::http::StatusCode::NOT_FOUND, "binary not found").into_response();
+        }
+    };
+    let len = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot stat binary",
             )
-            .header(axum::http::header::CONTENT_LENGTH, bytes.len().to_string())
-            .header(axum::http::header::CACHE_CONTROL, "no-cache")
-            .body(axum::body::Body::from(bytes))
-            .unwrap(),
-        Err(_) => (axum::http::StatusCode::NOT_FOUND, "binary not found").into_response(),
-    }
+                .into_response();
+        }
+    };
+    // 带宽限速（MYS-2287）：整文件读入内存 → `ReaderStream` 流式发送，
+    // 每个 chunk 先过下行 `acquire`。限速时形成稳定背压，也让一个 100MB
+    // 的 agent 二进制不再把 relay 峰值内存翻倍。
+    let limiter = state.bandwidth.clone();
+    let chunks = tokio_util::io::ReaderStream::new(file);
+    let stream = async_stream::stream! {
+        let mut chunks = chunks;
+        while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    limiter.down.acquire(bytes.len()).await;
+                    yield Ok::<_, std::io::Error>(bytes);
+                }
+                Err(e) => {
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
+    };
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/octet-stream",
+        )
+        .header(axum::http::header::CONTENT_LENGTH, len.to_string())
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
 }
 
 pub async fn start(
@@ -1564,6 +1607,9 @@ pub async fn start(
     tls_disabled: bool,
     registration_rate_limit: usize,
     strict_agent_auth: bool,
+    bandwidth_down_mbps: Option<f64>,
+    bandwidth_up_mbps: Option<f64>,
+    settings_file: Option<String>,
 ) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -1627,7 +1673,30 @@ pub async fn start(
     if strict_agent_auth {
         tracing::info!("strict agent auth enabled — agents without X-SR-Agent-Token are rejected");
     }
+
+    // 整体带宽限制（MYS-2287）：settings 文件字段 > CLI > 不限。
+    // settings 路径默认 ~/.shell-remote/relay-settings.json。启动时读一次，
+    // 之后 admin 的 POST 会即时改内存值并原子写回该文件。
+    let settings_path = settings_file
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                .join(".shell-remote")
+                .join("relay-settings.json")
+        });
+    // 在 Arc 包起来之前初始化不了（limiter 自己就是 Arc），所以这里先建
+    // state，再对 `state.bandwidth` 走同一条启动路径。
     let state = Arc::new(st);
+    bandwidth::apply_startup_rates(
+        &state.bandwidth,
+        settings_path,
+        bandwidth_down_mbps,
+        bandwidth_up_mbps,
+    )
+    .await;
+    // 1s ticker：维护 1s / 10s 平均吞吐（admin 实时曲线与概览卡片）。
+    state.bandwidth.spawn_sampler();
 
     // Agent self-upgrade artifacts: `--agent-upgrade-dir` stages binaries
     // (`shell-remote-<arch>[.exe]`). Create the dir up front so a bad path
@@ -1716,6 +1785,8 @@ pub async fn start(
             .route(&format!("{}/api/token/permission", ap), axum::routing::post(admin::permission_handler))
             .route(&format!("{}/api/server-auth", ap), get(admin::get_server_auth_handler))
             .route(&format!("{}/api/server-auth", ap), axum::routing::post(admin::set_server_auth_handler))
+            .route(&format!("{}/api/bandwidth", ap), get(admin::get_bandwidth_handler))
+            .route(&format!("{}/api/bandwidth", ap), axum::routing::post(admin::set_bandwidth_handler))
             .route(&format!("{}/api/recordings", ap), get(admin::recordings_handler))
             .route(&format!("{}/api/recordings/content", ap), get(admin::recording_content_handler))
             .route(&format!("{}/api/recordings/delete", ap), axum::routing::delete(admin::recording_delete_handler))

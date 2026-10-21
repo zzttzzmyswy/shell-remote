@@ -101,6 +101,11 @@ cargo build --release --no-default-features
 | `--record-dir` | 无 | 终端会话录制目录（asciinema cast v2）；不设则不录制 |
 | `--download-dir` | 无 | 离线二进制分发目录：目录内按文件名（如 `shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`、`shell-remote-x86_64.exe`，以及同名的 `shell-remote-ui-*` 桌面版）放置各平台 agent 二进制，经 `/download/<文件名>` 对外提供；**安装脚本会优先从本 relay 下载**，GitHub 镜像仅作回退（适合内网/镜像受限环境） |
 | `--agent-upgrade-dir` | 无 | agent 自升级制品目录（`shell-remote-<arch>[.exe]` 与 `shell-remote-ui-<arch>[.exe]`，可选 `shell-remote-<arch>.version` 标注版本）；不设则"设备"页升级功能不可用 |
+| `--bandwidth-down-mbps` | `0`（不限） | relay 整体**下行**（relay 出站）带宽上限，单位 Mbit/s。优先级：settings 文件里的同名字段 > 本参数 > 不限。后台"设置 → 带宽限制"修改后即时生效并写回 settings 文件 |
+| `--bandwidth-up-mbps` | `0`（不限） | relay 整体**上行**（relay 入站）带宽上限，单位 Mbit/s，优先级同上 |
+| `--settings-file` | `~/.shell-remote/relay-settings.json` | 带宽设置的持久化文件（JSON）。后台每次保存都会先写临时文件再 rename 覆盖（原子写）；文件损坏或缺失时按"未配置"处理并退回 CLI 值 |
+
+**带宽限制的行为**（详见下方「带宽限制」一节）：文件传输、升级包、二进制下载走等待式限速（只降速、不丢数据）；桌面视频令牌不足时丢帧并回传 `desktop:congested`（带宽丢帧不计入踢 viewer 的计数，agent 会自动降码率）；终端与控制等交互消息只记账不等待，保证响应速度。
 
 ### 启动 Agent（CLI，终端转发）
 
