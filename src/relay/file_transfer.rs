@@ -1521,7 +1521,7 @@ mod tests {
             crate::relay::ChannelMap {
                 agent: None,
                 agent_bulk: Some(bulk_tx),
-                browser_sessions: HashMap::new(),
+                ..crate::relay::ChannelMap::new()
             },
         );
         let state_c = state.clone();
