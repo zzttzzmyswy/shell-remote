@@ -77,6 +77,9 @@ pkg-config = "0.3"
 [dev-dependencies]
 tempfile = "3"
 http-body-util = "0.1"
+# `test-util` 提供 `#[tokio::test(start_paused = true)]`（虚拟时间），带宽限速
+# 单测用它把"5MB @1MB/s ≈ 4.8s"压缩到毫秒级。仅测试构建启用，不进发布产物。
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [profile.release]
 opt-level = "z"

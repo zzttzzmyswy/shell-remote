@@ -90,6 +90,22 @@ enum Command {
         /// 可开启。开启后旧版 agent 无法注册上行（会被 401 拒绝）。
         #[arg(long)]
         strict_agent_auth: bool,
+
+        /// relay 整体下行（relay 出站）带宽上限，单位 Mbit/s。0 = 不限。
+        /// 优先级：settings 文件里的同名字段 > 本参数 > 不限；Web 后台
+        /// 修改后即时生效并写回 settings 文件。
+        #[arg(long)]
+        bandwidth_down_mbps: Option<f64>,
+
+        /// relay 整体上行（relay 入站）带宽上限，单位 Mbit/s。0 = 不限。
+        #[arg(long)]
+        bandwidth_up_mbps: Option<f64>,
+
+        /// 带宽设置的持久化文件（JSON）。默认
+        /// `~/.shell-remote/relay-settings.json`；Web 后台每次修改都会原子
+        /// 写回这里，重启后以此为准。
+        #[arg(long)]
+        settings_file: Option<String>,
     },
 
     /// Run in agent mode (connects to a relay; terminal forwarding only —
@@ -160,6 +176,9 @@ async fn main() -> anyhow::Result<()> {
             no_tls,
             registration_rate_limit,
             strict_agent_auth,
+            bandwidth_down_mbps,
+            bandwidth_up_mbps,
+            settings_file,
         } => {
             relay::start(
                 bind,
@@ -175,6 +194,9 @@ async fn main() -> anyhow::Result<()> {
                 no_tls,
                 registration_rate_limit,
                 strict_agent_auth,
+                bandwidth_down_mbps,
+                bandwidth_up_mbps,
+                settings_file,
             )
             .await?;
         }

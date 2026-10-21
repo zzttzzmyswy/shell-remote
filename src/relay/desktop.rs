@@ -63,6 +63,10 @@ struct Inner {
     init: tokio::sync::RwLock<Option<Vec<u8>>>,
     /// connected viewers, keyed by a per-connection id.
     viewers: tokio::sync::RwLock<HashMap<String, ViewerCtx>>,
+    /// relay 的整体带宽限制器（`None` = 不限速 / agent 侧 LAN fan-out）。
+    /// 视频走 `try_acquire`：令牌不足直接丢帧（等下一个关键帧恢复），
+    /// 绝不在这里 await——一帧的等待会把这个会话所有 viewer 一起拖住。
+    limiter: Option<Arc<crate::relay::bandwidth::BandwidthLimiter>>,
 }
 
 impl Default for DesktopStream {
@@ -73,10 +77,18 @@ impl Default for DesktopStream {
 
 impl DesktopStream {
     pub fn new() -> Self {
+        Self::with_limiter(None)
+    }
+
+    /// 带 relay 带宽限制器的 fan-out（`relay::start` 创建的流用这个）。
+    pub fn with_limiter(
+        limiter: Option<Arc<crate::relay::bandwidth::BandwidthLimiter>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 init: tokio::sync::RwLock::new(None),
                 viewers: tokio::sync::RwLock::new(HashMap::new()),
+                limiter,
             }),
         }
     }
@@ -109,9 +121,11 @@ impl DesktopStream {
     /// >0 说明 relay→浏览器传输段发生了拥塞/积压，调用方据此限频回传
     /// agent，作为浏览器段 e2e/dq 之外的传输段拥塞证据）。
     pub async fn push_frag(&self, is_key: bool, bytes: Vec<u8>) -> u32 {
+        let limiter = self.inner.limiter.clone();
         let mut viewers = self.inner.viewers.write().await;
         let mut dead = Vec::new();
         let mut congested = 0u32;
+        let mut bw_dropped = 0u64;
         for (id, ctx) in viewers.iter_mut() {
             if !ctx.key_ok && !is_key {
                 // Waiting for a key frame after a drop: skipped deltas still
@@ -124,6 +138,18 @@ impl DesktopStream {
                     }
                 }
                 continue;
+            }
+            // 带宽限速（MYS-2287）：令牌不足就直接丢这一帧（关键帧同样受限）。
+            // 与"缓冲满"不同，这里**不累加 `drop_count`**——带宽丢帧不是
+            // viewer 消费能力的问题，绝不能因此把它踢出 fan-out。丢帧同样
+            // 打断参考链，必须等下一个关键帧才能继续发。
+            if let Some(lim) = &limiter {
+                if !lim.down.try_acquire(bytes.len()) {
+                    ctx.key_ok = false;
+                    congested += 1;
+                    bw_dropped += 1;
+                    continue;
+                }
             }
             match ctx.tx.try_send(bytes.clone()) {
                 Ok(()) => {
@@ -152,6 +178,12 @@ impl DesktopStream {
             }
         }
         drop(viewers);
+        if bw_dropped > 0 {
+            // 带宽丢帧单独计数（admin 概览展示），与 viewer 侧 drop_count 分开。
+            if let Some(lim) = &limiter {
+                lim.count_dropped_frame(bw_dropped);
+            }
+        }
         if !dead.is_empty() {
             let mut w = self.inner.viewers.write().await;
             for id in dead {
@@ -165,9 +197,15 @@ impl DesktopStream {
         // 与 push_frag 一样用 write 锁：需要改 drop_count，且 init 重发是
         // 低频事件（不会与并发读形成热路径竞争）。read 锁内嵌套 write 会
         // 死锁（tokio RwLock write 等待 read 释放）。
+        let limiter = self.inner.limiter.clone();
         let mut viewers = self.inner.viewers.write().await;
         let mut dead = Vec::new();
         for (id, ctx) in viewers.iter_mut() {
+            // init 段是解码前提，绝不能丢（丢了 viewer 就再也解不出画面）。
+            // 因此这里只记账（`consume`，可透支成负额度），不等待、不丢帧。
+            if let Some(lim) = &limiter {
+                lim.down.consume(bytes.len());
+            }
             match ctx.tx.try_send(bytes.clone()) {
                 Ok(()) => {
                     ctx.drop_count = 0;
@@ -189,6 +227,19 @@ impl DesktopStream {
                 w.remove(&id);
             }
         }
+    }
+
+    /// 让所有 viewer 回到"等关键帧"状态（MYS-2287）。
+    ///
+    /// 上行带宽不足时 relay 会丢掉 agent 发来的视频帧；只要丢了一帧，所有
+    /// viewer 的参考链就断了，后续 delta 帧会解成花屏。这里把它们统一置为
+    /// `key_ok=false`，下一次 IDR 到达后自动恢复。返回受影响的 viewer 数。
+    pub async fn invalidate_keys(&self) -> usize {
+        let mut viewers = self.inner.viewers.write().await;
+        for ctx in viewers.values_mut() {
+            ctx.key_ok = false;
+        }
+        viewers.len()
     }
 
     /// Register a new viewer. Returns `(viewer_id, receiver, cached_init)`.
@@ -1032,5 +1083,116 @@ mod tests {
         .expect("frame")
         .expect("ok frame");
         assert_eq!(second.into_data().to_vec(), vec![0x77]);
+    }
+
+    // ── 带宽限速丢帧（MYS-2287 验收 3.1）────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn test_push_frag_drops_on_bandwidth_without_kicking_viewer() {
+        // 下行限到 1KB/s（8kbps）：burst = 64KiB。首帧把额度吃光，后续帧
+        // 只能丢——但必须满足：drop_count 不增长（带宽丢帧不是 viewer 慢）、
+        // viewer 不被移除、congested 计数 >0、限速丢帧独立计数。
+        let limiter = Arc::new(crate::relay::bandwidth::BandwidthLimiter::with_mbps(
+            0.008, // 8 kbit/s = 1 KB/s
+            0.0,
+        ));
+        let ds = DesktopStream::with_limiter(Some(limiter.clone()));
+        let (_vid, mut rx, _init) = ds.add_viewer().await;
+
+        // 首帧：64KiB 突发额度足够，正常送达。
+        let first = vec![0xAAu8; 20 * 1024];
+        assert_eq!(ds.push_frag(true, first.clone()).await, 0);
+        assert_eq!(rx.recv().await.unwrap(), first);
+
+        // 之后连推 10 帧，额度耗尽 → 全部因带宽被丢。
+        let mut congested_total = 0u32;
+        for _ in 0..10 {
+            congested_total += ds.push_frag(true, vec![0xBB; 20 * 1024]).await;
+        }
+        assert!(
+            congested_total > 0,
+            "带宽不足时应报告 congested > 0，实际 {congested_total}"
+        );
+        // burst = 64KiB：首帧 20KiB 后剩 44KiB，正好够再放 2 帧，其余 8 帧
+        // 全部因带宽被丢弃（虚拟时间不前进，所以这个数是确定的）。
+        assert_eq!(
+            limiter.dropped_frames(),
+            8,
+            "额度耗尽后的 8 帧应因带宽丢弃，且独立计数（与 viewer drop_count 分开）"
+        );
+        // 关键断言：viewer 仍在 fan-out 里，drop_count 未增长。
+        assert_eq!(
+            ds.stats().await.viewer_count,
+            1,
+            "带宽丢帧绝不能把 viewer 踢出 fan-out"
+        );
+        {
+            let viewers = ds.inner.viewers.read().await;
+            let ctx = viewers.values().next().expect("viewer must still exist");
+            assert_eq!(ctx.drop_count, 0, "带宽丢帧不得累加 drop_count");
+            assert!(!ctx.key_ok, "丢帧后必须回到等关键帧状态");
+        }
+        // burst = 64KiB、单帧 20KiB：首帧后还剩 44KiB，正好够再放 2 帧，
+        // 之后 8 帧全部被限速丢弃 → 队列里只应多出这 2 帧。
+        assert!(rx.try_recv().is_ok(), "burst 额度内的帧应正常送达");
+        assert!(rx.try_recv().is_ok(), "burst 额度内的帧应正常送达");
+        assert!(
+            rx.try_recv().is_err(),
+            "额度耗尽后的帧应被限速丢弃，不进 viewer 队列"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_push_frag_keyframe_also_bounded_by_bandwidth() {
+        // 设计明确：关键帧同样受限（限速不能因为"这是 IDR"就放行，否则
+        // 一个 IDR 就击穿速率上限）。
+        let limiter = Arc::new(crate::relay::bandwidth::BandwidthLimiter::with_mbps(0.008, 0.0));
+        let ds = DesktopStream::with_limiter(Some(limiter.clone()));
+        let (_vid, _rx, _init) = ds.add_viewer().await;
+        for _ in 0..20 {
+            ds.push_frag(true, vec![0xCC; 16 * 1024]).await;
+        }
+        assert!(
+            limiter.dropped_frames() > 0,
+            "关键帧也必须受限，实际丢帧 {}",
+            limiter.dropped_frames()
+        );
+        assert_eq!(ds.stats().await.viewer_count, 1, "viewer 不得被移除");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_set_init_only_accounts_never_drops() {
+        // init 段是解码前提，绝不能丢：即使额度早已透支，也必须送达并只记账。
+        let limiter = Arc::new(crate::relay::bandwidth::BandwidthLimiter::with_mbps(0.008, 0.0));
+        let ds = DesktopStream::with_limiter(Some(limiter.clone()));
+        let (_vid, mut rx, _init) = ds.add_viewer().await;
+        limiter.down.consume(1024 * 1024); // 先把额度打穿
+        let init = vec![0x11u8; 4096];
+        ds.set_init(init.clone()).await;
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            init,
+            "init 段必须送达（丢了解码器就建不起来）"
+        );
+        assert_eq!(limiter.dropped_frames(), 0, "init 不丢帧");
+        assert_eq!(ds.stats().await.viewer_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_keys_forces_wait_for_next_idr() {
+        // 上行丢帧后 relay 调用 invalidate_keys()：所有 viewer 回到等关键帧，
+        // 后续 delta 被跳过，直到下一个 IDR 恢复。
+        let ds = DesktopStream::new();
+        let (_vid, mut rx, _init) = ds.add_viewer().await;
+        ds.push_frag(true, vec![1]).await; // key：viewer 进入可解码状态
+        assert_eq!(rx.recv().await.unwrap(), vec![1]);
+        assert_eq!(ds.invalidate_keys().await, 1, "应返回受影响的 viewer 数");
+        ds.push_frag(false, vec![2]).await; // delta：必须被跳过
+        assert!(
+            rx.try_recv().is_err(),
+            "invalidate 后的 delta 帧不得下发（会花屏）"
+        );
+        ds.push_frag(true, vec![3]).await; // 下一个 IDR：恢复
+        assert_eq!(rx.recv().await.unwrap(), vec![3]);
     }
 }

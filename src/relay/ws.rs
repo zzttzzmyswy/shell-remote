@@ -109,6 +109,45 @@ fn kpi_anomalous(active: bool, fps: u32) -> bool {
     active && fps < 10
 }
 
+/// 向 agent 回传 `desktop:congested`（R5#16），限频 ≥5s/会话。
+///
+/// agent 侧据此把"relay→浏览器"或"agent→relay"丢帧当作传输段拥塞证据，
+/// 触发降码率。带宽限速丢帧（MYS-2287）复用同一个信令，不新增消息类型。
+async fn notify_congested(state: &Arc<SharedState>, session_id: &str, dropped: u32) {
+    let should_notify = {
+        let guard = state.last_congest_notify.read().await;
+        guard
+            .get(session_id)
+            .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(5))
+    };
+    if !should_notify {
+        return;
+    }
+    state
+        .last_congest_notify
+        .write()
+        .await
+        .insert(session_id.to_string(), std::time::Instant::now());
+    let tx = state
+        .agent_broadcast
+        .read()
+        .await
+        .get(session_id)
+        .and_then(|cm| cm.agent.clone());
+    if let Some(tx) = tx {
+        let _ = deliver(
+            &tx,
+            "desktop:congested",
+            serde_json::json!({
+                "type": "desktop:congested",
+                "session_id": session_id,
+                "payload": { "dropped": dropped }
+            })
+            .to_string(),
+        );
+    }
+}
+
 // ── Shared agent message routing ─────────────────────────────────────
 
 pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, text_str: &str) {
@@ -199,6 +238,12 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
         }
     }
     if let Ok(proto_msg) = serde_json::from_str::<ProtoMessage>(text_str) {
+        // 上行带宽记账（MYS-2287）：agent 上行的每条消息都计入上行用量，只记账
+        // 不等待（交互/控制消息不能因限速变慢）。桌面视频例外——它在自己的分支
+        // 里按解码后的帧字节 `try_acquire`/`consume`，这里再记会重复计数。
+        if proto_msg.msg_type != "desktop:video" {
+            state.bandwidth.up.consume(text_str.len());
+        }
         // Agent self-upgrade progress: capture it for the admin panel's
         // devices page (polled via /api/overview) and stop here — the frame
         // is relay→admin telemetry, not something browsers or MCP callers see.
@@ -256,13 +301,32 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                     let mut streams = state.desktop_streams.write().await;
                     streams
                         .entry(session_id.to_string())
-                        .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                        .or_insert_with(|| crate::relay::desktop::DesktopStream::with_limiter(Some(state.bandwidth.clone())))
                         .clone()
                 };
                 tracing::debug!("desktop:video kind={kind} bytes={}", bytes.len());
                 if kind == "init" {
+                    // init 段是解码前提，丢了下游就再也解不出画面 → 只记账不丢
+                    // （与下行 init 重发同一个口径：consume 可透支成负额度）。
+                    state.bandwidth.up.consume(bytes.len());
                     ds.set_init(bytes).await;
                 } else {
+                    // 上行带宽（MYS-2287）：agent→relay 的视频帧走 try_acquire，
+                    // 令牌不足直接丢这一帧并让所有 viewer 回到"等关键帧"状态。
+                    // **不能在这里 await**——路由循环里 await 会阻塞该会话的
+                    // 全部上行（终端输出也会停）。
+                    if !state.bandwidth.up.try_acquire(bytes.len()) {
+                        let n = ds.invalidate_keys().await;
+                        state.bandwidth.count_dropped_frame(1);
+                        tracing::debug!(
+                            session = %session_id,
+                            bytes = bytes.len(),
+                            viewers = n,
+                            "desktop:video upstream throttled — frame dropped"
+                        );
+                        notify_congested(state, session_id, 1).await;
+                        return;
+                    }
                     let is_key = proto_msg
                         .payload
                         .get("key")
@@ -276,37 +340,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                     // 浏览器段，relay drop 是传输段，两者互补）。仅回 agent，
                     // 不进 broadcast_types，也不入 EventBuffer（现发现报）。
                     if congested > 0 {
-                        let should_notify = {
-                            let guard = state.last_congest_notify.read().await;
-                            guard
-                                .get(session_id)
-                                .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(5))
-                        };
-                        if should_notify {
-                            state
-                                .last_congest_notify
-                                .write()
-                                .await
-                                .insert(session_id.to_string(), std::time::Instant::now());
-                            if let Some(tx) = state
-                                .agent_broadcast
-                                .read()
-                                .await
-                                .get(session_id)
-                                .and_then(|cm| cm.agent.clone())
-                            {
-                                let _ = deliver(
-                                    &tx,
-                                    "desktop:congested",
-                                    serde_json::json!({
-                                        "type": "desktop:congested",
-                                        "session_id": session_id,
-                                        "payload": { "dropped": congested }
-                                    })
-                                    .to_string(),
-                                );
-                            }
-                        }
+                        notify_congested(state, session_id, congested).await;
                     }
                 }
             }
@@ -328,7 +362,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
                 .write()
                 .await
                 .entry(session_id.to_string())
-                .or_insert_with(crate::relay::desktop::DesktopStream::new);
+                .or_insert_with(|| crate::relay::desktop::DesktopStream::with_limiter(Some(state.bandwidth.clone())));
             // R5#12：记录当前运行状态，供 SSE（重建）握手补发 desktop:state。
             state
                 .desktop_states
@@ -870,12 +904,27 @@ async fn route_bin_desktop_frame(
         let mut streams = state.desktop_streams.write().await;
         streams
             .entry(session_id.to_string())
-            .or_insert_with(crate::relay::desktop::DesktopStream::new)
+            .or_insert_with(|| crate::relay::desktop::DesktopStream::with_limiter(Some(state.bandwidth.clone())))
             .clone()
     };
     if flags & BIN_FRAME_FLAG_INIT != 0 {
         tracing::debug!("desktop:video-bin kind=init bytes={}", payload.len());
+        // init 段只记账不丢（解码前提），与 text 路径同一口径。
+        state.bandwidth.up.consume(payload.len());
         ds.set_init(payload.to_vec()).await;
+        return;
+    }
+    // 上行带宽（MYS-2287）：令牌不足直接丢这一帧，并让所有 viewer 回到
+    // "等关键帧"状态（丢帧打断参考链，继续发 delta 会花屏）。
+    if !state.bandwidth.up.try_acquire(payload.len()) {
+        let viewers = ds.invalidate_keys().await;
+        state.bandwidth.count_dropped_frame(1);
+        tracing::debug!(
+            session = %session_id,
+            seq, bytes = %payload.len(), viewers,
+            "desktop:video-bin upstream throttled — frame dropped"
+        );
+        notify_congested(state, session_id, 1).await;
         return;
     }
     let is_key = flags & BIN_FRAME_FLAG_KEY != 0;
@@ -886,37 +935,7 @@ async fn route_bin_desktop_frame(
     );
     if congested > 0 {
         // R5#16 回传拥塞信号（限频 ≥5s），语义与 JSON text 路径一致。
-        let should_notify = {
-            let guard = state.last_congest_notify.read().await;
-            guard
-                .get(session_id)
-                .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(5))
-        };
-        if should_notify {
-            state
-                .last_congest_notify
-                .write()
-                .await
-                .insert(session_id.to_string(), std::time::Instant::now());
-            if let Some(tx) = state
-                .agent_broadcast
-                .read()
-                .await
-                .get(session_id)
-                .and_then(|cm| cm.agent.clone())
-            {
-                let _ = deliver(
-                    &tx,
-                    "desktop:congested",
-                    serde_json::json!({
-                        "type": "desktop:congested",
-                        "session_id": session_id,
-                        "payload": { "dropped": congested }
-                    })
-                    .to_string(),
-                );
-            }
-        }
+        notify_congested(state, session_id, congested).await;
     }
 }
 
@@ -1330,22 +1349,27 @@ pub async fn agent_send_handler(
 /// (bulk) yield to terminal:input / mcp:exec / control messages. Both
 /// receivers are bounded independently; bulk backpressure cannot stall
 /// interactive.
+///
+/// Yields `(is_bulk, message)`: the caller uses the flag to decide how the
+/// message is charged against the relay's downlink bandwidth budget (bulk
+/// file chunks `acquire` = backpressure; interactive traffic only `consume`
+/// so terminal latency is never gated by the limiter — MYS-2287).
 fn merge_biased(
     mut interactive: tokio::sync::mpsc::Receiver<String>,
     mut bulk: tokio::sync::mpsc::Receiver<String>,
-) -> impl tokio_stream::Stream<Item = String> {
+) -> impl tokio_stream::Stream<Item = (bool, String)> {
     async_stream::stream! {
         loop {
             tokio::select! {
                 biased;
-                m = interactive.recv() => match m { Some(s) => yield s, None => {
+                m = interactive.recv() => match m { Some(s) => yield (false, s), None => {
                     // drain remaining bulk
-                    while let Some(s) = bulk.recv().await { yield s; }
+                    while let Some(s) = bulk.recv().await { yield (true, s); }
                     break;
                 }},
-                m = bulk.recv() => match m { Some(s) => yield s, None => {
+                m = bulk.recv() => match m { Some(s) => yield (true, s), None => {
                     // drain remaining interactive
-                    while let Some(s) = interactive.recv().await { yield s; }
+                    while let Some(s) = interactive.recv().await { yield (false, s); }
                     break;
                 }},
             }
@@ -1505,7 +1529,24 @@ pub async fn upgrade_blob_handler(
                         .into_response();
                 }
             };
-            let stream = tokio_util::io::ReaderStream::new(file);
+            // 下行带宽（MYS-2287）：升级包是大文件，按 chunk 取令牌。限速时
+            // agent 侧下载变慢（自升级本身有超时/重试），不会丢字节。
+            let limiter = state.bandwidth.clone();
+            let stream = async_stream::stream! {
+                let mut inner = tokio_util::io::ReaderStream::new(file);
+                while let Some(chunk) = inner.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            limiter.down.acquire(bytes.len()).await;
+                            yield Ok::<_, std::io::Error>(bytes);
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            break;
+                        }
+                    }
+                }
+            };
             axum::http::Response::builder()
                 .status(axum::http::StatusCode::OK)
                 .header(
@@ -1665,7 +1706,16 @@ pub async fn agent_events_handler(
         };
 
         let mut merged = Box::pin(merge_biased(rx, bulk_rx));
-        while let Some(msg) = merged.next().await {
+        while let Some((is_bulk, msg)) = merged.next().await {
+            // 下行带宽（MYS-2287）：给 agent 转发的文件块（bulk 通道）走
+            // `acquire` 产生端到端背压——relay 出站受限时，agent 会因 SSE
+            // 读得慢而自己慢下来，而不是让 relay 无限缓冲。交互消息只记账
+            // （`consume`），绝不等待：终端回显不能被限速拖慢。
+            if is_bulk {
+                state_clone.bandwidth.down.acquire(msg.len()).await;
+            } else {
+                state_clone.bandwidth.down.consume(msg.len());
+            }
             let id = state_clone.buffer_agent_event(&sid_clone, &msg).await;
             yield Ok::<_, Infallible>(
                 axum::response::sse::Event::default()
@@ -2021,6 +2071,10 @@ pub async fn browser_sse_handler(
 
         let mut inner_stream = stream;
         while let Some(msg) = tokio_stream::StreamExt::next(&mut inner_stream).await {
+            // 下行带宽（MYS-2287）：浏览器 SSE 承载终端输出等交互数据，
+            // 只记账不等待——限速不能变成终端卡顿。大流量（文件下载）走
+            // /agent/mcp/get 的 body 流，那里是等待式限速。
+            state_snapshot_clone.bandwidth.down.consume(msg.len());
             yield Ok::<_, Infallible>(axum::response::sse::Event::default()
                 .data(msg));
         }
@@ -2136,6 +2190,11 @@ pub async fn browser_send_handler(
         let broadcast = state.agent_broadcast.read().await;
         if let Some(cm) = broadcast.get(&session_id) {
             if let Some(ref agent_tx) = cm.agent {
+                // 上行/下行记账拆分（MYS-2287）：浏览器发来的是 relay **入站**
+                // 流量，记到 up；转发给 agent 是出站，记到 down。两者都只记账
+                // 不等待——这是终端输入路径，绝不能限速拖慢回显。
+                state.bandwidth.up.consume(forward_msg.len());
+                state.bandwidth.down.consume(forward_msg.len());
                 deliver(agent_tx, msg_type, forward_msg);
             }
         }
@@ -2227,7 +2286,7 @@ mod tests {
             let mut streams = state.desktop_streams.write().await;
             streams
                 .entry(sid.clone())
-                .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                .or_insert_with(|| crate::relay::desktop::DesktopStream::with_limiter(Some(state.bandwidth.clone())))
                 .clone()
         };
         let (_vid, _rx, _init) = ds.add_viewer().await;
@@ -2261,7 +2320,7 @@ mod tests {
             let mut streams = state.desktop_streams.write().await;
             streams
                 .entry(sid.clone())
-                .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                .or_insert_with(|| crate::relay::desktop::DesktopStream::with_limiter(Some(state.bandwidth.clone())))
                 .clone()
         };
         // init 帧 → set_init 缓存。
@@ -2290,7 +2349,7 @@ mod tests {
             let mut streams = state.desktop_streams.write().await;
             streams
                 .entry(sid.clone())
-                .or_insert_with(crate::relay::desktop::DesktopStream::new)
+                .or_insert_with(|| crate::relay::desktop::DesktopStream::with_limiter(Some(state.bandwidth.clone())))
                 .clone()
         };
         let (_vid, _rx, _init) = ds.add_viewer().await;
@@ -3455,8 +3514,8 @@ mod tests {
             got.push(s);
         }
         // interactive i0 must come before all bulk (biased: interactive drained first each cycle)
-        let i_pos = got.iter().position(|s| s == "i0").unwrap();
-        let first_bulk = got.iter().position(|s| s.starts_with('b')).unwrap();
+        let i_pos = got.iter().position(|(_, s)| s == "i0").unwrap();
+        let first_bulk = got.iter().position(|(_, s)| s.starts_with('b')).unwrap();
         assert!(
             i_pos < first_bulk,
             "interactive must precede bulk under biased merge; got {:?}",
@@ -3493,10 +3552,11 @@ mod tests {
         assert_eq!(got.len(), 101, "should receive 101 messages total");
         let first = got.first().expect("non-empty");
         assert_eq!(
-            first, "interactive-ping",
+            first.1, "interactive-ping",
             "interactive must be very first item under heavy bulk flood; got {:?}",
             first
         );
+        assert!(!first.0, "the first item must be flagged interactive (is_bulk=false)");
     }
 
     /// Relay-level integration test for biased merge.  Channels are wired into
@@ -3534,11 +3594,12 @@ mod tests {
 
         assert_eq!(got.len(), 6, "one interactive + five bulk");
         assert_eq!(
-            got[0],
-            "terminal:input",
+            got[0].1, "terminal:input",
             "interactive must be first in merged output; got {:?}",
             got.first()
         );
+        assert!(!got[0].0, "is_bulk flag must be false for interactive");
+        assert!(got[1].0, "is_bulk flag must be true for bulk file chunks");
     }
 
     // ── Access-audit (conn_log) tests ────────────────────────────────
