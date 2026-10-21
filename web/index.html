@@ -4,73 +4,122 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>shell-remote</title>
+    <script>
+        // Apply the stored theme before first paint — no flash of the wrong
+        // palette. Mirrors UI.theme in /ui.js (same key, same mode names).
+        (function () {
+            try {
+                var m = localStorage.getItem('sr-theme');
+                var t = (m === 'light' || m === 'dark') ? m
+                    : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+                document.documentElement.setAttribute('data-theme', t);
+                document.documentElement.setAttribute('data-theme-mode',
+                    (m === 'light' || m === 'dark' || m === 'system') ? m : 'system');
+            } catch (e) {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            }
+        })();
+    </script>
+    <link rel="stylesheet" href="/theme.css">
+    <link rel="stylesheet" href="/ui.css">
     <link rel="stylesheet" href="/style.css">
 </head>
 <body class="connect-page">
-    <a class="github-link" href="https://github.com/zzttzzmyswy/shell-remote" target="_blank" rel="noopener" title="GitHub">
-        <svg width="24" height="24" viewBox="0 0 16 16" fill="currentColor">
-            <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-        </svg>
-    </a>
+    <div class="connect-toolbar">
+        <button type="button" class="theme-toggle" data-mode="system" title="主题" aria-label="切换主题">
+            <svg class="ico ico-system" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1a1 1 0 0 1 1 1v1.5a.5.5 0 0 1-1 0V2a1 1 0 0 1 1-1zm4.95 2.05a1 1 0 0 1 0 1.414l-1.06 1.06a.5.5 0 1 1-.708-.707l1.06-1.06a1 1 0 0 1 1.415 0zM14 7.5a.5.5 0 0 1 .5.5 6.5 6.5 0 0 1-13 0 .5.5 0 0 1 1 0 5.5 5.5 0 0 0 11 0 .5.5 0 0 1 .5-.5zM3.11 4.464a.5.5 0 0 1 0 .708l-1.06 1.06a.5.5 0 1 1-.707-.707l1.06-1.06a.5.5 0 0 1 .707 0z"/></svg>
+            <svg class="ico ico-light" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm0-9.5a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0V2a.5.5 0 0 1 .5-.5zm0 10.5a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0v-1a.5.5 0 0 1 .5-.5zM14.5 7.5a.5.5 0 0 1 0 1h-1a.5.5 0 0 1 0-1h1zM2.5 7.5a.5.5 0 0 1 0 1h-1a.5.5 0 0 1 0-1h1zm10.096-4.096a.5.5 0 0 1 0 .707l-.707.707a.5.5 0 1 1-.707-.707l.707-.707a.5.5 0 0 1 .707 0zM4.818 10.768a.5.5 0 0 1 0 .707l-.707.707a.5.5 0 1 1-.707-.707l.707-.707a.5.5 0 0 1 .707 0zm8.778 1.414a.5.5 0 0 1-.707.707l-.707-.707a.5.5 0 0 1 .707-.707l.707.707zM4.818 4.232a.5.5 0 0 1-.707.707l-.707-.707a.5.5 0 0 1 .707-.707l.707.707z"/></svg>
+            <svg class="ico ico-dark" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.2 1.6a6.5 6.5 0 1 0 8.2 8.2A5.5 5.5 0 0 1 6.2 1.6z"/></svg>
+        </button>
+        <a class="github-link" href="https://github.com/zzttzzmyswy/shell-remote" target="_blank" rel="noopener" title="GitHub" aria-label="GitHub 仓库">
+            <svg width="22" height="22" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+            </svg>
+        </a>
+    </div>
 
     <!-- Connect Section -->
-    <div class="connect-container">
+    <main class="connect-container">
         <div class="brand-mark" aria-hidden="true">&gt;_</div>
         <h1>shell-remote</h1>
         <p class="subtitle">远程协作终端 · 文件 · 桌面</p>
-        <div class="connect-form">
+        <form class="connect-form" id="connect-form" novalidate>
             <label for="auth-input">服务器密码</label>
-            <input type="password" id="auth-input" placeholder="服务器访问密码..." autocomplete="current-password">
+            <input type="password" id="auth-input" placeholder="服务器访问密码…" autocomplete="current-password"
+                   aria-describedby="auth-hint">
+            <p class="field-hint" id="auth-hint">如服务器未设置密码可留空</p>
+
             <label for="token-input">会话密钥</label>
-            <input type="text" id="token-input" placeholder="粘贴会话密钥..." autocomplete="off">
+            <input type="text" id="token-input" placeholder="粘贴会话密钥…" autocomplete="off" required>
+
             <div class="button-row">
-                <button id="connect-btn" class="btn btn-primary">连接</button>
+                <button type="submit" id="connect-btn" class="btn btn-primary">连接</button>
             </div>
-            <div id="connect-error" class="error-message hidden"></div>
+            <div id="connect-error" class="error-message hidden" role="alert"></div>
             <p class="connect-hint">密钥由 agent 启动时输出（rw 读写 / ro 只读）</p>
-        </div>
-    </div>
+        </form>
+    </main>
 
     <!-- Install Section -->
-    <div class="install-section">
+    <section class="install-section">
         <h2>一行命令启动客户端</h2>
         <p>在目标机器上执行以下命令即可自动部署并运行：</p>
 
-        <div class="install-block">
-            <div class="install-label">Linux / macOS</div>
+        <div class="tab-group" role="tablist" aria-label="操作系统">
+            <button type="button" role="tab" id="tab-linux" aria-controls="panel-linux"
+                    aria-selected="true" tabindex="0" data-panel="panel-linux">Linux</button>
+            <button type="button" role="tab" id="tab-macos" aria-controls="panel-macos"
+                    aria-selected="false" tabindex="-1" data-panel="panel-macos">macOS</button>
+            <button type="button" role="tab" id="tab-windows" aria-controls="panel-windows"
+                    aria-selected="false" tabindex="-1" data-panel="panel-windows">Windows</button>
+        </div>
+
+        <div class="tab-panel-body" id="panel-linux" role="tabpanel" aria-labelledby="tab-linux">
             <div class="install-cmd">
                 <code id="linux-run">$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh</code>
-                <button class="copy-btn" onclick="copyCmd('linux-run')">copy</button>
+                <button type="button" class="copy-btn" data-copy="linux-run" aria-label="复制命令">copy</button>
             </div>
             <div class="install-cmd">
                 <code id="linux-run-wget">$ wget -qO- <span class="relay-host">https://host</span>/agent/install | sh</code>
-                <button class="copy-btn" onclick="copyCmd('linux-run-wget')">copy</button>
+                <button type="button" class="copy-btn" data-copy="linux-run-wget" aria-label="复制命令">copy</button>
             </div>
             <div class="install-sub">仅下载到当前目录不执行：</div>
             <div class="install-cmd">
                 <code id="linux-dl">$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh -s -- --download-only</code>
-                <button class="copy-btn" onclick="copyCmd('linux-dl')">copy</button>
+                <button type="button" class="copy-btn" data-copy="linux-dl" aria-label="复制命令">copy</button>
             </div>
             <div class="install-cmd">
                 <code id="linux-dl-wget">$ wget -qO- <span class="relay-host">https://host</span>/agent/install | sh -s -- --download-only</code>
-                <button class="copy-btn" onclick="copyCmd('linux-dl-wget')">copy</button>
+                <button type="button" class="copy-btn" data-copy="linux-dl-wget" aria-label="复制命令">copy</button>
             </div>
         </div>
 
-        <div class="install-block">
-            <div class="install-label">Windows（PowerShell）</div>
+        <div class="tab-panel-body" id="panel-macos" role="tabpanel" aria-labelledby="tab-macos" hidden>
+            <div class="install-cmd">
+                <code id="mac-run">$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh</code>
+                <button type="button" class="copy-btn" data-copy="mac-run" aria-label="复制命令">copy</button>
+            </div>
+            <div class="install-sub">macOS 与 Linux 共用同一个脚本（自动识别 darwin 架构）：</div>
+            <div class="install-cmd">
+                <code id="mac-dl">$ curl -fsSL <span class="relay-host">https://host</span>/agent/install | sh -s -- --download-only</code>
+                <button type="button" class="copy-btn" data-copy="mac-dl" aria-label="复制命令">copy</button>
+            </div>
+        </div>
+
+        <div class="tab-panel-body" id="panel-windows" role="tabpanel" aria-labelledby="tab-windows" hidden>
             <div class="install-cmd">
                 <code id="win-run">irm <span class="relay-host">https://host</span>/agent/install.ps1 | iex</code>
-                <button class="copy-btn" onclick="copyCmd('win-run')">copy</button>
+                <button type="button" class="copy-btn" data-copy="win-run" aria-label="复制命令">copy</button>
             </div>
             <div class="install-sub">仅下载到当前目录不执行：</div>
             <div class="install-cmd">
                 <code id="win-dl">&amp; ([scriptblock]::Create((irm <span class="relay-host">https://host</span>/agent/install.ps1))) --download-only</code>
-                <button class="copy-btn" onclick="copyCmd('win-dl')">copy</button>
+                <button type="button" class="copy-btn" data-copy="win-dl" aria-label="复制命令">copy</button>
             </div>
         </div>
-    </div>
+    </section>
 
+    <script src="/ui.js"></script>
     <script>
         // ── Connect logic ──────────────────────────────────────────────
         const tokenInput = document.getElementById('token-input');
@@ -81,12 +130,10 @@
             const token = tokenInput.value.trim();
             if (!token) {
                 showError('请输入会话密钥');
+                tokenInput.focus();
                 return;
             }
-            if (!authInput.value) {
-                showError('请输入服务器密码');
-                return;
-            }
+            // 服务器密码可留空：relay 未设置 --auth 时无需密码。
             // 服务器密码（relay --auth）：随每个请求以 X-Auth 头发送。
             // 与会话密钥、管理后台账号密码是三个独立的凭据。
             sessionStorage.setItem('shell-remote-auth', authInput.value);
@@ -99,11 +146,10 @@
             errorDiv.classList.remove('hidden');
         }
 
-        document.getElementById('connect-btn').addEventListener('click', () => connect());
-
-        [tokenInput, authInput].forEach((el) => el.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') connect();
-        }));
+        document.getElementById('connect-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            connect();
+        });
 
         // 被 session 页退回时提示原因，并预填上次的会话密钥
         const errCode = new URLSearchParams(window.location.search).get('err');
@@ -112,6 +158,7 @@
         const prevToken = sessionStorage.getItem('shell-remote-token');
         if (prevToken) tokenInput.value = prevToken;
         if (errCode === 'password') authInput.focus();
+        else if (!prevToken) tokenInput.focus();
 
         const urlParams = new URLSearchParams(window.location.search);
         const urlToken = urlParams.get('token');
@@ -136,43 +183,54 @@
             el.textContent = relayHost;
         });
 
-        function copyCmd(id) {
-            var host = location.protocol + '//' + location.host;
-            var cmds = {
-                'linux-run': 'curl -fsSL ' + host + '/agent/install | sh',
-                'linux-run-wget': 'wget -qO- ' + host + '/agent/install | sh',
-                'linux-dl':  'curl -fsSL ' + host + '/agent/install | sh -s -- --download-only',
-                'linux-dl-wget': 'wget -qO- ' + host + '/agent/install | sh -s -- --download-only',
-                'win-run':   'irm ' + host + '/agent/install.ps1 | iex',
-                'win-dl':    '& ([scriptblock]::Create((irm ' + host + '/agent/install.ps1))) --download-only'
-            };
-            var cmd = cmds[id];
-            var done = function() {
-                var code = document.getElementById(id);
-                var btn = code.parentElement.querySelector('.copy-btn');
-                btn.textContent = 'copied!';
-                btn.classList.add('copied');
-                setTimeout(function() { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 2000);
-            };
-            var fallback = function() {
-                // 非安全上下文（http）无 navigator.clipboard：隐藏 textarea + execCommand
-                var ta = document.createElement('textarea');
-                ta.value = cmd;
-                ta.style.position = 'fixed';
-                ta.style.opacity = '0';
-                document.body.appendChild(ta);
-                ta.select();
-                var ok = false;
-                try { ok = document.execCommand('copy'); } catch (e) {}
-                document.body.removeChild(ta);
-                if (ok) done();
-            };
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(cmd).then(done).catch(fallback);
-            } else {
-                fallback();
-            }
+        // ── Install command tabs (Linux / macOS / Windows) ─────────────
+        const tabButtons = Array.from(document.querySelectorAll('.tab-group [role="tab"]'));
+        function selectTab(btn, focus) {
+            tabButtons.forEach((b) => {
+                const on = b === btn;
+                b.setAttribute('aria-selected', on ? 'true' : 'false');
+                b.tabIndex = on ? 0 : -1;
+                const panel = document.getElementById(b.dataset.panel);
+                if (panel) panel.hidden = !on;
+            });
+            if (focus) btn.focus();
         }
+        tabButtons.forEach((btn) => {
+            btn.addEventListener('click', () => selectTab(btn, false));
+            btn.addEventListener('keydown', (e) => {
+                const i = tabButtons.indexOf(btn);
+                if (e.key === 'ArrowRight') { e.preventDefault(); selectTab(tabButtons[(i + 1) % tabButtons.length], true); }
+                else if (e.key === 'ArrowLeft') { e.preventDefault(); selectTab(tabButtons[(i - 1 + tabButtons.length) % tabButtons.length], true); }
+                else if (e.key === 'Home') { e.preventDefault(); selectTab(tabButtons[0], true); }
+                else if (e.key === 'End') { e.preventDefault(); selectTab(tabButtons[tabButtons.length - 1], true); }
+            });
+        });
+
+        // ── Copy buttons ───────────────────────────────────────────────
+        const cmds = {
+            'linux-run': 'curl -fsSL ' + relayHost + '/agent/install | sh',
+            'linux-run-wget': 'wget -qO- ' + relayHost + '/agent/install | sh',
+            'linux-dl':  'curl -fsSL ' + relayHost + '/agent/install | sh -s -- --download-only',
+            'linux-dl-wget': 'wget -qO- ' + relayHost + '/agent/install | sh -s -- --download-only',
+            'mac-run':   'curl -fsSL ' + relayHost + '/agent/install | sh',
+            'mac-dl':    'curl -fsSL ' + relayHost + '/agent/install | sh -s -- --download-only',
+            'win-run':   'irm ' + relayHost + '/agent/install.ps1 | iex',
+            'win-dl':    '& ([scriptblock]::Create((irm ' + relayHost + '/agent/install.ps1))) --download-only'
+        };
+
+        document.querySelectorAll('.copy-btn[data-copy]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const id = btn.dataset.copy;
+                const cmd = cmds[id];
+                if (cmd === undefined) return;
+                const done = (ok) => {
+                    btn.textContent = ok ? 'copied!' : 'copy';
+                    btn.classList.toggle('copied', ok);
+                    setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 2000);
+                };
+                UI.copyText(cmd, done);
+            });
+        });
     </script>
 </body>
 </html>

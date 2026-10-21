@@ -1,10 +1,36 @@
-<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>MSE 探针</title>
-<style>body{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:#111;color:#ddd;padding:16px;white-space:pre-wrap;word-break:break-all}
-input{background:#222;color:#eee;border:1px solid #555;padding:4px 6px;width:200px}
-button{background:#2a6;color:#fff;border:0;padding:5px 12px;cursor:pointer}
-.bad{color:#f77}.ok{color:#7d7}</style></head>
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MSE 探针</title>
+<script>
+    // Apply the stored theme before first paint (mirrors UI.theme in /ui.js).
+    (function () {
+        try {
+            var m = localStorage.getItem('sr-theme');
+            var t = (m === 'light' || m === 'dark') ? m
+                : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+            document.documentElement.setAttribute('data-theme', t);
+            document.documentElement.setAttribute('data-theme-mode',
+                (m === 'light' || m === 'dark' || m === 'system') ? m : 'system');
+        } catch (e) {
+            document.documentElement.setAttribute('data-theme', 'dark');
+        }
+    })();
+</script>
+<link rel="stylesheet" href="/theme.css">
+<style>
+body{font-family:var(--font-mono);font-size:12px;background:var(--bg-primary);color:var(--text-primary);
+     padding:var(--space-4);white-space:pre-wrap;word-break:break-all;margin:0}
+input{background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border);
+      border-radius:var(--radius-sm);padding:var(--space-1) 6px;width:200px;font-family:var(--font-mono)}
+button{background:var(--accent);color:var(--on-accent);border:0;border-radius:var(--radius-sm);
+       padding:5px var(--space-3);cursor:pointer;font-family:var(--font-sans);font-weight:600}
+button:hover{background:var(--accent-hover)}
+.bad{color:var(--danger)}.ok{color:var(--success)}
+pre{margin:0;font-family:var(--font-mono)}
+</style></head>
 <body>MSE 自诊断（Token:
-<input id="tok" value="testkey">
+<input id="tok" value="testkey" aria-label="会话密钥">
 <button onclick="run()">开始</button>）
 <pre id="out">等待…</pre>
 <script>
