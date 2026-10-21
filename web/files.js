@@ -4,9 +4,76 @@ class FileManager {
         this.currentPath = '.';
         this._pendingDownloads = {};
         this._uploadQueue = [];
+        // 下载 id：Date.now() 在快速连续点击时会同值（同一毫秒），后一次会把
+        // 前一次 pending 覆盖掉。用单调自增计数器 + 前缀即可。
+        this._downloadSeq = 0;
     }
 
     init() { this.loadDirectory('.'); }
+
+    // ── Windows / POSIX 路径工具（纯函数，便于单测）──────────────────
+    // agent 可能跑在 Windows 上：列目录返回的 path 形如 `C:\Users\u\a.txt`。
+    // 写死 '/' 会让面包屑、`..` 和重命名拼出混合分隔符的路径，
+    // agent 侧 resolve 后可能指向不存在的目录。
+    static separatorFor(path) {
+        const p = String(path || '');
+        if (p.indexOf('\\') !== -1 && p.indexOf('/') === -1) return '\\';
+        if (p.indexOf('\\') !== -1 && /^[A-Za-z]:\\/.test(p)) return '\\';
+        return '/';
+    }
+
+    static splitPath(path) {
+        return String(path || '').split(/[\\/]/).filter(Boolean);
+    }
+
+    static isWindowsPath(path) {
+        return FileManager.separatorFor(path) === '\\';
+    }
+
+    // 拼一个子项路径，保持父路径本身的分隔符风格。
+    static joinPath(base, name) {
+        const sep = FileManager.separatorFor(base);
+        const b = String(base || '');
+        if (!b) return name;
+        if (b.endsWith('/') || b.endsWith('\\')) return b + name;
+        return b + sep + name;
+    }
+
+    // 去掉最后一个分量，得到父目录。Windows 盘根的父目录是它自己
+    // （`C:\a` → `C:\`，`C:\` → `C:\`）。
+    static parentPath(path) {
+        const p = String(path || '');
+        const sep = FileManager.separatorFor(p);
+        const parts = FileManager.splitPath(p);
+        if (parts.length === 0) return p;
+        const isWindows = sep === '\\';
+        if (parts.length === 1) {
+            // 已在根上：POSIX 根是 `/`，Windows 盘根是 `C:\`。
+            return isWindows ? parts[0] + '\\' : '/';
+        }
+        parts.pop();
+        if (isWindows) return parts.join('\\') + '\\';
+        return '/' + parts.join('/');
+    }
+
+    // 替换最后一个分量（重命名）。新名由调用方校验过不含分隔符。
+    static replaceLeaf(path, newName) {
+        const p = String(path || '');
+        const sep = FileManager.separatorFor(p);
+        const parts = FileManager.splitPath(p);
+        if (parts.length === 0) return newName;
+        parts[parts.length - 1] = newName;
+        if (sep === '\\') {
+            // 保留盘符后的反斜杠风格：C:\a\b → C:\a\c
+            return parts.join('\\');
+        }
+        return (p.startsWith('/') ? '/' : '') + parts.join('/');
+    }
+
+    static hasSeparator(name) {
+        const n = String(name || '');
+        return n.indexOf('/') !== -1 || n.indexOf('\\') !== -1;
+    }
 
     loadDirectory(path) {
         this.currentPath = path;
@@ -28,21 +95,26 @@ class FileManager {
     _renderBreadcrumb(path) {
         const bc = document.createElement('div');
         bc.className = 'breadcrumb';
-        const parts = path === '/' ? [''] : path.split('/').filter(Boolean);
+        const sep = FileManager.separatorFor(path);
+        const parts = FileManager.splitPath(path);
         let acc = '';
+        const isWindows = sep === '\\';
 
         const root = document.createElement('span');
         root.className = 'breadcrumb-item';
-        root.textContent = '/';
-        root.onclick = () => this.navigateTo('/');
+        root.textContent = isWindows ? (parts[0] || '') + '\\' : '/';
+        // Windows 盘根：`C:\`；POSIX：`/`。
+        root.onclick = () => this.navigateTo(isWindows ? (parts[0] || '') + '\\' : '/');
         bc.appendChild(root);
 
         parts.forEach((p, i) => {
-            const sep = document.createTextNode('');
+            // 第一段在 Windows 下已经作为根显示过了（盘符）。
+            if (isWindows && i === 0) return;
             const span = document.createElement('span');
             span.className = 'breadcrumb-item';
             span.textContent = p;
-            acc += '/' + p;
+            acc = acc ? FileManager.joinPath(acc, p) : (isWindows ? parts[0] + '\\' : '') + p;
+            if (!isWindows && !acc.startsWith('/')) acc = '/' + acc;
             const target = acc;
             span.onclick = () => this.navigateTo(target);
             if (i === parts.length - 1) span.classList.add('current');
@@ -83,14 +155,15 @@ class FileManager {
 
         const tbody = document.createElement('tbody');
 
-        if (currentPath !== '/' && currentPath !== '.') {
+        const atRoot = currentPath === '/'
+            || currentPath === '.'
+            || /^[A-Za-z]:[\\/]$/.test(currentPath || '');
+        if (!atRoot) {
             const row = document.createElement('tr');
             row.className = 'file-row';
             row.innerHTML = '<td class="file-name directory"><svg width="14" height="14" viewBox="0 0 16 16"><path fill="currentColor" d="M8.086 2.207a2 2 0 0 1 1.414.586l.828.828A2 2 0 0 0 11.742 4H14a2 2 0 0 1 2 2v6.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 12.5v-9A1.5 1.5 0 0 1 1.5 2h5.172a2 2 0 0 1 1.414.586z"/></svg> ..</td><td></td><td></td><td></td><td></td>';
             row.addEventListener('click', () => {
-                const parts = currentPath.split('/').filter(Boolean);
-                parts.pop();
-                this.navigateTo('/' + parts.join('/') || '/');
+                this.navigateTo(FileManager.parentPath(currentPath));
             });
             tbody.appendChild(row);
         }
@@ -151,9 +224,7 @@ class FileManager {
 
     uploadFile(file) {
         const token = sessionStorage.getItem('shell-remote-token') || '';
-        const fullPath = this.currentPath.endsWith('/')
-            ? this.currentPath + file.name
-            : this.currentPath + '/' + file.name;
+        const fullPath = FileManager.joinPath(this.currentPath, file.name);
 
         const q = { name: file.name, size: file.size, loaded: 0, total: file.size };
         this._uploadQueue.push(q);
@@ -183,7 +254,10 @@ class FileManager {
             console.error('Upload network error');
             this._showToast('上传失败: ' + file.name + ' (网络错误)');
         };
-        xhr.open('POST', '/agent/upload?path=' + encodeURIComponent(fullPath) + '&token=' + encodeURIComponent(token));
+        // relay 的 /agent/upload 用 extract_token_from_headers_or_query 先看
+        // Authorization: Bearer —— URL 里不必再带 token（会被 nginx/访问日志
+        // 记录下来）。
+        xhr.open('POST', '/agent/upload?path=' + encodeURIComponent(fullPath));
         xhr.setRequestHeader('Authorization', 'Bearer ' + token);
         const pw = sessionStorage.getItem('shell-remote-auth');
         if (pw) xhr.setRequestHeader('X-Auth', pw);
@@ -191,7 +265,7 @@ class FileManager {
     }
 
     downloadFile(path, name) {
-        const dlId = 'dl-' + Date.now();
+        const dlId = 'dl-' + (++this._downloadSeq);
         // The agent streams the file as multiple chunked fs:result messages
         // (256 KiB each) to keep messages small; we reassemble here.
         this._pendingDownloads[dlId] = { name, chunks: [], total: 0, timer: null };
@@ -277,7 +351,7 @@ class FileManager {
     createFolder() {
         const name = prompt('文件夹名称:');
         if (name) {
-            const fp = this.currentPath === '/' ? '/' + name : this.currentPath + '/' + name;
+            const fp = FileManager.joinPath(this.currentPath, name);
             window.shellRemote.send('fs:mkdir', { path: fp });
         }
     }
@@ -309,11 +383,11 @@ class FileManager {
         add('重命名', () => {
             const nn = prompt('新名称:', entry.name);
             if (nn === null || nn === entry.name) return;
-            if (!nn.trim() || nn.indexOf('/') !== -1) {
-                this._showToast('重命名失败: 名称不能为空或包含 /');
+            if (!nn.trim() || FileManager.hasSeparator(nn)) {
+                this._showToast('重命名失败: 名称不能为空，也不能包含 / 或 \\');
                 return;
             }
-            const np = entry.path.replace(/[^/]+$/, () => nn);
+            const np = FileManager.replaceLeaf(entry.path, nn);
             window.shellRemote.send('fs:rename', { from: entry.path, to: np });
         });
         add('删除', () => this.deletePath(entry.path), true);
@@ -349,3 +423,16 @@ class FileManager {
         return (b / 1048576).toFixed(1) + ' MB';
     }
 }
+
+// 路径工具是纯函数：挂到 window 供 verify_mys2283_c.js 用 page.evaluate
+// 直接断言（没有 Windows 环境，靠单测覆盖分隔符分支）。真实页面里
+// files.js 与其它脚本共享全局作用域，这里只新增一个命名空间。
+window.SRPathUtils = {
+    separatorFor: FileManager.separatorFor,
+    splitPath: FileManager.splitPath,
+    isWindowsPath: FileManager.isWindowsPath,
+    joinPath: FileManager.joinPath,
+    parentPath: FileManager.parentPath,
+    replaceLeaf: FileManager.replaceLeaf,
+    hasSeparator: FileManager.hasSeparator
+};

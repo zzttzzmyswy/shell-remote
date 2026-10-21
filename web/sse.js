@@ -56,6 +56,8 @@
   var sseIdleTimer = null;        // setInterval id（惰性创建，连接成功后启动）
   var SSE_IDLE_MS = 30000;
   var SSE_IDLE_CHECK_MS = 5000;
+  // 建连看门狗：fetch resolve 之前没有任何超时保护，半开连接会让重连静默停摆。
+  var SSE_CONNECT_TIMEOUT_MS = 15000;
 
   function checkSseIdle() {
     if (lastSseAt === 0 || intentionalClose) return;
@@ -217,6 +219,23 @@
     var localController = controller;
     var buffer = '';
 
+    // C8：fetch 只有在拿到响应头之后才会 resolve。半开连接/被黑洞的 TCP 上
+    // 它可以挂很久，期间的 reconnectTimer 已清空 → 页面既不报错也不重连。
+    // 15s 内没拿到响应头就 abort，交给 scheduleReconnect。
+    var connectTimer = setTimeout(function() {
+      connectTimer = null;
+      if (localController.signal.aborted) return;
+      console.warn('SSE connect timeout (15s without response headers)');
+      localController.abort();
+      scheduleReconnect();
+    }, SSE_CONNECT_TIMEOUT_MS);
+    function clearConnectTimer() {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+    }
+
     fetch('/agent/session/sse', {
       method: 'GET',
       headers: authHeaders({
@@ -226,6 +245,8 @@
       }),
       signal: localController.signal
     }).then(function(resp) {
+      // 响应头已到：看门狗交棒给 sseIdleTimer。
+      clearConnectTimer();
       if (!resp.ok || !resp.body) {
         if (resp.status === 401 && !everConnected) {
           // 先区分是服务器密码错还是会话密钥错
@@ -296,7 +317,8 @@
       }
       return pump();
     }).catch(function(err) {
-      if (localController.signal.aborted) return;  // deliberate stop
+      clearConnectTimer();
+      if (localController.signal.aborted) return;  // deliberate stop / connect timeout
       console.warn('SSE stream error:', err.message);
       scheduleReconnect();
     });

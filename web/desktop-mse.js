@@ -505,6 +505,8 @@
     _bindInput() {
       if (this._inputBound) return;
       this._inputBound = true;
+      // 当前按住的键（C11）：窗口失焦那一刻浏览器不再派发 keyup。
+      if (!this._pressedKeys) this._pressedKeys = new Set();
       const v = this.video;
       const self = this;
 
@@ -579,12 +581,29 @@
           if (!self._inputBound) return;
           const t = e.target;
           if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+          // 跟踪按下的键：失焦后 keyup 丢失会让远端键位卡住（C11）。
+          if (down) self._pressedKeys.add(e.code);
+          else self._pressedKeys.delete(e.code);
           send('desktop:key', { code: e.code, down: down });
           if (['F5', 'F12'].indexOf(e.code) < 0) e.preventDefault();
         };
       };
       this._onKeyDown = this._onKeyWin(true);
       this._onKeyUp = this._onKeyWin(false);
+
+      // 失焦 / 页面隐藏：把仍按住的键补发 keyup。
+      this._releasePressedKeys = function() {
+        if (!self._inputBound) return;
+        const codes = Array.from(self._pressedKeys);
+        self._pressedKeys.clear();
+        for (const code of codes) {
+          send('desktop:key', { code: code, down: false });
+        }
+      };
+      this._onWindowBlur = function() { self._releasePressedKeys(); };
+      this._onVisibilityChange = function() {
+        if (document.visibilityState === 'hidden') self._releasePressedKeys();
+      };
 
       v.addEventListener('pointermove', this._onPointerMove);
       v.addEventListener('pointerdown', this._onPointerDown);
@@ -593,11 +612,14 @@
       v.addEventListener('contextmenu', this._onContextMenu);
       window.addEventListener('keydown', this._onKeyDown);
       window.addEventListener('keyup', this._onKeyUp);
+      window.addEventListener('blur', this._onWindowBlur);
+      document.addEventListener('visibilitychange', this._onVisibilityChange);
       v.tabIndex = 0;
     }
 
     _unbindInput() {
       if (!this._inputBound) return;
+      if (this._releasePressedKeys) this._releasePressedKeys();
       this._inputBound = false;
       const v = this.video;
       v.removeEventListener('pointermove', this._onPointerMove);
@@ -607,6 +629,8 @@
       v.removeEventListener('contextmenu', this._onContextMenu);
       window.removeEventListener('keydown', this._onKeyDown);
       window.removeEventListener('keyup', this._onKeyUp);
+      window.removeEventListener('blur', this._onWindowBlur);
+      document.removeEventListener('visibilitychange', this._onVisibilityChange);
     }
   };
 })();
