@@ -112,11 +112,40 @@ struct Transport {
     _task: tokio::task::JoinHandle<()>,
 }
 
+/// 上行身份令牌的请求头名（与 relay 的 `auth::AGENT_TOKEN_HEADER` 一致）。
+/// 新版 relay 据此校验「这条上行确实属于该会话」，缺失则按旧版 agent 处理
+/// （仅在会话无在线 agent 时放行）。
+pub(crate) const AGENT_TOKEN_HEADER: &str = "X-SR-Agent-Token";
+
 impl Drop for Transport {
     // The SSE reader is a detached task; abort it with the session so a
     // session that ends for a non-SSE reason does not leak the GET connection.
     fn drop(&mut self) {
         self._task.abort();
+    }
+}
+
+/// 从注册返回的 token 集合里挑出用于证明 agent 身份的那个：优先 `rw`，
+/// 只有 `ro`（`--token-type ro`）时就用它——relay 接受该会话的**任何**
+/// token 作为 agent 身份。空集合 → `None`（不带身份头）。
+pub(crate) fn pick_agent_token(tokens: &[(String, String)]) -> Option<String> {
+    tokens
+        .iter()
+        .find(|(_, p)| p == "rw")
+        .or_else(|| tokens.first())
+        .map(|(t, _)| t.clone())
+}
+
+/// 给一次上行请求附加 `X-SR-Agent-Token`。`token` 为空时不附加（旧 relay
+/// 不认识该头，register 请求本身也还没有 token）。
+pub(crate) fn with_agent_token(
+    rb: reqwest::RequestBuilder,
+    token: &str,
+) -> reqwest::RequestBuilder {
+    if token.is_empty() {
+        rb
+    } else {
+        rb.header(AGENT_TOKEN_HEADER, token)
     }
 }
 
@@ -205,6 +234,22 @@ fn parse_desktop_binary(response: &serde_json::Value) -> bool {
         .get("desktop_binary")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// 从注册响应里解析 `payload.tokens` 为 `(token, permission)` 列表。
+/// 解析失败/缺失 → 空列表（老 relay 兼容）。
+pub(crate) fn parse_tokens(response: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(arr) = response["payload"]["tokens"].as_array() {
+        for t in arr {
+            if let (Some(tok), Some(perm)) =
+                (t["token"].as_str(), t["permission"].as_str())
+            {
+                out.push((tok.to_string(), perm.to_string()));
+            }
+        }
+    }
+    out
 }
 
 impl RelayClient {
@@ -320,17 +365,24 @@ impl RelayClient {
             .to_string();
 
         let events_url = format!("{}/agent/events?session={}", http_base, session_id);
+        // 身份令牌来自注册响应（此时 client.tokens 还没填充），先就地解析：
+        // 优先 rw，只有 ro 时用 ro——relay 接受该会话的任何 token 作为 agent
+        // 身份。老 relay 不校验此头，多带也无害。
+        let agent_token = pick_agent_token(&parse_tokens(&response)).unwrap_or_default();
 
         let (tx, rx) = mpsc::unbounded_channel::<String>();
 
         let sse_client = http_client.clone();
         let sse_task = tokio::spawn(async move {
-            let stream = match sse_client
-                .get(&events_url)
-                .header("Accept", "text/event-stream")
-                .header("Cache-Control", "no-cache")
-                .send()
-                .await
+            let stream = match with_agent_token(
+                sse_client
+                    .get(&events_url)
+                    .header("Accept", "text/event-stream")
+                    .header("Cache-Control", "no-cache"),
+                &agent_token,
+            )
+            .send()
+            .await
             {
                 Ok(resp) if !resp.status().is_success() => {
                     // e.g. 404 after a relay restart: end now so the session
@@ -505,6 +557,13 @@ impl RelayClient {
 
     pub(crate) fn send_url(&self) -> &str {
         &self.transport.send_url
+    }
+
+    /// 该会话用来证明 agent 身份的上行令牌（`X-SR-Agent-Token` 的值）。
+    /// 注册响应里的 tokens 已填充；异常情况（老 relay 无 tokens）→ 空串，
+    /// 此时上行不带身份头（对应旧版 agent 行为）。
+    pub(crate) fn agent_token(&self) -> String {
+        pick_agent_token(&self.tokens).unwrap_or_default()
     }
 
     /// The `--key` value used at registration ("" when unset). The desktop
@@ -770,5 +829,65 @@ mod tests {
         assert_eq!(snippet("abc", 8), "abc");
         assert_eq!(snippet("密钥密钥", 8), "密钥"); // 8 falls inside the 3rd char
         assert_eq!(snippet("abcdefghij", 8), "abcdefgh");
+    }
+
+    // ── agent 身份令牌（A1）────────────────────────────────────────
+
+    #[test]
+    fn test_pick_agent_token_prefers_rw() {
+        let toks = vec![
+            ("ro-tok".to_string(), "ro".to_string()),
+            ("rw-tok".to_string(), "rw".to_string()),
+        ];
+        assert_eq!(pick_agent_token(&toks), Some("rw-tok".to_string()));
+    }
+
+    #[test]
+    fn test_pick_agent_token_falls_back_to_ro() {
+        // `--token-type ro` 的 agent 只有 ro token；relay 接受该会话的任何
+        // token 作为 agent 身份，所以必须带它而不是干脆不带。
+        let toks = vec![("ro-only".to_string(), "ro".to_string())];
+        assert_eq!(pick_agent_token(&toks), Some("ro-only".to_string()));
+        assert_eq!(pick_agent_token(&[]), None);
+    }
+
+    #[test]
+    fn test_parse_tokens_from_register_response() {
+        let resp = serde_json::json!({
+            "type": "agent:registered",
+            "session_id": "s1",
+            "payload": { "tokens": [
+                {"token": "a", "permission": "rw"},
+                {"token": "b", "permission": "ro"}
+            ]}
+        });
+        assert_eq!(
+            parse_tokens(&resp),
+            vec![
+                ("a".to_string(), "rw".to_string()),
+                ("b".to_string(), "ro".to_string())
+            ]
+        );
+        // 老 relay 无 payload → 空（不带身份头）
+        assert!(parse_tokens(&serde_json::json!({"type": "agent:registered"})).is_empty());
+    }
+
+    #[test]
+    fn test_with_agent_token_sets_header_only_when_nonempty() {
+        let client = reqwest::Client::new();
+        let req = with_agent_token(client.post("http://127.0.0.1:1/agent/send"), "tok-1")
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get(AGENT_TOKEN_HEADER).unwrap(),
+            "tok-1",
+            "agent uplink must carry X-SR-Agent-Token"
+        );
+
+        // 空 token（老 relay / 无 token）→ 不附加该头，行为与旧版一致
+        let req = with_agent_token(client.post("http://127.0.0.1:1/agent/send"), "")
+            .build()
+            .unwrap();
+        assert!(req.headers().get(AGENT_TOKEN_HEADER).is_none());
     }
 }

@@ -95,17 +95,22 @@ impl SessionRegistry {
         // Any existing session under this id — or any session currently
         // holding one of the tokens we're about to install — is evicted so the
         // new incarnation fully owns the identity. No 409 "id in use" anymore.
+        //
+        // 两把锁一次性按 `sessions → token_map` 顺序取写锁并持有到 token_map
+        // 更新完毕：此前在每个被驱逐会话上反复 `token_map.read()` 再单独取
+        // 写锁，中间窗口能读到「会话已换、token 还指向旧 sid」的撕裂状态。
+        // 全仓库统一这个加锁顺序（反序会与这里互锁）。
         let mut evicted = false;
         {
             let mut sessions = self.sessions.write().await;
+            let mut tmap = self.token_map.write().await;
             // If any of our tokens already maps to a *different* session, that
             // session is displaced too (token reuse → newest wins).
             for (t, _) in &tokens {
-                let old_sid = self.token_map.read().await.get(t).map(|(sid, _)| sid.clone());
+                let old_sid = tmap.get(t).map(|(sid, _)| sid.clone());
                 if let Some(old_sid) = old_sid {
                     if old_sid != session_id {
                         if let Some(old_info) = sessions.remove(&old_sid) {
-                            let mut tmap = self.token_map.write().await;
                             for (ot, _) in &old_info.tokens {
                                 tmap.remove(ot);
                             }
@@ -115,7 +120,6 @@ impl SessionRegistry {
                 }
             }
             if let Some(old_info) = sessions.remove(&session_id) {
-                let mut tmap = self.token_map.write().await;
                 for (t, _) in &old_info.tokens {
                     tmap.remove(t);
                 }
@@ -133,10 +137,6 @@ impl SessionRegistry {
                     lan_addr: None,
                 },
             );
-        }
-
-        {
-            let mut tmap = self.token_map.write().await;
             for (token, perm) in &tokens {
                 tmap.insert(token.clone(), (session_id.clone(), perm.clone()));
             }
@@ -152,6 +152,16 @@ impl SessionRegistry {
     pub async fn authenticate(&self, token: &str) -> Option<(String, Permission)> {
         let tmap = self.token_map.read().await;
         tmap.get(token).cloned()
+    }
+
+    /// 只查 token 属于哪个会话（不关心权限）。用于凭证变更后定位需要断开
+    /// 的浏览器流。
+    pub async fn session_of_token(&self, token: &str) -> Option<String> {
+        self.token_map
+            .read()
+            .await
+            .get(token)
+            .map(|(sid, _)| sid.clone())
     }
 
     /// Re-register an agent that already holds a set of tokens (e.g. on
@@ -174,13 +184,13 @@ impl SessionRegistry {
         let mut evicted = false;
         {
             let mut sessions = self.sessions.write().await;
+            let mut tmap = self.token_map.write().await;
             // Displace any session that currently holds one of our tokens.
             for (t, _) in &tokens {
-                let old_sid = self.token_map.read().await.get(t).map(|(sid, _)| sid.clone());
+                let old_sid = tmap.get(t).map(|(sid, _)| sid.clone());
                 if let Some(old_sid) = old_sid {
                     if old_sid != session_id {
                         if let Some(old_info) = sessions.remove(&old_sid) {
-                            let mut tmap = self.token_map.write().await;
                             for (ot, _) in &old_info.tokens {
                                 tmap.remove(ot);
                             }
@@ -190,7 +200,6 @@ impl SessionRegistry {
                 }
             }
             if let Some(old_info) = sessions.remove(&session_id) {
-                let mut tmap = self.token_map.write().await;
                 for (t, _) in &old_info.tokens {
                     tmap.remove(t);
                 }
@@ -208,9 +217,6 @@ impl SessionRegistry {
                     lan_addr: None,
                 },
             );
-        }
-        {
-            let mut tmap = self.token_map.write().await;
             for (token, perm) in &tokens {
                 tmap.insert(token.clone(), (session_id.clone(), perm.clone()));
             }
@@ -298,6 +304,39 @@ impl SessionRegistry {
         self.sessions.read().await.len()
     }
 
+    /// 注册抢占的归属证明（`agent:register` 在同一 sid 已有**在线** agent 时
+    /// 使用）：请求必须能证明自己就是该会话的主人，否则是 id 抢占。
+    ///
+    /// 认可两种证明：
+    /// - 请求的 fixed key（`--key`）与该会话登记的 `fixed_key` 相同；
+    /// - 请求携带的缓存 tokens 中至少一个仍属于该会话。
+    ///
+    /// 会话不存在 → 返回 true（没有可抢占的对象，正常新建）。
+    pub async fn can_reclaim(
+        &self,
+        session_id: &str,
+        fixed_key: Option<&str>,
+        cached_tokens: Option<&[(String, Permission)]>,
+    ) -> bool {
+        let sessions = self.sessions.read().await;
+        let Some(info) = sessions.get(session_id) else {
+            return true;
+        };
+        if let (Some(req_key), Some(cur_key)) = (fixed_key, info.fixed_key.as_deref()) {
+            if req_key == cur_key {
+                return true;
+            }
+        }
+        if let Some(tokens) = cached_tokens {
+            return tokens.iter().any(|(t, _)| {
+                info.tokens
+                    .iter()
+                    .any(|(existing, _)| crate::relay::auth::constant_time_eq(existing, t))
+            });
+        }
+        false
+    }
+
     /// Snapshot of all sessions for the admin overview. Clones session info
     /// (tokens, permissions, fixed_key, temporary flag).
     pub async fn list_sessions(&self) -> Vec<(String, SessionInfo)> {
@@ -312,16 +351,16 @@ impl SessionRegistry {
     /// Remove a single token from both the token map and its session's token
     /// list. Returns false if the token was unknown. Browsers/MCP clients
     /// using it will fail to authenticate on their next request.
+    ///
+    /// 两把锁按 `sessions → token_map` 顺序同时持有（与 `register` 一致），
+    /// 避免中途被读到「token 失效但会话仍列着它」的撕裂状态。
     pub async fn revoke_token(&self, token: &str) -> bool {
-        let sid = self
-            .token_map
-            .read()
-            .await
-            .get(token)
-            .map(|(sid, _)| sid.clone());
-        let Some(sid) = sid else { return false };
-        self.token_map.write().await.remove(token);
-        if let Some(info) = self.sessions.write().await.get_mut(&sid) {
+        let mut sessions = self.sessions.write().await;
+        let mut tmap = self.token_map.write().await;
+        let Some((sid, _)) = tmap.remove(token) else {
+            return false;
+        };
+        if let Some(info) = sessions.get_mut(&sid) {
             info.tokens.retain(|(t, _)| t != token);
         }
         true
@@ -336,43 +375,33 @@ impl SessionRegistry {
         &self,
         session_id: &str,
     ) -> Option<Vec<(String, Permission)>> {
-        let perms: Vec<Permission> = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .get(session_id)?
-                .tokens
-                .iter()
-                .map(|(_, p)| p.clone())
-                .collect()
-        };
-        if perms.is_empty() {
+        // 两把锁一次性按 `sessions → token_map` 顺序取得（与 `register`
+        // 一致），旧 token 的移除与新 token 的安装在同一个临界区内完成。
+        let mut sessions = self.sessions.write().await;
+        let mut tmap = self.token_map.write().await;
+        let old_tokens: Vec<String> = sessions
+            .get(session_id)?
+            .tokens
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
+        if old_tokens.is_empty() {
             return None;
         }
-        let new_tokens: Vec<(String, Permission)> = perms
+        let new_tokens: Vec<(String, Permission)> = sessions
+            .get(session_id)?
+            .tokens
             .iter()
-            .map(|p| (generate_token(), p.clone()))
+            .map(|(_, p)| (generate_token(), p.clone()))
             .collect();
 
-        // token_map: drop old tokens for this session, insert new ones.
-        {
-            let old: Vec<String> = {
-                let sessions = self.sessions.read().await;
-                sessions
-                    .get(session_id)
-                    .map(|i| i.tokens.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            };
-            let mut tmap = self.token_map.write().await;
-            for t in &old {
-                tmap.remove(t);
-            }
-            for (t, p) in &new_tokens {
-                tmap.insert(t.clone(), (session_id.to_string(), p.clone()));
-            }
+        for t in &old_tokens {
+            tmap.remove(t);
         }
-
-        // session: replace the token list.
-        if let Some(info) = self.sessions.write().await.get_mut(session_id) {
+        for (t, p) in &new_tokens {
+            tmap.insert(t.clone(), (session_id.to_string(), p.clone()));
+        }
+        if let Some(info) = sessions.get_mut(session_id) {
             info.tokens = new_tokens.clone();
         }
         Some(new_tokens)
@@ -381,17 +410,15 @@ impl SessionRegistry {
     /// Flip a single token's permission (rw <-> ro) in both the token map and
     /// its session entry. Returns false if the token was unknown.
     pub async fn set_token_permission(&self, token: &str, perm: Permission) -> bool {
-        let sid = self
-            .token_map
-            .read()
-            .await
-            .get(token)
-            .map(|(sid, _)| sid.clone());
-        let Some(sid) = sid else { return false };
-        if let Some(entry) = self.token_map.write().await.get_mut(token) {
+        let mut sessions = self.sessions.write().await;
+        let mut tmap = self.token_map.write().await;
+        let Some((sid, _)) = tmap.get(token).cloned() else {
+            return false;
+        };
+        if let Some(entry) = tmap.get_mut(token) {
             entry.1 = perm.clone();
         }
-        if let Some(info) = self.sessions.write().await.get_mut(&sid) {
+        if let Some(info) = sessions.get_mut(&sid) {
             if let Some(e) = info.tokens.iter_mut().find(|(t, _)| t == token) {
                 e.1 = perm;
             }
@@ -819,5 +846,157 @@ mod tests {
         let (_, perm) = registry.authenticate(&r.tokens[0].0).await.unwrap();
         assert_eq!(perm, Permission::ReadWrite);
         assert!(!registry.set_token_permission("nope", Permission::ReadOnly).await);
+    }
+
+    // ── A5 原子性 / 加锁顺序 ──────────────────────────────────────
+
+    /// `register` 在同一临界区内完成「驱逐旧会话 + 安装新 token」：并发读
+    /// 的观察者永远看不到「会话已换、token 还指向旧 sid」的撕裂状态。
+    #[tokio::test]
+    async fn test_register_is_atomic_under_concurrent_reads() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let registry = std::sync::Arc::new(SessionRegistry::new());
+        let first = registry
+            .register(Some("stable-key".to_string()), "rw", Some("atomic1".to_string()))
+            .await
+            .unwrap();
+        let old_token = first.tokens[0].0.clone();
+
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let reg = registry.clone();
+            let done = done.clone();
+            let token = old_token.clone();
+            tokio::spawn(async move {
+                let mut torn = 0;
+                while !done.load(Ordering::Relaxed) {
+                    // 每次读：token 要么还在（指向已有会话），要么已消失。
+                    // 「token 在但会话不在」就是撕裂。
+                    if let Some((sid, _)) = reg.authenticate(&token).await {
+                        if reg.get(&sid).await.is_none() {
+                            torn += 1;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                torn
+            })
+        };
+        // 并发地反复重注册同一 id / 同一 key（每次都会驱逐重建）。
+        for _ in 0..40 {
+            registry
+                .register(Some("stable-key".to_string()), "rw", Some("atomic1".to_string()))
+                .await
+                .unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let torn = reader.await.unwrap();
+        assert_eq!(torn, 0, "token→session must never be observed in a torn state");
+    }
+
+    /// 全仓库统一「sessions → token_map」加锁顺序：反序调用会在高并发下
+    /// 互相死锁。这里用超时兜住——若发生反序，注册与凭证操作并发会卡住。
+    #[tokio::test]
+    async fn test_no_lock_order_inversion_under_concurrency() {
+        let registry = std::sync::Arc::new(SessionRegistry::new());
+        let r = registry
+            .register(None, "both", Some("lockord1".to_string()))
+            .await
+            .unwrap();
+        let token = r.tokens[0].0.clone();
+        let sid = r.session_id.clone();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let reg = registry.clone();
+                let token = token.clone();
+                let sid = sid.clone();
+                tokio::spawn(async move {
+                    for _ in 0..20 {
+                        match i % 4 {
+                            0 => {
+                                let _ = reg
+                                    .register(None, "rw", Some(format!("lo{:05}", i)))
+                                    .await;
+                            }
+                            1 => {
+                                let _ = reg.register_existing(
+                                    vec![(format!("tok-{i}"), Permission::ReadWrite)],
+                                    Some(sid.clone()),
+                                )
+                                .await;
+                            }
+                            2 => {
+                                let _ = reg.revoke_token(&format!("tok-{i}")).await;
+                                let _ = reg.session_of_token(&token).await;
+                            }
+                            _ => {
+                                let _ = reg
+                                    .set_token_permission(&token, Permission::ReadWrite)
+                                    .await;
+                                let _ = reg.list_sessions().await;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(20), h)
+                .await
+                .expect("lock ordering must not deadlock")
+                .unwrap();
+        }
+    }
+
+    // ── A4 归属证明 ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_can_reclaim_accepts_fixed_key_or_cached_token() {
+        let registry = SessionRegistry::new();
+        let r = registry
+            .register(Some("my-key".to_string()), "rw", Some("claim01".to_string()))
+            .await
+            .unwrap();
+        let token = r.tokens[0].0.clone();
+
+        // 同 fixed key → 可接管
+        assert!(registry.can_reclaim("claim01", Some("my-key"), None).await);
+        // 错的 key、无 token → 不可接管
+        assert!(!registry.can_reclaim("claim01", Some("other"), None).await);
+        assert!(!registry.can_reclaim("claim01", None, None).await);
+        // 缓存 token 命中 → 可接管
+        assert!(
+            registry
+                .can_reclaim(
+                    "claim01",
+                    None,
+                    Some(&[(token.clone(), Permission::ReadWrite)])
+                )
+                .await
+        );
+        // 不属于该会话的 token → 不可接管
+        assert!(
+            !registry
+                .can_reclaim(
+                    "claim01",
+                    None,
+                    Some(&[("someone-elses".to_string(), Permission::ReadWrite)])
+                )
+                .await
+        );
+        // 会话根本不存在 → 无需证明（正常新建）
+        assert!(registry.can_reclaim("brand-new", None, None).await);
+    }
+
+    #[tokio::test]
+    async fn test_can_reclaim_ignores_key_when_session_has_none() {
+        // 临时会话（无 fixed key）不能被「随便报个 key」认领。
+        let registry = SessionRegistry::new();
+        registry
+            .register(None, "rw", Some("nokey01".to_string()))
+            .await
+            .unwrap();
+        assert!(!registry.can_reclaim("nokey01", Some("anything"), None).await);
     }
 }

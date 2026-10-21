@@ -155,11 +155,7 @@ pub async fn get_handler(
     headers: axum::http::HeaderMap,
     Query(params): Query<Vec<(String, String)>>,
 ) -> axum::response::Response {
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+    let client_ip = crate::relay::auth::client_ip(&headers);
     {
         let mut rl = state.rate_limiter.write().await;
         if !rl.check(&format!("ft:{client_ip}"), 60, std::time::Duration::from_secs(60)) {
@@ -438,14 +434,12 @@ pub async fn put_handler(
     body: axum::body::Body,
 ) -> axum::response::Response {
     // Rate limit (mirrors upload_handler).
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+    let client_ip = crate::relay::auth::client_ip(&headers);
     {
         let mut rl = state.rate_limiter.write().await;
-        if !rl.check(&client_ip, 20, std::time::Duration::from_secs(60)) {
+        // 与 upload_handler 共享 `up:` 命名空间：两者是同一条「写入上行」
+        // 通道，分开计数反而给攻击者两倍配额。
+        if !rl.check(&format!("up:{client_ip}"), 20, std::time::Duration::from_secs(60)) {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
     }
@@ -757,6 +751,7 @@ mod tests {
                 agent: None,
                 agent_bulk: Some(bulk_tx),
                 browser_sessions: HashMap::new(),
+                browser_tokens: HashMap::new(),
             };
             broadcast.insert(_sid.clone(), cm);
         }
@@ -814,6 +809,7 @@ mod tests {
                     agent: None,
                     agent_bulk: Some(bulk_tx),
                     browser_sessions: HashMap::new(),
+                    browser_tokens: HashMap::new(),
                 },
             );
         }
@@ -866,6 +862,7 @@ mod tests {
                 agent: None,
                 agent_bulk: Some(bulk_tx),
                 browser_sessions: HashMap::new(),
+                browser_tokens: HashMap::new(),
             };
             broadcast.insert(_sid.clone(), cm);
         }
@@ -925,6 +922,7 @@ mod tests {
                     agent: None,
                     agent_bulk: Some(bulk_tx),
                     browser_sessions: HashMap::new(),
+                    browser_tokens: HashMap::new(),
                 },
             );
         }
@@ -1004,6 +1002,7 @@ mod tests {
                     agent: None,
                     agent_bulk: Some(bulk_tx),
                     browser_sessions: HashMap::new(),
+                    browser_tokens: HashMap::new(),
                 },
             );
         }
@@ -1038,6 +1037,12 @@ mod tests {
         use std::time::{Duration, Instant};
         let state = make_state();
         let (tx, mut rx) = mpsc::channel(16);
+        // route_agent_message 只路由已注册会话（未注册 sid 直接丢弃）。
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert("sid1".to_string(), crate::relay::ChannelMap::new());
         let old = Instant::now() - Duration::from_secs(600);
         state.download_streams.write().await.insert(
             "dl-act".to_string(),
@@ -1156,6 +1161,7 @@ mod tests {
                     agent: None,
                     agent_bulk: Some(bulk_tx),
                     browser_sessions: HashMap::new(),
+                    browser_tokens: HashMap::new(),
                 },
             );
         }
@@ -1199,6 +1205,7 @@ mod tests {
                     agent: None,
                     agent_bulk: Some(bulk_tx),
                     browser_sessions: HashMap::new(),
+                    browser_tokens: HashMap::new(),
                 },
             );
         }
@@ -1260,6 +1267,7 @@ mod tests {
                     agent: None,
                     agent_bulk: Some(bulk_tx),
                     browser_sessions: HashMap::new(),
+                    browser_tokens: HashMap::new(),
                 },
             );
         }
@@ -1304,6 +1312,7 @@ mod tests {
                     agent: None,
                     agent_bulk: Some(bulk_tx),
                     browser_sessions: HashMap::new(),
+                    browser_tokens: HashMap::new(),
                 },
             );
         }

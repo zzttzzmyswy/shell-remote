@@ -116,11 +116,7 @@ pub async fn messages_handler(
 ) -> impl IntoResponse {
     // Rate limit
     {
-        let client_ip = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
+        let client_ip = crate::relay::auth::client_ip(&headers);
         let mut rl = state.rate_limiter.write().await;
         if !rl.check(&format!("mcp:{client_ip}"), 60, std::time::Duration::from_secs(60)) {
             return (
