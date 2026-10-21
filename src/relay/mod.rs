@@ -871,6 +871,231 @@ mod tests {
         assert_eq!(reassembled, original);
     }
 
+    // ── B3: upload temp-file guard + empty upload ───────────────────
+
+    #[test]
+    fn test_tmp_guard_removes_file_on_drop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("upload-temp.bin");
+        std::fs::write(&path, b"partial").unwrap();
+        assert!(path.exists());
+        {
+            let _g = TmpGuard(path.clone());
+            assert!(path.exists(), "guard must not delete before drop");
+        }
+        assert!(!path.exists(), "TmpGuard must remove the temp file on drop");
+    }
+
+    #[test]
+    fn test_tmp_guard_drop_is_idempotent_when_missing() {
+        // A path that never existed (or was already removed) must not panic —
+        // Drop runs on error paths where the file may be gone already.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("never-created.bin");
+        drop(TmpGuard(path.clone()));
+        assert!(!path.exists());
+    }
+
+    /// Relay-side temp files whose name carries `tag`. The upload handler names
+    /// them `<uuid>_<path with / → _>`, so a per-test tag in the destination
+    /// path isolates this test from others sharing `/tmp/opencode/uploads`
+    /// (tests run in parallel in one process).
+    fn upload_temps_tagged(tag: &str) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir("/tmp/opencode/uploads")
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.contains(tag))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_upload_empty_body_still_sends_one_chunk() {
+        // A zero-length upload used to return 200 while emitting no `fs:upload`
+        // at all, so the agent never created the file. It must send exactly one
+        // empty chunk: index 0 of 1.
+        let state = Arc::new(SharedState::new(
+            "".into(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+            None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let token = r.tokens[0].0.clone();
+
+        let (atx, mut arx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);
+        let mut cm = ChannelMap::new();
+        cm.agent = Some(atx);
+        state.agent_broadcast.write().await.insert(sid.clone(), cm);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "/tmp/mys2285empty/empty.txt".to_string());
+
+        let result = upload_handler(
+            State(state.clone()),
+            headers,
+            Query(params),
+            Body::from(Vec::new()),
+        )
+        .await;
+        assert_eq!(result, Ok(StatusCode::OK));
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), arx.recv())
+            .await
+            .expect("an empty upload must still emit one fs:upload")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["type"], "fs:upload");
+        assert_eq!(v["payload"]["final_path"], "/tmp/mys2285empty/empty.txt");
+        assert_eq!(v["payload"]["chunk_index"], serde_json::json!(0));
+        assert_eq!(v["payload"]["total_chunks"], serde_json::json!(1));
+        assert_eq!(v["payload"]["content"], serde_json::json!(""));
+        // Exactly one message — no trailing empty chunk.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), arx.recv())
+                .await
+                .is_err(),
+            "empty upload must emit exactly one chunk"
+        );
+        assert!(
+            upload_temps_tagged("mys2285empty").is_empty(),
+            "empty upload must not leak a temp file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_leaves_no_temp_file_behind() {
+        // The temp file must be gone on the success path (and, via TmpGuard, on
+        // every error path — see the capacity test below).
+        let state = Arc::new(SharedState::new(
+            "".into(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+            None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let token = r.tokens[0].0.clone();
+
+        let (atx, mut arx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);
+        let mut cm = ChannelMap::new();
+        cm.agent = Some(atx);
+        state.agent_broadcast.write().await.insert(sid.clone(), cm);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert(
+            "path".to_string(),
+            "/tmp/mys2285success/leftover-check.txt".to_string(),
+        );
+        let result = upload_handler(
+            State(state.clone()),
+            headers,
+            Query(params),
+            Body::from("payload bytes"),
+        )
+        .await;
+        assert_eq!(result, Ok(StatusCode::OK));
+
+        assert!(
+            upload_temps_tagged("mys2285success").is_empty(),
+            "success path must not leak a temp file"
+        );
+        let _ = arx.try_recv();
+    }
+
+    #[tokio::test]
+    async fn test_upload_agent_unreachable_leaves_no_temp_file() {
+        // The `None` agent branch returns 500; the guard, not an ad-hoc
+        // remove_file, must have deleted the temp file.
+        let state = Arc::new(SharedState::new(
+            "".into(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+            None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let token = r.tokens[0].0.clone();
+        state
+            .agent_broadcast
+            .write()
+            .await
+            .insert(sid, ChannelMap::new()); // no agent -> no sender
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "/tmp/mys2285noagent/no-agent.txt".to_string());
+        let result = upload_handler(
+            State(state.clone()),
+            headers,
+            Query(params),
+            Body::from("some bytes"),
+        )
+        .await;
+        assert_eq!(result, Err(StatusCode::INTERNAL_SERVER_ERROR));
+
+        assert!(
+            upload_temps_tagged("mys2285noagent").is_empty(),
+            "agent-unreachable path must not leak a temp file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_too_large_leaves_no_temp_file() {
+        // PayloadTooLarge is an early `return Err` — the guard must cover it.
+        let state = Arc::new(SharedState::new(
+            "".into(),
+            8, // 8-byte cap
+            None,
+            String::new(),
+            String::new(),
+            None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id;
+        let token = r.tokens[0].0.clone();
+        let (atx, _arx) = mpsc::channel::<String>(crate::relay::SSE_CHANNEL_CAPACITY);
+        let mut cm = ChannelMap::new();
+        cm.agent = Some(atx);
+        state.agent_broadcast.write().await.insert(sid, cm);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "/tmp/mys2285huge/huge.bin".to_string());
+        let result = upload_handler(
+            State(state.clone()),
+            headers,
+            Query(params),
+            Body::from(vec![0u8; 64]),
+        )
+        .await;
+        assert_eq!(result, Err(StatusCode::PAYLOAD_TOO_LARGE));
+
+        assert!(
+            upload_temps_tagged("mys2285huge").is_empty(),
+            "payload-too-large path must not leak a temp file"
+        );
+    }
+
     // ── EventBuffer tests ───────────────────────────────────────────
 
     #[test]
@@ -991,6 +1216,22 @@ mod tests {
     }
 }
 
+/// Deletes a relay-side temp file when dropped, on every exit path — `?`
+/// early returns, client mid-body disconnect, agent unreachable, panic unwind.
+/// Removal is synchronous (the `Drop` cannot await) and best-effort: a missing
+/// file is fine, and a failure must not mask the status the handler returns.
+struct TmpGuard(std::path::PathBuf);
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("Failed to remove upload temp {}: {}", self.0.display(), e);
+            }
+        }
+    }
+}
+
 pub async fn upload_handler(
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
@@ -1032,26 +1273,33 @@ pub async fn upload_handler(
     let _ = tokio::fs::create_dir_all(&tmp_dir).await;
     let tmp_name = format!("{}_{}", uuid::Uuid::new_v4(), path.replace('/', "_"));
     let tmp_path = tmp_dir.join(&tmp_name);
-
+    // Owns the temp file from here on: every `?`/early return below drops the
+    // guard and deletes it. `create` failing leaves nothing to delete, so the
+    // guard is only armed once the file exists.
     let mut file = tokio::fs::File::create(&tmp_path)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!("Upload temp create failed for {}: {}", path, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let _tmp_guard = TmpGuard(tmp_path.clone());
     let mut total: u64 = 0;
     let mut stream = body.into_data_stream();
     while let Some(result) = stream.next().await {
-        let chunk = result.map_err(|_| {
-            // Will clean up below
+        // A client that aborts mid-body surfaces here; the guard removes the
+        // partial temp file on this early return.
+        let chunk = result.map_err(|e| {
+            tracing::warn!("Upload body interrupted for {} after {} bytes: {}", path, total, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         total += chunk.len() as u64;
         if total > state.max_upload_size {
             drop(file);
-            let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
         use tokio::io::AsyncWriteExt;
-        file.write_all(&chunk).await.map_err(|_| {
-            // Will clean up below
+        file.write_all(&chunk).await.map_err(|e| {
+            tracing::error!("Upload temp write failed for {}: {}", path, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     }
@@ -1086,24 +1334,24 @@ pub async fn upload_handler(
     };
     let agent_tx = match agent_tx {
         Some(tx) => tx,
-        None => {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
+        None => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
 
     // The stream already counted every byte received; use that as the
     // authoritative size rather than re-stat'ing the file (a stat can race
     // the sync above and under-report on some filesystems).
     let file_size = total as usize;
-    let total_chunks = file_size.div_ceil(CHUNK_SIZE);
+    // A zero-length body still has to reach the agent as one `fs:upload`, or
+    // the destination file is never created/truncated and the 200 we return
+    // would be a lie. One empty chunk (index 0 of 1) makes the agent open,
+    // truncate, and close the path.
+    let total_chunks = file_size.div_ceil(CHUNK_SIZE).max(1);
     let upload_id = uuid::Uuid::new_v4().to_string();
 
     use tokio::io::AsyncReadExt;
     let mut f = match tokio::fs::File::open(&tmp_path).await {
         Ok(f) => f,
         Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
             tracing::error!("Upload temp open failed for {}: {}", path, e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -1111,16 +1359,21 @@ pub async fn upload_handler(
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut chunk_index: u32 = 0;
-    let send_ok = loop {
+    let mut send_ok = true;
+    loop {
         let n = match f.read(&mut buf).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::error!("Upload temp read failed for {}: {}", path, e);
-                break false;
+                send_ok = false;
+                break;
             }
         };
-        if n == 0 {
-            break true;
+        // EOF. The first read of an empty file also yields 0, and that must
+        // still be sent as its single empty chunk (see total_chunks above), so
+        // only stop at EOF once at least one chunk has gone out.
+        if n == 0 && chunk_index > 0 {
+            break;
         }
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
         let content_b64 = B64.encode(&buf[..n]);
@@ -1139,12 +1392,12 @@ pub async fn upload_handler(
         // Backpressure: if the agent can't keep up, await rather than drop —
         // dropping a file chunk would silently corrupt the upload.
         if agent_tx.send(msg).await.is_err() {
-            break false; // agent gone
+            send_ok = false; // agent gone
+            break;
         }
         chunk_index += 1;
-    };
+    }
     drop(f);
-    let _ = tokio::fs::remove_file(&tmp_path).await;
 
     if !send_ok {
         tracing::warn!("Upload aborted (agent unreachable mid-transfer): {}", path);

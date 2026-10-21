@@ -130,10 +130,17 @@ fn percent_encode(s: &str) -> String {
 
 /// Content-Disposition value: ASCII names inline; non-ASCII via RFC 5987
 /// `filename*` so Chinese filenames survive as UTF-8.
+///
+/// Control characters are stripped first: a filename may legally contain a raw
+/// `\n` (POSIX allows every byte but `/` and NUL), and such a byte makes the
+/// value an invalid header — `HeaderValue::from_str` then rejects it. Callers
+/// pair this with [`header_value_or_attachment`], which falls back to a bare
+/// `attachment` instead of panicking.
 fn content_disposition(path: &str) -> String {
     let name = download_filename(path);
     let quoted: String = name
         .chars()
+        .filter(|c| !c.is_control())
         .map(|c| match c {
             '"' | '\\' => format!("\\{}", c),
             c if c.is_ascii() => c.to_string(),
@@ -148,6 +155,34 @@ fn content_disposition(path: &str) -> String {
             percent_encode(&name)
         )
     }
+}
+
+/// Turn a candidate `Content-Disposition` value into a header value, degrading
+/// to a bare `attachment` (no filename) when the octets are not header-safe.
+/// Never panics — the filename comes from a remote agent.
+fn header_value_or_attachment(value: &str) -> axum::http::HeaderValue {
+    axum::http::HeaderValue::from_str(value)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment"))
+}
+
+/// 416 response. When the total size is known, RFC 9110 requires
+/// `Content-Range: bytes */<size>` so the client can retry with a valid range.
+fn range_not_satisfiable(total: Option<u64>) -> axum::response::Response {
+    let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+    if let Some(total) = total {
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_RANGE,
+            header_value_or_static(&format!("bytes */{total}"), "bytes */0"),
+        );
+    }
+    resp
+}
+
+/// Header value from a dynamically formatted string, with a static fallback so
+/// a malformed input can never panic.
+fn header_value_or_static(value: &str, fallback: &'static str) -> axum::http::HeaderValue {
+    axum::http::HeaderValue::from_str(value)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static(fallback))
 }
 
 pub async fn get_handler(
@@ -178,12 +213,12 @@ pub async fn get_handler(
         Ok(p) => p,
         Err(s) => return s.into_response(),
     };
-    // Range [start, end] — end is exclusive-cap semantics (inclusive in HTTP);
-    // a suffix range (`bytes=-n`) is ignored (None) and the full file is served.
+    // Range [start, end] — end is inclusive per HTTP; a suffix range
+    // (`bytes=-n`) is ignored (None) and the full file is served.
     let range = parse_range_header(headers.get("range").and_then(|v| v.to_str().ok()));
     if let Some((s, Some(e))) = range {
         if e < s {
-            return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            return range_not_satisfiable(None);
         }
     }
     let bulk_tx = {
@@ -216,8 +251,10 @@ pub async fn get_handler(
     });
     if let Some((start, end)) = range {
         read_payload["offset"] = json!(start);
+        // `end` is clamped by the relay once the agent reports the file size;
+        // before that, saturate rather than overflow on `bytes=0-18446744073709551615`.
         if let Some(e) = end {
-            read_payload["limit"] = json!(e - start + 1);
+            read_payload["limit"] = json!(e.saturating_sub(start).saturating_add(1));
         }
     }
     let proto = json!({"type":"fs:read","session_id":&session_id, "payload": read_payload});
@@ -251,27 +288,55 @@ pub async fn get_handler(
             data: first_bytes,
             file_size,
         }) => {
-            // Byte length of the requested range: from an explicit end, or from
-            // the agent-reported file size for an open-ended (`bytes=a-`) range.
-            let range_len: Option<u64> = if let Some((s, e)) = range {
-                Some(if let Some(en) = e {
-                    en - s + 1
-                } else {
-                    file_size.map_or(0, |t| t.saturating_sub(s))
-                })
-            } else {
-                None
-            };
-            // 416 check: range start at/beyond EOF is unsatisfiable (only when
-            // the agent reports the full size; includes empty files).
+            // 416: a range whose start is at/beyond EOF is unsatisfiable. Only
+            // decidable once the agent reports the full size (an old agent omits
+            // it, and then we can only clamp optimistically).
             if let (Some((start, _)), Some(total)) = (range, file_size) {
                 if start >= total {
                     state.download_streams.write().await.remove(&correlation_id);
                     let proto = json!({"type":"fs:read_cancel","session_id":&session_id,
                         "payload":{"_mcp_request_id":&correlation_id}});
                     let _ = deliver_bulk(&bulk_tx, proto.to_string()).await;
-                    return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+                    audit_ft(
+                        &state,
+                        &session_id,
+                        token,
+                        &permission,
+                        &path,
+                        0,
+                        "downfile_failed",
+                        "range not satisfiable",
+                    )
+                    .await;
+                    return range_not_satisfiable(file_size);
                 }
+            }
+            // Serve only what the clamped range actually asks for: an explicit
+            // `end` past EOF, or an open-ended range, both stop at the last
+            // byte the file has. `first_bytes` may already be the whole rest of
+            // the file (an old agent ignores offset/limit), so truncate here.
+            let range_len: Option<u64> = range.and_then(|(s, e)| match (e, file_size) {
+                // Explicit end, clamped to the last available byte.
+                (Some(en), Some(total)) => Some(en.min(total.saturating_sub(1)) + 1 - s),
+                // Explicit end with no reported size: cannot clamp to EOF, but
+                // the requested length is still a real upper bound.
+                (Some(en), None) => Some(en.saturating_sub(s).saturating_add(1)),
+                // Open-ended `bytes=a-`: everything from `a` to EOF.
+                (None, Some(total)) => Some(total.saturating_sub(s)),
+                // Open-ended with no reported size (old agent): the length is
+                // unknowable, so forward the bytes untruncated and send no
+                // length header rather than claim an empty body.
+                (None, None) => None,
+            });
+            let mut first_bytes = first_bytes;
+            // Budget for the whole response body: the clamped range length.
+            // An old agent ignores `offset`/`limit` and streams the entire file,
+            // so every chunk — not just the first — must be trimmed to what the
+            // client asked for, or the body contradicts `Content-Length`.
+            let mut budget = range_len;
+            if let Some(len) = budget {
+                let keep = (len as usize).min(first_bytes.len());
+                first_bytes.truncate(keep);
             }
             // Build streaming body: first_bytes + rest from sink_rx until End.
             // Use a spawned task + ReceiverStream so cleanup runs even on
@@ -319,11 +384,35 @@ pub async fn get_handler(
                     return;
                 }
                 let mut total = first_len;
+                if let Some(b) = budget.as_mut() {
+                    *b = b.saturating_sub(first_len);
+                }
                 let mut saw_end = false;
                 while let Some(ev) = sink_rx.recv().await {
                     match ev {
                         DownloadEvent::Chunk { data: b, .. } => {
-                            let chunk_len = b.len() as u64;
+                            let mut b = b;
+                            let mut chunk_len = b.len() as u64;
+                            if let Some(left) = budget.as_mut() {
+                                // Discard anything past the requested range: the
+                                // agent may still be streaming the rest of the
+                                // file (an old agent ignores offset/limit).
+                                let keep = (*left).min(chunk_len) as usize;
+                                b.truncate(keep);
+                                chunk_len = keep as u64;
+                                *left -= chunk_len;
+                            }
+                            if chunk_len == 0 {
+                                // Everything the client asked for is delivered;
+                                // stop the agent instead of pulling the tail of
+                                // the file through the relay only to drop it.
+                                if budget == Some(0) {
+                                    send_cancel().await;
+                                    saw_end = true;
+                                    break;
+                                }
+                                continue;
+                            }
                             if body_tx.send(Ok(b)).await.is_err() {
                                 let _ = state_c.download_streams.write().await.remove(&cid_c);
                                 send_cancel().await;
@@ -394,29 +483,38 @@ pub async fn get_handler(
             resp.headers_mut()
                 .insert("content-type", "application/octet-stream".parse().unwrap());
             // Content-Disposition with the remote basename (RFC 5987 for non-ASCII).
+            // The name comes from the remote agent, so a header-unsafe byte must
+            // degrade to a bare `attachment`, never panic.
             resp.headers_mut().insert(
                 "content-disposition",
-                content_disposition(&path).parse().unwrap(),
+                header_value_or_attachment(&content_disposition(&path)),
             );
             if range.is_some() {
                 // HTTP status: partial content. Content-Range needs both a
                 // known end and the full size (from a current agent).
                 if let (Some((start, _)), Some(total), Some(len)) = (range, file_size, range_len) {
+                    // `len >= 1` here: `start < total` was checked above and
+                    // `end` is clamped to `total - 1`, so `end >= start`.
                     let end = start + len - 1;
                     resp.headers_mut().insert(
                         "content-range",
-                        format!("bytes {}-{}/{}", start, end, total)
-                            .parse()
-                            .unwrap(),
+                        header_value_or_static(
+                            &format!("bytes {}-{}/{}", start, end, total),
+                            "bytes 0-0/0",
+                        ),
                     );
-                    resp.headers_mut()
-                        .insert("content-length", len.to_string().parse().unwrap());
+                    resp.headers_mut().insert(
+                        "content-length",
+                        header_value_or_static(&len.to_string(), "0"),
+                    );
                 }
                 *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
             } else if let Some(total) = file_size {
                 // Non-range: send the known full length so clients see progress.
-                resp.headers_mut()
-                    .insert("content-length", total.to_string().parse().unwrap());
+                resp.headers_mut().insert(
+                    "content-length",
+                    header_value_or_static(&total.to_string(), "0"),
+                );
             }
             resp
         }
@@ -1127,6 +1225,64 @@ mod tests {
         assert_eq!(download_filename("/tmp/中文文件.txt"), "中文文件.txt");
     }
 
+    #[test]
+    fn test_content_disposition_control_chars_never_panic() {
+        // A newline in a filename is legal on POSIX and used to make
+        // `content_disposition(..).parse().unwrap()` panic on a remote file.
+        let raw = content_disposition("/tmp/evil\nname.txt");
+        assert!(
+            !raw.contains('\n'),
+            "control chars must be stripped, got: {raw:?}"
+        );
+        assert!(raw.contains("evilname.txt"), "got: {raw:?}");
+
+        // The header builder degrades instead of panicking for any octets.
+        let hv = header_value_or_attachment(&raw);
+        assert_eq!(hv, "attachment; filename=\"evilname.txt\"");
+
+        // CR, TAB, NUL, and DEL are all stripped too.
+        for bad in ["a\rb", "a\tb", "a\u{0}b", "a\u{7f}b"] {
+            let v = content_disposition(&format!("/tmp/{bad}"));
+            assert!(
+                v.chars().all(|c| !c.is_control()),
+                "control char survived in {v:?}"
+            );
+            // Must be usable as a real header value.
+            assert!(axum::http::HeaderValue::from_str(&v).is_ok(), "got: {v:?}");
+        }
+
+        // A non-ASCII name keeps its `filename*` form after filtering.
+        let cn = content_disposition("/tmp/中\n文.txt");
+        assert!(cn.contains("filename*=UTF-8''"), "got: {cn}");
+        assert!(!cn.contains('\n'));
+    }
+
+    #[test]
+    fn test_header_value_or_attachment_falls_back() {
+        // Valid input passes through untouched.
+        assert_eq!(
+            header_value_or_attachment("attachment; filename=\"a.txt\""),
+            "attachment; filename=\"a.txt\""
+        );
+        // Invalid octets degrade to a bare attachment, never panic.
+        assert_eq!(
+            header_value_or_attachment("attachment; filename=\"a\nb\""),
+            "attachment"
+        );
+    }
+
+    #[test]
+    fn test_range_not_satisfiable_carries_content_range() {
+        // RFC 9110: a 416 SHOULD carry `Content-Range: bytes */<size>`.
+        let resp = range_not_satisfiable(Some(1000));
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */1000");
+        // Unknown size → no Content-Range, still 416.
+        let resp = range_not_satisfiable(None);
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert!(resp.headers().get("content-range").is_none());
+    }
+
     #[tokio::test]
     async fn test_get_duplicate_path_params_rejected() {
         let state = make_state();
@@ -1335,5 +1491,202 @@ mod tests {
             "attachment; filename=\"report.txt\""
         );
         assert_eq!(resp.headers().get("content-length").unwrap(), "2");
+    }
+
+    // ── B1: Range clamping / overflow ───────────────────────────
+
+    /// Register a session whose bulk channel is driven by `agent`, which gets
+    /// the live state, the serialized `fs:read` message, and the session id.
+    /// Returns the token to send.
+    async fn setup_range<F, Fut>(state: &Arc<crate::relay::SharedState>, agent: F) -> String
+    where
+        F: FnOnce(Arc<crate::relay::SharedState>, String, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let r = state.sessions.register(None, "ro", None).await.unwrap();
+        let sid = r.session_id;
+        let token = r.tokens[0].0.clone();
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
+        state.agent_broadcast.write().await.insert(
+            sid.clone(),
+            crate::relay::ChannelMap {
+                agent: None,
+                agent_bulk: Some(bulk_tx),
+                browser_sessions: HashMap::new(),
+            },
+        );
+        let state_c = state.clone();
+        tokio::spawn(async move {
+            let m = bulk_rx.recv().await.expect("fs:read");
+            agent(state_c, m, sid).await;
+        });
+        token
+    }
+
+    fn range_headers(token: &str, range: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sr-token", token.parse().unwrap());
+        headers.insert("range", range.parse().unwrap());
+        headers
+    }
+
+    async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+        use http_body_util::BodyExt;
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    /// Reply to the pending `fs:read` with one final chunk of `bytes` plus the
+    /// real `file_size`. `assert_payload` sees the forwarded request first.
+    async fn reply_whole_file(
+        state: Arc<crate::relay::SharedState>,
+        m: String,
+        sid: String,
+        bytes: Vec<u8>,
+        file_size: u64,
+    ) {
+        let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(v["type"], "fs:read");
+        let cid = v["payload"]["_mcp_request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let chunk = serde_json::json!({
+            "type":"fs:result","session_id":&sid,
+            "payload":{"success":true,"content":BASE64.encode(&bytes),
+            "chunk_index":0,"total_chunks":1,"is_last":true,
+            "file_size":file_size,"_mcp_request_id":&cid}
+        })
+        .to_string();
+        crate::relay::ws::route_agent_message(&state, &sid, &chunk).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_range_end_past_eof_is_clamped_to_file_size() {
+        // `bytes=0-999999` against a 1000-byte file: the agent ignores the
+        // limit (old agent) and returns the whole file. The relay must report
+        // 0-999/1000 with a 1000-byte body, not 0-999999.
+        let state = make_state();
+        let token = setup_range(&state, |st, m, sid| async move {
+            reply_whole_file(st, m, sid, vec![0x41u8; 1000], 1000).await;
+        })
+        .await;
+
+        let params: Vec<(String, String)> = vec![("path".into(), "/remote/f".into())];
+        let resp = get_handler(
+            State(state.clone()),
+            range_headers(&token, "bytes=0-999999"),
+            Query(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("content-range").unwrap(),
+            "bytes 0-999/1000"
+        );
+        assert_eq!(resp.headers().get("content-length").unwrap(), "1000");
+        let body = body_bytes(resp).await;
+        assert_eq!(body.len(), 1000, "body must be clamped to the file size");
+        assert!(body.iter().all(|&b| b == 0x41));
+    }
+
+    #[tokio::test]
+    async fn test_get_range_u64_max_does_not_panic_and_clamps() {
+        // `bytes=0-18446744073709551615` (u64::MAX): `end - start + 1` overflows
+        // u64. Must not panic, and must clamp to the real file size.
+        let state = make_state();
+        let token = setup_range(&state, |st, m, sid| async move {
+            let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+            // The forwarded limit must saturate, not wrap around.
+            assert_eq!(v["payload"]["offset"], serde_json::json!(0));
+            assert_eq!(v["payload"]["limit"], serde_json::json!(u64::MAX));
+            reply_whole_file(st, m, sid, vec![0x42u8; 1000], 1000).await;
+        })
+        .await;
+
+        let params: Vec<(String, String)> = vec![("path".into(), "/remote/f".into())];
+        let resp = get_handler(
+            State(state.clone()),
+            range_headers(&token, "bytes=0-18446744073709551615"),
+            Query(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("content-range").unwrap(),
+            "bytes 0-999/1000"
+        );
+        assert_eq!(resp.headers().get("content-length").unwrap(), "1000");
+        assert_eq!(body_bytes(resp).await.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_get_range_start_past_eof_416_with_content_range() {
+        // `bytes=5000-` against a 1000-byte file → 416 + `Content-Range: bytes */1000`.
+        let state = make_state();
+        let token = setup_range(&state, |st, m, sid| async move {
+            // The agent reports EOF with an empty chunk plus the real size.
+            reply_whole_file(st, m, sid, Vec::new(), 1000).await;
+        })
+        .await;
+
+        let params: Vec<(String, String)> = vec![("path".into(), "/remote/f".into())];
+        let resp = get_handler(
+            State(state.clone()),
+            range_headers(&token, "bytes=5000-"),
+            Query(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */1000");
+    }
+
+    #[tokio::test]
+    async fn test_get_range_multi_chunk_old_agent_body_is_trimmed() {
+        // An old agent ignores offset/limit and streams the whole 1000-byte
+        // file in 4 chunks of 250. `bytes=0-499` must yield exactly 500 bytes
+        // across chunks — not 1000 — so Content-Length stays honest.
+        let state = make_state();
+        let token = setup_range(&state, |st, m, sid| async move {
+            let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+            let cid = v["payload"]["_mcp_request_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            for i in 0..4u64 {
+                let chunk = serde_json::json!({
+                    "type":"fs:result","session_id":&sid,
+                    "payload":{"success":true,"content":BASE64.encode(&vec![0x43u8; 250]),
+                    "chunk_index":i,"total_chunks":4,"is_last":i + 1 == 4,
+                    "file_size":1000,"_mcp_request_id":&cid}
+                })
+                .to_string();
+                crate::relay::ws::route_agent_message(&st, &sid, &chunk).await;
+            }
+        })
+        .await;
+
+        let params: Vec<(String, String)> = vec![("path".into(), "/remote/f".into())];
+        let resp = get_handler(
+            State(state.clone()),
+            range_headers(&token, "bytes=0-499"),
+            Query(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("content-range").unwrap(),
+            "bytes 0-499/1000"
+        );
+        assert_eq!(resp.headers().get("content-length").unwrap(), "500");
+        assert_eq!(
+            body_bytes(resp).await.len(),
+            500,
+            "tail past `end` must be dropped"
+        );
     }
 }
