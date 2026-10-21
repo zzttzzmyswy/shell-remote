@@ -1177,7 +1177,8 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
     pointer-events: none;
     backdrop-filter: blur(6px);
 }
-#terminal-container.hidden {
+#terminal-container.hidden,
+.terminal-area.hidden {
     display: none !important;
 }
 #tab-bar.hidden {

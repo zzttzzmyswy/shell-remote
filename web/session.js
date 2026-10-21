@@ -77,6 +77,9 @@
     const statusDotEl = document.getElementById('status-dot');
     const toggleDesktopBtn = document.getElementById('toggle-desktop-btn');
     const terminalContainer = document.getElementById('terminal-container');
+    // 终端视图的 flex 容器（终端 + 移动端快捷键行）。切桌面视图时要连同它
+    // 一起隐藏，否则这个 flex:1 的占位会把桌面画面挤成半宽。
+    const terminalArea = document.getElementById('terminal-area');
     const desktopContainer = document.getElementById('desktop-container');
     const tabBarEl = document.getElementById('tab-bar');
     const disconnectOverlay = document.getElementById('disconnect-overlay');
@@ -248,7 +251,7 @@
 
     function showDesktopView() {
         desktopActive = true;
-        terminalContainer.classList.add('hidden');
+        terminalArea.classList.add('hidden');
         desktopContainer.classList.remove('hidden');
         tabBarEl.classList.add('hidden');
         toggleDesktopBtn.textContent = '终端';
@@ -259,7 +262,7 @@
 
     function showTerminalView() {
         desktopActive = false;
-        terminalContainer.classList.remove('hidden');
+        terminalArea.classList.remove('hidden');
         desktopContainer.classList.add('hidden');
         tabBarEl.classList.remove('hidden');
         toggleDesktopBtn.textContent = '桌面';
