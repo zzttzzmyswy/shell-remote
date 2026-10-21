@@ -336,11 +336,11 @@ pub async fn stream_handler(
         // SEND_TIMEOUT_VIDEO=12s，MYS-886），主动收尾让浏览器 fetch 结束、
         // viewer 条目被清理，避免永久悬挂。
         loop {
-            match tokio::time::timeout(Duration::from_secs(12), rx.recv()).await {
-                Ok(Some(chunk)) => {
+            match next_frame_or_idle(&mut rx, DOWNLINK_IDLE_TIMEOUT).await {
+                Some(chunk) => {
                     yield Ok::<_, Infallible>(Bytes::from(chunk));
                 }
-                _ => break,
+                None => break,
             }
         }
         drop(guard);
@@ -354,6 +354,27 @@ pub async fn stream_handler(
         .header("x-accel-buffering", "no")
         .body(body)
         .unwrap()
+}
+
+/// Connected viewers stay in the fan-out until they miss this long. A healthy
+/// stream produces at least one frame every 4.5s (static desktop IDR
+/// heartbeat); 12s of silence means the agent stopped or the uplink broke, so
+/// the viewer is closed instead of hanging forever. Aligned with rustdesk's
+/// `SEND_TIMEOUT_VIDEO=12s` (MYS-886). Shared by both downlink transports so
+/// HTTP and WS cannot drift apart.
+const DOWNLINK_IDLE_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Next frame for a viewer, or `None` when the stream is over: the fan-out
+/// dropped the viewer, or nothing arrived within `budget`. Both downlink
+/// transports go through this so the idle policy is one place, not two.
+async fn next_frame_or_idle(
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    match tokio::time::timeout(budget, rx.recv()).await {
+        Ok(Some(chunk)) => Some(chunk),
+        _ => None,
+    }
 }
 
 /// Viewer cleanup on disconnect (caller owns the id; remove on stream end).
@@ -416,13 +437,14 @@ pub async fn ws_downlink_handler(
                 .into_response();
         }
     };
-    ws.on_upgrade(move |socket| ws_downlink_loop(ds, session_id, socket))
+    ws.on_upgrade(move |socket| ws_downlink_loop(ds, session_id, socket, DOWNLINK_IDLE_TIMEOUT))
 }
 
 async fn ws_downlink_loop(
     ds: DesktopStream,
     _session_id: String,
     mut socket: axum::extract::ws::WebSocket,
+    idle_timeout: Duration,
 ) {
     use axum::extract::ws::Message;
     // add_viewer() 只等第一个 init；先拿到 init 缓存（已存在则立即返回,
@@ -468,13 +490,16 @@ async fn ws_downlink_loop(
                 Some(Err(_)) => break,
             }
         }
-            chunk = rx.recv() => {
+            chunk = next_frame_or_idle(&mut rx, idle_timeout) => {
                 match chunk {
                     Some(c) => {
                         if socket.send(Message::Binary(c.into())).await.is_err() {
                             break;
                         }
                     }
+                    // Fan-out dropped the viewer, or no frame within the idle
+                    // budget — same verdict as the HTTP stream, so a dead agent
+                    // cannot leave this socket pinned open.
                     None => break,
                 }
             }
@@ -843,5 +868,169 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── B4: downlink idle timeout ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_next_frame_or_idle_times_out_on_silence() {
+        // The idle policy both transports share: no frame within the budget
+        // ends the viewer. Uses a short budget so the test stays fast.
+        let (_tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let started = std::time::Instant::now();
+        let got = next_frame_or_idle(&mut rx, Duration::from_millis(120)).await;
+        assert!(got.is_none(), "silent viewer must be reported as ended");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "must actually wait out the budget, elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_frame_or_idle_passes_frames_through() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        tx.send(vec![1, 2, 3]).await.unwrap();
+        let got = next_frame_or_idle(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(got, Some(vec![1, 2, 3]));
+        // A closed channel ends the viewer immediately, without waiting.
+        drop(tx);
+        let started = std::time::Instant::now();
+        assert!(next_frame_or_idle(&mut rx, Duration::from_secs(5))
+            .await
+            .is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_ws_downlink_closes_on_idle_and_removes_viewer() {
+        // Regression: the WS downlink used to `select!` on a bare `rx.recv()`,
+        // so an agent that stopped pushing left the socket open forever (the
+        // HTTP stream had a 12s idle cut-off; WS did not). Exercise the real
+        // loop directly with a short budget so the test stays fast.
+        let state = Arc::new(crate::relay::SharedState::new(
+            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let token = r.tokens[0].0.clone();
+
+        let ds = DesktopStream::new();
+        ds.set_init(vec![0xa1, 0xa2]).await; // init so the loop starts
+        state.desktop_streams.write().await.insert(sid.clone(), ds.clone());
+
+        // A real upgrade through the router, so the socket is a real one.
+        let app: axum::Router = axum::Router::new()
+            .route(
+                "/agent/desktop/ws",
+                axum::routing::get(
+                    move |State(st): State<Arc<crate::relay::SharedState>>,
+                          Query(p): Query<HashMap<String, String>>,
+                          ws: axum::extract::ws::WebSocketUpgrade| async move {
+                        let stream = st.desktop_streams.read().await.get(&sid).cloned().unwrap();
+                        ws.on_upgrade(move |socket| {
+                            ws_downlink_loop(stream, String::new(), socket, Duration::from_millis(150))
+                        })
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/agent/desktop/ws?token={token}"
+        ))
+        .await
+        .expect("ws connect");
+
+        // First frame is the cached init.
+        let first = tokio::time::timeout(
+            Duration::from_secs(3),
+            futures_util::StreamExt::next(&mut ws),
+        )
+        .await
+        .expect("init frame")
+        .expect("frame")
+        .expect("ok frame");
+        assert_eq!(first.into_data().to_vec(), vec![0xa1, 0xa2]);
+
+        // The agent pushes nothing more: the loop must close the socket once
+        // its idle budget expires instead of holding it open forever.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match futures_util::StreamExt::next(&mut ws).await {
+                    None => return true,
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return true,
+                    Some(Err(_)) => return true,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.expect("WS downlink must close after the idle budget"),
+            "idle WS downlink must close the socket"
+        );
+        // ViewerGuard removes the viewer on the way out.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            ds.stats().await.viewer_count,
+            0,
+            "closing an idle WS viewer must release its fan-out slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_downlink_forwards_frames_before_idle_timeout() {
+        // A live stream must be unaffected by the idle budget: frames keep
+        // arriving and the socket stays open.
+        let _state = Arc::new(crate::relay::SharedState::new(
+            "".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None,
+        ));
+        let ds = DesktopStream::new();
+        ds.set_init(vec![0x01]).await;
+        let app: axum::Router = axum::Router::new()
+            .route(
+                "/agent/desktop/ws",
+                axum::routing::get({
+                    let ds = ds.clone();
+                    move |ws: axum::extract::ws::WebSocketUpgrade| async move {
+                        let ds = ds.clone();
+                        ws.on_upgrade(move |socket| {
+                            ws_downlink_loop(ds, String::new(), socket, Duration::from_millis(150))
+                        })
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/agent/desktop/ws"))
+            .await
+            .expect("ws connect");
+        let first = tokio::time::timeout(
+            Duration::from_secs(3),
+            futures_util::StreamExt::next(&mut ws),
+        )
+        .await
+        .expect("init frame")
+        .expect("frame")
+        .expect("ok frame");
+        assert_eq!(first.into_data().to_vec(), vec![0x01]);
+
+        // Push inside the budget: the frame must be delivered, not dropped.
+        ds.push_frag(true, vec![0x77]).await;
+        let second = tokio::time::timeout(
+            Duration::from_secs(3),
+            futures_util::StreamExt::next(&mut ws),
+        )
+        .await
+        .expect("frag frame")
+        .expect("frame")
+        .expect("ok frame");
+        assert_eq!(second.into_data().to_vec(), vec![0x77]);
     }
 }
