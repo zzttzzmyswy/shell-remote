@@ -1,0 +1,303 @@
+/* ── Design tokens ──────────────────────────────────────────────
+   The single source of truth for colour, radius, shadow, spacing and
+   typography on every page (login / session / probe and the admin panel).
+   style.css and the admin page only *reference* these tokens — no page may
+   declare its own palette (MYS-2288 E1).
+
+   Themes
+     :root[data-theme="dark"]   dark palette (default before JS runs)
+     :root[data-theme="light"]  light palette, WCAG AA (body text ≥ 4.5:1)
+   The <head> of each page sets data-theme synchronously from
+   localStorage['sr-theme'] (system | light | dark) so there is no flash; when
+   JS is unavailable the prefers-color-scheme block at the bottom picks a
+   palette. theme.js owns the runtime switching.
+
+   Contrast (light): text-primary 18.2:1, text-secondary 7.8:1,
+   text-muted 5.9:1, accent 6.4:1, success 5.5:1, danger 5.8:1 — all on
+   --bg-secondary (#fff); on --bg-primary they are slightly higher.
+   Contrast (dark): text-primary 15.4:1, text-secondary 7.4:1,
+   text-muted 5.3:1 on --bg-primary.
+   ─────────────────────────────────────────────────────────────── */
+
+:root {
+    /* Typography */
+    --font-mono: "Sarasa Term SC", "Sarasa Mono SC", "Noto Sans Mono CJK SC", "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace;
+    --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    --font-size-xs: 0.72rem;
+    --font-size-sm: 0.82rem;
+    --font-size-md: 0.9rem;
+    --font-size-lg: 1.1rem;
+    --font-size-xl: 1.9rem;
+
+    /* Spacing scale: 4 / 8 / 12 / 16 / 24 */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-6: 24px;
+
+    /* Radii */
+    --radius-sm: 6px;
+    --radius: 10px;
+    --radius-lg: 14px;
+    --radius-pill: 999px;
+
+    /* Layout */
+    --toolbar-h: 44px;
+    --tabbar-h: 36px;
+
+    /* z-index ladder */
+    --z-sticky: 30;
+    --z-drawer: 50;
+    --z-menu: 300;
+    --z-toast: 400;
+    --z-modal: 500;
+    --z-dialog: 600;
+}
+
+/* ── Dark (default) ──────────────────────────────────────────── */
+:root,
+:root[data-theme="dark"] {
+    color-scheme: dark;
+
+    /* Surfaces, three levels */
+    --bg-primary: #0b0f17;      /* app background */
+    --bg-secondary: #121826;    /* panels: toolbar, drawer, cards */
+    --bg-tertiary: #1a2233;     /* raised: inputs, buttons */
+    --bg-hover: #222c41;
+    --bg-overlay: rgba(6, 9, 15, 0.72);
+    --surface-glass: rgba(18, 24, 38, 0.92);
+    --overlay-surface: rgba(14, 19, 30, 0.92);
+    --overlay-surface-strong: rgba(12, 16, 26, 0.72);
+    --overlay-text: #b8c0cc;
+
+    /* Borders */
+    --border: #273145;
+    --border-strong: #36425c;
+    --border-subtle: rgba(39, 49, 69, 0.55);
+
+    /* Text, three levels */
+    --text-primary: #e6ebf5;
+    --text-secondary: #9aa6bd;
+    --text-muted: #7b8798;
+    --text: var(--text-primary);
+    --code-text: #b7f3d9;
+    --metric-value: #7ee2b8;
+
+    /* Accent + semantic */
+    --accent: #6d8cff;
+    --accent-hover: #8ca4ff;
+    --accent-strong: #5b7cf5;
+    --accent-2: #2dd4bf;
+    --accent-soft: rgba(109, 140, 255, 0.14);
+    --accent-ring: rgba(109, 140, 255, 0.32);
+    --accent-glow: rgba(109, 140, 255, 0.28);
+    --accent-glow-strong: rgba(109, 140, 255, 0.38);
+    --on-accent: #ffffff;
+    --brand-fg: #0b0f17;
+
+    --danger: #f26d6d;
+    --danger-soft: rgba(242, 109, 109, 0.13);
+    --danger-border: rgba(242, 109, 109, 0.3);
+    --danger-strong: #d95757;
+    --success: #3ecf8e;
+    --success-soft: rgba(62, 207, 142, 0.13);
+    --success-border: rgba(62, 207, 142, 0.45);
+    --warning: #f0b43c;
+    --warning-soft: rgba(240, 180, 60, 0.14);
+    --warning-border: rgba(240, 180, 60, 0.4);
+
+    /* Elevation: dark themes read depth from darkness */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+    --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.5);
+
+    /* Desktop viewer letterbox: black in both themes */
+    --desktop-bg: #000000;
+
+    /* Terminal (xterm reads these through getComputedStyle — term.js) */
+    --term-bg: #0b0f17;
+    --term-fg: #d8deea;
+    --term-cursor: #8ca4ff;
+    --term-cursor-accent: #0b0f17;
+    --term-selection: rgba(109, 140, 255, 0.35);
+    --term-black: #000000;
+    --term-red: #cd3131;
+    --term-green: #0dbc79;
+    --term-yellow: #e5e510;
+    --term-blue: #2472c8;
+    --term-magenta: #bc3fbc;
+    --term-cyan: #11a8cd;
+    --term-white: #e5e5e5;
+    --term-bright-black: #666666;
+    --term-bright-red: #f14c4c;
+    --term-bright-green: #23d18b;
+    --term-bright-yellow: #f5f543;
+    --term-bright-blue: #3b8eea;
+    --term-bright-magenta: #d670d6;
+    --term-bright-cyan: #29b8db;
+    --term-bright-white: #ffffff;
+}
+
+/* ── Light ───────────────────────────────────────────────────── */
+:root[data-theme="light"] {
+    color-scheme: light;
+
+    --bg-primary: #f4f6fb;
+    --bg-secondary: #ffffff;
+    --bg-tertiary: #eef1f7;
+    --bg-hover: #e3e8f2;
+    --bg-overlay: rgba(15, 21, 36, 0.42);
+    --surface-glass: rgba(255, 255, 255, 0.95);
+    --overlay-surface: rgba(255, 255, 255, 0.95);
+    --overlay-surface-strong: rgba(255, 255, 255, 0.88);
+    --overlay-text: #35415a;
+
+    --border: #d7dde9;
+    --border-strong: #bcc5d6;
+    --border-subtle: rgba(215, 221, 233, 0.8);
+
+    --text-primary: #0f1524;
+    --text-secondary: #46536b;
+    --text-muted: #5b6478;
+    --text: var(--text-primary);
+    --code-text: #0d6b47;
+    --metric-value: #0d6b47;
+
+    --accent: #2b52d6;
+    --accent-hover: #1d3fae;
+    --accent-strong: #1d3fae;
+    --accent-2: #0d7a68;
+    --accent-soft: rgba(43, 82, 214, 0.1);
+    --accent-ring: rgba(43, 82, 214, 0.28);
+    --accent-glow: rgba(43, 82, 214, 0.18);
+    --accent-glow-strong: rgba(43, 82, 214, 0.26);
+    --on-accent: #ffffff;
+    --brand-fg: #ffffff;
+
+    --danger: #bf2d2d;
+    --danger-soft: rgba(191, 45, 45, 0.1);
+    --danger-border: rgba(191, 45, 45, 0.32);
+    --danger-strong: #9c2020;
+    --success: #12784f;
+    --success-soft: rgba(18, 120, 79, 0.1);
+    --success-border: rgba(18, 120, 79, 0.35);
+    --warning: #8a6008;
+    --warning-soft: rgba(138, 96, 8, 0.12);
+    --warning-border: rgba(138, 96, 8, 0.32);
+
+    /* Light elevation: shadows do the lifting, keep them soft and warm-grey */
+    --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+    --shadow: 0 6px 18px rgba(15, 23, 42, 0.1);
+    --shadow-lg: 0 18px 48px rgba(15, 23, 42, 0.16);
+
+    --desktop-bg: #000000;
+
+    --term-bg: #ffffff;
+    --term-fg: #1b2437;
+    --term-cursor: #2b52d6;
+    --term-cursor-accent: #ffffff;
+    --term-selection: rgba(43, 82, 214, 0.22);
+    --term-black: #1b2437;
+    --term-red: #b62324;
+    --term-green: #1a7f37;
+    --term-yellow: #8a6008;
+    --term-blue: #0a58ca;
+    --term-magenta: #8250df;
+    --term-cyan: #0d7b8a;
+    --term-white: #57606a;
+    --term-bright-black: #57606a;
+    --term-bright-red: #cf222e;
+    --term-bright-green: #116329;
+    --term-bright-yellow: #7d4e00;
+    --term-bright-blue: #0969da;
+    --term-bright-magenta: #a475f9;
+    --term-bright-cyan: #1b7c83;
+    --term-bright-white: #1b2437;
+}
+
+/* No-JS / first-paint fallback: honour the OS preference. */
+@media (prefers-color-scheme: light) {
+    :root:not([data-theme]) {
+        color-scheme: light;
+
+        --bg-primary: #f4f6fb;
+        --bg-secondary: #ffffff;
+        --bg-tertiary: #eef1f7;
+        --bg-hover: #e3e8f2;
+        --bg-overlay: rgba(15, 21, 36, 0.42);
+        --surface-glass: rgba(255, 255, 255, 0.95);
+        --overlay-surface: rgba(255, 255, 255, 0.95);
+        --overlay-surface-strong: rgba(255, 255, 255, 0.88);
+        --overlay-text: #35415a;
+
+        --border: #d7dde9;
+        --border-strong: #bcc5d6;
+        --border-subtle: rgba(215, 221, 233, 0.8);
+
+        --text-primary: #0f1524;
+        --text-secondary: #46536b;
+        --text-muted: #5b6478;
+        --text: var(--text-primary);
+        --code-text: #0d6b47;
+        --metric-value: #0d6b47;
+
+        --accent: #2b52d6;
+        --accent-hover: #1d3fae;
+        --accent-strong: #1d3fae;
+        --accent-2: #0d7a68;
+        --accent-soft: rgba(43, 82, 214, 0.1);
+        --accent-ring: rgba(43, 82, 214, 0.28);
+        --accent-glow: rgba(43, 82, 214, 0.18);
+        --accent-glow-strong: rgba(43, 82, 214, 0.26);
+        --on-accent: #ffffff;
+        --brand-fg: #ffffff;
+
+        --danger: #bf2d2d;
+        --danger-soft: rgba(191, 45, 45, 0.1);
+        --danger-border: rgba(191, 45, 45, 0.32);
+        --danger-strong: #9c2020;
+        --success: #12784f;
+        --success-soft: rgba(18, 120, 79, 0.1);
+        --success-border: rgba(18, 120, 79, 0.35);
+        --warning: #8a6008;
+        --warning-soft: rgba(138, 96, 8, 0.12);
+        --warning-border: rgba(138, 96, 8, 0.32);
+
+        --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+        --shadow: 0 6px 18px rgba(15, 23, 42, 0.1);
+        --shadow-lg: 0 18px 48px rgba(15, 23, 42, 0.16);
+
+        --term-bg: #ffffff;
+        --term-fg: #1b2437;
+        --term-cursor: #2b52d6;
+        --term-cursor-accent: #ffffff;
+        --term-selection: rgba(43, 82, 214, 0.22);
+        --term-black: #1b2437;
+        --term-red: #b62324;
+        --term-green: #1a7f37;
+        --term-yellow: #8a6008;
+        --term-blue: #0a58ca;
+        --term-magenta: #8250df;
+        --term-cyan: #0d7b8a;
+        --term-white: #57606a;
+        --term-bright-black: #57606a;
+        --term-bright-red: #cf222e;
+        --term-bright-green: #116329;
+        --term-bright-yellow: #7d4e00;
+        --term-bright-blue: #0969da;
+        --term-bright-magenta: #a475f9;
+        --term-bright-cyan: #1b7c83;
+        --term-bright-white: #1b2437;
+    }
+}
+
+/* Theme switch button: one icon per mode (system / light / dark). */
+.theme-toggle .ico { display: none; }
+.theme-toggle[data-mode="system"] .ico-system,
+.theme-toggle[data-mode="light"] .ico-light,
+.theme-toggle[data-mode="dark"] .ico-dark { display: block; }
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+}

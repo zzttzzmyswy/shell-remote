@@ -4,177 +4,338 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>shell-remote admin</title>
+<script>
+// Apply the stored theme before first paint — no flash of the wrong palette.
+// Mirrors UI.theme in /ui.js (same key, same mode names). The admin page is
+// served under the secret admin path, so assets use absolute URLs.
+(function () {
+  try {
+    var m = localStorage.getItem('sr-theme');
+    var t = (m === 'light' || m === 'dark') ? m
+      : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    document.documentElement.setAttribute('data-theme', t);
+    document.documentElement.setAttribute('data-theme-mode',
+      (m === 'light' || m === 'dark' || m === 'system') ? m : 'system');
+  } catch (e) {
+    document.documentElement.setAttribute('data-theme', 'dark');
+  }
+})();
+</script>
+<link rel="stylesheet" href="/theme.css">
+<link rel="stylesheet" href="/ui.css">
 <style>
-  /* Same palette as web/style.css (login / session pages). */
-  :root {
-    color-scheme: dark;
-    --bg: #0b0f17;
-    --panel: #121826;
-    --panel2: #1a2233;
-    --panel-hover: #222c41;
-    --text: #e6ebf5;
-    --muted: #9aa6bd;
-    --accent: #6d8cff;
-    --accent-hover: #8ca4ff;
-    --green: #3ecf8e;
-    --red: #f26d6d;
-    --yellow: #f0b43c;
-    --border: #273145;
-  }
+  /* Admin panel layout. Every colour / radius / shadow / spacing value comes
+     from /theme.css (the single token source) — this block only arranges
+     things. Do not declare a palette here. */
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 14px; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  .wrap { max-width: 1200px; margin: 0 auto; padding: 28px 24px 60px; }
-  .center-screen { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .mono { font-family: var(--font-mono); }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: var(--space-6) var(--space-6) 60px; }
+  .center-screen { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: var(--space-4); }
+  .hidden { display: none !important; }
 
-  /* Login */
-  .login-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 32px 28px; width: 100%; max-width: 360px; box-shadow: 0 8px 32px rgba(0,0,0,0.35); }
+  /* ── Login ─────────────────────────────────────────────────── */
+  .login-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-6);
+    width: 100%; max-width: 360px;
+    box-shadow: var(--shadow-lg);
+  }
   .login-card h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
-  .login-card .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
-  label { display: block; color: var(--muted); font-size: 12px; margin: 12px 0 5px; }
-  input, button, select { font: inherit; color: var(--text); }
-  input[type="text"], input[type="password"] {
-    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-    padding: 10px 12px; outline: none; color: var(--text);
+  .login-card .sub { color: var(--text-secondary); font-size: 13px; margin-bottom: var(--space-6); }
+  label { display: block; color: var(--text-secondary); font-size: 12px; margin: var(--space-3) 0 5px; }
+  input, button, select { font: inherit; color: var(--text-primary); }
+  input[type="text"], input[type="password"], input[type="number"] {
+    width: 100%;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px var(--space-3);
+    outline: none;
+    color: var(--text-primary);
   }
-  input[type="text"]:focus, input[type="password"]:focus { border-color: var(--accent); }
+  input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus,
+  select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  select {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+  }
   .btn {
-    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
-    padding: 9px 14px; cursor: pointer; color: var(--text); font-weight: 500; transition: background .12s, border-color .12s;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 9px var(--space-4);
+    cursor: pointer;
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-weight: 500;
+    transition: background .12s, border-color .12s, color .12s;
   }
-  .btn:hover { background: var(--panel-hover); }
-  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-  .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
-  .btn-red { background: var(--red); border-color: var(--red); color: #fff; }
-  .btn-red:hover { background: #d95757; }
-  .btn-sm { padding: 4px 8px; font-size: 12px; border-radius: 6px; }
-  .btn-block { width: 100%; margin-top: 18px; }
-  .err { color: var(--red); font-size: 12px; min-height: 16px; margin-top: 10px; }
+  .btn:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--border-strong); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .btn-red { background: var(--danger); border-color: var(--danger); color: var(--on-accent); }
+  .btn-red:hover:not(:disabled) { background: var(--danger-strong); border-color: var(--danger-strong); }
+  .btn-sm { padding: var(--space-1) var(--space-2); font-size: 12px; border-radius: var(--radius-sm); }
+  .btn-block { width: 100%; margin-top: var(--space-4); }
+  .err { color: var(--danger); font-size: 12px; min-height: 16px; margin-top: 10px; }
 
-  /* Dashboard */
-  .header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
-  .header h1 { margin: 0; font-size: 20px; font-weight: 600; }
-  .badge { background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; font-size: 12px; color: var(--muted); }
-  .badge-version { color: var(--accent); }
-  .spacer { flex: 1 1 auto; }
-
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 26px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
-  .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-  .card .v { font-size: 22px; font-weight: 600; margin-top: 6px; }
-  .card .v small { font-size: 13px; color: var(--muted); font-weight: 400; }
-
-  /* Tabs */
-  .tabbar { display: flex; gap: 2px; flex-wrap: wrap; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
-  .tab-btn { background: transparent; border: none; color: var(--muted); padding: 10px 16px; font-size: 14px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 500; }
-  .tab-btn:hover { color: var(--text); background: rgba(109,140,255,.06); }
-  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
-  .tab-panel { display: block; }
-
-  /* Device filter bar */
-  .filter-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
-  .filter-bar input[type="text"], .filter-bar select {
-    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
-    color: var(--text); outline: none; font-size: 13px;
+  /* ── Top bar ───────────────────────────────────────────────── */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+    padding: var(--space-3) var(--space-4);
+    margin-bottom: var(--space-6);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
   }
-  .filter-bar input[type="text"] { flex: 1 1 220px; min-width: 180px; }
-  .filter-bar input[type="text"]:focus, .filter-bar select:focus { border-color: var(--accent); }
-  .filter-count { color: var(--muted); font-size: 12px; }
-
-  /* Agent upgrade status in the devices table */
-  .upg-status { font-size: 12px; display: inline-block; }
-  .upg-status.upg-done { color: var(--green); }
-  .upg-status.upg-fail { color: var(--red); }
-  .upg-list { margin: 0; padding-left: 18px; }
-  .upg-list li { margin: 4px 0; }
-
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 22px; }
-  .panel h2 { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
-
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 10px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; font-weight: 500; }
-  tr:last-child td { border-bottom: none; }
-  td.actions { white-space: nowrap; }
-
-  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: var(--muted); }
-  .dot.on { background: var(--green); box-shadow: 0 0 6px rgba(62,207,142,.6); }
-  td.recent { color: var(--green); font-weight: 500; }
-
-  .status-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; border: 1px solid var(--border); }
-  .status-pill.on { color: var(--green); border-color: rgba(62,207,142,.4); background: rgba(62,207,142,.12); }
-  .status-pill.off { color: var(--muted); border-color: var(--border); background: var(--panel2); }
-
-  .evt-conn { color: var(--green); font-size: 12px; font-weight: 500; }
-  .evt-disc { color: var(--muted); font-size: 12px; }
-
-  .tok-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; flex-wrap: wrap; }
-  .tok { font-family: ui-monospace, monospace; font-size: 11px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; cursor: pointer; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tok:hover { border-color: var(--accent); }
-  .perm { font-size: 10px; font-weight: 700; border-radius: 4px; padding: 2px 5px; text-transform: uppercase; }
-  .perm-rw { background: rgba(62,207,142,.18); color: var(--green); border: 1px solid rgba(62,207,142,.4); }
-  .perm-ro { background: rgba(240,180,60,.18); color: var(--yellow); border: 1px solid rgba(240,180,60,.4); }
-  .xbtn { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 1px 6px; cursor: pointer; font-size: 11px; line-height: 1.4; }
-  .xbtn:hover { color: var(--red); border-color: var(--red); }
-  .copied { font-size: 10px; color: var(--green); }
-
-  .srv-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .srv-val { flex: 1 1 240px; min-width: 0; font-family: ui-monospace, monospace; font-size: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; word-break: break-all; }
-  .srv-input { flex: 1 1 240px; min-width: 0; }
-  .muted { color: var(--muted); }
-  .alert { background: rgba(109,140,255,.1); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; font-size: 12px; margin-top: 10px; word-break: break-all; }
-
-  .rec-badge { background: rgba(237,87,87,.16); border: 1px solid var(--red); color: var(--red); border-radius: 4px; padding: 3px 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em; margin-right: 10px; }
-  .rec-badge::before { content: "● "; }
-  .row-rec { font-size: 10px; color: var(--red); font-weight: 600; margin-left: 6px; }
-
-
-  /* Language toggle */
-  .lang-toggle { position: fixed; bottom: 14px; right: 14px; z-index: 50; background: var(--panel); border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .topbar h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  .topbar .spacer { flex: 1 1 auto; }
+  .badge {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    padding: 3px 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .badge-version { color: var(--accent); font-family: var(--font-mono); }
+  .theme-toggle {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background .15s, color .15s, border-color .15s;
+  }
+  .theme-toggle:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border-strong); }
+  .lang-toggle {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    border-radius: var(--radius-pill);
+    padding: 5px var(--space-3);
+    font-size: 12px;
+    cursor: pointer;
+  }
   .lang-toggle:hover { color: var(--accent); border-color: var(--accent); }
 
-  .hidden { display: none !important; }
-  @media (max-width: 640px) { .tok { max-width: 140px; } .lang-toggle { bottom: 8px; right: 8px; } }
+  /* ── Overview cards ────────────────────────────────────────── */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--space-3); margin-bottom: var(--space-6); }
+  .card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-4);
+    box-shadow: var(--shadow-sm);
+  }
+  .card .k { color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 22px; font-weight: 600; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .card .v small { font-size: 13px; color: var(--text-secondary); font-weight: 400; }
 
-  /* Recordings */
-  .rec-kind { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; border-radius: 6px; padding: 3px 8px; }
-  .rec-kind.cast { background: rgba(109,140,255,.14); color: var(--accent); border: 1px solid rgba(109,140,255,.4); }
-  .rec-kind.audit { background: rgba(240,180,60,.14); color: var(--yellow); border: 1px solid rgba(240,180,60,.4); }
+  /* ── Tabs ──────────────────────────────────────────────────── */
+  .tabbar { display: flex; gap: 2px; flex-wrap: wrap; margin-bottom: var(--space-4); border-bottom: 1px solid var(--border); }
+  .tab-btn {
+    background: transparent; border: none;
+    color: var(--text-secondary);
+    padding: 10px var(--space-4);
+    font-size: 14px; cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    font-weight: 500;
+  }
+  .tab-btn:hover { color: var(--text-primary); background: var(--accent-soft); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
+  /* ── Filter bar ────────────────────────────────────────────── */
+  .filter-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: var(--space-3); align-items: center; }
+  .filter-bar input[type="text"], .filter-bar select {
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 8px 10px;
+    color: var(--text-primary); outline: none; font-size: 13px;
+  }
+  .filter-bar input[type="text"] { flex: 1 1 220px; min-width: 180px; }
+  .filter-count { color: var(--text-secondary); font-size: 12px; }
+
+  .upg-status { font-size: 12px; display: inline-block; }
+  .upg-status.upg-done { color: var(--success); }
+  .upg-status.upg-fail { color: var(--danger); }
+  .upg-list { margin: 0; padding-left: 18px; }
+  .upg-list li { margin: var(--space-1) 0; }
+
+  .panel {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-4);
+    margin-bottom: var(--space-6);
+  }
+  .panel h2 { margin: 0 0 var(--space-3); font-size: 15px; font-weight: 600; }
+  .panel-head { display: flex; align-items: center; gap: 10px; margin-bottom: var(--space-3); flex-wrap: wrap; }
+  .panel-head h2 { margin: 0; }
+  .panel-head .spacer { flex: 1 1 auto; }
+
+  /* ── Tables ────────────────────────────────────────────────── */
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th {
+    color: var(--text-secondary);
+    font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+    font-weight: 500; white-space: nowrap;
+    position: sticky; top: 0; background: var(--bg-secondary); z-index: var(--z-sticky);
+  }
+  tbody tr:hover { background: var(--bg-tertiary); }
+  tr:last-child td { border-bottom: none; }
+  td.actions { white-space: nowrap; }
+  td.mono, th.mono { font-family: var(--font-mono); font-size: 12px; }
+  .empty-state { color: var(--text-secondary); font-size: 13px; padding: var(--space-6) var(--space-1); text-align: center; }
+
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: var(--text-muted); }
+  .dot.on { background: var(--success); box-shadow: 0 0 6px var(--success-border); }
+  td.recent { color: var(--success); font-weight: 500; }
+
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: var(--radius-pill);
+    font-size: 12px; font-weight: 500; border: 1px solid var(--border);
+  }
+  .status-pill.on { color: var(--success); border-color: var(--success-border); background: var(--success-soft); }
+  .status-pill.off { color: var(--text-secondary); border-color: var(--border); background: var(--bg-tertiary); }
+
+  .evt-conn { color: var(--success); font-size: 12px; font-weight: 500; }
+  .evt-disc { color: var(--text-secondary); font-size: 12px; }
+
+  .tok-row { display: flex; align-items: center; gap: 6px; margin: var(--space-1) 0; flex-wrap: wrap; }
+  .tok {
+    font-family: var(--font-mono); font-size: 11px;
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 3px 6px; cursor: pointer;
+    max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tok:hover { border-color: var(--accent); }
+  .perm { font-size: 10px; font-weight: 700; border-radius: var(--radius-sm); padding: 2px 5px; text-transform: uppercase; }
+  .perm-rw { background: var(--success-soft); color: var(--success); border: 1px solid var(--success-border); }
+  .perm-ro { background: var(--warning-soft); color: var(--warning); border: 1px solid var(--warning-border); }
+  .xbtn {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--text-secondary); border-radius: var(--radius-sm);
+    padding: 1px 6px; cursor: pointer; font-size: 11px; line-height: 1.4;
+  }
+  .xbtn:hover { color: var(--danger); border-color: var(--danger); }
+  .copied { font-size: 10px; color: var(--success); }
+
+  .srv-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .srv-val {
+    flex: 1 1 240px; min-width: 0;
+    font-family: var(--font-mono); font-size: 12px;
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 9px var(--space-3);
+    word-break: break-all;
+  }
+  .srv-input { flex: 1 1 240px; min-width: 0; }
+  .muted { color: var(--text-secondary); }
+  .alert {
+    background: var(--accent-soft);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    padding: 10px var(--space-3);
+    font-size: 12px; margin-top: 10px; word-break: break-all;
+  }
+
+  .rec-badge {
+    background: var(--danger-soft); border: 1px solid var(--danger);
+    color: var(--danger); border-radius: var(--radius-sm);
+    padding: 3px 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em;
+    margin-right: 10px;
+  }
+  .rec-badge::before { content: "● "; }
+  .row-rec { font-size: 10px; color: var(--danger); font-weight: 600; margin-left: 6px; }
+
+  /* ── Recordings ────────────────────────────────────────────── */
+  .rec-kind { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; border-radius: var(--radius-sm); padding: 3px 8px; }
+  .rec-kind.cast { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }
+  .rec-kind.audit { background: var(--warning-soft); color: var(--warning); border: 1px solid var(--warning-border); }
   .rec-act { margin-right: 6px; }
-  .pager { display: flex; align-items: center; gap: 8px; justify-content: flex-end; padding: 10px 4px 0; }
-  .page-info { font-size: 12px; color: var(--muted); font-family: ui-monospace, monospace; }
-  .btn:disabled { opacity: .45; cursor: default; }
+  .pager { display: flex; align-items: center; gap: var(--space-2); justify-content: flex-end; padding: 10px var(--space-1) 0; }
+  .page-info { font-size: 12px; color: var(--text-secondary); font-family: var(--font-mono); }
 
-  /* Player modal */
-  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 90; display: flex; align-items: center; justify-content: center; padding: 20px; }
-  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; max-width: 100%; width: 860px; max-height: 92vh; display: flex; flex-direction: column; overflow: hidden; }
-  .modal-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-  .modal-title { font-weight: 600; font-family: ui-monospace, monospace; font-size: 13px; }
-  .player-term { padding: 12px 16px; overflow: auto; background: #070a10; min-height: 240px; }
-  .player-term .xterm { padding: 4px; }
-  .player-controls { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+  /* ── Player / audit modals ─────────────────────────────────── */
+  .modal-mask {
+    position: fixed; inset: 0;
+    background: var(--bg-overlay);
+    z-index: var(--z-modal);
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .modal {
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); max-width: 100%; width: 860px;
+    max-height: 92vh; display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: var(--shadow-lg);
+  }
+  .modal-head { display: flex; align-items: center; gap: 10px; padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .modal-title { font-weight: 600; font-family: var(--font-mono); font-size: 13px; }
+  .player-term { padding: var(--space-3) var(--space-4); overflow: auto; background: var(--term-bg); min-height: 240px; }
+  .player-term .xterm { padding: var(--space-1); }
+  .player-controls { display: flex; align-items: center; gap: 10px; padding: 10px var(--space-4); border-top: 1px solid var(--border); flex-wrap: wrap; }
   .player-controls .btn { padding: 6px 11px; }
-  .speed-group { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-  .speed-group button { background: transparent; border: none; color: var(--muted); padding: 6px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
-  .speed-group button.active { background: var(--accent); color: #fff; }
-  .player-time { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
+  .speed-group { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+  .speed-group button { background: transparent; border: none; color: var(--text-secondary); padding: 6px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
+  .speed-group button.active { background: var(--accent); color: var(--on-accent); }
+  .player-time { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
   input[type="range"] { flex: 1 1 120px; accent-color: var(--accent); }
 
-  /* Audit view */
   .audit-list { overflow: auto; max-height: 70vh; }
-  .audit-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; margin: 10px; padding: 12px 14px; }
-  .audit-card .cmd { font-family: ui-monospace, monospace; font-size: 13px; word-break: break-all; margin-bottom: 6px; color: var(--accent); }
-  .audit-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-bottom: 6px; }
-  .audit-out { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; max-height: 160px; overflow: auto; color: var(--text); }
-  .audit-out.err { color: var(--red); }
-  .audit-empty { color: var(--muted); font-size: 12px; padding: 16px; text-align: center; }
-  .res-page { font-size: 12px; color: var(--muted); font-weight: 600; }
+  .audit-card {
+    background: var(--bg-tertiary); border: 1px solid var(--border);
+    border-radius: var(--radius); margin: 10px; padding: var(--space-3) var(--space-4);
+  }
+  .audit-card .cmd { font-family: var(--font-mono); font-size: 13px; word-break: break-all; margin-bottom: 6px; color: var(--accent); }
+  .audit-meta { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; font-size: 11px; color: var(--text-secondary); margin-bottom: 6px; }
+  .audit-out {
+    font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; word-break: break-word;
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: var(--space-2) 10px;
+    max-height: 160px; overflow: auto; color: var(--text-primary);
+  }
+  .audit-out.err { color: var(--danger); }
+  .audit-empty { color: var(--text-secondary); font-size: 12px; padding: var(--space-4); text-align: center; }
+  .res-page { font-size: 12px; color: var(--text-secondary); font-weight: 600; }
+
+  /* ── Narrow screens ────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    .wrap { padding: var(--space-4) var(--space-3) 40px; }
+    .topbar { padding: var(--space-2) var(--space-3); gap: var(--space-2); }
+    .topbar h1 { font-size: 15px; }
+    .tok { max-width: 140px; }
+    .cards { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+    .card .v { font-size: 18px; }
+  }
 </style>
 <link rel="stylesheet" href="/vendor/xterm/xterm.css">
 </head>
 <body>
-
-<button class="lang-toggle" id="langToggle" title="切换语言 / Switch language">中 / EN</button>
 
 <!-- Login view. Kept as a template: once logged in the form is REMOVED from
      the DOM (not just hidden) so the browser's password manager stops treating
@@ -198,13 +359,19 @@
 
 <!-- Dashboard view -->
 <div id="dashView" class="wrap hidden">
-  <div class="header">
+  <div class="topbar">
     <h1 data-i18n="app_title">shell-remote admin</h1>
     <span class="badge badge-version" id="verBadge">v?</span>
     <span class="badge" id="upBadge">uptime —</span>
     <span id="recBadge" class="rec-badge hidden" data-i18n="recording">Recording</span>
     <span class="spacer"></span>
-    <button class="btn" id="logoutBtn" data-i18n="logout">Logout</button>
+    <button type="button" class="lang-toggle" id="langToggle" title="切换语言 / Switch language">中 / EN</button>
+    <button type="button" class="theme-toggle" data-mode="system" title="主题" aria-label="切换主题">
+      <svg class="ico ico-system" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1a1 1 0 0 1 1 1v1.5a.5.5 0 0 1-1 0V2a1 1 0 0 1 1-1zm4.95 2.05a1 1 0 0 1 0 1.414l-1.06 1.06a.5.5 0 1 1-.708-.707l1.06-1.06a1 1 0 0 1 1.415 0zM14 7.5a.5.5 0 0 1 .5.5 6.5 6.5 0 0 1-13 0 .5.5 0 0 1 1 0 5.5 5.5 0 0 0 11 0 .5.5 0 0 1 .5-.5zM3.11 4.464a.5.5 0 0 1 0 .708l-1.06 1.06a.5.5 0 1 1-.707-.707l1.06-1.06a.5.5 0 0 1 .707 0z"/></svg>
+      <svg class="ico ico-light" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm0-9.5a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0V2a.5.5 0 0 1 .5-.5zm0 10.5a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0v-1a.5.5 0 0 1 .5-.5zM14.5 7.5a.5.5 0 0 1 0 1h-1a.5.5 0 0 1 0-1h1zM2.5 7.5a.5.5 0 0 1 0 1h-1a.5.5 0 0 1 0-1h1zm10.096-4.096a.5.5 0 0 1 0 .707l-.707.707a.5.5 0 1 1-.707-.707l.707-.707a.5.5 0 0 1 .707 0zM4.818 10.768a.5.5 0 0 1 0 .707l-.707.707a.5.5 0 1 1-.707-.707l.707-.707a.5.5 0 0 1 .707 0zm8.778 1.414a.5.5 0 0 1-.707.707l-.707-.707a.5.5 0 0 1 .707-.707l.707.707zM4.818 4.232a.5.5 0 0 1-.707.707l-.707-.707a.5.5 0 0 1 .707-.707l.707.707z"/></svg>
+      <svg class="ico ico-dark" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.2 1.6a6.5 6.5 0 1 0 8.2 8.2A5.5 5.5 0 0 1 6.2 1.6z"/></svg>
+    </button>
+    <button type="button" class="btn" id="logoutBtn" data-i18n="logout">Logout</button>
   </div>
 
   <nav class="tabbar" id="tabbar">
@@ -225,7 +392,7 @@
     <div class="card"><div class="k" data-i18n="card_bw_down">Downlink</div><div class="v" id="cBwDown">—</div></div>
     <div class="card"><div class="k" data-i18n="card_bw_up">Uplink</div><div class="v" id="cBwUp">—</div></div>
   </div>
-  <div class="panel" style="margin-top:22px;">
+  <div class="panel">
     <h2 data-i18n="bw_title">Bandwidth limit</h2>
     <div class="muted" id="bwSummary" style="font-size:12px; line-height:1.9;">—</div>
   </div>
@@ -234,7 +401,7 @@
   <section class="tab-panel hidden" id="tab-sessions">
   <div class="panel">
     <h2 data-i18n="sessions">Sessions</h2>
-    <div style="overflow-x:auto;">
+    <div class="table-scroll">
       <table>
         <thead>
           <tr id="sessHead">
@@ -251,14 +418,14 @@
         <tbody id="sessionsBody"></tbody>
       </table>
     </div>
-    <div id="sessEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_sessions">No sessions.</div>
+    <div id="sessEmpty" class="empty-state" data-i18n="no_sessions">No sessions.</div>
   </div>
   </section>
 
   <section class="tab-panel hidden" id="tab-devices">
   <div class="panel">
-    <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
-      <h2 style="margin:0;" data-i18n="devices_title">Devices</h2>
+    <div class="panel-head">
+      <h2 data-i18n="devices_title">Devices</h2>
       <span class="filter-count" id="devCount"></span>
     </div>
     <div class="filter-bar">
@@ -272,7 +439,7 @@
         <option value="offline" data-i18n="offline">Offline</option>
       </select>
     </div>
-    <div style="overflow-x:auto;">
+    <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -291,19 +458,19 @@
         <tbody id="devicesBody"></tbody>
       </table>
     </div>
-    <div id="devicesEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_devices">No devices.</div>
+    <div id="devicesEmpty" class="empty-state" data-i18n="no_devices">No devices.</div>
   </div>
   </section>
 
   <section class="tab-panel hidden" id="tab-recordings">
   <div class="panel">
-    <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
-      <h2 style="margin:0 0 0;" data-i18n="recordings">Recordings</h2>
+    <div class="panel-head">
+      <h2 data-i18n="recordings">Recordings</h2>
       <span class="badge" id="recCount" data-i18n="recordings_count">–</span>
       <span class="spacer"></span>
       <button class="btn btn-sm" id="recRefresh" data-i18n="refresh">Refresh</button>
     </div>
-    <div style="overflow-x:auto;">
+    <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -317,7 +484,7 @@
         <tbody id="recBody"></tbody>
       </table>
     </div>
-    <div id="recEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_recordings">No recordings.</div>
+    <div id="recEmpty" class="empty-state" data-i18n="no_recordings">No recordings.</div>
     <div id="recDisabled" class="alert hidden" data-i18n="recordings_disabled">Recording is off — start the relay with --record-dir to enable.</div>
     <div id="recPager" class="pager hidden">
       <button class="btn btn-sm" id="recPrev" type="button" data-i18n="rec_prev">上一页</button>
@@ -330,7 +497,7 @@
   <section class="tab-panel hidden" id="tab-accesslog">
   <div class="panel">
     <h2 data-i18n="access_log">Access log</h2>
-    <div style="overflow-x:auto;">
+    <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -344,7 +511,7 @@
         <tbody id="connLogBody"></tbody>
       </table>
     </div>
-    <div id="connLogEmpty" class="muted" style="padding:10px 4px;" data-i18n="no_access_log">No access events yet.</div>
+    <div id="connLogEmpty" class="empty-state" data-i18n="no_access_log">No access events yet.</div>
   </div>
   </section>
 
@@ -372,12 +539,12 @@
       <button class="btn btn-primary btn-sm" id="bwSave" data-i18n="save">Save</button>
     </div>
     <div class="muted" id="bwEffective" style="margin-top:10px; font-size:12px;"></div>
-    <div class="muted" id="bwSaved" style="font-size:12px; color:var(--green);"></div>
+    <div class="muted" id="bwSaved" style="font-size:12px; color:var(--success);"></div>
     <div class="err" id="bwErr"></div>
   </div>
   <div class="panel">
-    <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
-      <h2 style="margin:0;" data-i18n="upg_artifacts">Agent updates</h2>
+    <div class="panel-head">
+      <h2 data-i18n="upg_artifacts">Agent updates</h2>
       <span class="spacer"></span>
       <button class="btn btn-sm" id="upgRefresh" data-i18n="refresh">Refresh</button>
     </div>
@@ -424,6 +591,9 @@
 </div>
 
 <script src="/vendor/xterm/xterm.js"></script>
+<!-- Shared UI kit: theme switching + in-page dialogs (E1/E4). Absolute path:
+     this page is served under the secret admin path. -->
+<script src="/ui.js"></script>
 <script>
 (function () {
   "use strict";
@@ -586,7 +756,25 @@
       bw_saved: "带宽设置已保存。",
       bw_saved_local: "已生效，但写入设置文件失败：{err}",
       bw_save_failed: "保存失败：",
-      bw_invalid: "请输入 0 到 100000 之间的数字。"
+      bw_invalid: "请输入 0 到 100000 之间的数字。",
+      // Dialogs (E4): titles + button labels
+      dlg_confirm: "确认",
+      dlg_cancel: "取消",
+      dlg_ok: "确定",
+      dlg_copy: "复制",
+      dlg_copied: "已复制",
+      dlg_delete: "删除",
+      dlg_title_revoke: "撤销令牌",
+      dlg_title_regenerate: "重新生成令牌",
+      dlg_title_kick: "踢除会话",
+      dlg_kick: "踢除",
+      dlg_title_update_pw: "更新服务器密码",
+      dlg_title_delete_rec: "删除录像",
+      dlg_title_upgrade: "升级 Agent",
+      dlg_title_new_tokens: "新的令牌（请立即保存）",
+      dlg_title_error: "操作失败",
+      dlg_hint_revoke_once: "旧令牌会立即失效，正在使用的浏览器需要重新连接。",
+      dlg_hint_new_tokens: "现有令牌已全部失效，正在连接的浏览器需要重新连接。",
     },
     en: {
       app_title: "shell-remote admin",
@@ -740,7 +928,25 @@
       bw_saved: "Bandwidth settings saved.",
       bw_saved_local: "Applied, but writing the settings file failed: {err}",
       bw_save_failed: "Save failed: ",
-      bw_invalid: "Enter a number between 0 and 100000."
+      bw_invalid: "Enter a number between 0 and 100000.",
+      // Dialogs (E4): titles + button labels
+      dlg_confirm: "Confirm",
+      dlg_cancel: "Cancel",
+      dlg_ok: "OK",
+      dlg_copy: "Copy",
+      dlg_copied: "Copied",
+      dlg_delete: "Delete",
+      dlg_title_revoke: "Revoke token",
+      dlg_title_regenerate: "Regenerate tokens",
+      dlg_title_kick: "Kick session",
+      dlg_kick: "Kick",
+      dlg_title_update_pw: "Update server password",
+      dlg_title_delete_rec: "Delete recording",
+      dlg_title_upgrade: "Upgrade agent",
+      dlg_title_new_tokens: "New tokens (save them now)",
+      dlg_title_error: "Action failed",
+      dlg_hint_revoke_once: "Existing tokens stop working immediately; connected browsers must reconnect.",
+      dlg_hint_new_tokens: "All previous tokens are invalidated; connected browsers must reconnect.",
     }
   };
 
@@ -780,6 +986,8 @@
     // 带宽区块的文案依赖当前语言，切语言后重绘（不重新请求）。
     renderBandwidthEffective(lastBandwidth);
     refreshRecordings();
+    // 主题按钮的 title/aria-label 跟着语言走。
+    if (window.UI && UI.theme) UI.theme.refreshLabels();
   }
   function applyStaticI18n() {
     document.documentElement.lang = LANG;
@@ -918,26 +1126,54 @@
   });
 
   // --- Overview refresh ---
+  // 5s 周期刷新，但两次「跳过」条件（E3）：
+  //   1. 上一轮还没跑完（请求在途）→ 本轮直接跳过，避免请求堆积；
+  //   2. 用户正在交互（输入框/下拉框有焦点，或打开了对话框/弹窗）→ 跳过，
+  //      否则重绘会打断输入、把下拉框弹回、把正在读的弹窗内容换掉。
+  // 手动操作（切 tab、点刷新、保存）走 refreshNow()，不受交互条件限制。
   let timer = null;
   let lastOverview = null;
+  let refreshInFlight = false;
 
-  function startRefresh() { if (!timer) timer = setInterval(refresh, 5000); }
+  function startRefresh() { if (!timer) timer = setInterval(tickRefresh, 5000); }
   function stopRefresh() { if (timer) { clearInterval(timer); timer = null; } }
 
+  function userIsBusy() {
+    // 对话框（含 ui.js 的 sr-dialog 与页面自带的 modal-mask）打开时不重绘。
+    if (document.querySelector('.sr-dialog-mask, .modal-mask:not(.hidden)')) return true;
+    const a = document.activeElement;
+    if (!a) return false;
+    const tag = a.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
+    return a.isContentEditable === true;
+  }
+
+  async function tickRefresh() {
+    if (refreshInFlight) return;      // 有请求在途：跳过本轮
+    if (userIsBusy()) return;         // 用户正在交互：跳过本轮
+    await refresh();
+  }
+
   async function refresh() {
-    let o;
-    try { o = await api('/api/overview'); }
-    catch (_) { return; }
-    lastOverview = o;
-    renderOverview(o);
-    renderSessions(o.sessions || []);
-    // Upgrade eligibility shapes the devices table's row buttons/status, so
-    // the artifacts list is fetched before the devices table is rebuilt.
-    await refreshUpgradeArtifacts();
-    await refreshBandwidth();
-    renderDevices(o.sessions || []);
-    renderConnLog(o.conn_log || []);
-    refreshRecordings();
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    try {
+      let o;
+      try { o = await api('/api/overview'); }
+      catch (_) { return; }
+      lastOverview = o;
+      renderOverview(o);
+      renderSessions(o.sessions || []);
+      // Upgrade eligibility shapes the devices table's row buttons/status, so
+      // the artifacts list is fetched before the devices table is rebuilt.
+      await refreshUpgradeArtifacts();
+      await refreshBandwidth();
+      renderDevices(o.sessions || []);
+      renderConnLog(o.conn_log || []);
+      refreshRecordings();
+    } finally {
+      refreshInFlight = false;
+    }
   }
 
   // --- Recordings ---
@@ -1033,13 +1269,22 @@
   }
 
   async function onDeleteRecording(r) {
-    if (!confirm(t('confirm_delete_rec', { name: r.name || '' }))) return;
+    const ok = await UI.confirm(t('confirm_delete_rec', { name: r.name || '' }), {
+      title: t('dlg_title_delete_rec'), danger: true,
+      okLabel: t('dlg_delete'), cancelLabel: t('dlg_cancel')
+    });
+    if (!ok) return;
     try {
       await api('/api/recordings/delete', { method: 'DELETE', body: { file: r.name } });
       // Deleting the last file of a non-first page would leave it empty; step back.
       if (recPage > 1 && recTotal - 1 <= (recPage - 1) * REC_PAGE_SIZE) recPage--;
       refreshRecordings();
-    } catch (e) { alert(t('err_delete_rec') + e.message); }
+    } catch (e) { failDialog(t('err_delete_rec') + e.message); }
+  }
+
+  // Native dialogs are gone: failures surface in the shared dialog component.
+  function failDialog(msg) {
+    UI.alert(msg, { title: t('dlg_title_error'), okLabel: t('dlg_ok') });
   }
 
   function renderOverview(o) {
@@ -1091,27 +1336,44 @@
   // --- Devices table (device-management panel) ---
   let devQuery = '', devArch = '', devStatus = '';
 
-  function renderDevices(sessions) {
-    sessions = sessions || [];
-    // Rebuild the arch filter dropdown, preserving the current selection.
+  // arch 下拉框只在「选项集合变了」时重建（E3）：每 5s 无条件 innerHTML 重建会
+  // 让正在展开的下拉框收起、把焦点丢掉，用户选到一半就被打断。选项没变时
+  // 只同步文案（语言切换需要）与当前选中值。
+  let archOptionsKey = null;
+
+  function syncArchFilter(sessions) {
     const archSet = new Set();
     sessions.forEach(s => {
       const a = (s.device && s.device.arch) || '';
       if (a) archSet.add(a);
     });
+    const values = Array.from(archSet).sort();
+    const key = values.join('\u0000') + '|' + LANG;
     const archSel = $('devArchFilter');
-    const prevArch = devArch;
-    archSel.textContent = '';
-    const optAll = document.createElement('option');
-    optAll.value = ''; optAll.textContent = t('dev_arch_all');
-    archSel.appendChild(optAll);
-    Array.from(archSet).sort().forEach(a => {
-      const o = document.createElement('option');
-      o.value = a; o.textContent = a;
-      archSel.appendChild(o);
-    });
-    devArch = archSet.has(prevArch) ? prevArch : '';
-    archSel.value = devArch;
+    if (key !== archOptionsKey) {
+      archOptionsKey = key;
+      // 保留用户当前选中值：重建后若该值仍存在就恢复，否则回落到「全部」。
+      const want = archSel.value || devArch;
+      archSel.textContent = '';
+      const optAll = document.createElement('option');
+      optAll.value = ''; optAll.textContent = t('dev_arch_all');
+      archSel.appendChild(optAll);
+      values.forEach(a => {
+        const o = document.createElement('option');
+        o.value = a; o.textContent = a;
+        archSel.appendChild(o);
+      });
+      devArch = archSet.has(want) ? want : '';
+      archSel.value = devArch;
+    } else if (archSel.value !== devArch) {
+      // 选项未变但 DOM 里的选中值被外部改动（如浏览器恢复表单状态）。
+      archSel.value = devArch;
+    }
+  }
+
+  function renderDevices(sessions) {
+    sessions = sessions || [];
+    syncArchFilter(sessions);
 
     const q = devQuery.trim().toLowerCase();
     const filtered = sessions.filter(s => {
@@ -1148,8 +1410,9 @@
     tdSt.appendChild(pill);
     tr.appendChild(tdSt);
 
-    // Session ID
+    // Session ID（等宽字体，便于比对长串）
     const tdId = document.createElement('td');
+    tdId.className = 'mono';
     tdId.appendChild(textNode(s.session_id || ''));
     tr.appendChild(tdId);
 
@@ -1273,12 +1536,16 @@
   async function onUpgrade(s) {
     const art = artifactFor(s);
     if (!art) return;
-    if (!confirm(t('upg_confirm', { id: s.session_id || '', v: art.version || s.agent_version || '' }))) return;
+    const ok = await UI.confirm(t('upg_confirm', { id: s.session_id || '', v: art.version || s.agent_version || '' }), {
+      title: t('dlg_title_upgrade'),
+      okLabel: t('dlg_confirm'), cancelLabel: t('dlg_cancel')
+    });
+    if (!ok) return;
     try {
       const r = await api('/api/agent/upgrade', { method: 'POST', body: { session_id: s.session_id } });
       if (!r.ok) throw new Error(r.error || 'failed');
       refresh();
-    } catch (e) { alert(t('upg_err') + e.message); }
+    } catch (e) { failDialog(t('upg_err') + e.message); }
   }
 
   async function refreshUpgradeArtifacts() {
@@ -1409,7 +1676,9 @@
 
     // KPI 曲线按钮（R5 丙111/140）：点击展开/收起行内 fps/bitrate 时间序列。
     const kpi = document.createElement('button'); kpi.className = 'btn btn-sm'; kpi.textContent = '📈';
+    kpi.type = 'button';
     kpi.title = 'Desktop KPI (fps / bitrate)';
+    kpi.setAttribute('aria-label', 'Desktop KPI (fps / bitrate)');
     kpi.addEventListener('click', () => onShowKpi(s.session_id, kpi));
     const tdK = document.createElement('td');
     tdK.appendChild(kpi);
@@ -1454,17 +1723,27 @@
   function drawKpi(canvas, samples) {
     const ctx = canvas.getContext('2d');
     const w = canvas.width, h = canvas.height, padL = 44, padR = 8, padT = 10, padB = 20;
+    // 曲线配色同样取自设计令牌（theme.css），切换主题后重绘即跟随。
+    const css = getComputedStyle(document.documentElement);
+    const tok = (name, fallback) => {
+      const raw = css.getPropertyValue(name);
+      return raw && raw.trim() ? raw.trim() : fallback;
+    };
+    const cMuted = tok('--text-muted', '#888');
+    const cAccent = tok('--accent', '#4f8cff');
+    const cSuccess = tok('--success', '#3fbf6f');
+    const cGrid = tok('--border', 'rgba(128,128,128,0.25)');
     ctx.clearRect(0, 0, w, h);
     ctx.font = '11px monospace';
     // 空态
     if (!samples.length) {
-      ctx.fillStyle = '#888'; ctx.textAlign = 'center';
+      ctx.fillStyle = cMuted; ctx.textAlign = 'center';
       ctx.fillText('No KPI yet — agent heartbeat samples every 15s (desktop on).', w / 2, h / 2);
       return;
     }
     const plotW = w - padL - padR, plotH = h - padT - padB;
     // 网格
-    ctx.strokeStyle = 'rgba(128,128,128,0.25)';
+    ctx.strokeStyle = cGrid;
     ctx.beginPath();
     for (let i = 0; i <= 4; i++) {
       const y = padT + plotH * i / 4;
@@ -1483,10 +1762,10 @@
       }
       ctx.stroke();
     };
-    line('fps', 60, '#4f8cff');
-    line('bitrate_kbps', Math.max(2000, ...samples.map(s => s.bitrate_kbps || 0)), '#3fbf6f');
+    line('fps', 60, cAccent);
+    line('bitrate_kbps', Math.max(2000, ...samples.map(s => s.bitrate_kbps || 0)), cSuccess);
     // 轴标
-    ctx.fillStyle = '#999'; ctx.textAlign = 'left';
+    ctx.fillStyle = cMuted; ctx.textAlign = 'left';
     ctx.fillText('60', 4, padT + 8);
     ctx.fillText('30', 4, padT + plotH / 2 + 3);
     ctx.fillText('0', 4, padT + plotH + 3);
@@ -1494,8 +1773,8 @@
     ctx.fillText(n + '×15s', w - padR, h - 4);
     // 图例
     ctx.textAlign = 'left';
-    ctx.fillStyle = '#4f8cff'; ctx.fillText('─ fps', padL, padT + 2);
-    ctx.fillStyle = '#3fbf6f'; ctx.fillText('─ bitrate', padL + 60, padT + 2);
+    ctx.fillStyle = cAccent; ctx.fillText('─ fps', padL, padT + 2);
+    ctx.fillStyle = cSuccess; ctx.fillText('─ bitrate', padL + 60, padT + 2);
   }
 
   function buildTokenRow(s, tk) {
@@ -1503,6 +1782,12 @@
 
     const tok = document.createElement('span'); tok.className = 'tok'; tok.title = t('click_to_copy');
     tok.textContent = tk.token || '';
+    tok.tabIndex = 0;
+    tok.setAttribute('role', 'button');
+    tok.setAttribute('aria-label', t('click_to_copy') + ': ' + (tk.token || ''));
+    tok.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); tok.click(); }
+    });
     const copied = document.createElement('span'); copied.className = 'copied hidden'; copied.textContent = t('copied');
     tok.addEventListener('click', async () => {
       try { await navigator.clipboard.writeText(tk.token || ''); }
@@ -1522,6 +1807,8 @@
     row.appendChild(toggle);
 
     const x = document.createElement('button'); x.className = 'xbtn'; x.textContent = '×'; x.title = t('revoke_label');
+    x.type = 'button';
+    x.setAttribute('aria-label', t('revoke_label'));
     x.addEventListener('click', () => onRevoke(tk));
     row.appendChild(x);
 
@@ -1530,9 +1817,13 @@
   }
 
   async function onRevoke(tk) {
-    if (!confirm(t('confirm_revoke'))) return;
+    const ok = await UI.confirm(t('confirm_revoke'), {
+      title: t('dlg_title_revoke'), danger: true,
+      okLabel: t('dlg_delete'), cancelLabel: t('dlg_cancel')
+    });
+    if (!ok) return;
     try { await api('/api/token/revoke', { method: 'POST', body: { token: tk.token } }); refresh(); }
-    catch (e) { alert(t('err_revoke') + e.message); }
+    catch (e) { failDialog(t('err_revoke') + e.message); }
   }
 
   async function onTogglePerm(s, tk, btn) {
@@ -1540,27 +1831,40 @@
     try {
       await api('/api/token/permission', { method: 'POST', body: { token: tk.token, permission: next } });
       refresh();
-    } catch (e) { alert(t('err_toggle') + e.message); }
+    } catch (e) { failDialog(t('err_toggle') + e.message); }
   }
 
   async function onRegenerate(s) {
-    if (!confirm(t('confirm_regenerate', { id: s.session_id || '' }))) return;
+    const ok = await UI.confirm(t('confirm_regenerate', { id: s.session_id || '' }), {
+      title: t('dlg_title_regenerate'),
+      okLabel: t('dlg_confirm'), cancelLabel: t('dlg_cancel')
+    });
+    if (!ok) return;
     try {
       const r = await api('/api/token/regenerate', { method: 'POST', body: { session_id: s.session_id } });
       if (r && r.tokens) {
+        // 只读输入框 + 复制按钮（E3：不能再用 alert 展示秘密）。
         const list = r.tokens.map(tk => tk.token + ' (' + (tk.permission || '?') + ')').join('\n');
-        alert(t('new_tokens') + list);
+        await UI.showSecret(t('dlg_title_new_tokens'), list, {
+          hint: t('dlg_hint_new_tokens'),
+          okLabel: t('dlg_ok'), copyLabel: t('dlg_copy'), copiedLabel: t('dlg_copied')
+        });
       }
       refresh();
     } catch (e) {
-      alert(t('err_regenerate') + e.message);
+      failDialog(t('err_regenerate') + e.message);
     }
   }
 
   async function onKick(s) {
-    if (!confirm(t('confirm_kick', { id: s.session_id || '' }))) return;
+    const ok = await UI.confirm(t('confirm_kick', { id: s.session_id || '' }), {
+      title: t('dlg_title_kick'), danger: true,
+      okLabel: t('dlg_kick'),
+      cancelLabel: t('dlg_cancel')
+    });
+    if (!ok) return;
     try { await api('/api/session/kick', { method: 'POST', body: { session_id: s.session_id } }); refresh(); }
-    catch (e) { alert(t('err_kick') + e.message); }
+    catch (e) { failDialog(t('err_kick') + e.message); }
   }
 
   // --- Server auth ---
@@ -1582,12 +1886,16 @@
     const v = $('srvInput').value;
     $('srvErr').textContent = '';
     if (!v) { $('srvErr').textContent = t('enter_new_pw'); return; }
-    if (!confirm(t('confirm_update_pw'))) return;
+    const ok = await UI.confirm(t('confirm_update_pw'), {
+      title: t('dlg_title_update_pw'), danger: true,
+      okLabel: t('dlg_confirm'), cancelLabel: t('dlg_cancel')
+    });
+    if (!ok) return;
     try {
       await api('/api/server-auth', { method: 'POST', body: { password: v } });
       $('srvInput').value = '';
       $('srvVal').textContent = '••••••••'; srvShown = false; renderSrvButton();
-      alert(t('pw_updated'));
+      UI.alert(t('pw_updated'), { title: t('dlg_ok'), okLabel: t('dlg_ok') });
     } catch (e) { $('srvErr').textContent = t('srv_update_failed') + e.message; }
   });
 
@@ -1714,7 +2022,7 @@
     fetch(BASE + '/api/recordings/content?file=' + encodeURIComponent(r.name), { credentials: 'same-origin' })
       .then((res) => { if (!res.ok) throw new Error('HTTP ' + res.status); return res.text(); })
       .then((text) => startPlayer(r, text))
-      .catch((e) => alert(t('err_open_rec') + e.message));
+      .catch((e) => failDialog(t('err_open_rec') + e.message));
   }
 
   function parseCast(text) {
@@ -1741,11 +2049,11 @@
 
   function startPlayer(r, text) {
     if (typeof Terminal === 'undefined') {
-      alert(t('player_unavailable'));
+      failDialog(t('player_unavailable'));
       return;
     }
     const parsed = parseCast(text);
-    if (!parsed) { alert(t('err_parse_cast')); return; }
+    if (!parsed) { failDialog(t('err_parse_cast')); return; }
     const view = $('playerView');
     const termEl = $('playerTerm');
     termEl.textContent = '';
@@ -1864,7 +2172,7 @@
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const text = await res.text();
       renderAudit(text);
-    } catch (e) { alert(t('err_open_rec') + e.message); }
+    } catch (e) { failDialog(t('err_open_rec') + e.message); }
   }
 
   function renderAudit(text) {

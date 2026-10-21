@@ -1,0 +1,135 @@
+/* ── Dialog component (E4) ───────────────────────────────────────
+   Styles for the markup ui.js builds. Split out of theme.css so that file
+   stays a pure token sheet, and loaded by both the user pages and the admin
+   panel (which cannot share style.css). Every value is a token from
+   theme.css. */
+
+.sr-dialog-mask {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-4);
+    background: var(--bg-overlay);
+    backdrop-filter: blur(4px);
+    z-index: var(--z-dialog);
+    animation: fade-in 0.16s ease-out;
+}
+
+.sr-dialog {
+    width: min(440px, 100%);
+    max-height: calc(100vh - 2 * var(--space-4));
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg);
+    animation: pop-in 0.16s ease-out;
+    font-family: var(--font-sans);
+    font-size: var(--font-size-md);
+    line-height: 1.55;
+}
+
+.sr-dialog-head {
+    padding: var(--space-4) var(--space-4) 0;
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.sr-dialog-head:empty { display: none; }
+
+.sr-dialog-body {
+    padding: var(--space-3) var(--space-4) 0;
+    overflow-y: auto;
+    color: var(--text-secondary);
+}
+
+.sr-dialog-msg {
+    margin: 0;
+    display: block;
+    overflow-wrap: anywhere;
+}
+
+.sr-dialog-danger .sr-dialog-msg { color: var(--text-primary); }
+
+.sr-dialog-input {
+    display: block;
+    width: 100%;
+    margin-top: var(--space-2);
+    padding: 0.6rem 0.75rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-md);
+    resize: vertical;
+}
+.sr-dialog-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.sr-secret-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+}
+.sr-secret-row .sr-dialog-input { margin-top: 0; flex: 1; min-width: 0; }
+.sr-secret-field { color: var(--text-primary); }
+
+.sr-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    padding: var(--space-4);
+}
+
+.sr-dialog-btn {
+    padding: 0.5rem 0.9rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    line-height: 1.2;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.sr-dialog-btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+.sr-dialog-btn:active { transform: translateY(1px); }
+
+.sr-dialog-btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--on-accent);
+}
+.sr-dialog-btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+.sr-dialog-btn-danger {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--on-accent);
+}
+.sr-dialog-btn-danger:hover { background: var(--danger-strong); border-color: var(--danger-strong); }
+
+.sr-dialog-btn-ghost {
+    background: transparent;
+    color: var(--text-secondary);
+}
+.sr-dialog-btn-ghost:hover { color: var(--text-primary); }
+.sr-dialog-btn.copied { color: var(--success); border-color: var(--success-border); background: var(--success-soft); }
+
+@media (max-width: 480px) {
+    .sr-dialog-actions { flex-direction: column-reverse; }
+    .sr-dialog-actions .sr-dialog-btn { width: 100%; }
+}

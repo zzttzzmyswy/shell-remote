@@ -7,30 +7,8 @@ class TerminalManager {
             cursorBlink: true,
             fontSize: 14,
             fontFamily: "'Sarasa Term SC', 'Sarasa Mono SC', 'Noto Sans Mono CJK SC', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
-            theme: {
-                // 与页面 --bg-primary / --accent 同色系（style.css）
-                background: '#0b0f17',
-                foreground: '#d8deea',
-                cursor: '#8ca4ff',
-                cursorAccent: '#0b0f17',
-                selectionBackground: 'rgba(109, 140, 255, 0.35)',
-                black: '#000000',
-                red: '#cd3131',
-                green: '#0dbc79',
-                yellow: '#e5e510',
-                blue: '#2472c8',
-                magenta: '#bc3fbc',
-                cyan: '#11a8cd',
-                white: '#e5e5e5',
-                brightBlack: '#666666',
-                brightRed: '#f14c4c',
-                brightGreen: '#23d18b',
-                brightYellow: '#f5f543',
-                brightBlue: '#3b8eea',
-                brightMagenta: '#d670d6',
-                brightCyan: '#29b8db',
-                brightWhite: '#ffffff',
-            },
+            // 配色来自 theme.css 的设计令牌（唯一来源），不再写死第三份调色板。
+            theme: TerminalManager.readTheme(),
         });
 
         this.fitAddon = new FitAddon.FitAddon();
@@ -74,6 +52,53 @@ class TerminalManager {
                 this.onInputCallback(data);
             }
         });
+    }
+
+    // 从 CSS 变量读出 xterm 主题：theme.css 里 :root[data-theme=...] 定义，
+    // 切换主题后调用 applyTheme() 重新读取即可，不需要在 JS 里复制颜色。
+    static readTheme() {
+        const css = getComputedStyle(document.documentElement);
+        const v = (name, fallback) => {
+            const raw = css.getPropertyValue(name);
+            return raw && raw.trim() ? raw.trim() : fallback;
+        };
+        return {
+            background: v('--term-bg', '#0b0f17'),
+            foreground: v('--term-fg', '#d8deea'),
+            cursor: v('--term-cursor', '#8ca4ff'),
+            cursorAccent: v('--term-cursor-accent', '#0b0f17'),
+            selectionBackground: v('--term-selection', 'rgba(109, 140, 255, 0.35)'),
+            black: v('--term-black', '#000000'),
+            red: v('--term-red', '#cd3131'),
+            green: v('--term-green', '#0dbc79'),
+            yellow: v('--term-yellow', '#e5e510'),
+            blue: v('--term-blue', '#2472c8'),
+            magenta: v('--term-magenta', '#bc3fbc'),
+            cyan: v('--term-cyan', '#11a8cd'),
+            white: v('--term-white', '#e5e5e5'),
+            brightBlack: v('--term-bright-black', '#666666'),
+            brightRed: v('--term-bright-red', '#f14c4c'),
+            brightGreen: v('--term-bright-green', '#23d18b'),
+            brightYellow: v('--term-bright-yellow', '#f5f543'),
+            brightBlue: v('--term-bright-blue', '#3b8eea'),
+            brightMagenta: v('--term-bright-magenta', '#d670d6'),
+            brightCyan: v('--term-bright-cyan', '#29b8db'),
+            brightWhite: v('--term-bright-white', '#ffffff'),
+        };
+    }
+
+    // 主题切换后调用（session.js 监听 sr-theme-change）。
+    applyTheme() {
+        try {
+            this.term.options.theme = TerminalManager.readTheme();
+            // WebGL 渲染器把颜色烘进 atlas，需要重建才能拾取新主题；
+            // canvas 渲染器会自动重绘，重建失败也不能影响终端可用性。
+            if (this.webglAddon && typeof this.webglAddon.clearTextureAtlas === 'function') {
+                this.webglAddon.clearTextureAtlas();
+            }
+        } catch (e) {
+            console.warn('Terminal theme update failed:', e);
+        }
     }
 
     write(data) {

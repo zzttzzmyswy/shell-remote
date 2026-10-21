@@ -4,6 +4,23 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>shell-remote — 会话</title>
+    <script>
+        // Apply the stored theme before first paint (mirrors UI.theme).
+        (function () {
+            try {
+                var m = localStorage.getItem('sr-theme');
+                var t = (m === 'light' || m === 'dark') ? m
+                    : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+                document.documentElement.setAttribute('data-theme', t);
+                document.documentElement.setAttribute('data-theme-mode',
+                    (m === 'light' || m === 'dark' || m === 'system') ? m : 'system');
+            } catch (e) {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            }
+        })();
+    </script>
+    <link rel="stylesheet" href="/theme.css">
+    <link rel="stylesheet" href="/ui.css">
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/vendor/xterm/xterm.css">
 </head>
@@ -12,29 +29,54 @@
         <div class="toolbar-left">
             <span class="toolbar-brand">shell-remote</span>
             <span class="toolbar-divider"></span>
-            <span id="session-name" class="connecting">连接中…</span>
-            <span id="online-count" class="badge">0 在线</span>
+            <span class="session-meta">
+                <span id="status-dot" class="status-dot" role="img" aria-label="连接中"></span>
+                <span id="session-host" title="设备主机名"></span>
+                <button type="button" id="session-id-btn" title="点击复制会话 ID" aria-label="复制会话 ID">
+                    <span class="sid-text" id="session-id-text">连接中…</span>
+                </button>
+                <span id="online-count" class="badge" aria-live="polite">—</span>
+            </span>
         </div>
         <div class="toolbar-right">
-            <button id="copy-token-btn" class="btn btn-small" title="复制密钥">复制密钥</button>
-            <button id="toggle-desktop-btn" class="btn btn-small" title="打开桌面画面（默认关闭）" disabled>桌面</button>
-            <button id="toggle-files-btn" class="btn btn-small">文件</button>
+            <button type="button" class="theme-toggle" data-mode="system" title="主题" aria-label="切换主题">
+                <svg class="ico ico-system" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1a1 1 0 0 1 1 1v1.5a.5.5 0 0 1-1 0V2a1 1 0 0 1 1-1zm4.95 2.05a1 1 0 0 1 0 1.414l-1.06 1.06a.5.5 0 1 1-.708-.707l1.06-1.06a1 1 0 0 1 1.415 0zM14 7.5a.5.5 0 0 1 .5.5 6.5 6.5 0 0 1-13 0 .5.5 0 0 1 1 0 5.5 5.5 0 0 0 11 0 .5.5 0 0 1 .5-.5zM3.11 4.464a.5.5 0 0 1 0 .708l-1.06 1.06a.5.5 0 1 1-.707-.707l1.06-1.06a.5.5 0 0 1 .707 0z"/></svg>
+                <svg class="ico ico-light" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm0-9.5a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0V2a.5.5 0 0 1 .5-.5zm0 10.5a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0v-1a.5.5 0 0 1 .5-.5zM14.5 7.5a.5.5 0 0 1 0 1h-1a.5.5 0 0 1 0-1h1zM2.5 7.5a.5.5 0 0 1 0 1h-1a.5.5 0 0 1 0-1h1zm10.096-4.096a.5.5 0 0 1 0 .707l-.707.707a.5.5 0 1 1-.707-.707l.707-.707a.5.5 0 0 1 .707 0zM4.818 10.768a.5.5 0 0 1 0 .707l-.707.707a.5.5 0 1 1-.707-.707l.707-.707a.5.5 0 0 1 .707 0zm8.778 1.414a.5.5 0 0 1-.707.707l-.707-.707a.5.5 0 0 1 .707-.707l.707.707zM4.818 4.232a.5.5 0 0 1-.707.707l-.707-.707a.5.5 0 0 1 .707-.707l.707.707z"/></svg>
+                <svg class="ico ico-dark" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.2 1.6a6.5 6.5 0 1 0 8.2 8.2A5.5 5.5 0 0 1 6.2 1.6z"/></svg>
+            </button>
+            <button type="button" id="copy-token-btn" class="btn btn-small" title="复制密钥" aria-label="复制密钥">复制密钥</button>
+            <button type="button" id="toggle-desktop-btn" class="btn btn-small" title="打开桌面画面（默认关闭）" aria-label="打开桌面画面" disabled>桌面</button>
+            <button type="button" id="toggle-files-btn" class="btn btn-small" aria-label="打开文件管理" aria-expanded="false" aria-controls="file-drawer">文件</button>
         </div>
     </div>
     <div id="tab-bar">
-        <div id="tab-list"></div>
-        <button id="tab-new-btn" class="tab-new-btn" title="新建标签">+</button>
+        <div id="tab-list" role="tablist" aria-label="终端标签"></div>
+        <button type="button" id="tab-new-btn" class="tab-new-btn" title="新建标签" aria-label="新建标签">+</button>
     </div>
     <div class="main-content">
-        <div id="terminal-container"></div>
+        <div class="terminal-area" id="terminal-area">
+            <div id="terminal-container"></div>
+            <!-- 移动端（≤768px）常驻快捷键行；Ctrl 为粘滞键 -->
+            <div id="key-bar" role="toolbar" aria-label="终端快捷键">
+                <button type="button" data-key="Escape" title="Esc">Esc</button>
+                <button type="button" data-key="Tab" title="Tab">Tab</button>
+                <button type="button" data-key="Ctrl" id="key-ctrl" aria-pressed="false" title="粘滞 Ctrl：按下后下一个按键带 Ctrl">Ctrl</button>
+                <button type="button" data-key="ArrowUp" title="上方向键">↑</button>
+                <button type="button" data-key="ArrowDown" title="下方向键">↓</button>
+                <button type="button" data-key="ArrowLeft" title="左方向键">←</button>
+                <button type="button" data-key="ArrowRight" title="右方向键">→</button>
+            </div>
+        </div>
         <div id="desktop-container" class="desktop-container hidden">
             <div id="desktop-loading" class="desktop-loading hidden">正在连接桌面…</div>
             <div id="desktop-ctrl-bar" class="desktop-ctrl-bar hidden">
-                <span class="ctrl-group-label">显示</span>
-                <label class="desktop-ctrl-item">编码
-                    <select id="desktop-codec-select" title="编码方案（切换后自动重建画面）">
-                        <option value="av1">AV1</option>
-                        <option value="h264">H264</option>
+                <span class="ctrl-group-label">基础</span>
+                <label class="desktop-ctrl-item" title="码率档：越低越省带宽、越不容易卡">画质
+                    <select id="desktop-quality-select" title="码率档（rustdesk 三档 + 自定义）">
+                        <option value="speed">极速 (低码率)</option>
+                        <option value="balanced" selected>均衡 (默认)</option>
+                        <option value="best">画质 (高码率)</option>
+                        <option value="custom">自定义…</option>
                     </select>
                 </label>
                 <label class="desktop-ctrl-item" id="desktop-display-label" title="多显示器选屏（切换后重建画面）">
@@ -43,20 +85,23 @@
                         <option value="">默认</option>
                     </select>
                 </label>
-                <label class="desktop-ctrl-item">码率
-                    <select id="desktop-quality-select" title="码率档（rustdesk 三档 + 自定义）">
-                        <option value="speed">极速 (低码率)</option>
-                        <option value="balanced" selected>均衡 (默认)</option>
-                        <option value="best">画质 (高码率)</option>
-                        <option value="custom">自定义…</option>
-                    </select>
-                </label>
-                <label class="desktop-ctrl-item" title="灰度模式：弱网下省带宽（去除色度，画面变灰但更流畅）">
-                    <input type="checkbox" id="desktop-gray-toggle"> 灰度
-                </label>
+                <button type="button" id="desktop-fullscreen-btn" class="ctrl-btn" title="全屏显示桌面画面（Esc 退出）">全屏</button>
+                <button type="button" id="desktop-clip-btn" class="ctrl-btn" title="剪贴板：本机⇄远端 同步文本">剪贴板</button>
                 <span class="ctrl-sep"></span>
-                <button id="desktop-metrics-btn" class="ctrl-btn" title="性能指标">指标</button>
-                <button id="desktop-clip-btn" class="ctrl-btn" title="剪贴板：本机⇄远端 同步文本">剪贴板</button>
+                <button type="button" id="ctrl-advanced-toggle" class="ctrl-advanced-toggle"
+                        aria-expanded="false" aria-controls="ctrl-advanced">高级</button>
+                <span id="ctrl-advanced" class="ctrl-advanced" hidden>
+                    <label class="desktop-ctrl-item">编码
+                        <select id="desktop-codec-select" title="编码方案（切换后自动重建画面）">
+                            <option value="av1">AV1</option>
+                            <option value="h264">H264</option>
+                        </select>
+                    </label>
+                    <label class="desktop-ctrl-item" title="灰度模式：弱网下省带宽（去除色度，画面变灰但更流畅）">
+                        <input type="checkbox" id="desktop-gray-toggle"> 灰度
+                    </label>
+                    <button type="button" id="desktop-metrics-btn" class="ctrl-btn" title="性能指标面板">指标</button>
+                </span>
             </div>
             <canvas id="desktop-canvas" class="desktop-canvas"></canvas>
             <video id="desktop-video" autoplay muted playsinline></video>
@@ -65,61 +110,62 @@
                 <div class="metrics-title">剪贴板同步 <span class="metrics-hint">(纯文本)</span></div>
                 <textarea id="desktop-clip-text" class="clip-textarea" rows="5" placeholder="粘贴或编辑文本…"></textarea>
                 <div class="clip-actions">
-                    <button id="clip-to-remote-btn" class="btn btn-small">→ 远端</button>
-                    <button id="clip-from-remote-btn" class="btn btn-small">远端 → 本机</button>
+                    <button type="button" id="clip-to-remote-btn" class="btn btn-small">→ 远端</button>
+                    <button type="button" id="clip-from-remote-btn" class="btn btn-small">远端 → 本机</button>
                 </div>
             </div>
             <div id="desktop-metrics" class="desktop-metrics hidden">
                 <div class="metrics-title">性能指标 <span class="metrics-hint">(点击“指标”按钮开关)</span></div>
                 <div class="metrics-group-title">流畅度</div>
-                <div class="metrics-row"><span>端到端延时</span><b id="metric-lag">-</b></div>
-                <div class="metrics-row"><span>渲染帧率</span><b id="metric-fps">-</b></div>
-                <div class="metrics-row"><span>目标帧率/活动</span><b id="metric-gofps">-</b></div>
-                <div class="metrics-row"><span>帧到达 jitter</span><b id="metric-jitter">-</b></div>
-                <div class="metrics-row"><span>网络 RTT</span><b id="metric-probe">-</b></div>
-                <div class="metrics-row"><span>丢帧</span><b id="metric-dropped">-</b></div>
+                <div class="metrics-row"><span title="一帧从远端采集到本机显示的端到端耗时">端到端延时</span><b id="metric-lag">-</b></div>
+                <div class="metrics-row"><span title="本机每秒实际渲染的画面帧数">渲染帧率</span><b id="metric-fps">-</b></div>
+                <div class="metrics-row"><span title="QoS 目标帧率 / 画面是否在活动（无变化时会降帧省带宽）">目标帧率/活动</span><b id="metric-gofps">-</b></div>
+                <div class="metrics-row"><span title="相邻帧到达间隔的抖动，越小越平滑">帧到达 jitter</span><b id="metric-jitter">-</b></div>
+                <div class="metrics-row"><span title="探针包往返时延（纯网络层，不含编解码）">网络 RTT</span><b id="metric-probe">-</b></div>
+                <div class="metrics-row"><span title="因解码跟不上或队列溢出被丢弃的帧数">丢帧</span><b id="metric-dropped">-</b></div>
                 <div class="metrics-group-title">质量</div>
-                <div class="metrics-row"><span>QoS 状态</span><b id="metric-qos-state">-</b></div>
-                <div class="metrics-row"><span>当前码率</span><b id="metric-bitrate">-</b></div>
-                <div class="metrics-row"><span>分辨率</span><b id="metric-res">-</b></div>
-                <div class="metrics-row"><span>解码队列</span><b id="metric-buffer">-</b></div>
-                <div class="metrics-row"><span>编码方案</span><b id="metric-encoder">-</b></div>
-                <div class="metrics-row"><span>解码方案</span><b id="metric-decoder">-</b></div>
+                <div class="metrics-row"><span title="QoS 自适应状态：按网络状况自动升降码率">QoS 状态</span><b id="metric-qos-state">-</b></div>
+                <div class="metrics-row"><span title="当前视频流实际码率">当前码率</span><b id="metric-bitrate">-</b></div>
+                <div class="metrics-row"><span title="远端桌面分辨率">分辨率</span><b id="metric-res">-</b></div>
+                <div class="metrics-row"><span title="已解码但尚未渲染的帧数，持续增长说明渲染跟不上">解码队列</span><b id="metric-buffer">-</b></div>
+                <div class="metrics-row"><span title="远端使用的视频编码器">编码方案</span><b id="metric-encoder">-</b></div>
+                <div class="metrics-row"><span title="本机使用的解码路径（WebCodecs / MSE）">解码方案</span><b id="metric-decoder">-</b></div>
                 <div class="metrics-group-title">传输</div>
-                <div class="metrics-row"><span>关键帧请求</span><b id="metric-reqkey">-</b></div>
-                <div class="metrics-row"><span>链路状态</span><b id="metric-weaknet">-</b></div>
-                <div class="metrics-row"><span>relay 拥塞</span><b id="metric-bp">-</b></div>
-                <div class="metrics-row"><span>捕获方式</span><b id="metric-backend">-</b></div>
-                <div class="metrics-row"><span>远端显示器</span><b id="metric-monitors">-</b></div>
-                <div class="metrics-row"><span>链路方式</span><b id="metric-uplink">-</b></div>
-                <div class="metrics-row"><span>下行通道</span><b id="metric-downlink">-</b></div>
+                <div class="metrics-row"><span title="向远端请求关键帧的次数，网络抖动后会自动补帧">关键帧请求</span><b id="metric-reqkey">-</b></div>
+                <div class="metrics-row"><span title="到远端的链路质量判定">链路状态</span><b id="metric-weaknet">-</b></div>
+                <div class="metrics-row"><span title="relay 是否因带宽上限被拥塞（触发整体限速）">relay 拥塞</span><b id="metric-bp">-</b></div>
+                <div class="metrics-row"><span title="远端抓屏后端（dxgi / x11 / pipewire 等）">捕获方式</span><b id="metric-backend">-</b></div>
+                <div class="metrics-row"><span title="远端枚举到的显示器及分辨率">远端显示器</span><b id="metric-monitors">-</b></div>
+                <div class="metrics-row"><span title="agent 上行链路方式（ws 长连接 / http）">链路方式</span><b id="metric-uplink">-</b></div>
+                <div class="metrics-row"><span title="视频帧下发给浏览器的通道（p2p 直连 / lan / relay）">下行通道</span><b id="metric-downlink">-</b></div>
                 <div class="metrics-group-title">进程</div>
-                <div class="metrics-row"><span>JS 内存</span><b id="metric-jsmem">-</b></div>
+                <div class="metrics-row"><span title="本页 JavaScript 堆内存占用（Chrome 支持时）">JS 内存</span><b id="metric-jsmem">-</b></div>
             </div>
         </div>
-        <div id="file-resizer" class="file-resizer"></div>
-        <div id="file-drawer" class="file-drawer hidden">
+        <div id="file-resizer" class="file-resizer" role="separator" aria-orientation="vertical" aria-label="调整文件面板宽度"></div>
+        <aside id="file-drawer" class="file-drawer hidden" aria-label="文件管理">
             <div class="file-drawer-header">
                 <span>文件管理</span>
                 <div class="file-drawer-toolbar">
-                    <button id="file-new-folder-btn" class="btn-icon" title="新建文件夹">
-                        <svg width="14" height="14" viewBox="0 0 16 16"><path fill="currentColor" d="m.5 3 .04.87a1.99 1.99 0 0 0-.342 1.311l.637 7A2 2 0 0 0 2.826 14H9v-1H2.826a1 1 0 0 1-.995-.91l-.637-7A1 1 0 0 1 2.19 4h11.62a1 1 0 0 1 .996 1.09L14.54 8h1.005l.256-2.819A2 2 0 0 0 13.81 3H9.828a2 2 0 0 1-1.414-.586l-.828-.828A2 2 0 0 0 6.172 1H2.5a2 2 0 0 0-2 2zm5.672-1a1 1 0 0 1 .707.293L7.586 3H2.19c-.24 0-.47.042-.683.12L1.5 2.98a1 1 0 0 1 1-.98h3.672z"/><path fill="currentColor" d="M13.5 10a.5.5 0 0 1 .5.5V12h1.5a.5.5 0 1 1 0 1H14v1.5a.5.5 0 1 1-1 0V13h-1.5a.5.5 0 0 1 0-1H13v-1.5a.5.5 0 0 1 .5-.5z"/></svg>
+                    <button type="button" id="file-new-folder-btn" class="btn-icon" title="新建文件夹" aria-label="新建文件夹">
+                        <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="m.5 3 .04.87a1.99 1.99 0 0 0-.342 1.311l.637 7A2 2 0 0 0 2.826 14H9v-1H2.826a1 1 0 0 1-.995-.91l-.637-7A1 1 0 0 1 2.19 4h11.62a1 1 0 0 1 .996 1.09L14.54 8h1.005l.256-2.819A2 2 0 0 0 13.81 3H9.828a2 2 0 0 1-1.414-.586l-.828-.828A2 2 0 0 0 6.172 1H2.5a2 2 0 0 0-2 2zm5.672-1a1 1 0 0 1 .707.293L7.586 3H2.19c-.24 0-.47.042-.683.12L1.5 2.98a1 1 0 0 1 1-.98h3.672z"/><path fill="currentColor" d="M13.5 10a.5.5 0 0 1 .5.5V12h1.5a.5.5 0 1 1 0 1H14v1.5a.5.5 0 1 1-1 0V13h-1.5a.5.5 0 0 1 0-1H13v-1.5a.5.5 0 0 1 .5-.5z"/></svg>
                     </button>
-                    <label for="file-upload-input" class="btn-icon" title="上传文件">
-                        <svg width="14" height="14" viewBox="0 0 16 16"><path fill="currentColor" d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/><path fill="currentColor" d="M7.646 1.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1-.708.708L8.5 2.707V11.5a.5.5 0 0 1-1 0V2.707L5.354 4.854a.5.5 0 1 1-.708-.708l3-3z"/></svg>
+                    <label for="file-upload-input" class="btn-icon" title="上传文件" aria-label="上传文件">
+                        <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/><path fill="currentColor" d="M7.646 1.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1-.708.708L8.5 2.707V11.5a.5.5 0 0 1-1 0V2.707L5.354 4.854a.5.5 0 1 1-.708-.708l3-3z"/></svg>
                     </label>
                     <input type="file" id="file-upload-input" class="file-input-hidden" multiple>
-                    <button id="file-refresh-btn" class="btn-icon" title="刷新">
-                        <svg width="14" height="14" viewBox="0 0 16 16"><path fill="currentColor" fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2z"/><path fill="currentColor" d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466"/></svg>
+                    <button type="button" id="file-refresh-btn" class="btn-icon" title="刷新" aria-label="刷新文件列表">
+                        <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2z"/><path fill="currentColor" d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466"/></svg>
                     </button>
-                    <button id="close-files-btn" class="btn-icon" title="关闭">&times;</button>
+                    <button type="button" id="close-files-btn" class="btn-icon" title="关闭" aria-label="关闭文件管理">&times;</button>
                 </div>
             </div>
             <div id="upload-progress" class="upload-progress hidden"></div>
+            <div id="download-progress" class="download-progress hidden"></div>
             <div id="file-tree" class="file-tree"></div>
-        </div>
+        </aside>
     </div>
-    <div id="toast" class="toast hidden"></div>
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
     <div id="connect-modal" class="connect-modal hidden">
         <div class="connect-modal-box">
             <h3 id="connect-modal-title">正在连接桌面…</h3>
@@ -127,7 +173,7 @@
             <div class="connect-modal-track"><div id="connect-modal-bar" class="connect-modal-bar" style="width:8%"></div></div>
             <div id="connect-modal-meta" class="connect-modal-meta"></div>
             <div class="connect-modal-actions">
-                <button id="connect-skip-p2p-btn" class="btn btn-small hidden" title="放弃 P2P 直连，立即改走中继转发">放弃 P2P，改用中继 (Relay)</button>
+                <button type="button" id="connect-skip-p2p-btn" class="btn btn-small hidden" title="放弃 P2P 直连，立即改走中继转发">放弃 P2P，改用中继 (Relay)</button>
             </div>
         </div>
     </div>
@@ -135,13 +181,14 @@
         <div class="disconnect-message">
             <h2>连接断开</h2>
             <p id="disconnect-text">远程会话已结束</p>
-            <button id="disconnect-ok-btn" class="btn btn-primary">确定</button>
+            <button type="button" id="disconnect-ok-btn" class="btn btn-primary">确定</button>
         </div>
     </div>
 
     <script src="/vendor/xterm/xterm.js"></script>
     <script src="/vendor/xterm-addon-fit/xterm-addon-fit.js"></script>
     <script src="/vendor/xterm-addon-webgl/xterm-addon-webgl.js"></script>
+    <script src="/ui.js"></script>
     <script src="/sse.js"></script>
     <script src="/desktop-mse.js"></script>
     <script src="/desktop.js"></script>

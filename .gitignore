@@ -2,3 +2,6 @@ target/
 .superpowers/
 releases/
 docs/superpowers/
+# Playwright 截图产物（verify_mys2283_e.js 输出，不随仓库分发）
+artifacts/
+node_modules/

@@ -547,6 +547,11 @@ mod tests {
             "index.html",
             "session.html",
             "style.css",
+            // MYS-2288：设计令牌与共享 UI 组件（rust-embed 按目录打包，新增
+            // 文件自动包含；这里列出以便打包回归被单测捕获）。
+            "theme.css",
+            "ui.css",
+            "ui.js",
             "term.js",
             "files.js",
             "desktop.js",

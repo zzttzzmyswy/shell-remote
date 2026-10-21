@@ -71,9 +71,15 @@
     }
 
     const onlineCountEl = document.getElementById('online-count');
-    const sessionNameEl = document.getElementById('session-name');
+    const sessionHostEl = document.getElementById('session-host');
+    const sessionIdTextEl = document.getElementById('session-id-text');
+    const sessionIdBtn = document.getElementById('session-id-btn');
+    const statusDotEl = document.getElementById('status-dot');
     const toggleDesktopBtn = document.getElementById('toggle-desktop-btn');
     const terminalContainer = document.getElementById('terminal-container');
+    // 终端视图的 flex 容器（终端 + 移动端快捷键行）。切桌面视图时要连同它
+    // 一起隐藏，否则这个 flex:1 的占位会把桌面画面挤成半宽。
+    const terminalArea = document.getElementById('terminal-area');
     const desktopContainer = document.getElementById('desktop-container');
     const tabBarEl = document.getElementById('tab-bar');
     const disconnectOverlay = document.getElementById('disconnect-overlay');
@@ -85,12 +91,78 @@
     const tabNewBtn = document.getElementById('tab-new-btn');
 
     let toastTimer = null;
+    // 普通提示 3s、错误提示 6s（MYS-2288 E2）；统一走 UI.toast。
     function showToast(msg, cls) {
-        toast.textContent = msg;
-        toast.className = 'toast ' + cls; // className 重置，同时去掉 hidden
-        clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => { toast.classList.add('hidden'); }, 3000);
+        toastTimer = UI.toast(msg, cls || 'info', cls === 'error' ? 6000 : 3000);
     }
+
+    // ── 粘滞 Ctrl（移动端快捷键行）────────────────────────────────
+    // 按下 Ctrl 后高亮；下一次按键带上 Ctrl，然后自动复位。作用于软键盘
+    // 输入的单个可打印字符（Ctrl+A → 0x01 … Ctrl+_ → 0x1f）。
+    const ctrlBtn = document.getElementById('key-ctrl');
+    let stickyCtrl = false;
+    function setStickyCtrl(on) {
+        stickyCtrl = on;
+        if (ctrlBtn) ctrlBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+    // 返回带上 Ctrl 后的数据；不是可识别的单字符就原样返回。
+    function applyStickyCtrl(data) {
+        if (!stickyCtrl || typeof data !== 'string' || data.length !== 1) return data;
+        const code = data.toUpperCase().charCodeAt(0);
+        setStickyCtrl(false);
+        if (code >= 64 && code <= 95) return String.fromCharCode(code - 64);
+        return data;
+    }
+
+    // ── 会话标识区（状态点 + 主机名 + 会话 ID + 在线人数）──────────
+    // 旧的静态「已连接 / 0 在线」占位改成随状态变化。主机名来自 agent 的
+    // device 信息（兼容缺失）；会话 ID 截断显示，点击复制完整值。
+    // 会话 ID 最长 20 字符（relay 的 --session-id 约束），工具栏窄屏放不下：
+    // 超过 16 字符时截断成「前 12 + … + 后 4」，完整值在 title 里并可点击复制。
+    const SID_MAX = 16;
+    function shortSessionId(sid) {
+        if (!sid) return '—';
+        if (sid.length <= SID_MAX) return sid;
+        return sid.slice(0, 12) + '…' + sid.slice(-4);
+    }
+    function setSessionId(sid) {
+        if (!sid) {
+            sessionIdTextEl.textContent = '—';
+            sessionIdBtn.title = '会话 ID 未知';
+            return;
+        }
+        sessionIdTextEl.textContent = shortSessionId(sid);
+        sessionIdBtn.title = '点击复制会话 ID：' + sid;
+    }
+    function setSessionHost(host) {
+        sessionHostEl.textContent = host || '';
+        sessionHostEl.title = host ? ('设备主机名：' + host) : '';
+    }
+    // state: 'connecting' | 'online' | 'offline'
+    function setConnectionState(state) {
+        statusDotEl.className = 'status-dot' + (state === 'online' ? ' online' : state === 'offline' ? ' offline' : '');
+        const label = state === 'online' ? '已连接' : state === 'offline' ? '连接断开' : '连接中';
+        statusDotEl.setAttribute('aria-label', label);
+        statusDotEl.title = label;
+    }
+
+    sessionIdBtn.addEventListener('click', function () {
+        const sid = sessionIdBtn.dataset.sid || '';
+        if (!sid) return;
+        UI.copyText(sid, function (ok) {
+            showToast(ok ? '会话 ID 已复制' : '复制失败，请手动复制', ok ? 'success' : 'error');
+        });
+    });
+
+    // 设备主机名：agent 的设备探测（hostname）目前只在出厂注册里上报给 relay
+    // 管理端，relay 不下发给浏览器（下发需要新增字段，本卡禁止改协议）。
+    // 这里预留展示位：任何下行消息只要带了 hostname（顶层或 device 对象里），
+    // 就显示出来；没有就保持隐藏。见交付说明的偏差一节。
+    window.shellRemote.on('*', function (msg) {
+        const p = (msg && msg.payload) || {};
+        const host = p.hostname || (p.device && p.device.hostname) || '';
+        if (host && host !== sessionHostEl.textContent) setSessionHost(host);
+    });
 
     // Join-ack watchdog: once connected, the agent must answer quickly
     // (session:users / session:tab_list / any terminal output). If nothing
@@ -170,14 +242,16 @@
     window.__applyQualityOnJoin = applyQualityOnJoin;
 
     function updateOnlineCount() {
-        onlineCountEl.textContent = onlineUsers + ' online';
+        // 统一中文文案；0 人时不显示夸张的「0 人在线」占位。
+        onlineCountEl.textContent = onlineUsers > 0 ? (onlineUsers + ' 人在线') : '';
+        onlineCountEl.classList.toggle('hidden', onlineUsers <= 0);
     }
 
     // ── Desktop view control ──────────────────────────────────
 
     function showDesktopView() {
         desktopActive = true;
-        terminalContainer.classList.add('hidden');
+        terminalArea.classList.add('hidden');
         desktopContainer.classList.remove('hidden');
         tabBarEl.classList.add('hidden');
         toggleDesktopBtn.textContent = '终端';
@@ -188,7 +262,7 @@
 
     function showTerminalView() {
         desktopActive = false;
-        terminalContainer.classList.remove('hidden');
+        terminalArea.classList.remove('hidden');
         desktopContainer.classList.add('hidden');
         tabBarEl.classList.remove('hidden');
         toggleDesktopBtn.textContent = '桌面';
@@ -272,11 +346,13 @@
     // 重建桌面流应用新档/自定义码率硬顶。
     const qualitySelect = document.getElementById('desktop-quality-select');
     if (qualitySelect) {
-        qualitySelect.addEventListener('change', function() {
+        qualitySelect.addEventListener('change', async function() {
             let quality = this.value;
             let custom = 0;
             if (quality === 'custom') {
-                const input = window.prompt('自定义码率 (kbps)，例如 1000', '1000');
+                const input = await UI.prompt('自定义码率 (kbps)，例如 1000', '1000', {
+                    title: '自定义码率', inputMode: 'numeric'
+                });
                 if (input === null) { this.value = 'balanced'; return; }
                 custom = parseInt(input, 10);
                 if (!(custom > 0)) { this.value = 'balanced'; return; }
@@ -335,6 +411,51 @@
             armCodecSwitchPending();
             window.shellRemote.send('desktop:select-display', { display: display, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast(display ? ('切换显示器 ' + display) : '恢复默认显示器…', '');
+        });
+    }
+
+    // ── 「高级」折叠区（E2）─────────────────────────────────────
+    // 默认收起，只把编码 / 灰度 / 指标这类低频控件放进去；基础组
+    // （画质 / 显示器 / 全屏 / 剪贴板）常驻。折叠状态记在 localStorage。
+    const advancedToggle = document.getElementById('ctrl-advanced-toggle');
+    const advancedBox = document.getElementById('ctrl-advanced');
+    function setAdvanced(open) {
+        if (!advancedToggle || !advancedBox) return;
+        advancedToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        advancedBox.hidden = !open;
+        try { localStorage.setItem('sr-desktop-advanced', open ? '1' : '0'); } catch (e) {}
+    }
+    if (advancedToggle && advancedBox) {
+        let savedAdvanced = false;
+        try { savedAdvanced = localStorage.getItem('sr-desktop-advanced') === '1'; } catch (e) {}
+        setAdvanced(savedAdvanced);
+        advancedToggle.addEventListener('click', function () {
+            setAdvanced(advancedBox.hidden);
+        });
+    }
+
+    // ── 全屏（E2 基础组）───────────────────────────────────────
+    const fullscreenBtn = document.getElementById('desktop-fullscreen-btn');
+    if (fullscreenBtn) {
+        const fsTarget = function () { return document.getElementById('desktop-container'); };
+        fullscreenBtn.addEventListener('click', function () {
+            const el = fsTarget();
+            if (!el) return;
+            if (document.fullscreenElement) {
+                document.exitFullscreen().catch(function () {});
+            } else if (el.requestFullscreen) {
+                el.requestFullscreen().catch(function () {
+                    showToast('浏览器拒绝全屏', 'error');
+                });
+            } else {
+                showToast('当前浏览器不支持全屏', 'warning');
+            }
+        });
+        // 全屏状态可能由 Esc（浏览器接管）改变，按钮文案跟着走。
+        document.addEventListener('fullscreenchange', function () {
+            const on = !!document.fullscreenElement;
+            fullscreenBtn.textContent = on ? '退出全屏' : '全屏';
+            fullscreenBtn.title = on ? '退出全屏（Esc）' : '全屏显示桌面画面（Esc 退出）';
         });
     }
 
@@ -445,11 +566,19 @@
         });
     }
 
+    // \u2500\u2500 \u7ec8\u7aef\u6807\u7b7e\uff1arole="tab" + \u5de6\u53f3\u65b9\u5411\u952e\u5207\u6362 + Enter \u6fc0\u6d3b\uff08E5\uff09\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    // roving tabindex\uff1a\u53ea\u6709\u5f53\u524d\u6807\u7b7e\u5728 Tab \u5e8f\u5217\u91cc\uff0c\u65b9\u5411\u952e\u5728\u540c\u7ec4\u6807\u7b7e\u95f4\u79fb\u52a8\u3002
     function renderTabs() {
         tabListEl.innerHTML = '';
-        tabs.forEach(t => {
-            const el = document.createElement('div');
-            el.className = 'tab-item' + (t.tab_id === activeTabId ? ' active' : '');
+        tabs.forEach((t, i) => {
+            const active = t.tab_id === activeTabId;
+            const el = document.createElement('button');
+            el.type = 'button';
+            el.className = 'tab-item' + (active ? ' active' : '');
+            el.setAttribute('role', 'tab');
+            el.setAttribute('aria-selected', active ? 'true' : 'false');
+            el.tabIndex = active ? 0 : -1;
+            el.dataset.tabId = t.tab_id;
             const label = document.createElement('span');
             label.textContent = t.title || 'Shell';
             el.appendChild(label);
@@ -457,6 +586,8 @@
                 const close = document.createElement('span');
                 close.className = 'tab-close';
                 close.textContent = '\u00d7';
+                close.setAttribute('role', 'button');
+                close.setAttribute('aria-label', '\u5173\u95ed\u6807\u7b7e ' + (t.title || 'Shell'));
                 close.onclick = (e) => {
                     e.stopPropagation();
                     dropTabDecoder(t.tab_id);
@@ -464,14 +595,36 @@
                 };
                 el.appendChild(close);
             }
-            el.onclick = () => {
+            const activate = () => {
                 if (t.tab_id !== activeTabId) {
                     pendingTabSwitch = t.tab_id;
                     window.shellRemote.send('session:tab_switch', { tab_id: t.tab_id, _user_id: window.shellRemote.getUserId() });
                 }
             };
+            el.onclick = activate;
+            el.addEventListener('keydown', (e) => {
+                let target = null;
+                if (e.key === 'ArrowRight') target = tabs[(i + 1) % tabs.length];
+                else if (e.key === 'ArrowLeft') target = tabs[(i - 1 + tabs.length) % tabs.length];
+                else if (e.key === 'Home') target = tabs[0];
+                else if (e.key === 'End') target = tabs[tabs.length - 1];
+                else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); return; }
+                if (!target) return;
+                // \u65b9\u5411\u952e\u53ea\u79fb\u52a8\u7126\u70b9\uff08WAI-ARIA automatic activation \u4f1a\u8ba9\u7eaf\u952e\u76d8
+                // \u6d4f\u89c8\u65f6\u4e0d\u505c\u5207\u6362 shell\uff09\uff1bEnter \u624d\u771f\u6b63\u5207\u6362\u3002
+                e.preventDefault();
+                const next = tabListEl.querySelector('[data-tab-id="' + cssEscape(target.tab_id) + '"]');
+                if (next) next.focus();
+            });
             tabListEl.appendChild(el);
         });
+    }
+
+    // CSS.escape \u5728\u65e7 WebView \u4e0a\u53ef\u80fd\u7f3a\u5931\uff1a\u9000\u5316\u4e3a\u53ea\u8f6c\u4e49\u5f15\u53f7\u4e0e\u53cd\u659c\u6760\u3002
+    function cssEscape(v) {
+        const s = String(v == null ? '' : v);
+        if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(s);
+        return s.replace(/[\\"]/g, '\\$&');
     }
 
     // ── ShellRemote event handlers ─────────────────────────────────────
@@ -480,8 +633,12 @@
     let rejoinPending = false;
     window.shellRemote.on('connected', function(msg) {
         rejoinPending = true;
-        sessionNameEl.textContent = '已连接';
-        sessionNameEl.className = '';
+        setConnectionState('connecting');
+        // 会话 ID 由 SSE 的 connected 事件带出（relay 认证后的 session_id）。
+        if (msg && msg.session_id) {
+            sessionIdBtn.dataset.sid = msg.session_id;
+            setSessionId(msg.session_id);
+        }
         disconnectOverlay.classList.add('hidden');
         armJoinWatchdog();
         term.focus();
@@ -490,7 +647,7 @@
                 cols: cols, rows: rows, tab_id: activeTabId
             });
         });
-        term.onInput((data) => queueInput(activeTabId, data));
+        term.onInput((data) => queueInput(activeTabId, applyStickyCtrl(data)));
     });
 
     // C9：每个 tab 一个 streaming TextDecoder。base64 块是任意字节切分，
@@ -527,6 +684,8 @@
 
     window.shellRemote.on('session:tab_list', function(msg) {
         clearJoinWatchdog();
+        // tab_list 也是 join 应答：收到即代表设备在线。
+        if (disconnectOverlay.classList.contains('hidden')) setConnectionState('online');
         tabs = msg.payload.tabs || [];
         // tab 已经不在了（关闭/重连后 agent 重建了 shell）：丢弃它的 decoder，
         // 否则残留的半个多字节字符会串到下一个输出里。
@@ -579,6 +738,9 @@
         clearJoinWatchdog();
         onlineUsers = (msg.payload || {}).count || 0;
         updateOnlineCount();
+        // session:users 是 join 的应答之一：设备侧确实在线了。断线遮罩还挂着
+        // 时不要翻回在线（那只是别的浏览器进出触发的计数广播）。
+        if (disconnectOverlay.classList.contains('hidden')) setConnectionState('online');
         // 重连成功（join 已应答）：若此前标记了重连降质 → 应用低码率档。
         if (window.__applyQualityOnJoin) window.__applyQualityOnJoin();
     });
@@ -849,8 +1011,7 @@
         resetDesktopStarting();
         clearCodecSwitchPending();
         disconnectText.textContent = '设备连接中断，正在自动重连…';
-        sessionNameEl.textContent = '设备重连中…';
-        sessionNameEl.className = 'connecting';
+        setConnectionState('offline');
         disconnectOverlay.classList.remove('hidden');
     });
 
@@ -860,8 +1021,7 @@
         } else if (msg.payload && msg.payload.code === 'AUTH_PENDING') {
             // relay 重启后 agent 重新注册前，密钥会短暂无效：保持页面并重试
             showToast('服务端暂不认识该会话（可能刚重启），正在重试…', 'warning');
-            sessionNameEl.textContent = '等待会话恢复…';
-            sessionNameEl.className = 'connecting';
+            setConnectionState('connecting');
         }
     });
 
@@ -888,35 +1048,26 @@
     };
 
     document.getElementById('copy-token-btn').addEventListener('click', () => {
-        const fallback = () => {
-            const ta = document.createElement('textarea');
-            ta.value = token;
-            ta.style.position = 'fixed';
-            ta.style.opacity = '0';
-            document.body.appendChild(ta);
-            ta.select();
-            let ok = false;
-            try { ok = document.execCommand('copy'); } catch (e) {}
-            document.body.removeChild(ta);
+        UI.copyText(token, function (ok) {
             showToast(ok ? '密钥已复制' : '复制失败，请手动复制', ok ? 'success' : 'error');
-        };
-        if (navigator.clipboard && window.isSecureContext) {
-            navigator.clipboard.writeText(token).then(() => {
-                showToast('密钥已复制', 'success');
-            }).catch(fallback);
-        } else {
-            fallback();
-        }
+        });
     });
 
-    document.getElementById('toggle-files-btn').addEventListener('click', () => {
-        const isHidden = fileDrawer.classList.contains('hidden');
-        if (isHidden) { fileDrawer.classList.remove('hidden'); files.init(); }
-        else { fileDrawer.classList.add('hidden'); }
+    const toggleFilesBtn = document.getElementById('toggle-files-btn');
+    function setFileDrawerOpen(open) {
+        fileDrawer.classList.toggle('hidden', !open);
+        toggleFilesBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) files.init();
+        // 抽屉改变终端宽度：等布局稳定后再 fit，避免列数算错。
+        setTimeout(() => { term.resize(); }, 60);
+    }
+    toggleFilesBtn.addEventListener('click', () => {
+        setFileDrawerOpen(fileDrawer.classList.contains('hidden'));
     });
 
     document.getElementById('close-files-btn').addEventListener('click', () => {
-        fileDrawer.classList.add('hidden');
+        setFileDrawerOpen(false);
+        toggleFilesBtn.focus();
     });
 
     document.getElementById('file-new-folder-btn').onclick = () => files.createFolder();
@@ -972,4 +1123,49 @@
     }
     window.addEventListener('pagehide', notifyDesktopLeave);
     window.addEventListener('beforeunload', notifyDesktopLeave);
+
+    // ── 移动端快捷键行（E2）────────────────────────────────────────
+    // 终端没有 Esc/Tab/方向键，移动端软键盘也发不出来。
+    const keyBar = document.getElementById('key-bar');
+
+    // 终端输入走同一条队列（queueInput），保证与键盘输入顺序一致。
+    function sendKeys(data) {
+        if (!data) return;
+        queueInput(activeTabId, data);
+    }
+
+    const KEY_SEQ = {
+        Escape: '\x1b',
+        Tab: '\t',
+        ArrowUp: '\x1b[A',
+        ArrowDown: '\x1b[B',
+        ArrowRight: '\x1b[C',
+        ArrowLeft: '\x1b[D'
+    };
+
+    if (keyBar) {
+        keyBar.addEventListener('click', function (e) {
+            const btn = e.target.closest('button[data-key]');
+            if (!btn) return;
+            const key = btn.dataset.key;
+            if (key === 'Ctrl') {
+                setStickyCtrl(!stickyCtrl);
+                return;
+            }
+            // Esc/Tab/方向键本身已是控制序列：粘滞 Ctrl 对它们没有意义，
+            // 直接发送并复位。
+            if (KEY_SEQ[key]) {
+                sendKeys(KEY_SEQ[key]);
+                if (stickyCtrl) setStickyCtrl(false);
+                return;
+            }
+            // 其它按键（含以后新增的字母键）走统一的粘滞 Ctrl 处理。
+            sendKeys(applyStickyCtrl(key));
+        });
+    }
+
+    // ── 主题切换：xterm 主题从 CSS 变量重读（E1）──────────────────
+    document.addEventListener('sr-theme-change', function () {
+        if (term && typeof term.applyTheme === 'function') term.applyTheme();
+    });
 })();

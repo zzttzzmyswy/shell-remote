@@ -1,0 +1,11 @@
+{
+  "name": "shell-remote-verify",
+  "private": true,
+  "description": "Browser-side verification scripts (playwright) for shell-remote.",
+  "scripts": {
+    "verify:mys2283-e": "node verify_mys2283_e.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}
