@@ -178,6 +178,13 @@ impl Terminals {
     }
 }
 
+/// Terminal size from an untrusted payload field: clamp into `1..=1000` before
+/// narrowing to u16. A raw `as u16` cast wraps (65536 → 0), and a 0-column
+/// terminal cannot render anything.
+fn clamp_term_size(value: Option<u64>, default: u16) -> u16 {
+    value.unwrap_or(default as u64).clamp(1, 1000) as u16
+}
+
 /// In-flight chunked-upload reassembly state. Holds the open destination file
 /// across chunk messages so each chunk's decoded bytes append in order; the
 /// last chunk flushes/closes and emits the fs:result reply.
@@ -185,6 +192,11 @@ struct UploadReassembly {
     file: std::fs::File,
     final_path: String,
     last_activity: std::time::Instant,
+    /// Index the next chunk must carry. Chunks below it are duplicates (the
+    /// relay may re-deliver after a timeout) and are ignored; chunks above it
+    /// mean a gap — the upload is aborted rather than producing a file with a
+    /// silent hole.
+    next_index: u32,
 }
 
 /// Outbound message handle. The main loop never blocks on HTTP: terminal
@@ -773,7 +785,8 @@ fn handle_upload_abort(
     final_path: &str,
 ) {
     reassembly.remove(upload_id);
-    if let Some(p) = crate::agent::fs::resolve_path(root, final_path) {
+    // nofollow：上传目标若是符号链接，删掉的必须是链接本身。
+    if let Some(p) = crate::agent::fs::resolve_path_nofollow(root, final_path) {
         let _ = std::fs::remove_file(&p);
     }
 }
@@ -785,6 +798,11 @@ fn handle_upload_abort(
 /// last chunk flushes, closes, and returns a terminal result. Returns
 /// `(result, more_expected)` — when `more_expected` is true the caller should
 /// wait for the final chunk before emitting `fs:result`.
+///
+/// Ordering (`UploadReassembly::next_index`): a chunk whose index is below the
+/// expected one is a duplicate and is ignored (success); an index above it
+/// means chunks were lost, so the upload is aborted and the partial file
+/// removed rather than leaving a hole in the destination.
 fn assemble_upload_chunk(
     reassembly: &mut HashMap<String, UploadReassembly>,
     root: &Path,
@@ -817,85 +835,133 @@ fn assemble_upload_chunk(
         path: Some(final_path.to_string()),
         new_path: None,
     };
+    let ok_path = |p: &str| crate::proto::FsResultPayload {
+        kind: None,
+        success: true,
+        error: None,
+        entries: None,
+        content: None,
+        path: Some(p.to_string()),
+        new_path: None,
+    };
+
+    /// Drop the in-flight upload and remove the partially written file.
+    fn abort_upload(
+        reassembly: &mut HashMap<String, UploadReassembly>,
+        upload_id: &str,
+        final_path: &str,
+        root: &Path,
+    ) {
+        reassembly.remove(upload_id);
+        if let Some(p) = crate::agent::fs::resolve_path(root, final_path) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 
     if chunk_index == 0 {
-        match decoded_opt {
-            None => (err_no_kind("Invalid base64 content"), false),
-            Some(decoded) => match crate::agent::fs::resolve_path(root, final_path) {
-                None => (err("invalid_path", "Invalid destination path"), false),
-                Some(p) => match std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&p)
-                {
-                    Err(e) => (err(kind_for_io(&e), &format!("Failed to open destination: {}", e)), false),
-                    Ok(mut f) => {
-                        if f.write_all(&decoded).is_err() {
-                            (err_no_kind("Failed to write uploaded chunk"), false)
-                        } else if is_last {
-                            let _ = f.sync_all();
-                            (ok(), false)
-                        } else {
-                            reassembly.insert(
-                                upload_id.to_string(),
-                                UploadReassembly {
-                                    file: f,
-                                    final_path: final_path.to_string(),
-                                    last_activity: std::time::Instant::now(),
-                                },
-                            );
-                            (ok(), true)
-                        }
-                    }
-                },
-            },
+        let decoded = match decoded_opt {
+            None => return (err_no_kind("Invalid base64 content"), false),
+            Some(d) => d,
+        };
+        let p = match crate::agent::fs::resolve_path(root, final_path) {
+            None => return (err("invalid_path", "Invalid destination path"), false),
+            Some(p) => p,
+        };
+        let mut f = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&p)
+        {
+            Err(e) => {
+                return (
+                    err(kind_for_io(&e), &format!("Failed to open destination: {}", e)),
+                    false,
+                )
+            }
+            Ok(f) => f,
+        };
+        // An empty upload (total_chunks == 1, empty content) still has to
+        // produce the file — created above by `truncate(true)`, zero bytes.
+        if let Err(e) = f.write_all(&decoded) {
+            drop(f);
+            let _ = std::fs::remove_file(&p);
+            return (
+                err_no_kind(&format!("Failed to write uploaded chunk: {}", e)),
+                false,
+            );
         }
+        if is_last {
+            let _ = f.sync_all();
+            return (ok(), false);
+        }
+        reassembly.insert(
+            upload_id.to_string(),
+            UploadReassembly {
+                file: f,
+                final_path: final_path.to_string(),
+                last_activity: std::time::Instant::now(),
+                next_index: 1,
+            },
+        );
+        (ok(), true)
     } else {
-        match decoded_opt {
-            None => (err_no_kind("Invalid base64 content"), false),
-            Some(decoded) => match reassembly.remove(upload_id) {
-                None => (
+        let decoded = match decoded_opt {
+            None => return (err_no_kind("Invalid base64 content"), false),
+            Some(d) => d,
+        };
+        let mut st = match reassembly.remove(upload_id) {
+            None => {
+                return (
                     err_no_kind("Upload chunk received without a preceding chunk 0"),
                     false,
-                ),
-                Some(mut st) => {
-                    let fp = st.final_path.clone();
-                    if st.file.write_all(&decoded).is_err() {
-                        (err_no_kind("Failed to write uploaded chunk"), false)
-                    } else if is_last {
-                        let _ = st.file.sync_all();
-                        (
-                            crate::proto::FsResultPayload {
-                                kind: None,
-                                success: true,
-                                error: None,
-                                entries: None,
-                                content: None,
-                                path: Some(fp),
-                                new_path: None,
-                            },
-                            false,
-                        )
-                    } else {
-                        let mut st = st;
-                        st.last_activity = std::time::Instant::now();
-                        reassembly.insert(upload_id.to_string(), st);
-                        (
-                            crate::proto::FsResultPayload {
-                                kind: None,
-                                success: true,
-                                error: None,
-                                entries: None,
-                                content: None,
-                                path: Some(fp),
-                                new_path: None,
-                            },
-                            true,
-                        )
-                    }
-                }
-            },
+                )
+            }
+            Some(st) => st,
+        };
+        let fp = st.final_path.clone();
+
+        // Out-of-order: a gap means we can never rebuild a correct file.
+        if chunk_index > st.next_index {
+            drop(st.file);
+            abort_upload(reassembly, upload_id, &fp, root);
+            return (
+                err_no_kind(&format!(
+                    "Upload chunk {} arrived out of order (expected {}); upload aborted",
+                    chunk_index, st.next_index
+                )),
+                false,
+            );
+        }
+        // Duplicate: the relay re-sent a chunk we already appended. Ignore its
+        // payload, keep the upload alive, and report progress as before.
+        if chunk_index < st.next_index {
+            st.last_activity = std::time::Instant::now();
+            let more = !is_last;
+            if more {
+                reassembly.insert(upload_id.to_string(), st);
+            } else {
+                let _ = st.file.sync_all();
+            }
+            return (ok_path(&fp), more);
+        }
+
+        if let Err(e) = st.file.write_all(&decoded) {
+            drop(st.file);
+            abort_upload(reassembly, upload_id, &fp, root);
+            return (
+                err_no_kind(&format!("Failed to write uploaded chunk: {}", e)),
+                false,
+            );
+        }
+        st.next_index = chunk_index + 1;
+        if is_last {
+            let _ = st.file.sync_all();
+            (ok_path(&fp), false)
+        } else {
+            st.last_activity = std::time::Instant::now();
+            reassembly.insert(upload_id.to_string(), st);
+            (ok_path(&fp), true)
         }
     }
 }
@@ -1759,8 +1825,10 @@ async fn run_session(
                                         .as_str()
                                         .unwrap_or(&active_tab_id)
                                         .to_string();
-                                    let cols = msg.payload["cols"].as_u64().unwrap_or(80) as u16;
-                                    let rows = msg.payload["rows"].as_u64().unwrap_or(24) as u16;
+                                    // 先按 u64 读再 clamp：直接 `as u16` 会把
+                                    // 65536 截断成 0（列数 0 的终端无法输出）。
+                                    let cols = clamp_term_size(msg.payload["cols"].as_u64(), 80);
+                                    let rows = clamp_term_size(msg.payload["rows"].as_u64(), 24);
                                     if let Some(ts) = tabs.get_mut(&tab_id) {
                                         if let Err(e) = ts.shell.resize(cols, rows) {
                                             tracing::error!("Failed to resize terminal: {}", e);
@@ -3215,6 +3283,7 @@ mod tests {
             file: std::fs::File::open(&dest).unwrap(),
             final_path: final_path.clone(),
             last_activity: std::time::Instant::now() - Duration::from_secs(600),
+            next_index: 1,
         };
         reassembly.insert("stale-uid".to_string(), old_entry);
 
@@ -3249,6 +3318,7 @@ mod tests {
             file: std::fs::File::open(&dest).unwrap(),
             final_path: final_path.clone(),
             last_activity: std::time::Instant::now(),
+            next_index: 1,
         };
         reassembly.insert("fresh-uid".to_string(), fresh_entry);
 
@@ -3289,6 +3359,7 @@ mod tests {
                 file: fs::OpenOptions::new().append(true).open(&dest).unwrap(),
                 final_path: final_path.clone(),
                 last_activity: std::time::Instant::now(),
+                next_index: 1,
             },
         );
 
@@ -3339,6 +3410,7 @@ mod tests {
                     .unwrap(),
                 final_path: "big.bin".to_string(),
                 last_activity: stale,
+                next_index: 1,
             },
         );
         let before = reassembly.get("uid-2").unwrap().last_activity;
@@ -3360,6 +3432,143 @@ mod tests {
             std::time::Instant::now().duration_since(after) < Duration::from_secs(1),
             "last_activity must be refreshed on non-final append"
         );
+    }
+
+    #[test]
+    fn test_assemble_upload_chunk_ignores_duplicate_chunk() {
+        // C5：重复块（index < next_index）被忽略并返回成功，内容不重复写入；
+        // 后续块照常追加，最终文件内容正确。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+
+        let (res, more) = assemble_upload_chunk(
+            &mut reassembly,
+            &root,
+            "dup-uid",
+            "dup.bin",
+            &crate::agent::fs::encode_b64(b"AAAA"),
+            0,
+            3,
+        );
+        assert!(res.success && more);
+
+        // chunk 1 written twice — the second delivery must be a no-op.
+        let (res, more) = assemble_upload_chunk(
+            &mut reassembly,
+            &root,
+            "dup-uid",
+            "dup.bin",
+            &crate::agent::fs::encode_b64(b"BBBB"),
+            1,
+            3,
+        );
+        assert!(res.success && more);
+        let (res, more) = assemble_upload_chunk(
+            &mut reassembly,
+            &root,
+            "dup-uid",
+            "dup.bin",
+            &crate::agent::fs::encode_b64(b"BBBB"),
+            1,
+            3,
+        );
+        assert!(res.success, "duplicate chunk must report success");
+        assert!(more, "duplicate must not terminate the upload");
+        assert!(
+            reassembly.contains_key("dup-uid"),
+            "duplicate must keep the upload alive"
+        );
+
+        let (res, more) = assemble_upload_chunk(
+            &mut reassembly,
+            &root,
+            "dup-uid",
+            "dup.bin",
+            &crate::agent::fs::encode_b64(b"CCCC"),
+            2,
+            3,
+        );
+        assert!(res.success);
+        assert!(!more, "last chunk is terminal");
+        assert!(reassembly.is_empty());
+
+        assert_eq!(
+            std::fs::read(root.join("dup.bin")).unwrap(),
+            b"AAAABBBBCCCC".to_vec(),
+            "duplicate chunk must not be appended twice"
+        );
+    }
+
+    #[test]
+    fn test_assemble_upload_chunk_out_of_order_chunk_aborts() {
+        // C5：跳号（index > next_index）说明中间丢块，无法拼出正确文件——
+        // 必须报错、终止该上传并删除半成品。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+
+        let (res, more) = assemble_upload_chunk(
+            &mut reassembly,
+            &root,
+            "ooo-uid",
+            "ooo.bin",
+            &crate::agent::fs::encode_b64(b"AAAA"),
+            0,
+            3,
+        );
+        assert!(res.success && more);
+
+        // chunk 2 arrives while chunk 1 is missing.
+        let (res, more) = assemble_upload_chunk(
+            &mut reassembly,
+            &root,
+            "ooo-uid",
+            "ooo.bin",
+            &crate::agent::fs::encode_b64(b"CCCC"),
+            2,
+            3,
+        );
+        assert!(!res.success, "out-of-order chunk must fail");
+        assert!(!more, "upload must terminate");
+        assert!(
+            res.error.as_deref().unwrap_or("").contains("out of order"),
+            "unexpected error: {:?}",
+            res.error
+        );
+        assert!(reassembly.is_empty(), "reassembly entry must be dropped");
+        assert!(
+            !root.join("ooo.bin").exists(),
+            "partial file must be removed"
+        );
+    }
+
+    #[test]
+    fn test_assemble_upload_chunk_empty_upload_creates_zero_byte_file() {
+        // C5：空上传（total_chunks=1、content 为空）必须产生 0 字节文件。
+        // 卡 B 的 relay 会发出这种块。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut reassembly: HashMap<String, UploadReassembly> = HashMap::new();
+
+        let (res, more) = assemble_upload_chunk(&mut reassembly, &root, "empty-uid", "empty.bin", "", 0, 1);
+        assert!(res.success, "empty upload must succeed: {:?}", res.error);
+        assert!(!more);
+        let meta = std::fs::metadata(root.join("empty.bin")).expect("0-byte file must exist");
+        assert_eq!(meta.len(), 0);
+    }
+
+    #[test]
+    fn test_clamp_term_size() {
+        // C4：u64 → u16 直接 as 转换会回绕（65536 → 0，终端无法输出）。
+        assert_eq!(clamp_term_size(Some(65536), 80), 1000);
+        assert_eq!(clamp_term_size(Some(1000), 80), 1000);
+        assert_eq!(clamp_term_size(Some(0), 80), 1);
+        assert_eq!(clamp_term_size(Some(1), 80), 1);
+        assert_eq!(clamp_term_size(Some(120), 80), 120);
+        assert_eq!(clamp_term_size(None, 80), 80);
+        assert_eq!(clamp_term_size(None, 24), 24);
+        assert_ne!(clamp_term_size(Some(65536), 80), 0);
     }
 
     #[tokio::test]

@@ -41,6 +41,54 @@ pub fn resolve_path(root: &Path, user_path: &str) -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// Resolve `user_path` *without* following a symlink in its last component.
+///
+/// Only the parent directory is canonicalized; the final name is then appended
+/// verbatim. `resolve_path` canonicalizes the whole path, which turns a symlink
+/// into its target — deleting a link to a directory would then
+/// `remove_dir_all` the real directory. Destructive operations (delete/rename)
+/// must act on the link itself, so they use this variant instead.
+///
+/// Returns `None` when the path has no usable final component (empty, `.`,
+/// `..`) or when the parent directory does not exist.
+pub fn resolve_path_nofollow(root: &Path, user_path: &str) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let raw = PathBuf::from(user_path);
+    let name = raw.file_name()?;
+    if name.is_empty() {
+        return None;
+    }
+    let name_str = name.to_string_lossy();
+    if name_str == "." || name_str == ".." {
+        return None;
+    }
+
+    let dir = if raw.is_absolute() {
+        PathBuf::from(raw.parent()?)
+    } else {
+        let parent = raw
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        root.join(strip_leading_seps(&parent))
+    };
+    // Parent must resolve (it may itself be a symlink — that is fine, we only
+    // refuse to resolve the *last* component).
+    let dir = dir.canonicalize().ok()?;
+    Some(dir.join(name))
+}
+
+/// Resolve a path for a destructive operation (delete / rename).
+///
+/// Uses [`resolve_path_nofollow`] so a symlink's last component is never
+/// followed. `resolve_path_nofollow` refuses paths without a real final name
+/// (`.`, `..`, trailing separator); a symlink always has one, so falling back
+/// to the historical whole-path resolution for those is safe and keeps
+/// `..`-relative operations behaving exactly as before.
+fn resolve_mutation_target(root: &Path, user_path: &str) -> Option<PathBuf> {
+    resolve_path_nofollow(root, user_path).or_else(|| resolve_path(root, user_path))
+}
+
 pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
     let path = match resolve_path(root, user_path) {
         Some(p) => p,
@@ -62,12 +110,24 @@ pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
             let mut file_entries: Vec<FileEntry> = Vec::new();
             for entry in entries.flatten() {
                 let entry_path = entry.path();
-                let metadata = match entry.metadata() {
+                // symlink_metadata: never follow the entry itself, so a link to
+                // a directory is reported as a link (and its type/size describe
+                // the link, not the target's contents).
+                let metadata = match fs::symlink_metadata(&entry_path) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
+                let is_symlink = metadata.file_type().is_symlink();
+                // A link's own metadata says "file"; resolve the target so the
+                // frontend can still navigate into linked directories.
+                let target_meta = if is_symlink {
+                    fs::metadata(&entry_path).ok()
+                } else {
+                    None
+                };
+                let effective = target_meta.as_ref().unwrap_or(&metadata);
 
-                let entry_type = if metadata.is_dir() {
+                let entry_type = if effective.is_dir() {
                     "directory"
                 } else {
                     "file"
@@ -80,9 +140,10 @@ pub fn list_dir(root: &Path, user_path: &str) -> FsResultPayload {
                     name: entry.file_name().to_string_lossy().to_string(),
                     path: entry_path.to_string_lossy().to_string(),
                     entry_type: entry_type.to_string(),
-                    size: metadata.len(),
+                    size: effective.len(),
                     mode,
                     owner,
+                    is_symlink,
                 });
             }
 
@@ -280,7 +341,8 @@ pub fn write_file_bytes(root: &Path, user_path: &str, data: &[u8]) -> FsResultPa
 }
 
 pub fn delete_path(root: &Path, user_path: &str) -> FsResultPayload {
-    let path = match resolve_path(root, user_path) {
+    // nofollow: deleting a symlink must remove the link, never its target.
+    let path = match resolve_mutation_target(root, user_path) {
         Some(p) => p,
         None => {
             return FsResultPayload {
@@ -308,7 +370,44 @@ pub fn delete_path(root: &Path, user_path: &str) -> FsResultPayload {
         };
     }
 
-    let result = if path.is_dir() {
+    // symlink_metadata: decide on the link itself, not on what it points to.
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            let kind = if e.kind() == std::io::ErrorKind::NotFound {
+                "not_found"
+            } else {
+                "other"
+            };
+            return FsResultPayload {
+                kind: Some(kind.to_string()),
+                success: false,
+                error: Some(format!("Failed to delete: {}", e)),
+                entries: None,
+                content: None,
+                path: Some(user_path.to_string()),
+                new_path: None,
+            };
+        }
+    };
+
+    let result = if meta.file_type().is_symlink() {
+        // Unix removes any link with remove_file; Windows needs remove_dir for
+        // directory links/junctions and remove_file for file links.
+        #[cfg(windows)]
+        {
+            let target_is_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+            if target_is_dir {
+                fs::remove_dir(&path)
+            } else {
+                fs::remove_file(&path)
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            fs::remove_file(&path)
+        }
+    } else if meta.is_dir() {
         fs::remove_dir_all(&path)
     } else {
         fs::remove_file(&path)
@@ -337,7 +436,9 @@ pub fn delete_path(root: &Path, user_path: &str) -> FsResultPayload {
 }
 
 pub fn rename_path(root: &Path, from_path: &str, to_path: &str) -> FsResultPayload {
-    let from = match resolve_path(root, from_path) {
+    // nofollow on both ends: renaming a symlink must move the link itself, not
+    // the file/directory it points at.
+    let from = match resolve_mutation_target(root, from_path) {
         Some(p) => p,
         None => {
             return FsResultPayload {
@@ -352,7 +453,7 @@ pub fn rename_path(root: &Path, from_path: &str, to_path: &str) -> FsResultPaylo
         }
     };
 
-    let to = match resolve_path(root, to_path) {
+    let to = match resolve_mutation_target(root, to_path) {
         Some(p) => p,
         None => {
             return FsResultPayload {
@@ -685,6 +786,101 @@ mod tests {
         // Renaming to parent directory is allowed
         let result = rename_path(&root, "file.txt", "../outside.txt");
         assert!(result.success);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_delete_symlink_keeps_target_directory() {
+        // C1：删除指向目录的符号链接必须只删链接本身。旧实现走 resolve_path
+        // canonicalize 最后一个分量，会把 link 解析成 dir，从而 remove_dir_all
+        // 掉真实目录。
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/keep.txt"), b"keep").unwrap();
+        symlink(root.join("dir"), root.join("link")).unwrap();
+
+        let result = delete_path(root, "link");
+        assert!(result.success, "delete link failed: {:?}", result.error);
+
+        assert!(!root.join("link").exists(), "link itself must be removed");
+        assert!(root.join("dir").is_dir(), "target directory must survive");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/keep.txt")).unwrap(),
+            "keep",
+            "target directory contents must survive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rename_symlink_moves_link_not_target() {
+        // C1：重命名链接移动的是链接本身，目标文件/目录原地不动。
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/keep.txt"), b"keep").unwrap();
+        symlink(root.join("dir"), root.join("link")).unwrap();
+
+        let result = rename_path(root, "link", "link2");
+        assert!(result.success, "rename failed: {:?}", result.error);
+
+        assert!(!root.join("link").exists(), "old link name must be gone");
+        let moved = root.join("link2");
+        assert!(
+            std::fs::symlink_metadata(&moved)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "link2 must still be a symlink"
+        );
+        assert!(
+            root.join("dir").is_dir(),
+            "target directory must stay at its original path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/keep.txt")).unwrap(),
+            "keep"
+        );
+        // And it still points at the original target.
+        let target = std::fs::read_link(&moved).unwrap();
+        assert_eq!(target, root.join("dir").canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_resolve_path_nofollow_rejects_dot_and_dotdot() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        assert!(resolve_path_nofollow(root, "").is_none());
+        assert!(resolve_path_nofollow(root, ".").is_none());
+        assert!(resolve_path_nofollow(root, "..").is_none());
+        assert!(resolve_path_nofollow(root, "sub/..").is_none());
+        assert!(resolve_path_nofollow(root, "a.txt").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_list_dir_reports_is_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("plain.txt"), b"x").unwrap();
+        symlink(root.join("dir"), root.join("dlink")).unwrap();
+        symlink(root.join("plain.txt"), root.join("flink")).unwrap();
+
+        let result = list_dir(root, ".");
+        assert!(result.success);
+        let entries = result.entries.unwrap();
+        let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap();
+        assert!(!by_name("plain.txt").is_symlink);
+        assert!(!by_name("dir").is_symlink);
+        assert!(by_name("dlink").is_symlink);
+        assert!(by_name("flink").is_symlink);
+        // 链接的 type 仍按目标上报，前端才能双击进入被链接的目录。
+        assert_eq!(by_name("dlink").entry_type, "directory");
+        assert_eq!(by_name("flink").entry_type, "file");
     }
 
     #[test]

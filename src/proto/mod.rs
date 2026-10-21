@@ -41,6 +41,11 @@ pub struct FileEntry {
     pub size: u64,
     pub mode: String,
     pub owner: String,
+    /// Whether the entry itself is a symlink (checked with `symlink_metadata`,
+    /// so a link to a directory keeps `type: "directory"` but reports true).
+    /// Defaults to false for older agents that don't send the field.
+    #[serde(default)]
+    pub is_symlink: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -363,6 +368,7 @@ mod tests {
             size: 1024,
             mode: "-rw-r--r--".to_string(),
             owner: "1000:1000".to_string(),
+            is_symlink: false,
         };
         let result = FsResultPayload {
             success: true,

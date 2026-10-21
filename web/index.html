@@ -117,6 +117,17 @@
         const urlToken = urlParams.get('token');
         if (urlToken) {
             tokenInput.value = urlToken;
+            // ?token= 会留在地址栏、浏览器历史、Referer 和反代日志里。
+            // 已经填进表单了，立刻把参数从 URL 抹掉（保留其它参数与 err）。
+            urlParams.delete('token');
+            const rest = urlParams.toString();
+            const clean = window.location.pathname + (rest ? '?' + rest : '') + window.location.hash;
+            try {
+                window.history.replaceState(null, '', clean);
+            } catch (e) {
+                // 某些环境（file://、被沙箱化的 iframe）禁止 replaceState：
+                // 忽略即可，密钥仍已填入表单。
+            }
         }
 
         // ── Relay host substitution ────────────────────────────────────

@@ -213,6 +213,45 @@
         }
     }
 
+    // 解除"连接中…"：（1）agent 回 desktop:error，（2）agent 断开，
+    // （3）点击后 15s 内没等到 desktop:started。否则按钮永久 disabled、
+    // 文字停在"连接中…"，用户再也点不动桌面。
+    let desktopStartTimer = null;
+    function clearDesktopStartTimer() {
+        if (desktopStartTimer) {
+            clearTimeout(desktopStartTimer);
+            desktopStartTimer = null;
+        }
+    }
+    function resetDesktopStarting() {
+        clearDesktopStartTimer();
+        desktopStarting = false;
+        toggleDesktopBtn.disabled = !desktopEnabled;
+        // 桌面视图仍在时按钮语义是"切回终端"，此时保持"终端"。
+        toggleDesktopBtn.textContent = desktopActive ? '终端' : '桌面';
+    }
+
+    // 编码/码率/灰度/选屏切换都会让 agent stop→start 重建流。切换期间
+    // __codecSwitchPending 让 desktop:stopped 不退出桌面视图；但如果 agent
+    // 一直不回 desktop:started（崩溃/命令丢失），这个标志会永久为 true——
+    // 之后真正的"桌面已关闭"再也不会退回终端。故每次置位都挂 10s 兜底。
+    let codecSwitchTimer = null;
+    function armCodecSwitchPending() {
+        window.__codecSwitchPending = true;
+        if (codecSwitchTimer) clearTimeout(codecSwitchTimer);
+        codecSwitchTimer = setTimeout(function() {
+            codecSwitchTimer = null;
+            window.__codecSwitchPending = false;
+        }, 10000);
+    }
+    function clearCodecSwitchPending() {
+        if (codecSwitchTimer) {
+            clearTimeout(codecSwitchTimer);
+            codecSwitchTimer = null;
+        }
+        window.__codecSwitchPending = false;
+    }
+
     // 编码方案切换：发送 desktop:codec，agent 重建桌面流。
     // R5#2 控制命令 ack：命令带递增 seq，agent 处理后回 desktop:cmd-ack，
     // 浏览器 toast 反馈操作结果（弱网/高负载下操作是否生效可见）。
@@ -223,7 +262,7 @@
             if (!desktopEnabled || !window.shellRemote) return;
             // 切换中标志：agent stop→start 重建流期间, desktop:stopped 不
             // 触发退出桌面视图, 等 desktop:started 到来后自动重连新流。
-            window.__codecSwitchPending = true;
+            armCodecSwitchPending();
             window.shellRemote.send('desktop:codec', { codec: codec, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast('切换编码为 ' + codec.toUpperCase() + '…', '');
         });
@@ -244,7 +283,7 @@
                 quality = 'balanced'; // 自定义 = balanced 档 + 码率硬顶
             }
             if (!desktopEnabled || !window.shellRemote) return;
-            window.__codecSwitchPending = true;
+            armCodecSwitchPending();
             window.shellRemote.send('desktop:quality', { quality: quality, bitrate_kbps: custom, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast('切换码率档…', '');
         });
@@ -257,7 +296,7 @@
     if (grayToggle) {
         grayToggle.addEventListener('change', function() {
             if (!desktopEnabled || !window.shellRemote) return;
-            window.__codecSwitchPending = true;
+            armCodecSwitchPending();
             window.shellRemote.send('desktop:gray', { enabled: this.checked, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast(this.checked ? '已开启灰度模式（省带宽）' : '已关闭灰度模式', '');
         });
@@ -293,28 +332,36 @@
             if (!desktopEnabled || !window.shellRemote) return;
             const display = this.value || '';
             // 重建流期间 desktop:stopped 不退出桌面视图，等 started 后重连。
-            window.__codecSwitchPending = true;
+            armCodecSwitchPending();
             window.shellRemote.send('desktop:select-display', { display: display, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast(display ? ('切换显示器 ' + display) : '恢复默认显示器…', '');
         });
     }
 
     // R5#2 控制命令 ack：agent 回执——操作生效 ok / 失败 error → toast 反馈。
+    // 失败说明 agent 没有重建流，不会再有 desktop:started：立刻复位
+    // __codecSwitchPending（C7），否则之后真正的"桌面已关闭"不会再退回终端。
     window.shellRemote.on('desktop:cmd-ack', function(msg) {
         const p = msg.payload || {};
         if (typeof p.ok === 'boolean') {
             if (p.ok) {
                 showToast('指令已生效', 'success');
             } else {
+                clearCodecSwitchPending();
                 showToast('指令失败: ' + (p.error || '未知错误'), 'error');
             }
         }
     });
 
+    // 点击"桌面"后 15s 内没等到 desktop:started 就复位按钮，避免永久
+    // 停在"连接中…"（命令丢失/agent 无响应时原先只能刷新页面）。
+    const DESKTOP_START_TIMEOUT = 15000;
+
     toggleDesktopBtn.addEventListener('click', function() {
         if (!desktopEnabled) return;
         if (desktopActive) {
             // 切回终端：停流
+            clearDesktopStartTimer();
             desktopView.disconnect();
             window.shellRemote.send('desktop:stop', {});
             desktopStarting = false;
@@ -325,6 +372,13 @@
         desktopStarting = true;
         toggleDesktopBtn.disabled = true;
         toggleDesktopBtn.textContent = '连接中…';
+        clearDesktopStartTimer();
+        desktopStartTimer = setTimeout(function() {
+            desktopStartTimer = null;
+            if (!desktopStarting) return;
+            resetDesktopStarting();
+            showToast('桌面启动超时', 'error');
+        }, DESKTOP_START_TIMEOUT);
         window.shellRemote.send('desktop:start', {});
     });
 
@@ -405,6 +459,7 @@
                 close.textContent = '\u00d7';
                 close.onclick = (e) => {
                     e.stopPropagation();
+                    dropTabDecoder(t.tab_id);
                     window.shellRemote.send('session:tab_close', { tab_id: t.tab_id });
                 };
                 el.appendChild(close);
@@ -438,13 +493,31 @@
         term.onInput((data) => queueInput(activeTabId, data));
     });
 
+    // C9：每个 tab 一个 streaming TextDecoder。base64 块是任意字节切分，
+    // 一个多字节字符可能跨两个 terminal:output 消息；无状态 decode 会把两半
+    // 都变成 U+FFFD（中文/emoji 输出出现乱码方块）。tab 关闭时连同 decoder
+    // 一起丢弃，避免把上一个 shell 的半个字符带进新 shell。
+    const tabDecoders = new Map();
+    function decoderForTab(tabId) {
+        let d = tabDecoders.get(tabId);
+        if (!d) {
+            d = new TextDecoder('utf-8');
+            tabDecoders.set(tabId, d);
+        }
+        return d;
+    }
+    function dropTabDecoder(tabId) {
+        tabDecoders.delete(tabId);
+    }
+
     window.shellRemote.on('terminal:output', function(msg) {
         clearJoinWatchdog();
         try {
+            const tabId = msg.payload.tab_id;
             const binaryStr = atob(msg.payload.data);
             const bytes = Uint8Array.from(binaryStr, c => c.charCodeAt(0));
-            const decoded = new TextDecoder().decode(bytes);
-            if (msg.payload.tab_id === activeTabId) {
+            const decoded = decoderForTab(tabId).decode(bytes, { stream: true });
+            if (tabId === activeTabId) {
                 term.write(decoded);
             }
         } catch (e) {
@@ -455,6 +528,14 @@
     window.shellRemote.on('session:tab_list', function(msg) {
         clearJoinWatchdog();
         tabs = msg.payload.tabs || [];
+        // tab 已经不在了（关闭/重连后 agent 重建了 shell）：丢弃它的 decoder，
+        // 否则残留的半个多字节字符会串到下一个输出里。
+        if (tabDecoders.size > 0) {
+            const alive = new Set(tabs.map(t => t.tab_id));
+            Array.from(tabDecoders.keys()).forEach(function(id) {
+                if (!alive.has(id)) dropTabDecoder(id);
+            });
+        }
         // 重连后 agent 可能已换了一组 tab（如 shell 退出被重建）：当前 tab 不在
         // 列表里就改用 agent 标记的活动 tab，否则输出被过滤、输入发往不存在的 tab。
         if (tabs.length > 0 && !tabs.some(t => t.tab_id === activeTabId)) {
@@ -556,10 +637,11 @@
     });
 
     window.shellRemote.on('desktop:started', function(msg) {
+        clearDesktopStartTimer();
         desktopStarting = false;
         toggleDesktopBtn.disabled = !desktopEnabled;
         // 编码热切换完成：清除 pending 标志。
-        window.__codecSwitchPending = false;
+        clearCodecSwitchPending();
         if (msg.payload && msg.payload.error) {
             showToast('桌面启动失败: ' + msg.payload.error, 'error');
             showTerminalView();
@@ -724,11 +806,13 @@
 
     window.shellRemote.on('desktop:error', function(msg) {
         // 捕获/编码器持续失败（例如 Wayland 下 XWayland root 无法 GetImage）
-        desktopStarting = false;
         if (desktopActive) {
             desktopView.disconnect();
             showTerminalView();
         }
+        // 启动失败时不会再有 desktop:started：复位"连接中…"。
+        resetDesktopStarting();
+        clearCodecSwitchPending();
         if (msg.payload && msg.payload.error) {
             showToast('桌面捕获失败: ' + msg.payload.error, 'error');
         }
@@ -761,6 +845,9 @@
         clearJoinWatchdog();
         desktopView.disconnect();
         showTerminalView();
+        // agent 已断开：等待中的 desktop:start 不会再有回执，复位按钮。
+        resetDesktopStarting();
+        clearCodecSwitchPending();
         disconnectText.textContent = '设备连接中断，正在自动重连…';
         sessionNameEl.textContent = '设备重连中…';
         sessionNameEl.className = 'connecting';
