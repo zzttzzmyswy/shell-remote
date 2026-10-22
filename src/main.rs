@@ -147,6 +147,10 @@ enum Command {
         /// relay rejects registration and the agent exits. Omit for a random id.
         #[arg(long)]
         session_id: Option<String>,
+
+        /// 关闭命令日志（默认会把 MCP 执行的命令与 Web 终端输入的命令行打印到日志）
+        #[arg(long)]
+        no_cmd_log: bool,
     },
 }
 
@@ -208,7 +212,10 @@ async fn main() -> anyhow::Result<()> {
             token_type,
             shell,
             session_id,
+            no_cmd_log,
         } => {
+            // 命令日志开关：默认开启，`--no-cmd-log` 关闭。
+            agent::cmd_log::set_enabled(!no_cmd_log);
             let desired = match session_id.as_deref() {
                 Some(s) => {
                     if !shell_remote::proto::is_valid_custom_session_id(s) {

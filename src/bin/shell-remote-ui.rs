@@ -58,6 +58,10 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
 
+        /// 关闭命令日志（默认会把 MCP 执行的命令与 Web 终端输入的命令行打印到日志）
+        #[arg(long)]
+        no_cmd_log: bool,
+
         /// 本机状态面板视图：auto（默认：有 DISPLAY/Windows 开原生窗口，否则
         /// 有 TTY 开终端面板，两者皆无则 headless）/ window / tui / headless。
         #[arg(long, default_value = "auto")]
@@ -198,6 +202,7 @@ fn main() -> anyhow::Result<()> {
             token_type,
             shell,
             session_id,
+            no_cmd_log,
             view: _,
             desktop_capture,
             desktop_codec,
@@ -220,6 +225,8 @@ fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let root = root.unwrap_or_else(agent::home_dir);
+            // 命令日志开关：默认开启，`--no-cmd-log` 关闭。
+            agent::cmd_log::set_enabled(!no_cmd_log);
             // 共享状态 + 视图调度：window（原生窗口，主线程事件循环）/ tui（终端面板
             // 线程）/ headless。三者共用同一 AgentStatus（状态/会话id/token/延迟 +
             // 刷新/退出信号）。

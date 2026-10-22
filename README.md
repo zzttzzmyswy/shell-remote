@@ -122,11 +122,57 @@ cargo build --release --no-default-features
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
 | `--shell` | `/bin/bash` | Shell 路径。注意该参数绑定了 `SHELL` 环境变量，在 systemd 下会被服务注入的 `SHELL`（该账户登录 shell）顶掉，需要固定时请显式传参 |
 | `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；**可重复使用**——新的 agent 用相同 ID 注册会顶替旧会话（旧 Token 失效），不再报冲突 |
+| `--no-cmd-log` | — | 关闭命令日志（默认开启：把 MCP 执行的命令与 Web 终端输入的命令行打印到日志） |
 
 > CLI agent **不提供桌面转发**（无 `--desktop-*` 参数，能力上报 `available:false`，浏览器端不显示桌面按钮）。需要桌面共享请用 **shell-remote-ui**。
 
 > 要把 agent 装成**开机自启的 systemd 服务**（固定运行账户 / 固定 session-id 与 key /
 > 预置远端终端环境变量），见 [`deploy/systemd-agent/`](deploy/systemd-agent/)。
+
+### 命令日志
+
+agent（`shell-remote agent` 与 `shell-remote-ui agent` 两个二进制）**默认**把执行过的命令
+按统一格式打进日志，方便事后追溯"这条机器上到底跑了什么"。两个来源格式对齐，单行、字段
+间两个空格：
+
+```
+[MCP] exec        sess=ABCDE  shell=auto  cwd=/root  timeout=30s  $ ls -la
+[MCP] exec_start  sess=ABCDE  $ tail -f /var/log/syslog
+[MCP] stdin       sess=ABCDE  id=1a2b3c4d  bytes=4  "yes\n"
+[WEB] cmd         sess=ABCDE  tab=tab-1  $ git status
+[WEB] cmd~        sess=ABCDE  tab=tab-2  $ systemctl restart nginx
+```
+
+| 字段 | 含义 |
+|------|------|
+| 动作名 | `exec` / `exec_start` / `stdin` 来自 MCP；`cmd` / `cmd~` 来自网页终端 |
+| `sess=` | 设备会话 ID（后台看到的那个） |
+| `shell=` / `cwd=` / `timeout=` | MCP 请求里显式指定的值；未指定写 `-`。超时整秒写 `30s`，非整秒写 `1500ms` |
+| `id=` / `bytes=` | stdin 目标会话 ID 的前 8 位 + 原始字节数 |
+| `tab=` | 网页终端标签页 ID |
+| `$ ` 之后 | 命令文本，永远是最后一个字段；换行/制表符/控制符转义成 `\n` `\t` `\x1b`，超过 1000 字符截断 |
+
+`cmd~` 表示这一行在编辑过程中用过方向键、Tab 补全或历史检索——agent 侧只能按键重建，
+内容可能与实际执行的不完全一致。精确的命令请以 `exec` 系列（MCP）为准。
+
+**关闭**：加 `--no-cmd-log`。
+
+```bash
+./shell-remote agent --relay-url https://<relay-ip> --no-cmd-log
+```
+
+**日志位置**：沿用现有 tracing 配置——默认输出到 stderr；设 `SR_LOG_DIR` 时写该目录下
+按小时滚动的文件；`shell-remote-ui` 的窗口/TUI 交互模式会自动落到
+`~/.shell-remote/`，避免刷屏污染界面。
+
+**限制**
+
+- 网页终端只有在 shell 提示符下的输入才记录。密码输入（`sudo`/`ssh`/`read -s`，表现为
+  回显关闭 + 行缓冲）和 `vim`/`python`/`ssh` 等前台程序里的按键都不记录——前者防泄密，
+  后者防噪声。
+- 上述判定在 Unix 上通过终端 termios 与前台进程组实现；**Windows 的 ConPTY 拿不到这些
+  信息，所以 Windows agent 会记录全部终端输入**（包括密码输入）。在 Windows 上处理敏感
+  操作时请加 `--no-cmd-log`。
 
 ### 启动 UI Agent（桌面共享）
 
@@ -142,6 +188,7 @@ cargo build --release --no-default-features
 | `--token-type` | `rw` | Token 类型：`rw`、`ro` 或 `both` |
 | `--shell` | `/bin/bash` | Shell 路径 |
 | `--session-id` | — | 自定义会话 ID（5-20 位字母数字），后台据此区分设备；可重复使用 |
+| `--no-cmd-log` | — | 关闭命令日志（默认开启，格式与限制见上文「命令日志」） |
 | `--desktop-capture` | `auto` | 桌面捕获后端：`auto` / `dxgi` / `gdi` / `x11` / `wayland` / `none`（Windows 默认 DXGI Desktop Duplication，失败回退 GDI；`wayland` 需 `--features wayland` 构建且运行时存在 xdg-desktop-portal + PipeWire） |
 | `--desktop-codec` | `av1` | 桌面编码格式：`av1`（libaom）/ `h264`（openh264）；初始化失败自动按 av1→h264 回退 |
 | `--desktop-fps` | `30` | 桌面编码帧率上限（默认 30，QoS 内容驱动：静止 1fps、动态满帧） |

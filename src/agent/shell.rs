@@ -9,6 +9,10 @@ pub struct Shell {
     writer: Box<dyn Write + Send>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     _reader_thread: thread::JoinHandle<()>,
+    /// 终端子进程 pid（spawn 时取一次，用来判断前台进程组是不是 shell 自己）。
+    /// 非 Unix 平台无从判断前台进程，该字段只写不读。
+    #[cfg_attr(not(unix), allow(dead_code))]
+    child_pid: Option<u32>,
     pub cols: u16,
     pub rows: u16,
 }
@@ -56,6 +60,7 @@ impl Shell {
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn shell process")?;
+        let child_pid = child.process_id();
 
         drop(pair.slave);
 
@@ -93,9 +98,57 @@ impl Shell {
             writer,
             _child: child,
             _reader_thread: reader_thread,
+            child_pid,
             cols,
             rows,
         })
+    }
+
+    /// 当前这一行是否应作为“shell 命令”记录到命令日志。
+    ///
+    /// 只在 shell 提示符下的输入才算命令：密码输入（sudo/ssh/`read -s`）和
+    /// vim/python/ssh 等前台程序里的按键都不该进日志——前者是泄密，后者是噪声。
+    ///
+    /// Unix 判定（任一条件命中即不记录）：
+    /// 1. termios 里 `ECHO` 关闭且 `ICANON` 开启：典型的不回显行输入（密码）。
+    ///    注意 bash readline 在提示符下是 **ICANON 关 + ECHO 关**，这种情况要
+    ///    记录，所以不能只看 ECHO。
+    /// 2. PTY 的前台进程组不是 shell 子进程本身：前台是 vim/python/ssh/sudo 等。
+    ///
+    /// 拿不到信息时一律返回 true（宁可多记，不漏记）。
+    /// Windows 的 ConPTY 拿不到这两类信息，恒为 true（见 README 的限制说明）。
+    #[cfg(unix)]
+    pub fn should_log_typed_line(&self) -> bool {
+        // 1. termios：不回显 + 行缓冲（规范模式）→ 密码输入。
+        if let Some(fd) = self.master.as_raw_fd() {
+            let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: fd 由 master 持有且在本调用期间有效，termios 是合法的可写缓冲。
+            if unsafe { libc::tcgetattr(fd, &mut termios) } == 0 {
+                let echo = termios.c_lflag & libc::ECHO != 0;
+                let icanon = termios.c_lflag & libc::ICANON != 0;
+                if !echo && icanon {
+                    return false;
+                }
+            }
+        }
+
+        // 2. 前台进程组：不是 shell 本身就在跑别的程序。
+        if let (Some(fg), Some(pid)) = (
+            self.master.process_group_leader(),
+            self.child_pid.map(|p| p as libc::pid_t),
+        ) {
+            if fg != pid {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[cfg(not(unix))]
+    pub fn should_log_typed_line(&self) -> bool {
+        // ConPTY 不暴露前台进程组/termios，无法区分密码输入与普通输入。
+        true
     }
 
     pub fn write_input(&mut self, data: &[u8]) -> anyhow::Result<()> {
@@ -230,6 +283,50 @@ mod tests {
         assert!(
             seen.contains(&format!("CHILD_LANG=[{expected}]")),
             "子进程 LANG 与 agent 环境不一致（期望 [{expected}]）: {seen:?}"
+        );
+    }
+}
+
+/// 命令日志的“只在 shell 提示符下记录”判定（Unix）。
+#[cfg(all(test, unix))]
+mod cmd_log_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 轮询直到条件成立或超时。
+    fn wait_until<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        f()
+    }
+
+    /// 提示符下返回 true；前台跑着 sleep 时返回 false（不是 shell 自己在前台）。
+    #[test]
+    fn test_should_log_typed_line_tracks_foreground_process() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut shell = Shell::spawn(80, 24, "/bin/sh", "gate-tab", tx).unwrap();
+
+        // shell 启动后把前台进程组设为自身，回到提示符。
+        assert!(
+            wait_until(|| shell.should_log_typed_line(), Duration::from_secs(3)),
+            "提示符下应记录（shell 在前台）"
+        );
+
+        shell.write_input(b"sleep 3\n").unwrap();
+        assert!(
+            wait_until(|| !shell.should_log_typed_line(), Duration::from_secs(3)),
+            "sleep 占用前台时不应记录"
+        );
+
+        // sleep 结束后回到提示符，重新开始记录。
+        assert!(
+            wait_until(|| shell.should_log_typed_line(), Duration::from_secs(6)),
+            "sleep 退出后应恢复记录"
         );
     }
 }
