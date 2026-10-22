@@ -101,6 +101,7 @@ cargo build --release
 | `--desktop-max-bitrate` | `0` | Hard encode bitrate cap (kbps); 0 = auto (rustdesk base_bitrate × quality model, 1080p balanced ≈1388 kbps) |
 | `--desktop-min-bitrate` | `80` | Minimum encode bitrate (kbps) |
 | `--desktop-display` | platform default | Linux: X11 display (e.g. `:1`, defaults to `$DISPLAY`); Windows: monitor enumeration index (`"0"` = primary, `"1"` = second, MYS-954 multi-monitor, switchable live from the session page) |
+| `--no-cmd-log` | — | Disable the command log (on by default — see "Command Log" below) |
 
 Output:
 
@@ -108,6 +109,53 @@ Output:
 session: a1b2c3d4
   rw: 5fe42fc877b0a721157508c67fd19633c9c03cc97aaa2d5af0ced67cd3980d90
 ```
+
+### Command Log
+
+Both agent binaries (`shell-remote agent` and `shell-remote-ui agent`) log every command they
+run **by default**, in one aligned single-line format (fields separated by two spaces), so you can
+audit later what actually ran on the machine:
+
+```
+[MCP] exec        sess=ABCDE  shell=auto  cwd=/root  timeout=30s  $ ls -la
+[MCP] exec_start  sess=ABCDE  $ tail -f /var/log/syslog
+[MCP] stdin       sess=ABCDE  id=1a2b3c4d  bytes=4  "yes\n"
+[WEB] cmd         sess=ABCDE  tab=tab-1  $ git status
+[WEB] cmd~        sess=ABCDE  tab=tab-2  $ systemctl restart nginx
+```
+
+| Field | Meaning |
+|-------|---------|
+| Action | `exec` / `exec_start` / `stdin` come from MCP; `cmd` / `cmd~` from the web terminal |
+| `sess=` | Device session id (the one shown in the admin panel) |
+| `shell=` / `cwd=` / `timeout=` | Values explicitly set on the MCP request; `-` when absent. Timeouts print as `30s` for whole seconds, `1500ms` otherwise |
+| `id=` / `bytes=` | First 8 chars of the stdin target session id, and the raw byte count |
+| `tab=` | Web terminal tab id |
+| After `$ ` | The command text, always the last field; newlines/tabs/control chars are escaped to `\n` `\t` `\x1b`, and text over 1000 chars is truncated |
+
+`cmd~` means the line was edited with arrow keys, Tab completion or history search — the agent
+only reconstructs it from keystrokes, so the text may differ from what actually ran. Trust the
+`exec` lines (MCP) for exact commands.
+
+**Disable** with `--no-cmd-log`:
+
+```bash
+./shell-remote agent --relay-url https://<relay-ip> --no-cmd-log
+```
+
+**Where the output goes**: the existing tracing setup — stderr by default; a rolling hourly file
+under `SR_LOG_DIR` when that is set; `shell-remote-ui` in window/TUI mode writes to
+`~/.shell-remote/` so the panel stays clean.
+
+**Limitations**
+
+- Only input typed at a shell prompt is recorded for the web terminal. Password prompts
+  (`sudo`/`ssh`/`read -s` — echo off plus canonical mode) and keystrokes inside foreground
+  programs such as `vim`/`python`/`ssh` are skipped: the former to avoid leaking secrets, the
+  latter to avoid noise.
+- That check uses termios and the foreground process group on Unix. **Windows ConPTY exposes
+  neither, so a Windows agent records all terminal input**, password prompts included. Use
+  `--no-cmd-log` there when handling sensitive input.
 
 ### Browser Access
 

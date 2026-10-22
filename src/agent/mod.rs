@@ -1,4 +1,5 @@
 pub mod client;
+pub mod cmd_log;
 pub mod device;
                                 #[cfg(feature = "desktop")]
 pub mod desktop;
@@ -43,6 +44,8 @@ struct TabState {
     shell: Shell,
     title: String,
     output_buf: Vec<u8>,
+    /// 按键 → 命令行重建器（命令日志用；`terminal:input` 只带原始按键）。
+    line: cmd_log::LineTracker,
 }
 
 /// Per-tab replay buffer size (sent to a browser on join / tab switch).
@@ -79,6 +82,7 @@ fn spawn_tab(
             shell,
             title: format!("Shell {}", tab_counter),
             output_buf: Vec::new(),
+            line: cmd_log::LineTracker::default(),
         },
     );
     *active_tab_id = id.clone();
@@ -1813,6 +1817,21 @@ async fn run_session(
                                         .unwrap_or("");
                                     if let Some(data) = fs::decode_b64(data_b64) {
                                         if let Some(ts) = tabs.get_mut(&tab_id) {
+                                            // 命令日志：按键重建命令行，回车时打印。必须
+                                            // 在 write_input 之前喂——之后终端状态可能已变
+                                            // （前台切到子进程），判定会误判成“不记录”。
+                                            if cmd_log::enabled() {
+                                                for l in ts.line.feed(&data) {
+                                                    if ts.shell.should_log_typed_line() {
+                                                        cmd_log::log_web_cmd(
+                                                            &client.session_id,
+                                                            &tab_id,
+                                                            l.approx,
+                                                            &l.text,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                             if let Err(e) = ts.shell.write_input(&data) {
                                                 tracing::error!("Failed to write terminal input: {}", e);
                                             }
@@ -2108,6 +2127,17 @@ async fn run_session(
                                     // inheriting the agent's cwd, unchanged.
                                     #[cfg(windows)]
                                     let cwd = cwd.or_else(|| Some(root.to_string()));
+                                    // 命令日志：日志里打印的是客户端显式指定的
+                                    // shell（Windows 的 auto/powershell/cmd）；未指定
+                                    // 时写 `shell=-`，与 `--shell` 无关——Unix 侧
+                                    // execute_command 恒用 `sh -c`。
+                                    cmd_log::log_mcp_exec(
+                                        &client.session_id,
+                                        shell_override.as_deref(),
+                                        cwd.as_deref(),
+                                        timeout_ms,
+                                        &cmd,
+                                    );
                                     let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
                                     let session_id = client.session_id.clone();
                                     let ctrl_tx = task_control_tx.clone();
@@ -2131,6 +2161,7 @@ async fn run_session(
 
                                 "mcp:exec_start" => {
                                     let cmd = msg.payload["cmd"].as_str().unwrap_or("");
+                                    cmd_log::log_mcp_exec_start(&client.session_id, cmd);
                                     let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
                                     let mut result = match exec_sessions.spawn(cmd).await { Ok(r) => r, Err(r) => r };
                                     result._mcp_request_id = mcp_request_id;
@@ -2142,6 +2173,7 @@ async fn run_session(
                                     let exec_id = msg.payload["exec_id"].as_str().unwrap_or("");
                                     let data_b64 = msg.payload["data_b64"].as_str().unwrap_or("");
                                     let data = fs::decode_b64(data_b64).unwrap_or_default();
+                                    cmd_log::log_mcp_stdin(&client.session_id, exec_id, &data);
                                     let mcp_request_id = msg.payload["_mcp_request_id"].as_str().map(|s| s.to_string());
                                     let mut result = match exec_sessions.write_stdin(exec_id, &data).await { Ok(r) => r, Err(r) => r };
                                     result._mcp_request_id = mcp_request_id;
