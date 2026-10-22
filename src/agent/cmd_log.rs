@@ -300,9 +300,8 @@ impl LineTracker {
                     Some((i, c)) => i + c.len_utf8(),
                     None => 0,
                 };
+                // 保留单词前的空白（与 readline 一致：`git st` ^W `x` → `git x`）。
                 self.buf.truncate(cut);
-                let trimmed = self.buf.trim_end().len();
-                self.buf.truncate(trimmed);
                 self.buf_chars = self.buf.chars().count();
             }
             // Ctrl-C：放弃当前行。
@@ -442,6 +441,11 @@ mod tests {
         assert_eq!(
             lines(&[b"git status   \x17\r"]),
             vec![("git".to_string(), false)]
+        );
+        // 删词后继续输入：单词前的空格要保留
+        assert_eq!(
+            lines(&[b"git st\x17x\r"]),
+            vec![("git x".to_string(), false)]
         );
     }
 
