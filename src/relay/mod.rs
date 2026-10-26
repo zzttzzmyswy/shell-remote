@@ -9,6 +9,7 @@ pub mod recorder;
 pub mod bandwidth;
 pub mod desktop;
 pub mod file_transfer;
+pub mod web_proxy;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -129,6 +130,10 @@ pub struct SharedState {
     /// relay 整体带宽限制（MYS-2287）：上下行两个令牌桶 + 实时吞吐统计 +
     /// settings 持久化。进程级单例，与 session 无关；`Arc` 让各接入点直接持有。
     pub bandwidth: Arc<bandwidth::BandwidthLimiter>,
+    /// 网页流式代理状态（MYS-2383 阶段2）：ticket 表 + 在途请求表。与
+    /// `download_streams` 同构但**完全独立**——网页流量不得混进终端/MCP
+    /// 通道，因此不共享 sink、不共享清理路径。
+    pub web_proxy: Arc<web_proxy::WebProxyStore>,
 }
 
 /// Agent 心跳采样的一帧桌面 KPI（`agent/mod.rs sender_loop` 心跳 payload 的
@@ -312,6 +317,7 @@ impl SharedState {
             upgrade_dir: RwLock::new(None),
             kpi_history: RwLock::new(HashMap::new()),
             bandwidth: Arc::new(bandwidth::BandwidthLimiter::new()),
+            web_proxy: Arc::new(web_proxy::WebProxyStore::new()),
         }
     }
 
@@ -375,6 +381,10 @@ pub async fn remove_session_state(state: &SharedState, sid: &str) {
     state.desktop_streams.write().await.remove(sid);
     state.last_activity.write().await.remove(sid);
     state.agent_event_buffers.write().await.remove(sid);
+    // 网页代理（MYS-2383）：撤销该会话的全部 ticket 并取消在途网页请求。
+    // agent 已经不在（kick / 空闲回收 / 注册驱逐），这里只摘 sink，不发 cancel。
+    state.web_proxy.revoke_session_tickets(sid).await;
+    state.web_proxy.cancel_session(sid).await;
 }
 
 use axum::body::Body;
@@ -1744,6 +1754,11 @@ pub async fn start(
         )
         .route("/agent/mcp/get", axum::routing::get(file_transfer::get_handler))
         .route(
+            "/agent/web/ticket",
+            axum::routing::post(web_proxy::ticket_handler),
+        )
+        .route("/agent/web/proxy", get(web_proxy::proxy_handler))
+        .route(
             "/agent/desktop/stream",
             get(crate::relay::desktop::stream_handler),
         )
@@ -1883,6 +1898,18 @@ pub async fn start(
                     for k in stale {
                         ds.remove(&k);
                     }
+                }
+
+                // 网页代理周期清理（MYS-2383 阶段2）：过期 ticket + 已无消费者的
+                // 在途网页请求。正常路径由请求守卫清理，这里是兜底（进程被
+                // 拖慢 / 任务被 abort 时不会留下永久条目）。
+                let (tickets, streams) = state_clone.web_proxy.sweep().await;
+                if tickets > 0 || streams > 0 {
+                    tracing::debug!(
+                        tickets,
+                        streams,
+                        "web proxy: swept expired tickets / orphaned requests"
+                    );
                 }
             }
         });

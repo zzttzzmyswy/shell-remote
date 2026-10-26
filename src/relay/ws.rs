@@ -238,6 +238,13 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
         }
     }
     if let Ok(proto_msg) = serde_json::from_str::<ProtoMessage>(text_str) {
+        // 网页代理回包（MYS-2383 阶段2）：`web:head/chunk/end/error` 按
+        // request_id 送进该请求**独立**的 bounded channel，然后直接返回。
+        // 必须在广播/MCP/录制分支之前拦截——网页内容既不进 `broadcast_types`
+        // （会污染终端 SSE），也不进 terminal 录制和 MCP oneshot。
+        if crate::relay::web_proxy::route_agent_message(state, session_id, &proto_msg).await {
+            return;
+        }
         // 上行带宽记账（MYS-2287）：agent 上行的每条消息都计入上行用量，只记账
         // 不等待（交互/控制消息不能因限速变慢）。桌面视频例外——它在自己的分支
         // 里按解码后的帧字节 `try_acquire`/`consume`，这里再记会重复计数。
@@ -1142,17 +1149,24 @@ pub async fn agent_send_handler(
         // R5#44 capability 协商最小子集：注册消息可带 capabilities 数组
         // （agent 声明 codec/后端/功能），存入会话供 admin overview 展示与
         // 浏览器协商。老版本 agent 不带 → 保持空。
-        if let Some(caps) = body["capabilities"].as_array() {
-            let caps: Vec<String> = caps
-                .iter()
-                .filter_map(|c| c.as_str().map(|s| s.to_string()))
-                .collect();
-            if !caps.is_empty() {
-                state
-                    .sessions
-                    .update_capabilities(&session_id, caps)
-                    .await;
-            }
+        //
+        // MYS-2383：**每次注册都覆盖**（含空数组）。同一 sid 的新 incarnation
+        // 若不覆盖，旧能力会残留——旧 agent 重连后仍被当成支持 `web:proxy-v1`，
+        // UI 会显示一个必然 404 的入口。`body["capabilities"]` 缺失时同样写空，
+        // 效果与 `register` 新建的默认值一致。
+        {
+            let caps: Vec<String> = body["capabilities"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            state
+                .sessions
+                .update_capabilities(&session_id, caps)
+                .await;
         }
 
         // 阶段2 LAN 直连：注册消息可带 `lan_addr`（"ip:port"），存入会话表
@@ -1438,6 +1452,22 @@ impl Drop for AgentEventsCleanup {
                             .await
                             .insert(session_id.clone(), false);
                         state.agent_upgrades.write().await.remove(&session_id);
+                        // 网页代理（MYS-2383 阶段2）：agent 断线 → 撤销该会话
+                        // 的全部 ticket（浏览器不能再拿旧 ticket 取资源）、
+                        // 取消在途网页请求（其响应任务因通道关闭而结束）。
+                        // 注册能力**保留**不动：重连的 agent 会重新注册覆盖，
+                        // 浏览器在此期间也仍能读到能力（配合
+                        // `session:agent_disconnect` 自行隐藏入口）。
+                        let revoked = state.web_proxy.revoke_session_tickets(&session_id).await;
+                        let cancelled = state.web_proxy.cancel_session(&session_id).await;
+                        if revoked > 0 || cancelled > 0 {
+                            tracing::info!(
+                                session = %session_id,
+                                revoked,
+                                cancelled,
+                                "web proxy: session tickets revoked and in-flight requests cancelled on agent disconnect"
+                            );
+                        }
                         // No newer connection replaced this one → the agent is
                         // genuinely gone. Tell every connected browser so it can
                         // show a status and auto-rejoin instead of staring at a
@@ -2069,6 +2099,26 @@ pub async fn browser_sse_handler(
             yield Ok::<_, Infallible>(axum::response::sse::Event::default().data(snapshot));
         }
 
+        // MYS-2383：握手补发 agent 注册的能力声明，供 UI 判断是否显示
+        // 「网页」入口（旧 agent 不声明 web:proxy-v1 → 入口完全不出现）。
+        // payload 只含 capabilities 数组，UI 无需理解其它字段。
+        // **agent 断线时能力仍保留**（重连后由重新注册覆盖），浏览器收到
+        // `session:agent_disconnect` 自己隐藏入口。
+        let caps = state_snapshot_clone
+            .sessions
+            .get_capabilities(&sid_snapshot)
+            .await;
+        yield Ok::<_, Infallible>(
+            axum::response::sse::Event::default().data(
+                json!({
+                    "type": "session:capabilities",
+                    "session_id": sid_snapshot,
+                    "payload": { "capabilities": caps }
+                })
+                .to_string(),
+            ),
+        );
+
         let mut inner_stream = stream;
         while let Some(msg) = tokio_stream::StreamExt::next(&mut inner_stream).await {
             // 下行带宽（MYS-2287）：浏览器 SSE 承载终端输出等交互数据，
@@ -2219,6 +2269,48 @@ mod tests {
             String::new(),
             None,
         ))
+    }
+
+    /// 从 SSE 响应里读出最多 `max` 条事件（`data:` 行解析为 JSON），用于断言
+    /// 握手阶段的初始事件序列。读够或流不再产出即返回（不等待 keep-alive）。
+    async fn collect_sse_events(resp: Response, max: usize) -> Vec<serde_json::Value> {
+        use http_body_util::BodyExt;
+        let mut body = resp.into_body();
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        while out.len() < max {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame()).await;
+            let Ok(Some(Ok(frame))) = next else { break };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            buf.extend_from_slice(&data);
+            // SSE 帧以空行分隔；只解析 `data:` 行。
+            while let Some(pos) = find_double_newline(&buf) {
+                let block: Vec<u8> = buf.drain(..pos + 2).collect();
+                let text = String::from_utf8_lossy(&block);
+                let payload: String = text
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data:"))
+                    .map(|l| l.strip_prefix(' ').unwrap_or(l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if payload.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    out.push(v);
+                    if out.len() >= max {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn find_double_newline(buf: &[u8]) -> Option<usize> {
+        buf.windows(2).position(|w| w == b"\n\n")
     }
 
     async fn insert_channel_map(
@@ -2440,6 +2532,221 @@ mod tests {
         ];
         state.sessions.update_capabilities(&sid, caps.clone()).await;
         assert_eq!(state.sessions.get_capabilities(&sid).await, caps);
+    }
+
+    #[tokio::test]
+    async fn test_web_replies_never_reach_browser_broadcast() {
+        // MYS-2383 硬约束：web:head/chunk/end/error 必须走网页专用回包通道，
+        // 绝不能进 broadcast_types —— 否则远端页面内容会灌进终端 SSE、
+        // 触发录制、甚至被当成 MCP 结果。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        state
+            .sessions
+            .update_capabilities(&sid, vec![crate::relay::web_proxy::CAPABILITY.to_string()])
+            .await;
+        // 一条 agent 通道 + 一条「浏览器」SSE 通道。
+        let (agent_tx, mut agent_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (bulk_tx, mut bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        let (browser_tx, mut browser_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let sse_sid = "bs_web_isolation".to_string();
+        state
+            .sse_sessions
+            .write()
+            .await
+            .insert(sse_sid.clone(), browser_tx);
+        {
+            let mut broadcast = state.agent_broadcast.write().await;
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(agent_tx.clone());
+            cm.agent_bulk = Some(bulk_tx.clone());
+            cm.browser_sessions
+                .insert("user-1".to_string(), sse_sid.clone());
+            broadcast.insert(sid.clone(), cm);
+        }
+        // 保活：通道不掉线（agent_rx/bulk_rx 只用于维持发送端有效）。
+        let _keep = (agent_tx, agent_rx, bulk_tx, bulk_rx);
+
+        // 登记一个在途网页请求，让回包有主（否则按"未知请求"丢弃）。
+        let (tx, mut rx) = mpsc::channel::<crate::relay::web_proxy::WebEvent>(8);
+        state
+            .web_proxy
+            .register_stream(&sid, "rid-iso", tx)
+            .await
+            .unwrap();
+
+        let page_b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(b"<html>secret</html>")
+        };
+        for (ty, payload) in [
+            (
+                "web:head",
+                json!({"request_id": "rid-iso", "status": 200,
+                                "headers": [["content-type", "text/html"]],
+                                "final_url": "http://127.0.0.1/"}),
+            ),
+            (
+                "web:chunk",
+                json!({"request_id": "rid-iso", "seq": 0,
+                                 "data": page_b64}),
+            ),
+            ("web:end", json!({"request_id": "rid-iso"})),
+        ] {
+            route_agent_message(
+                &state,
+                &sid,
+                &json!({"type": ty, "session_id": sid, "payload": payload}).to_string(),
+            )
+            .await;
+        }
+        // 回包全部到了网页专用通道。
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+                .await
+                .expect("回包必须进网页通道")
+                .expect("网页通道未关闭");
+            got.push(ev);
+        }
+        assert!(
+            matches!(
+                got[0],
+                crate::relay::web_proxy::WebEvent::Head { status: 200, .. }
+            ),
+            "第一条应是 web:head，实收 {:?}",
+            got[0]
+        );
+        assert!(
+            matches!(
+                got[1],
+                crate::relay::web_proxy::WebEvent::Chunk { seq: 0, .. }
+            ),
+            "第二条应是 web:chunk，实收 {:?}",
+            got[1]
+        );
+        assert!(
+            matches!(got[2], crate::relay::web_proxy::WebEvent::End),
+            "第三条应是 web:end，实收 {:?}",
+            got[2]
+        );
+
+        // 浏览器 SSE 一条都没收到（含页面正文）。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), browser_rx.recv())
+                .await
+                .is_err(),
+            "网页回包绝不允许进入浏览器广播通道"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_overwrites_capabilities_including_empty() {
+        // MYS-2383：同一 sid 的新 incarnation 必须**覆盖**旧能力声明，含空数组。
+        // 不覆盖的话，旧 agent 重连后仍被当成支持 web:proxy-v1 → UI 显示一个
+        // 必然 404 的「网页」入口。
+        let state = make_state("");
+        let reg = |caps: Value| {
+            let state = state.clone();
+            async move {
+                let body = json!({
+                    "type": "agent:register",
+                    "token_type": "rw",
+                    "session_id": "capovr01",
+                    "capabilities": caps,
+                });
+                let resp = agent_send_handler(
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(body),
+                )
+                .await
+                .into_response();
+                assert_eq!(resp.status(), 200);
+                state.sessions.get_capabilities("capovr01").await
+            }
+        };
+
+        // 第一次注册声明新 agent 的能力。
+        let caps = reg(json!(["web:proxy-v1", "codec:av1"])).await;
+        assert_eq!(
+            caps,
+            vec!["web:proxy-v1".to_string(), "codec:av1".to_string()]
+        );
+
+        // 旧 agent 用同一 sid 重连（不带 capabilities）：必须清空，不能让能力残留。
+        let caps = reg(json!(null)).await;
+        assert!(
+            caps.is_empty(),
+            "不带 capabilities 的重注册必须覆盖为空，实际 {caps:?}"
+        );
+
+        // 显式空数组同样覆盖。
+        let _ = reg(json!(["web:proxy-v1"])).await;
+        let caps = reg(json!([])).await;
+        assert!(caps.is_empty(), "空数组也必须覆盖旧值，实际 {caps:?}");
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_sends_session_capabilities() {
+        // MYS-2383：浏览器 SSE 握手补发 session:capabilities，payload 只含
+        // capabilities 数组（UI 据此决定是否显示「网页」入口）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        state
+            .sessions
+            .update_capabilities(&sid, vec!["web:proxy-v1".to_string()])
+            .await;
+        let (_tx, _agent_rx) = insert_channel_map(&state, &sid).await;
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Query(params),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 200);
+        let collected = collect_sse_events(resp, 3).await;
+        let caps_ev = collected
+            .iter()
+            .find(|v| v["type"] == "session:capabilities")
+            .unwrap_or_else(|| panic!("未收到 session:capabilities，实收 {collected:?}"));
+        assert_eq!(caps_ev["session_id"], sid);
+        assert_eq!(
+            caps_ev["payload"]["capabilities"],
+            json!(["web:proxy-v1"]),
+            "payload 必须只含 capabilities 数组"
+        );
+        // connected 必须先到（既有握手语义不变）。
+        assert_eq!(collected[0]["type"], "browser:connected");
+    }
+
+    #[tokio::test]
+    async fn test_browser_sse_capabilities_empty_for_old_agent() {
+        // 旧 agent 不声明能力 → 发空数组（UI 看到空就不显示入口，无需猜版本）。
+        let state = make_state("");
+        let r = state.sessions.register(None, "rw", None).await.unwrap();
+        let sid = r.session_id.clone();
+        let (_tx, _agent_rx) = insert_channel_map(&state, &sid).await;
+        let mut params = HashMap::new();
+        params.insert("token".to_string(), r.tokens[0].0.clone());
+        let resp = browser_sse_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Query(params),
+        )
+        .await
+        .into_response();
+        let collected = collect_sse_events(resp, 3).await;
+        let caps_ev = collected
+            .iter()
+            .find(|v| v["type"] == "session:capabilities")
+            .expect("即使为空也必须有该事件");
+        assert_eq!(caps_ev["payload"]["capabilities"], json!([]));
     }
 
     #[tokio::test]
@@ -4159,9 +4466,13 @@ mod tests {
 
         let mut params = HashMap::new();
         params.insert("token".to_string(), token);
-        let resp = browser_sse_handler(State(state.clone()), axum::http::HeaderMap::new(), Query(params))
-            .await
-            .into_response();
+        let resp = browser_sse_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Query(params),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), 200);
         // 浏览器流里应能读到 desktop:state
         use tokio_stream::StreamExt as _;
@@ -4263,9 +4574,13 @@ mod tests {
         }
         let mut params = HashMap::new();
         params.insert("token".to_string(), token);
-        let resp = browser_sse_handler(State(state.clone()), axum::http::HeaderMap::new(), Query(params))
-            .await
-            .into_response();
+        let resp = browser_sse_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Query(params),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), 200);
         // 轮换后旧 token 全失效 → 全部断开
         let closed = disconnect_browser_streams(&state, &sid, None).await;
