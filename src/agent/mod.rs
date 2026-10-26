@@ -12,6 +12,7 @@ pub mod lan;
 pub mod p2p;
 pub mod shell;
 pub mod upgrade;
+pub mod web_proxy;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1226,6 +1227,10 @@ async fn run_session(
     // Keep a control sender for spawned long-running tasks (e.g. mcp:exec).
     let task_control_tx = control_tx;
 
+    // 网页代理（MYS-2383 阶段1）：回包与 mcp/fs 结果共用这条 control 上行，
+    // 抓取任务各自独立，主循环只做校验与派发（慢页面不阻塞终端/MCP）。
+    let web_proxy = web_proxy::WebProxy::new(client.session_id.clone(), task_control_tx.clone());
+
     // 时钟校准：采样 relay /api/clock 求 (relay_epoch - 本地_epoch) 偏移，
     // 注入 DesktopManager，srtc 打点落在 relay 时基 —— e2e 延时从此不再
     // 依赖 agent/浏览器两机系统时钟同步（MYS-886 指标失真根因）。
@@ -1793,7 +1798,10 @@ async fn run_session(
                 relay_msg = client.recv() => {
                     match relay_msg {
                         Some(msg) => {
-                            if is_readonly && crate::proto::requires_write(&msg.msg_type) {
+                            let is_readonly_blocked = is_readonly
+                                && crate::proto::requires_write(&msg.msg_type)
+                                && !web_proxy::readonly_allowed(&msg.msg_type);
+                            if is_readonly_blocked {
                                 let err_resp = Message {
                                     msg_type: "error".to_string(),
                                     session_id: client.session_id.clone(),
@@ -2708,6 +2716,17 @@ async fn run_session(
                                     }
                                 }
 
+                                // 网页代理（MYS-2383 阶段1）。两者都只做派发/取消，
+                                // 真正的抓取在 WebProxy 内部的独立 task 里，慢页面
+                                // 不会占住这个循环（终端输入与 MCP 调用照常）。
+                                "web:request" => {
+                                    web_proxy.handle_request(&msg.payload).await;
+                                }
+
+                                "web:cancel" => {
+                                    web_proxy.handle_cancel(&msg.payload);
+                                }
+
                                 other => {
                                     tracing::debug!("Unknown message type: {}", other);
                                 }
@@ -2723,6 +2742,9 @@ async fn run_session(
     }
 
     exec_sessions.shutdown_all().await;
+    // 网页代理会话退出清理：abort 全部在途抓取并停止回包（回包通道也随之
+    // 失效，若不先关会在新会话里继续向旧 session 发 web:chunk）。
+    web_proxy.shutdown();
     // Tabs are deliberately kept (owned by `start`): shells survive the
     // reconnect and are replayed to browsers on re-join.
 
