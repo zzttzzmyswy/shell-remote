@@ -1185,6 +1185,95 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
     display: none !important;
 }
 
+/* ── 网页映射视图（MYS-2383-C）────────────────────────────────────
+   与终端/桌面同级的独立视图：占满 .main-content 的剩余空间，自己一套
+   地址栏 + 状态区 + iframe。隐藏时完全不参与布局，不覆盖桌面 DOM。 */
+.webview-container {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    background: var(--bg-primary);
+}
+.webview-container.hidden { display: none !important; }
+.webview-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+.webview-url {
+    flex: 1;
+    min-width: 0;
+    padding: 0.36rem 0.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.webview-url:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.webview-hint {
+    padding: var(--space-1) var(--space-3) var(--space-2);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+.webview-hint code {
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+/* 状态区：加载中 / 成功 / 失败三态，只用 token 里的颜色。 */
+.web-status {
+    padding: 0 var(--space-3);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    background: var(--bg-secondary);
+    max-height: 0;
+    overflow: hidden;
+    flex-shrink: 0;
+    transition: max-height 0.15s ease;
+}
+.web-status:not(:empty) {
+    max-height: 4.5em;
+    padding: var(--space-1) var(--space-3);
+    border-bottom: 1px solid var(--border);
+    overflow-y: auto;
+}
+.web-status.loading { color: var(--text-secondary); }
+.web-status.ok { color: var(--success); }
+.web-status.warn { color: var(--warning); }
+.web-status.error { color: var(--danger); }
+.webview-frame-wrap {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    position: relative;
+    background: var(--bg-primary);
+}
+/* iframe 只做展示：srcdoc 里已是重写后的文档，无 allow-scripts。 */
+.webview-frame {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: block;
+    background: #ffffff;
+    color-scheme: light;
+}
+
 /* 桌面性能指标面板（“指标”按钮开关）。top 下移避开顶部控制栏。 */
 .desktop-metrics {
     position: absolute;

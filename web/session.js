@@ -15,6 +15,11 @@
     let desktopEnabled = false;   // agent 能力可用
     let desktopActive = false;    // 当前处于桌面视图
     let desktopStarting = false;  // 已发 desktop:start 等待回复
+    // 网页视图状态（MYS-2383-C）：与桌面同级的独立视图，互不覆盖 DOM。
+    // webAvailable 只看 `session:capabilities` 里的 `web:proxy-v1`——绝不按
+    // agent 版本或 desktop 能力猜测；断开/重连后无该能力则保持隐藏。
+    let webAvailable = false;
+    let webActive = false;
     const term = new TerminalManager('terminal-container');
     const files = new FileManager('file-tree');
     const desktopView = new DesktopView();
@@ -82,6 +87,11 @@
     const terminalArea = document.getElementById('terminal-area');
     const desktopContainer = document.getElementById('desktop-container');
     const tabBarEl = document.getElementById('tab-bar');
+    const toggleWebBtn = document.getElementById('toggle-web-btn');
+    const webviewContainer = document.getElementById('webview-container');
+    const webviewInput = document.getElementById('webview-url-input');
+    const webviewStatusEl = document.getElementById('webview-status');
+    const webviewFrame = document.getElementById('webview-frame');
     const disconnectOverlay = document.getElementById('disconnect-overlay');
     const disconnectText = document.getElementById('disconnect-text');
     const toast = document.getElementById('toast');
@@ -247,9 +257,28 @@
         onlineCountEl.classList.toggle('hidden', onlineUsers <= 0);
     }
 
-    // ── Desktop view control ──────────────────────────────────
+    // ── View switching: terminal ⇄ desktop ⇄ web ──────────────
+    // 三个视图互斥，但状态彼此独立：桌面开着就只是把它的容器藏起来（不悄悄
+    // 停流），回到桌面还能接着看；网页视图自己持有 iframe 与 ticket 生命周期。
+    //
+    // currentView 记录「现在显示的是哪个视图」，与 desktopActive（桌面流是否
+    // 已连上/正在跑）分开——否则从网页点回桌面会被误判成"再点一次桌面"而
+    // 直接停掉桌面流。默认 '' 直到首次显式切视图（= 终端）。
+    let currentView = 'terminal';
+
+    // 网页视图控制器：地址栏/状态区/iframe 都从 DOM 取；鉴权头复用 sse.js 的
+    // authHeaders（X-Auth 只在内存里拼进 ticket 请求，绝不进 URL）。
+    const webView = (typeof WebView === 'function') ? new WebView({
+        frame: webviewFrame,
+        statusEl: webviewStatusEl,
+        inputEl: webviewInput,
+        token: token,
+        getAuthHeaders: function () { return window.shellRemoteAuthHeaders ? window.shellRemoteAuthHeaders({}) : {}; }
+    }) : null;
 
     function showDesktopView() {
+        hideWebView(false);
+        currentView = 'desktop';
         desktopActive = true;
         terminalArea.classList.add('hidden');
         desktopContainer.classList.remove('hidden');
@@ -261,6 +290,8 @@
     }
 
     function showTerminalView() {
+        hideWebView(false);
+        currentView = 'terminal';
         desktopActive = false;
         terminalArea.classList.remove('hidden');
         desktopContainer.classList.add('hidden');
@@ -268,7 +299,95 @@
         toggleDesktopBtn.textContent = '桌面';
         const bar = document.getElementById('desktop-ctrl-bar');
         if (bar) bar.classList.add('hidden');
+        // 从网页/桌面切回终端都要重新 fit：容器尺寸变了，不 resize 会保留
+        // 之前（可能被隐藏时）算出来的列数。
         setTimeout(() => { term.resize(); }, 50);
+    }
+
+    // 进入网页视图：只隐藏终端/桌面 DOM，不碰桌面流生命周期（desktopActive
+    // 保持原值），因此从网页回到桌面能无缝继续。
+    function showWebView() {
+        if (!webAvailable || !webView) return;
+        currentView = 'web';
+        webActive = true;
+        terminalArea.classList.add('hidden');
+        desktopContainer.classList.add('hidden');
+        tabBarEl.classList.add('hidden');
+        webviewContainer.classList.remove('hidden');
+        const bar = document.getElementById('desktop-ctrl-bar');
+        if (bar) bar.classList.add('hidden');
+        if (webviewInput && !webviewInput.value) webviewInput.value = WebViewDEFAULT_URL;
+        // 首次进入才自动打开默认地址；之后切回来保留用户当前页面。
+        if (!webView.url) {
+            webView.navigate(webviewInput.value || WebViewDEFAULT_URL);
+        }
+    }
+
+    // 退出网页视图。discard=true 时连 iframe 与 ticket 一起清掉（断线/禁用）。
+    // 只负责藏容器：currentView 由调用方（showDesktopView/showTerminalView）设置。
+    function hideWebView(discard) {
+        webActive = false;
+        webviewContainer.classList.add('hidden');
+        if (discard && webView) webView.reset();
+        if (toggleWebBtn) toggleWebBtn.textContent = '网页';
+    }
+
+    // 能力门控：只有 `session:capabilities` 明确含 web:proxy-v1 才显示入口。
+    // 不可用时如果正在网页视图里，立刻退出并清理（断线后不应留下旧页面）。
+    function setWebEnabled(available) {
+        webAvailable = !!available && !!webView;
+        if (!webAvailable) {
+            if (webActive) showTerminalView();
+            if (webView) webView.reset();
+        }
+        if (!toggleWebBtn) return;
+        toggleWebBtn.classList.toggle('hidden', !webAvailable);
+        toggleWebBtn.disabled = !webAvailable;
+        toggleWebBtn.title = webAvailable
+            ? '浏览远端设备网络中的网页'
+            : '当前设备的 agent 不支持网页映射（需要新版 agent）';
+        toggleWebBtn.textContent = webActive ? '终端' : '网页';
+    }
+
+    if (toggleWebBtn) {
+        toggleWebBtn.addEventListener('click', function () {
+            if (!webAvailable) return;
+            if (webActive) {
+                showTerminalView();
+                toggleWebBtn.textContent = '网页';
+                return;
+            }
+            showWebView();
+            toggleWebBtn.textContent = '终端';
+        });
+    }
+
+    // 地址栏：Enter 打开；打开/刷新/返回终端按钮。
+    if (webviewInput) {
+        webviewInput.addEventListener('keydown', function (e) {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            if (webView) webView.navigate(webviewInput.value);
+        });
+    }
+    const webOpenBtn = document.getElementById('webview-open-btn');
+    if (webOpenBtn) {
+        webOpenBtn.addEventListener('click', function () {
+            if (webView) webView.navigate(webviewInput ? webviewInput.value : WebViewDEFAULT_URL);
+        });
+    }
+    const webRefreshBtn = document.getElementById('webview-refresh-btn');
+    if (webRefreshBtn) {
+        webRefreshBtn.addEventListener('click', function () {
+            if (webView) webView.refresh();
+        });
+    }
+    const webBackBtn = document.getElementById('webview-back-btn');
+    if (webBackBtn) {
+        webBackBtn.addEventListener('click', function () {
+            showTerminalView();
+            if (toggleWebBtn) toggleWebBtn.textContent = '网页';
+        });
     }
 
     function setDesktopEnabled(available) {
@@ -301,8 +420,10 @@
         clearDesktopStartTimer();
         desktopStarting = false;
         toggleDesktopBtn.disabled = !desktopEnabled;
-        // 桌面视图仍在时按钮语义是"切回终端"，此时保持"终端"。
-        toggleDesktopBtn.textContent = desktopActive ? '终端' : '桌面';
+        // 按钮语义跟着「正在看哪个视图」走，而不是桌面流是否在跑：桌面在跑但
+        // 用户切到了网页视图时，按钮应当是「桌面」（点它回去看），只有真的在
+        // 看桌面时才是「终端」（点它停流回终端）。
+        toggleDesktopBtn.textContent = (currentView === 'desktop') ? '终端' : '桌面';
     }
 
     // 编码/码率/灰度/选屏切换都会让 agent stop→start 重建流。切换期间
@@ -480,13 +601,22 @@
 
     toggleDesktopBtn.addEventListener('click', function() {
         if (!desktopEnabled) return;
-        if (desktopActive) {
+        // 判定「是否正在看桌面」用 currentView，不能用 desktopActive：桌面流可能
+        // 正在跑而用户临时切到了网页视图，这时点按钮应当是"回去接着看"，不是
+        // 把流停掉。
+        if (currentView === 'desktop') {
             // 切回终端：停流
             clearDesktopStartTimer();
             desktopView.disconnect();
             window.shellRemote.send('desktop:stop', {});
             desktopStarting = false;
             showTerminalView();
+            return;
+        }
+        if (desktopActive) {
+            // 桌面流还在跑（用户从网页/终端切回来）：只恢复显示，不发 desktop:start。
+            clearDesktopStartTimer();
+            showDesktopView();
             return;
         }
         if (desktopStarting) return;
@@ -745,6 +875,17 @@
         if (window.__applyQualityOnJoin) window.__applyQualityOnJoin();
     });
 
+    // 网页映射能力协商（MYS-2383）：relay 在浏览器 SSE 握手时补发
+    // `session:capabilities {capabilities:[...]}`。只有数组里出现
+    // `web:proxy-v1` 才显示「网页」入口——旧 agent（v0.57.0 及更早）没有这个
+    // 字符串，入口完全不出现；desktop 能力与本入口无关，绝不互相推导。
+    // 每次重连都会重新收到（agent 重新注册会覆盖能力），因此这里直接以最新
+    // 数组为准：不带该能力的重连会把入口重新隐藏。
+    window.shellRemote.on('session:capabilities', function(msg) {
+        const caps = (msg && msg.payload && msg.payload.capabilities) || [];
+        setWebEnabled(Array.isArray(caps) && caps.indexOf('web:proxy-v1') >= 0);
+    });
+
     window.shellRemote.on('desktop:capabilities', function(msg) {
         clearJoinWatchdog();
         setDesktopEnabled(msg.payload && msg.payload.available);
@@ -766,8 +907,9 @@
             sel.value = (codecs.indexOf(cur) >= 0) ? cur : (codecs[0] || 'av1');
         }
         if (msg.payload && msg.payload.running && !desktopActive && !desktopStarting) {
-            // 其它浏览器已开启桌面：本地直接进入观看
-            showDesktopView();
+            // 其它浏览器已开启桌面：把流连上。正在网页视图里时不抢视图。
+            desktopActive = true;
+            if (currentView !== 'web') showDesktopView();
             desktopView.connect(true);
         }
         // 阶段2 LAN 直连：agent 同网段直连地址（"ip:port"），浏览器据此
@@ -787,14 +929,17 @@
         const running = !!(msg.payload && msg.payload.running);
         if (running) {
             if (!desktopActive && !desktopStarting) {
-                // 桌面在跑：直接进入观看并拉流。
-                showDesktopView();
+                // 桌面在跑：接入观看。用户正停在网页视图时不抢视图——只把流连上
+                // （画面落在已隐藏的容器里），等他点「桌面」再显示。
+                desktopActive = true;
+                if (currentView !== 'web') showDesktopView();
                 desktopView.connect(true);
             }
         } else if (desktopActive && !window.__codecSwitchPending) {
-            // 桌面已停且不在编码热切换：退回终端视图。
+            // 桌面已停且不在编码热切换：断开流；只在用户正看着桌面时退回终端。
             desktopView.disconnect();
-            showTerminalView();
+            desktopActive = false;
+            if (currentView === 'desktop') showTerminalView();
         }
     });
 
@@ -812,7 +957,8 @@
         // 实际生效的捕获后端（auto 解析后可能与请求不同，例如 dxgi 回退 gdi）。
         // 先 connect 再设置：connect() 内部 disconnect(false) 会清空面板状态，
         // 若在此前赋值会被一并清掉（backend 行恒为 '-'）。
-        showDesktopView();
+        // 用户在等待期间切到了网页视图：不把他拽回桌面，只把流连上。
+        if (currentView !== 'web') showDesktopView(); else desktopActive = true;
         desktopView.connect(true);
         window._srDesktopInfo = window._srDesktopInfo || {};
         window._srDesktopInfo.backend = (msg.payload && msg.payload.backend) || null;
@@ -961,7 +1107,9 @@
         if (window.__codecSwitchPending) return;
         if (desktopActive) {
             desktopView.disconnect();
-            showTerminalView();
+            desktopActive = false;
+            // 用户可能正在网页视图里：那时不该被拽回终端，只是桌面流没了。
+            if (currentView === 'desktop') showTerminalView();
             showToast('桌面已关闭', 'success');
         }
     });
@@ -970,7 +1118,8 @@
         // 捕获/编码器持续失败（例如 Wayland 下 XWayland root 无法 GetImage）
         if (desktopActive) {
             desktopView.disconnect();
-            showTerminalView();
+            desktopActive = false;
+            if (currentView === 'desktop') showTerminalView();
         }
         // 启动失败时不会再有 desktop:started：复位"连接中…"。
         resetDesktopStarting();
@@ -1005,6 +1154,10 @@
 
     window.shellRemote.on('session:agent_disconnect', function(msg) {
         clearJoinWatchdog();
+        // agent 断线：relay 已撤销该会话的 ticket，网页视图必须立即收起并清空
+        // （否则用户会盯着一份不可刷新的静态页面）。能力本身保留在 relay，
+        // 重连后由新的 session:capabilities 决定入口是否再出现。
+        setWebEnabled(false);
         desktopView.disconnect();
         showTerminalView();
         // agent 已断开：等待中的 desktop:start 不会再有回执，复位按钮。
