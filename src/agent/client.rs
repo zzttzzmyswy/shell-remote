@@ -155,6 +155,9 @@ pub(crate) fn with_agent_token(
 /// feature 且 `WAYLAND_DISPLAY` 可达才声明（无 feature 恒不声明）。
 fn build_capabilities() -> Vec<String> {
     let mut caps: Vec<String> = Vec::new();
+    // 网页代理（MYS-2383）：与桌面能力无关——lean 构建（--no-default-features）
+    // 同样支持，因此不受任何 feature 门控。
+    caps.push(crate::agent::web_proxy::CAPABILITY.to_string());
     caps.push("codec:h264".to_string());
     #[cfg(feature = "av1")]
     caps.push("codec:av1".to_string());
@@ -626,6 +629,20 @@ mod tests {
         ] {
             assert!(caps.iter().any(|c| c == f), "缺少 {f}");
         }
+    }
+
+    #[test]
+    fn test_build_capabilities_declares_web_proxy() {
+        // MYS-2383：网页代理能力是**无条件**声明的——它不依赖桌面 feature，
+        // lean 构建（--no-default-features）也必须是同一个答案，否则 relay
+        // 会让 Web 页面隐藏本可用的入口。
+        assert!(
+            build_capabilities()
+                .iter()
+                .any(|c| c == crate::agent::web_proxy::CAPABILITY),
+            "注册能力必须包含 web:proxy-v1"
+        );
+        assert_eq!(crate::agent::web_proxy::CAPABILITY, "web:proxy-v1");
     }
 
     #[test]
