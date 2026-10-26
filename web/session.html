@@ -46,6 +46,7 @@
             </button>
             <button type="button" id="copy-token-btn" class="btn btn-small" title="复制密钥" aria-label="复制密钥">复制密钥</button>
             <button type="button" id="toggle-desktop-btn" class="btn btn-small" title="打开桌面画面（默认关闭）" aria-label="打开桌面画面" disabled>桌面</button>
+            <button type="button" id="toggle-web-btn" class="btn btn-small hidden" title="浏览远端设备网络中的网页（需要新版 agent）" aria-label="打开网页视图" disabled>网页</button>
             <button type="button" id="toggle-files-btn" class="btn btn-small" aria-label="打开文件管理" aria-expanded="false" aria-controls="file-drawer">文件</button>
         </div>
     </div>
@@ -142,6 +143,25 @@
                 <div class="metrics-row"><span title="本页 JavaScript 堆内存占用（Chrome 支持时）">JS 内存</span><b id="metric-jsmem">-</b></div>
             </div>
         </div>
+        <div id="webview-container" class="webview-container hidden">
+            <div class="webview-bar">
+                <input type="url" id="webview-url-input" class="webview-url" spellcheck="false"
+                       autocomplete="off" placeholder="http://127.0.0.1/"
+                       aria-label="远端网页地址（在远程设备侧解析）">
+                <button type="button" id="webview-open-btn" class="btn btn-small" title="打开地址">打开</button>
+                <button type="button" id="webview-refresh-btn" class="btn btn-small" title="重新加载当前页面">刷新</button>
+                <button type="button" id="webview-back-btn" class="btn btn-small" title="返回终端视图">返回终端</button>
+            </div>
+            <div class="webview-hint">
+                地址在<strong>远程设备侧</strong>解析，可直接访问设备自身的服务（如 <code>http://127.0.0.1/</code>）
+                或同网段内网地址。仅支持普通静态/轻量页面；复杂 SPA、WebSocket、下载与非 GET 表单不受支持。
+            </div>
+            <div id="webview-status" class="web-status" role="status" aria-live="polite"></div>
+            <div class="webview-frame-wrap">
+                <iframe id="webview-frame" class="webview-frame" title="远端网页内容"
+                        sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>
+            </div>
+        </div>
         <div id="file-resizer" class="file-resizer" role="separator" aria-orientation="vertical" aria-label="调整文件面板宽度"></div>
         <aside id="file-drawer" class="file-drawer hidden" aria-label="文件管理">
             <div class="file-drawer-header">
@@ -192,6 +212,7 @@
     <script src="/sse.js"></script>
     <script src="/desktop-mse.js"></script>
     <script src="/desktop.js"></script>
+    <script src="/webview.js"></script>
     <script src="/term.js"></script>
     <script src="/files.js"></script>
     <script src="/session.js"></script>

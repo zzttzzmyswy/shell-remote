@@ -17,6 +17,7 @@
 - **弱网续接** — 终端 shell（PTY）跨 relay 重连存活：断网 / relay 重启 / 半开链路恢复后，正在运行的命令不中断，浏览器重新加入时回放各标签页最近 64KB 输出；agent 上下行都有超时与心跳探活（下行 60s 空闲判死，上行连续 3 次心跳失败判死），重连退避带抖动且健康会话后复位。详见 [docs/weak-network-robustness.md](docs/weak-network-robustness.md)
 - **桌面共享** — agent 捕获 X11/Windows 桌面，H.264（openh264 软编）实时编码，动态码率 800–200kbps 自适应，浏览器 MSE 播放；会话页可在"终端/桌面"间任意切换（桌面默认关闭，点击按钮开流）
 - **P2P 直连（阶段1/2）** — 桌面流下行优先直连：同网段浏览器经 `--desktop-lan-port` 直连 agent 本地端点（LAN），否则 WebRTC DataChannel（WebRTC），均失败自动回退 relay 转发。三种路径用户无感切换，任何时刻不劣于纯 relay
+- **网页映射** — 会话页"网页"按钮经 relay/agent 隧道浏览远端设备网络中的页面（可直接访问设备自身 `127.0.0.1` 服务）；入口按 agent 能力 `web:proxy-v1` 协商，旧版 agent 完全不显示。适用普通静态/轻量页面，详见[网页映射](#网页映射)
 - **SSE+POST 协议** — 全链路使用 HTTP SSE 推送 + POST 发送，兼容性好，不依赖 WebSocket
 - **单二进制** — 所有 Web 资源通过 `rust-embed` 编译嵌入，零外部文件依赖
 - **Token 鉴权** — 随机临时 Token 或固定密钥；支持读写和只读两种权限
@@ -280,6 +281,72 @@ session: a1b2c3d4
   --desktop-capture auto --desktop-fps 30
 ```
 
+## 网页映射
+
+会话页工具栏的"网页"按钮打开一个独立视图，经 relay → agent 隧道访问**远端设备网络环境**中的网页——包括只监听 `127.0.0.1`、外部无法直接访问的设备自身服务。
+
+### 能力协商
+
+入口完全由 agent 声明的能力决定，不按版本号猜测：
+
+- agent 注册时在 `capabilities` 里声明 `web:proxy-v1`；relay 在浏览器 SSE 握手时补发一条 `session:capabilities {capabilities:[...]}`。
+- 浏览器只有在该数组含 `web:proxy-v1` 时才显示并启用"网页"按钮。**旧版 agent（≤ v0.57.0）不声明该能力 → 按钮不出现**，直接请求代理接口也会被 relay 以 404 拒绝。
+- `session:agent_disconnect`（agent 断线）时立即隐藏入口、退出网页视图并清空 iframe；重连后以新的 `session:capabilities` 为准，无该能力则保持隐藏。
+- 该能力与桌面能力（`desktop:capabilities`）互相独立，lean 构建的 agent 同样支持网页映射。
+
+### 鉴权与接口
+
+| 路径 | 方法 | 鉴权 | 说明 |
+|------|------|------|------|
+| `/agent/web/ticket` | POST | `X-SR-Token`（会话 Token）+ `X-Auth`（服务器口令，未配置可省略） | 签发绑定会话的短期凭据，返回 `{ticket, expires_in}`（默认 600s） |
+| `/agent/web/proxy?ticket=…&url=…` | GET | 仅 ticket（签发时已鉴权） | 取远端页面；响应头 `X-SR-Final-URL` 给出重定向后的最终地址 |
+
+- 只支持 GET；`url` 必须是绝对 `http://` / `https://` 地址，长度 ≤ 4096。
+- **ticket 与会话 Token 完全独立**：256 bit CSPRNG 随机、不可从 Token 推导、每会话最多 8 个、默认 10min 过期、agent 断线时全部撤销。ticket 只出现在代理 URL 的 query 里，**会话 Token 与服务器口令从不进入任何 URL**，浏览器请求也不带 cookie。
+- 状态码：无效会话 Token 401、无效/过期 ticket 403、agent 无该能力 404、agent 离线 503、并发超限（每会话 8 个在途）429。
+- ro Token 也能浏览（页面 GET 不改变远端状态）。
+
+### 页面加载策略
+
+relay **不重写** HTML/CSS（只做流式转发），相对资源的重写由浏览器端 `web/webview.js` 完成：
+
+1. 先用同一代理 fetch 主文档，用响应头 `X-SR-Final-URL`（和文档内 `<base href>`）作为相对 URL 的基准——重定向后仍能解析正确的相对路径。
+2. 重写 `src` / `href` / `poster` / `srcset` / `style` 属性与文档内 `<style>`、外部样式表里的 CSS `url()` 和 `@import`，全部指向同源代理 URL（只带 ticket）。
+3. 外部样式表取回后**内联**成 `<style>`：否则 CSS 内部的相对 `url()` 会以代理 URL 为基准解析，图片必然 404。
+4. 删除 `<script>`、远端 CSP/refresh `<meta>` 与 `<base>`，把结果放进 `iframe[srcdoc]`，sandbox 只用 `allow-same-origin`（**不给 `allow-scripts`**）——远端 JS 一律不执行。
+5. 站内链接点击被父页面拦截，改走同一条代理；表单提交被拦下并提示（不支持非 GET 表单）。
+
+### 使用示例
+
+会话页点"网页" → 地址栏填设备侧地址 → "打开"。地址在**远程设备侧解析**，因此可以填：
+
+```
+http://127.0.0.1/                  # 设备自身服务（默认地址）
+http://127.0.0.1:8080/admin        # 设备上另一端口
+http://192.168.1.50/status         # 设备所在内网的其它主机
+https://internal.example.local/    # 内网 HTTPS（自签证书会被 agent 拒绝，见下）
+```
+
+### 已知限制
+
+- **仅静态/轻量页面**：远端 JavaScript 不执行，依赖 JS 渲染的 SPA、懒加载、动态拼出来的 URL 都不会工作。
+- **WebSocket / SSE 等长连接**不支持（代理只转发单次 GET 的响应体）。
+- **非 GET 表单、文件下载**不支持。
+- **自签证书 / 双向 TLS** 的目标站会被 agent 的 HTTP 客户端拒绝（rustls 默认根证书）。
+- 单请求 5min 总时限、块间 30s 空闲超时（agent 侧重置）；单页并发子资源每会话上限 8 个在途请求，超出返回 429（页面可能显示部分资源缺失）。
+- 已内联的样式表上限 8 个 / 单个 512 KiB，主文档上限 8 MiB；超限时提示而不静默显示半页。
+
+### 验证
+
+```bash
+# 重写函数与 ticket 生命周期的单元测试（node，无框架）
+node tools/test_webview.js
+
+# 真 relay + 真 agent + 只监听 127.0.0.1 的静态站 + 无头 Chromium 的端到端验证
+cargo build --bin shell-remote --bin shell-remote-ui
+xvfb-run -a node tools/verify_webview_ui.js
+```
+
 ## Windows Agent
 
 系统要求：Windows 10 1809+（ConPTY 最低版本）。
@@ -347,6 +414,8 @@ cargo build --release --bin shell-remote-ui --target x86_64-pc-windows-gnu
 | `/agent/events` | GET → SSE | Agent 接收消息流（HTTP 模式） |
 | `/agent/send` | POST | Agent 发送消息（HTTP 模式） |
 | `/agent/upload` | POST | 文件上传 |
+| `/agent/web/ticket` | POST | 网页映射：签发绑定会话的短期资源凭据（`X-SR-Token` + `X-Auth`） |
+| `/agent/web/proxy` | GET | 网页映射：经隧道取远端页面（`?ticket=…&url=…`，返回 `X-SR-Final-URL`） |
 | `/agent/mcp/sse` | GET → SSE | MCP SSE Transport 端点 |
 | `/agent/mcp/messages` | POST | MCP JSON-RPC 消息 |
 

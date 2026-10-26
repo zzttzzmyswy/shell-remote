@@ -517,6 +517,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_static_handler_webview_js() {
+        // MYS-2383-C：会话页「网页」视图脚本必须能经静态路由取到（显式路由
+        // + fallback 两条路径都覆盖），否则页面会静默地没有 WebView。
+        let uri = "/webview.js".parse::<Uri>().unwrap();
+        let resp = static_handler(uri, HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("javascript")),
+            "webview.js 必须以 JS MIME 返回"
+        );
+    }
+
+    #[tokio::test]
     async fn test_static_handler_not_found() {
         let uri = "/nonexistent".parse::<Uri>().unwrap();
         let resp = static_handler(uri, HeaderMap::new()).await;
@@ -567,6 +583,8 @@ mod tests {
             "desktop.js",
             "desktop-mse.js",
             "session.js",
+            // MYS-2383-C：会话页「网页」视图（重写器 + WebView 控制器）。
+            "webview.js",
             "install.sh",
         ];
         for name in assets {
@@ -612,6 +630,8 @@ mod tests {
             .route("/term.js", get(static_handler))
             .route("/files.js", get(static_handler))
             .route("/session.js", get(static_handler))
+            // MYS-2383-C：会话页「网页」视图（WebView 控制器 + 重写器）。
+            .route("/webview.js", get(static_handler))
             .route("/agent/install", get(install_script_handler))
             .route("/agent/install.ps1", get(install_script_ps1_handler))
             .fallback(get(static_handler))
@@ -1783,7 +1803,9 @@ pub async fn start(
         .route("/sse.js", get(static_handler))
         .route("/term.js", get(static_handler))
         .route("/files.js", get(static_handler))
-        .route("/session.js", get(static_handler));
+        .route("/session.js", get(static_handler))
+        // MYS-2383-C：网页视图脚本（会话页 <script src="/webview.js">）。
+        .route("/webview.js", get(static_handler));
 
     // Admin panel routes — registered only when --admin-path is set. Paths
     // are built at startup from the configured secret prefix; axum parses them
