@@ -11,6 +11,7 @@ pub mod lan;
                                 #[cfg(feature = "desktop")]
 pub mod p2p;
 pub mod shell;
+pub mod tcp_tunnel;
 pub mod upgrade;
 pub mod web_proxy;
 
@@ -456,6 +457,43 @@ async fn post_raw(
     match client::with_agent_token(client.post(send_url), agent_token)
         .timeout(client::POST_TIMEOUT)
         .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "Agent POST failed ({}): {}",
+                status,
+                client::snippet(&body, 200)
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("Agent POST send error: {}", e);
+            false
+        }
+    }
+}
+
+/// 同 [`post_raw`]，但入参已是**序列化好的 JSON 文本**，直接作为请求体发出。
+///
+/// 数据面（`tcp_tunnel` 的批量上行）用这个：批次可能有 1 MiB，`post_raw` 会先
+/// `from_str` 成 `Value` 再 `json()` 序列化一遍，等于白白全量解析 + 重编码两次。
+/// 解析失败的行在这里不再单独校验 —— 调用方拼的数组来自自己的 `serde_json`
+/// 输出，本就合法。
+async fn post_json_text(
+    client: &reqwest::Client,
+    send_url: &str,
+    agent_token: &str,
+    text: String,
+) -> bool {
+    match client::with_agent_token(client.post(send_url), agent_token)
+        .timeout(client::POST_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(text)
         .send()
         .await
     {
@@ -1230,6 +1268,21 @@ async fn run_session(
     // 网页代理（MYS-2383 阶段1）：回包与 mcp/fs 结果共用这条 control 上行，
     // 抓取任务各自独立，主循环只做校验与派发（慢页面不阻塞终端/MCP）。
     let web_proxy = web_proxy::WebProxy::new(client.session_id.clone(), task_control_tx.clone());
+
+    // TCP 字节管道（MYS-2383 阶段2）：原始字节量大且连续，**不能**挤 control
+    // 通道（那条是单条逐个 POST，会把终端输出与 MCP 回包堵在后面）。这里起一条
+    // 专用上行 task：有界队列 → 批量 JSON 数组 → 一次 POST。会话结束时 abort。
+    let (tcp_up_tx, tcp_up_rx) = tokio::sync::mpsc::channel::<String>(tcp_tunnel::UPLINK_QUEUE);
+    let tcp_tunnel = tcp_tunnel::TcpTunnel::new(client.session_id.clone(), tcp_up_tx);
+    let tcp_uplink_task = tokio::spawn(tcp_tunnel::uplink_loop(
+        tcp_tunnel::HttpPoster::new(
+            client.http_client().clone(),
+            client.send_url().to_string(),
+            client.agent_token(),
+        ),
+        tcp_up_rx,
+        tcp_tunnel.clone(),
+    ));
 
     // 时钟校准：采样 relay /api/clock 求 (relay_epoch - 本地_epoch) 偏移，
     // 注入 DesktopManager，srtc 打点落在 relay 时基 —— e2e 延时从此不再
@@ -2727,6 +2780,29 @@ async fn run_session(
                                     web_proxy.handle_cancel(&msg.payload);
                                 }
 
+                                // TCP 字节管道（MYS-2383 阶段2）。与网页代理一样
+                                // 只做转交：建连与 socket I/O 都在每连接自己的
+                                // task 里，这个循环永远不会被慢目标或大流量占住。
+                                "tcp:open" => {
+                                    tcp_tunnel.handle_open(&msg.payload).await;
+                                }
+
+                                "tcp:data" => {
+                                    tcp_tunnel.handle_data(&msg.payload).await;
+                                }
+
+                                "tcp:ack" => {
+                                    tcp_tunnel.handle_ack(&msg.payload);
+                                }
+
+                                "tcp:eof" => {
+                                    tcp_tunnel.handle_eof(&msg.payload);
+                                }
+
+                                "tcp:close" => {
+                                    tcp_tunnel.handle_close(&msg.payload);
+                                }
+
                                 other => {
                                     tracing::debug!("Unknown message type: {}", other);
                                 }
@@ -2745,6 +2821,10 @@ async fn run_session(
     // 网页代理会话退出清理：abort 全部在途抓取并停止回包（回包通道也随之
     // 失效，若不先关会在新会话里继续向旧 session 发 web:chunk）。
     web_proxy.shutdown();
+    // TCP 管道会话退出清理：abort 全部连接 task 且不再发送消息，再收掉专用
+    // 上行 task（否则它会继续向已失效的 relay 连接 POST 上一批残留数据）。
+    tcp_tunnel.shutdown();
+    tcp_uplink_task.abort();
     // Tabs are deliberately kept (owned by `start`): shells survive the
     // reconnect and are replayed to browsers on re-join.
 

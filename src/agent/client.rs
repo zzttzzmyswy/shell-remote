@@ -158,6 +158,8 @@ fn build_capabilities() -> Vec<String> {
     // 网页代理（MYS-2383）：与桌面能力无关——lean 构建（--no-default-features）
     // 同样支持，因此不受任何 feature 门控。
     caps.push(crate::agent::web_proxy::CAPABILITY.to_string());
+    // 纯 TCP 字节管道（MYS-2383 阶段2）：同上，与 feature 无关，lean 构建也声明。
+    caps.push(crate::agent::tcp_tunnel::CAPABILITY.to_string());
     caps.push("codec:h264".to_string());
     #[cfg(feature = "av1")]
     caps.push("codec:av1".to_string());
@@ -187,6 +189,12 @@ fn build_capabilities() -> Vec<String> {
         caps.push(f.to_string());
     }
     caps
+}
+
+/// 仅测试用：让兄弟模块（`tcp_tunnel`）能断言能力集内容。
+#[cfg(test)]
+pub(crate) fn capabilities_for_test() -> Vec<String> {
+    build_capabilities()
 }
 
 pub struct RelayClient {
