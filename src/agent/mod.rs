@@ -478,6 +478,43 @@ async fn post_raw(
     }
 }
 
+/// 同 [`post_raw`]，但入参已是**序列化好的 JSON 文本**，直接作为请求体发出。
+///
+/// 数据面（`tcp_tunnel` 的批量上行）用这个：批次可能有 1 MiB，`post_raw` 会先
+/// `from_str` 成 `Value` 再 `json()` 序列化一遍，等于白白全量解析 + 重编码两次。
+/// 解析失败的行在这里不再单独校验 —— 调用方拼的数组来自自己的 `serde_json`
+/// 输出，本就合法。
+async fn post_json_text(
+    client: &reqwest::Client,
+    send_url: &str,
+    agent_token: &str,
+    text: String,
+) -> bool {
+    match client::with_agent_token(client.post(send_url), agent_token)
+        .timeout(client::POST_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(text)
+        .send()
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "Agent POST failed ({}): {}",
+                status,
+                client::snippet(&body, 200)
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("Agent POST send error: {}", e);
+            false
+        }
+    }
+}
+
 /// Map an I/O error to a coarse kind the relay can translate into an HTTP
 /// status code (404 / 400 / 403 / 500).
 fn kind_for_io(e: &std::io::Error) -> &'static str {
@@ -1238,9 +1275,11 @@ async fn run_session(
     let (tcp_up_tx, tcp_up_rx) = tokio::sync::mpsc::channel::<String>(tcp_tunnel::UPLINK_QUEUE);
     let tcp_tunnel = tcp_tunnel::TcpTunnel::new(client.session_id.clone(), tcp_up_tx);
     let tcp_uplink_task = tokio::spawn(tcp_tunnel::uplink_loop(
-        client.http_client().clone(),
-        client.send_url().to_string(),
-        client.agent_token(),
+        tcp_tunnel::HttpPoster::new(
+            client.http_client().clone(),
+            client.send_url().to_string(),
+            client.agent_token(),
+        ),
         tcp_up_rx,
         tcp_tunnel.clone(),
     ));

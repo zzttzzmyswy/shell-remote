@@ -32,13 +32,31 @@
 //! 空闲超时（WebSocket 可能长时间静默），只在 `tcp:close`、出错、会话
 //! `shutdown()` 时结束。
 //!
+//! # 全双工
+//!
+//! 每条连接拆成**两个独立 task**：读方向（socket → `tcp:data`，受发送窗口约束）
+//! 与写方向（`tcp:data` 队列 → socket，写完回 `tcp:ack`）。两者互不阻塞：目标
+//! 忙着自己写、暂时不读时，只有写方向停在 `write_all`，读方向照常把目标吐出的
+//! 数据搬走。WebSocket 与 HTTP 上传/下载同时进行不会互锁。
+//!
 //! # 上行通道
 //!
 //! 字节流**不走** control 通道（`task_control_tx` 单条逐个 POST，会把终端与 MCP
 //! 的回包挤在后面）。这里另起一条专用上行 task：有界队列 → 每轮取一批
 //! （≤[`UPLINK_BATCH_MSGS`] 条 / ≤[`UPLINK_BATCH_BYTES`] 字节）→ 拼成 JSON 数组
 //! 一次 POST 到 `/agent/send`（relay 已支持数组批量）。单 task 顺序 POST 保证同一
-//! 连接的消息不乱序。POST 失败即中止全部连接——字节流已不可恢复。
+//! 连接的消息不乱序。
+//!
+//! **一次 POST 失败不等于本会话的管道报废**：失败只中止当时在途的全部连接
+//! （它们的字节流可能只送达一半，无法续传），上行 task 随即继续工作，新的
+//! `tcp:open` 照常建连。只有会话 `shutdown()` 才把管道整体置废。
+//!
+//! # 派发不阻塞主循环
+//!
+//! `handle_open` / `handle_data` 跑在 `run_session` 的主循环里（那条循环同时负责
+//! 终端输入与 MCP）。它们的错误回包走 [`Out::send_detached`]：队列有空位就直接
+//! 入队，满了交给 detached task 去等，**从不** await 上行队列。高负载下第 33 个
+//! 连接的 `busy` 拒绝不会连带卡住整个 agent。
 //!
 //! # `tcp:close` 的严格语义
 //!
@@ -249,15 +267,15 @@ impl ClosedSet {
 }
 
 impl Out {
-    /// 返回 false = 这条没送出去（通道关闭或上行已废），调用方应停止发送。
-    async fn send(&self, msg_type: &str, payload: Value) -> bool {
+    /// 把一条消息序列化好；`None` = 不该发（上行已废 / 连接已 close）。
+    fn encode(&self, msg_type: &str, payload: Value) -> Option<String> {
         if self.dead.load(Ordering::SeqCst) {
-            return false;
+            return None;
         }
         // 已经 close 的连接，消息连队列都别进（第一道防线）。
         if let Some(id) = payload.get("conn_id").and_then(|v| v.as_str()) {
             if self.closed.lock().unwrap().contains(id) {
-                return true;
+                return None;
             }
         }
         let msg = Message {
@@ -266,10 +284,50 @@ impl Out {
             payload,
         };
         match serde_json::to_string(&msg) {
-            Ok(text) => self.tx.send(text).await.is_ok(),
+            Ok(text) => Some(text),
             Err(e) => {
                 tracing::warn!(msg_type, "tcp tunnel: failed to serialize message: {e}");
-                false
+                None
+            }
+        }
+    }
+
+    /// 发送一条消息，必要时等队列腾出位置（连接 task 内部用：那里可以阻塞，
+    /// 阻塞只影响自己这条连接）。
+    ///
+    /// 返回 false = 这条没送出去（通道关闭或上行已废），调用方应停止发送。
+    async fn send(&self, msg_type: &str, payload: Value) -> bool {
+        match self.encode(msg_type, payload) {
+            Some(text) => self.tx.send(text).await.is_ok(),
+            // 被墓碑/已废拦下不算通道坏掉：调用方继续跑即可。
+            None => !self.dead.load(Ordering::SeqCst),
+        }
+    }
+
+    /// 发送一条消息但**绝不等待**队列（派发路径专用）。
+    ///
+    /// `handle_open` / `handle_data` 跑在 `run_session` 的主循环里，那条循环同时
+    /// 负责终端输入与 MCP。高负载时上行队列（256 格）经常是满的，若在这里
+    /// `await`，第 33 个连接的 `busy` 拒绝就会把整个 agent 卡住。因此队列满时
+    /// 交给一个 detached task 去等，主循环立即返回。
+    ///
+    /// 顺序性：队列满说明这一批消息已经堆积在前，spawn 出去的那条排在它们之后
+    /// 入队，同一连接的消息顺序仍然成立（`tcp:error` 终态本就允许在迟到数据之后）。
+    fn send_detached(&self, msg_type: &str, payload: Value) {
+        let Some(text) = self.encode(msg_type, payload) else {
+            return;
+        };
+        match self.tx.try_send(text) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(msg_type, "tcp tunnel: uplink closed, message dropped");
+            }
+            Err(mpsc::error::TrySendError::Full(text)) => {
+                // 队列满：不阻塞主循环，丢给一个 detached task 去等。
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(text).await;
+                });
             }
         }
     }
@@ -347,7 +405,8 @@ impl TcpTunnel {
             Ok(p) => p,
             Err((kind, message)) => {
                 tracing::debug!(conn_id, %message, "tcp:open rejected");
-                self.emit_error(conn_id, kind, message).await;
+                // 派发路径在主循环里被 await：不能等上行队列。
+                self.emit_error_detached(conn_id, kind, message);
                 return;
             }
         };
@@ -356,8 +415,7 @@ impl TcpTunnel {
         // 是关旧的还是放弃这次 open）。
         if self.inner.conns.lock().unwrap().contains_key(conn_id) {
             tracing::debug!(conn_id, "tcp:open rejected: conn_id already in use");
-            self.emit_error(conn_id, "invalid", "conn_id already in use".to_string())
-                .await;
+            self.emit_error_detached(conn_id, "invalid", "conn_id already in use".to_string());
             return;
         }
 
@@ -366,15 +424,14 @@ impl TcpTunnel {
             Ok(p) => p,
             Err(_) => {
                 tracing::debug!(conn_id, "tcp:open rejected: concurrency limit");
-                self.emit_error(
+                self.emit_error_detached(
                     conn_id,
                     "busy",
                     format!(
                         "more than {} concurrent connections",
                         self.inner.limits.max_conns
                     ),
-                )
-                .await;
+                );
                 return;
             }
         };
@@ -442,7 +499,7 @@ impl TcpTunnel {
         let seq = match payload.get("seq").and_then(|v| v.as_u64()) {
             Some(s) => s,
             None => {
-                self.fail(conn_id, "protocol", "tcp:data missing seq").await;
+                self.fail(conn_id, "protocol", "tcp:data missing seq");
                 return;
             }
         };
@@ -450,8 +507,7 @@ impl TcpTunnel {
         let data = match B64.decode(data_b64) {
             Ok(d) => d,
             Err(_) => {
-                self.fail(conn_id, "protocol", "tcp:data has invalid base64")
-                    .await;
+                self.fail(conn_id, "protocol", "tcp:data has invalid base64");
                 return;
             }
         };
@@ -467,8 +523,7 @@ impl TcpTunnel {
                     conn_id,
                     "protocol",
                     "relay exceeded the write window (write queue full)",
-                )
-                .await;
+                );
             }
         }
     }
@@ -569,10 +624,39 @@ impl TcpTunnel {
         }
     }
 
-    /// 上行已废（批量 POST 失败）：字节流不可恢复，中止全部的连接。
-    pub fn fail_all(&self) {
-        tracing::warn!("tcp tunnel: uplink POST failed — aborting all connections");
-        self.shutdown();
+    /// 上行某批 POST 失败：中止**当时在途的全部连接**，但不废掉整条管道。
+    ///
+    /// 这一批里可能混着多个连接的消息，字节流已不可恢复，所以这些连接必须
+    /// 全部中止（现实中批次通常只涉及一两个连接）。但一次瞬时失败（20s 超时、
+    /// relay 重启、短暂 5xx）不该让终端仍在线时后续所有 `tcp:open` 都石沉大海，
+    /// 因此**不**置 `dead`：上行 task 丢弃本批后继续跑，新连接照常工作。
+    /// `dead` 只由会话 `shutdown()` 设置。
+    ///
+    /// 被中止的 conn_id 一律立墓碑，让队列里属于它们的残留消息在发批次前被
+    /// 过滤掉（这批 POST 已经失败，它们的内容可能只送达一半）。
+    pub fn abort_in_flight(&self) -> usize {
+        let drained: Vec<(String, Conn)> = {
+            let mut map = self.inner.conns.lock().unwrap();
+            map.drain().collect()
+        };
+        let n = drained.len();
+        {
+            let mut closed = self.inner.out.closed.lock().unwrap();
+            for (conn_id, _) in &drained {
+                closed.insert(conn_id.clone());
+            }
+        }
+        for (_, c) in drained {
+            c.cancel.cancel();
+            c.abort.abort();
+        }
+        if n > 0 {
+            tracing::warn!(
+                conns = n,
+                "tcp tunnel: uplink POST failed — aborted in-flight connections (tunnel stays usable)"
+            );
+        }
+        n
     }
 
     /// 当前在途连接数（测试与观测用）。
@@ -580,25 +664,30 @@ impl TcpTunnel {
         self.inner.conns.lock().unwrap().len()
     }
 
-    async fn emit_error(&self, conn_id: &str, kind: &str, message: String) {
+    /// 派发路径专用：回一条终态错误但**不等上行队列**（见
+    /// [`Out::send_detached`]）。`handle_*` 在主循环里被 await，不能阻塞。
+    fn emit_error_detached(&self, conn_id: &str, kind: &str, message: String) {
         let payload = json!({
             "conn_id": conn_id,
             "kind": kind,
             "message": message,
         });
-        if !self.inner.out.send("tcp:error", payload).await {
-            tracing::debug!(conn_id, "tcp:error not delivered (uplink closing)");
-        }
+        self.inner.out.send_detached("tcp:error", payload);
     }
 
     /// 派发侧判定某连接已不可用：摘掉记录、abort 任务、回一条 `tcp:error`。
-    async fn fail(&self, conn_id: &str, kind: &str, message: &str) {
+    ///
+    /// 派发串行且"摘记录"与"回终态"之间没有 await，因此"是否真的摘到"就是
+    /// "这条 open/data 是否该由我来回终态"的判据 —— 每个 open 仍然恰好一条终态。
+    fn fail(&self, conn_id: &str, kind: &str, message: &str) {
         let removed = self.inner.conns.lock().unwrap().remove(conn_id);
         match removed {
             Some(c) => {
                 c.cancel.cancel();
                 c.abort.abort();
-                self.emit_error(conn_id, kind, message.to_string()).await;
+                // 我摘到了记录 = 由我负责这条终态，所以这条必须在立墓碑之前
+                // 发出去（`fail` 只用于活连接，此时墓碑还没立）。
+                self.emit_error_detached(conn_id, kind, message.to_string());
             }
             // 任务已自己结束并摘了记录（终态已发）：别再补一条。
             None => {
@@ -653,7 +742,16 @@ async fn run_conn(
     unacked: Arc<Unacked>,
     write_rx: mpsc::Receiver<WriteCmd>,
 ) {
-    let outcome = drive(&inner, &conn_id, &host, port, &cancel, &unacked, write_rx).await;
+    let outcome = drive(
+        inner.clone(),
+        conn_id.clone(),
+        host,
+        port,
+        &cancel,
+        &unacked,
+        write_rx,
+    )
+    .await;
 
     // 先发终态，再摘记录：摘掉之后同 id 的新 open 才能进来，避免终态落到
     // 新连接头上。
@@ -687,17 +785,20 @@ async fn run_conn(
 }
 
 async fn drive(
-    inner: &Inner,
-    conn_id: &str,
-    host: &str,
+    inner: Arc<Inner>,
+    conn_id: String,
+    host: String,
     port: u16,
-    cancel: &CancelFlag,
-    unacked: &Unacked,
-    mut write_rx: mpsc::Receiver<WriteCmd>,
+    cancel: &Arc<CancelFlag>,
+    unacked: &Arc<Unacked>,
+    write_rx: mpsc::Receiver<WriteCmd>,
 ) -> Outcome {
     // ── 建连 ────────────────────────────────────────────────────────────
-    let stream = match tokio::time::timeout(inner.limits.connect, TcpStream::connect((host, port)))
-        .await
+    let stream = match tokio::time::timeout(
+        inner.limits.connect,
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
     {
         Err(_) => return Outcome::Failed("timeout", format!("connect to {host}:{port} timed out")),
         Ok(Err(e)) => {
@@ -721,86 +822,206 @@ async fn drive(
         return Outcome::Aborted;
     }
 
-    let (mut rd, mut wr) = stream.into_split();
+    let (rd, wr) = stream.into_split();
     let window = inner.limits.window.max(1);
+
+    // ── 两个方向**并发**跑 ──────────────────────────────────────────────
+    //
+    // 读、写各占一个 task，谁都不阻塞谁：目标忙着自己写（暂时不读）时，
+    // 我们的写半部分顶多卡在自己那个 task 里，读半部分照常把目标吐出的
+    // 数据取走 —— 全双工（WebSocket、HTTP 上传/下载同时进行）不会互锁。
+    //
+    // 语义与单循环版本一致：
+    // - 读方向看到 0 → `tcp:eof`，写方向继续（目标可能还在收我们的数据）；
+    // - 写方向收到 `tcp:eof` → 写半关闭，读方向继续；
+    // - 两边都结束 → `tcp:closed`；
+    // - 任一方向出错 → 立刻 cancel 另一个，整条连接只回**一条** `tcp:error`。
+    let read_task = tokio::spawn(read_half(
+        inner.clone(),
+        conn_id.to_string(),
+        rd,
+        window,
+        unacked.clone(),
+        cancel.clone(),
+    ));
+    let write_task = tokio::spawn(write_half(
+        inner.clone(),
+        conn_id.to_string(),
+        wr,
+        write_rx,
+        cancel.clone(),
+    ));
+
+    // 两个 task 都会在 cancel 后自行收敛，因此 join 一定会完成。
+    let (read_out, write_out) = tokio::join!(read_task, write_task);
+    let read_out = read_out.unwrap_or(HalfOutcome::Aborted);
+    let write_out = write_out.unwrap_or(HalfOutcome::Aborted);
+
+    // 终态优先级：错误 > 中止 > 正常结束。
+    for half in [&read_out, &write_out] {
+        if let HalfOutcome::Failed(kind, message) = half {
+            return Outcome::Failed(kind, message.clone());
+        }
+    }
+    if matches!(read_out, HalfOutcome::Aborted) || matches!(write_out, HalfOutcome::Aborted) {
+        return Outcome::Aborted;
+    }
+    Outcome::Closed
+}
+
+/// 单个方向的结局。
+enum HalfOutcome {
+    /// 被 close / 会话结束 / 兄弟方向出错带走：不留任何消息。
+    Aborted,
+    /// 目标关闭了读方向（已发 `tcp:eof`）。
+    ReadDone,
+    /// relay 发了 `tcp:eof`（已做写半关闭）。
+    RelayDone,
+    /// `(kind, message)`。
+    Failed(&'static str, String),
+}
+
+/// 发送一条上行消息，同时监听 cancel —— 连接被 close 时不必等队列腾位置。
+///
+/// `None` = 已取消（调用方直接收摊），`Some(ok)` = 送出去了没有。
+async fn send_cancellable(
+    out: &Out,
+    cancel: &CancelFlag,
+    msg_type: &str,
+    payload: Value,
+) -> Option<bool> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        ok = out.send(msg_type, payload) => Some(ok),
+    }
+}
+
+/// 读方向：socket → `tcp:data`（受发送窗口约束）/ `tcp:eof`。
+///
+/// 窗口用满就停在这里，让 TCP 把背压自然传给目标 —— 这段等待与写方向无关。
+async fn read_half(
+    inner: Arc<Inner>,
+    conn_id: String,
+    mut rd: OwnedReadHalf,
+    window: usize,
+    unacked: Arc<Unacked>,
+    cancel: Arc<CancelFlag>,
+) -> HalfOutcome {
     let mut buf = vec![0u8; MAX_CHUNK_BYTES.min(window)];
-    // relay→agent 方向的期望 seq（从 0 连续）。
-    let mut in_seq: u64 = 0;
     // agent→relay 方向的写出 seq（从 0 连续）。
     let mut out_seq: u64 = 0;
-    // 目标关闭了读方向（我们已发 tcp:eof）。
-    let mut read_done = false;
-    // relay 发来 tcp:eof（我们已做写半关闭）。
-    let mut relay_eof = false;
 
     loop {
-        if read_done && relay_eof {
-            return Outcome::Closed;
+        // 窗口用满就不读 socket。窗口为空时的等待也必须可取消。
+        if unacked.level() >= window {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return HalfOutcome::Aborted,
+                _ = unacked.wait_below(window) => continue,
+            }
         }
-
-        // 窗口用满就不读 socket，让 TCP 把背压传给目标。
-        let avail = window.saturating_sub(unacked.level());
-        let can_read = !read_done && avail > 0;
-        let want = avail.min(buf.len());
-        // 只有「读方向还活着、但窗口满了」才需要等窗口释放。读方向已结束时也
-        // 去等就是空转（`wait_below` 会立刻返回），会把写队列饿死。
-        let wait_window = !read_done && avail == 0;
-
-        tokio::select! {
+        let want = window.saturating_sub(unacked.level()).min(buf.len());
+        let read = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Outcome::Aborted,
+            _ = cancel.cancelled() => return HalfOutcome::Aborted,
+            r = rd.read(&mut buf[..want]) => r,
+        };
+        match read {
+            Err(e) => {
+                cancel.cancel();
+                return HalfOutcome::Failed("io", format!("read from target failed: {e}"));
+            }
+            Ok(0) => {
+                if send_cancellable(
+                    &inner.out,
+                    &cancel,
+                    "tcp:eof",
+                    json!({ "conn_id": conn_id }),
+                )
+                .await
+                .is_none_or(|ok| !ok)
+                {
+                    return HalfOutcome::Aborted;
+                }
+                return HalfOutcome::ReadDone;
+            }
+            Ok(n) => {
+                unacked.add(n);
+                let payload = json!({
+                    "conn_id": conn_id,
+                    "seq": out_seq,
+                    "data": B64.encode(&buf[..n]),
+                });
+                out_seq += 1;
+                if send_cancellable(&inner.out, &cancel, "tcp:data", payload)
+                    .await
+                    .is_none_or(|ok| !ok)
+                {
+                    return HalfOutcome::Aborted;
+                }
+            }
+        }
+    }
+}
 
-            cmd = write_rx.recv() => match cmd {
-                // 写队列发送端被丢弃 = 隧道正在销毁。
-                None => return Outcome::Aborted,
-                Some(WriteCmd::Data { seq, data }) => {
-                    if seq != in_seq {
-                        return Outcome::Failed(
-                            "protocol",
-                            format!("tcp:data seq {seq} out of order (expected {in_seq})"),
-                        );
-                    }
-                    in_seq += 1;
-                    if let Err(e) = wr.write_all(&data).await {
-                        return Outcome::Failed("io", format!("write to target failed: {e}"));
-                    }
-                    let ack = json!({ "conn_id": conn_id, "bytes": data.len() });
-                    if !inner.out.send("tcp:ack", ack).await {
-                        return Outcome::Aborted;
-                    }
-                }
-                Some(WriteCmd::Eof) => {
-                    relay_eof = true;
-                    if let Err(e) = wr.shutdown().await {
-                        return Outcome::Failed("io", format!("shutdown(write) failed: {e}"));
-                    }
-                }
-            },
+/// 写方向：`tcp:data` 队列 → socket，写完回 `tcp:ack`；`tcp:eof` → 写半关闭。
+///
+/// `wr.write_all` 只阻塞这个 task。目标读得慢时，这里的等待不会妨碍读方向
+/// 继续把目标吐出的数据搬走，因此不会出现"我不读你、你不读我"的互锁。
+async fn write_half(
+    inner: Arc<Inner>,
+    conn_id: String,
+    mut wr: OwnedWriteHalf,
+    mut write_rx: mpsc::Receiver<WriteCmd>,
+    cancel: Arc<CancelFlag>,
+) -> HalfOutcome {
+    // relay→agent 方向的期望 seq（从 0 连续）。
+    let mut in_seq: u64 = 0;
 
-            // 窗口释放后再回到循环顶部重算 avail。
-            _ = unacked.wait_below(window), if wait_window => continue,
-
-            r = rd.read(&mut buf[..want]), if can_read => match r {
-                Err(e) => return Outcome::Failed("io", format!("read from target failed: {e}")),
-                Ok(0) => {
-                    read_done = true;
-                    if !inner.out.send("tcp:eof", json!({ "conn_id": conn_id })).await {
-                        return Outcome::Aborted;
-                    }
+    loop {
+        let cmd = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return HalfOutcome::Aborted,
+            c = write_rx.recv() => c,
+        };
+        match cmd {
+            // 写队列发送端被丢弃 = 隧道正在销毁。
+            None => return HalfOutcome::Aborted,
+            Some(WriteCmd::Data { seq, data }) => {
+                if seq != in_seq {
+                    cancel.cancel();
+                    return HalfOutcome::Failed(
+                        "protocol",
+                        format!("tcp:data seq {seq} out of order (expected {in_seq})"),
+                    );
                 }
-                Ok(n) => {
-                    unacked.add(n);
-                    let payload = json!({
-                        "conn_id": conn_id,
-                        "seq": out_seq,
-                        "data": B64.encode(&buf[..n]),
-                    });
-                    out_seq += 1;
-                    if !inner.out.send("tcp:data", payload).await {
-                        return Outcome::Aborted;
-                    }
+                in_seq += 1;
+                // 写 socket 时也要能被 close 立刻打断。
+                let written = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return HalfOutcome::Aborted,
+                    r = wr.write_all(&data) => r,
+                };
+                if let Err(e) = written {
+                    cancel.cancel();
+                    return HalfOutcome::Failed("io", format!("write to target failed: {e}"));
                 }
-            },
+                let ack = json!({ "conn_id": conn_id, "bytes": data.len() });
+                if send_cancellable(&inner.out, &cancel, "tcp:ack", ack)
+                    .await
+                    .is_none_or(|ok| !ok)
+                {
+                    return HalfOutcome::Aborted;
+                }
+            }
+            Some(WriteCmd::Eof) => {
+                if let Err(e) = wr.shutdown().await {
+                    cancel.cancel();
+                    return HalfOutcome::Failed("io", format!("shutdown(write) failed: {e}"));
+                }
+                return HalfOutcome::RelayDone;
+            }
         }
     }
 }
@@ -881,17 +1102,46 @@ fn drop_closed_conns(batch: Vec<String>, closed: &std::sync::Mutex<ClosedSet>) -
         .collect()
 }
 
-/// 专用上行 task：批量取消息 → 拼 JSON 数组 → 一次 POST 到 `/agent/send`。
+/// 上行 POST 的抽象：入参是已拼好的 JSON 数组文本，返回 relay 是否接受。
 ///
-/// 单 task 顺序 POST，同一连接的消息天然保序。POST 失败即 `fail_all()`：
-/// 丢掉的字节流不可恢复，继续跑只会让 relay 收到半截数据。
-pub async fn uplink_loop(
+/// 抽成 trait 是为了单测能注入"第一次失败、之后成功"的假 poster —— 真实
+/// 网络失败没法在单测里稳定复现。
+pub trait Poster: Send + 'static {
+    fn post(&self, body: String) -> impl std::future::Future<Output = bool> + Send;
+}
+
+/// 生产实现：把 JSON 文本直接 POST 到 `/agent/send`。
+///
+/// 不复用 `super::post_raw` —— 那个函数会先把文本 `serde_json::from_str` 成
+/// `Value` 再序列化回去，1 MiB 的批次等于白白全量解析一遍。
+pub struct HttpPoster {
     client: reqwest::Client,
     send_url: String,
     agent_token: String,
-    mut rx: mpsc::Receiver<String>,
-    tunnel: TcpTunnel,
-) {
+}
+
+impl HttpPoster {
+    pub fn new(client: reqwest::Client, send_url: String, agent_token: String) -> Self {
+        Self {
+            client,
+            send_url,
+            agent_token,
+        }
+    }
+}
+
+impl Poster for HttpPoster {
+    async fn post(&self, body: String) -> bool {
+        super::post_json_text(&self.client, &self.send_url, &self.agent_token, body).await
+    }
+}
+
+/// 专用上行 task：批量取消息 → 拼 JSON 数组 → 一次 POST 到 `/agent/send`。
+///
+/// 单 task 顺序 POST，同一连接的消息天然保序。POST 失败只中止**当时在途**的
+/// 连接（[`TcpTunnel::abort_in_flight`]），随后继续运行 —— 一次瞬时故障不能让
+/// 整条管道在本会话内永久失效。
+pub async fn uplink_loop<P: Poster>(poster: P, mut rx: mpsc::Receiver<String>, tunnel: TcpTunnel) {
     let mut carry: Option<String> = None;
     loop {
         let batch = drain_batch(&mut rx, &mut carry, UPLINK_BATCH_MSGS, UPLINK_BATCH_BYTES).await;
@@ -900,7 +1150,7 @@ pub async fn uplink_loop(
             tracing::debug!("tcp tunnel uplink: all senders dropped, exiting");
             return;
         }
-        // 已经 `tcp:close` 的连接，它的消息一条都不能再出去。
+        // 已经 close（或被上一次失败中止）的连接，它的消息一条都不能再出去。
         let batch = drop_closed_conns(batch, &tunnel.inner.out.closed);
         if batch.is_empty() {
             continue;
@@ -908,15 +1158,15 @@ pub async fn uplink_loop(
         // relay 的 batch 通道（`src/relay/ws.rs` 的 `agent_send_handler`）接受
         // JSON 数组，逐条按各自的 `session_id` 路由。
         let body = format!("[{}]", batch.join(","));
-        if super::post_raw(&client, &send_url, &agent_token, &body).await {
+        if poster.post(body).await {
             continue;
         }
         tracing::warn!(
             dropped = batch.len(),
-            "tcp tunnel uplink: batch POST failed — aborting all connections"
+            "tcp tunnel uplink: batch POST failed — dropping batch and aborting in-flight connections"
         );
-        tunnel.fail_all();
-        return;
+        // 只中止在途连接，不 vs dead、不 return：新的 tcp:open 必须还能工作。
+        tunnel.abort_in_flight();
     }
 }
 
@@ -1686,5 +1936,228 @@ mod tests {
         assert_eq!(ty, "tcp:error");
         assert_eq!(p["kind"], "invalid");
         assert_eq!(tun.active_count(), 0);
+    }
+
+    // ── 回归：全双工 / POST 失败恢复 / 派发不阻塞 ───────────────────────
+
+    /// 回归（评审必须 1）：读、写两个方向必须**并发**推进。
+    ///
+    /// 目标先写满 8 MiB 才回头读，relay 同时按窗口上传 8 MiB。单循环实现在
+    /// 这里会互锁：agent 卡在 `write_all`（目标不读）就不再读目标 → 目标的
+    /// 发送缓冲写满 → 双方永久等待。拆成两个 task 后必须在时限内跑完。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_full_duplex_does_not_deadlock() {
+        const N: usize = 8 * 1024 * 1024;
+        let t = target(|s| async move {
+            let (mut r, mut w) = s.into_split();
+            let buf = vec![7u8; N];
+            w.write_all(&buf).await.unwrap();
+            let mut got = vec![0u8; N];
+            r.read_exact(&mut got).await.unwrap();
+            assert!(got.iter().all(|b| *b == 1), "上传内容必须原样到达目标");
+            let _ = w.shutdown().await;
+        })
+        .await;
+        let (tun, mut rx) = tunnel(small_limits());
+        tun.handle_open(&open_payload("c1", t.addr)).await;
+        let (ty, _) = recv(&mut rx).await;
+        assert_eq!(ty, "tcp:opened");
+
+        let res = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut sent = 0usize;
+            let mut seq = 0u64;
+            let mut outstanding = 0usize;
+            let mut received = 0usize;
+            let chunk = vec![1u8; MAX_CHUNK_BYTES];
+            loop {
+                while sent < N && outstanding + MAX_CHUNK_BYTES <= WINDOW_BYTES {
+                    let n = MAX_CHUNK_BYTES.min(N - sent);
+                    tun.handle_data(&json!({
+                        "conn_id": "c1",
+                        "seq": seq,
+                        "data": B64.encode(&chunk[..n]),
+                    }))
+                    .await;
+                    seq += 1;
+                    sent += n;
+                    outstanding += n;
+                }
+                if received >= N && sent >= N && outstanding == 0 {
+                    break;
+                }
+                let raw = rx.recv().await.unwrap();
+                let v: Value = serde_json::from_str(&raw).unwrap();
+                match v["type"].as_str().unwrap() {
+                    "tcp:data" => {
+                        let n = B64
+                            .decode(v["payload"]["data"].as_str().unwrap())
+                            .unwrap()
+                            .len();
+                        received += n;
+                        tun.handle_ack(&json!({ "conn_id": "c1", "bytes": n }));
+                    }
+                    "tcp:ack" => {
+                        outstanding -= v["payload"]["bytes"].as_u64().unwrap() as usize;
+                    }
+                    other => panic!("unexpected {other}: {raw}"),
+                }
+            }
+        })
+        .await;
+        assert!(res.is_ok(), "full-duplex transfer deadlocked");
+        assert_eq!(
+            tun.active_count(),
+            1,
+            "跑完 8MiB×2 后连接仍在（等 eof 收尾）"
+        );
+        tun.shutdown();
+    }
+
+    /// 回归（评审必须 2）：一次 POST 失败只中止在途连接，不能废掉整条管道。
+    ///
+    /// 用可注入的 poster：第一次返回 false，之后返回 true。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_post_failure_aborts_in_flight_but_tunnel_recovers() {
+        /// 第一次 POST 失败，之后全部成功；记录每次收到的 body。
+        struct FlakyPoster {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+            bodies: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl Poster for FlakyPoster {
+            async fn post(&self, body: String) -> bool {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                self.bodies.lock().unwrap().push(body);
+                n != 0
+            }
+        }
+
+        let t1 = idle_target().await;
+        // `rx` 交给上行 task，消息由 poster 的 `bodies` 观察（生产路径同理）。
+        let (tun, rx) = tunnel(small_limits());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let uplink = tokio::spawn(uplink_loop(
+            FlakyPoster {
+                calls: calls.clone(),
+                bodies: bodies.clone(),
+            },
+            rx,
+            tun.clone(),
+        ));
+
+        // 1) 建第一条连接：它的 tcp:opened 会触发第一次 POST → 失败。
+        tun.handle_open(&open_payload("c1", t1.addr)).await;
+        // 等第一次 POST 真的发生（失败）并把在途连接中止。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "first POST never happened");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // 失败后：c1 被摘除（不再占名额），且不会再有属于 c1 的消息。
+        while tun.active_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "in-flight connection not aborted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 2) 管道仍然可用：新连接照常 opened 并能双向往返。
+        let t2 = target(|mut s| async move {
+            let mut buf = vec![0u8; 64];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        tun.handle_open(&open_payload("c2", t2.addr)).await;
+        // 从 uplink 的 poster 收到的 body 里找 c2 的 opened（tcp:opened 由
+        // 连接 task 直接入队，走同一个 uplink）。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let b = bodies.lock().unwrap();
+                if b.iter().any(|s| s.contains("\"conn_id\":\"c2\"")) {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "c2 opened never posted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(tun.active_count(), 1, "c2 必须活着");
+        assert!(
+            no_messages_for_conn_after_first_failure(&bodies, "c1"),
+            "c1 被中止后不应再有新消息被 POST"
+        );
+
+        uplink.abort();
+        tun.shutdown();
+    }
+
+    /// 断言 `conn_id` 的消息只出现在第一次（失败）POST 之前的那一刻，之后
+    /// 不再出现 —— 即中止 + 墓碑确实截断了它的上行。
+    fn no_messages_for_conn_after_first_failure(
+        bodies: &Mutex<Vec<String>>,
+        conn_id: &str,
+    ) -> bool {
+        let b = bodies.lock().unwrap();
+        // 第一个 body 是触发失败的那批（含 c1 的 opened），之后不得再出现 c1。
+        b.iter()
+            .skip(1)
+            .all(|s| !s.contains(&format!("\"{conn_id}\"")))
+    }
+
+    /// 回归（评审应修 3）：上行队列打满时，派发路径不得阻塞调用方。
+    ///
+    /// 做法：用一个**没人消费**的有界队列（容量 1）建 Tunnel，把它填满，
+    /// 然后在 `tokio::time::timeout` 内调用会回错误的分支。队列满 + 派发若
+    /// 仍 await，这里必然超时。
+    #[tokio::test]
+    async fn test_dispatch_never_waits_on_full_uplink_queue() {
+        // 容量 1，且不 spawn 任何 consumer。
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let tun = TcpTunnel::with_limits(
+            "sess-test".to_string(),
+            tx,
+            Limits {
+                connect: Duration::from_secs(5),
+                max_conns: 1,
+                window: WINDOW_BYTES,
+            },
+        );
+
+        // 灌满队列：一条 tcp:error 就够（容量 1）。
+        tun.emit_error_detached("filler", "invalid", "fill the queue".to_string());
+
+        // 现在队列满。下面三条派发路径都必须在毫秒级返回：
+        //  a) 非法 port → invalid
+        //  b) 非法 conn_id → invalid
+        //  c) 超并发 → busy（先占满 max_conns=1）
+        let quick = tokio::time::timeout(Duration::from_secs(2), async {
+            tun.handle_open(&json!({"conn_id":"bad","host":"127.0.0.1","port":0}))
+                .await;
+            tun.handle_open(&json!({"conn_id":"","host":"127.0.0.1","port":80}))
+                .await;
+            // 占住唯一名额，再让第二个连接被 busy 拒。
+            let t = idle_target().await;
+            tun.handle_open(&open_payload("c1", t.addr)).await;
+            tun.handle_open(&open_payload("c2", t.addr)).await;
+            // handle_data 的协议错误分支同样不能等队列。
+            tun.handle_data(&json!({"conn_id":"c1","seq":9,"data":B64.encode(b"x")}))
+                .await;
+        })
+        .await;
+        assert!(
+            quick.is_ok(),
+            "dispatch blocked on a full uplink queue — main loop would stall"
+        );
     }
 }
