@@ -24,8 +24,20 @@ pub struct Shell {
 /// 常常没有任何 locale 数据，此时一个加载不了的 UTF-8 locale 会让依赖 locale 的
 /// 交互式程序启动即崩（静态 glibc 的 bash 直接 SIGSEGV），网页端只看到空白终端。
 /// 子进程继承 agent 自身环境，运维在目标机上设好的 locale 原样生效。
+///
+/// 登录环境（MYS-2421）：agent 由服务直接启动、不经过 PAM，子进程只有 agent 自己的
+/// 环境，`/etc/profile` 里配置的 PATH 一概看不到。这里让用户选择的 shell 以登录
+/// 模式启动（策略见 [`crate::agent::login_env`]），使 profile 生效。
+///
+/// 只在探测确认该 shell 接受 `-l` 时才加参数：tcsh/elvish/nu 之类会把它当未知参数
+/// 直接退出，那会让网页终端整块起不来。探测结果按 shell 路径缓存，`--shell` 是启动
+/// 参数不会变，所以每个 agent 进程只付出一次。
 fn pty_command(shell_path: &str) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(shell_path);
+    #[cfg(unix)]
+    for arg in crate::agent::login_env::shell_startup_args(shell_path) {
+        cmd.arg(arg);
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd
@@ -226,6 +238,95 @@ mod tests {
         assert_eq!(
             cmd.get_env("COLORTERM").and_then(|v| v.to_str()),
             Some("truecolor")
+        );
+    }
+
+    /// 验收项 3（启动命令层面）：Unix 上网页终端必须**以登录 shell 启动**，
+    /// 且用户指定的 shell 路径原样不变（不能自作主张换成 bash / `/bin/sh`）。
+    #[cfg(unix)]
+    #[test]
+    fn test_pty_command_starts_login_shell_with_unchanged_path() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            let cmd = pty_command(shell);
+            assert_eq!(
+                cmd.get_argv()
+                    .first()
+                    .map(|a| a.to_string_lossy().into_owned()),
+                Some(shell.to_string()),
+                "用户指定的 shell 路径必须原样保留（{shell}）"
+            );
+            assert_eq!(
+                cmd.get_argv()
+                    .get(1)
+                    .map(|a| a.to_string_lossy().into_owned()),
+                Some(crate::agent::login_env::LOGIN_FLAG.to_string()),
+                "POSIX shell 必须以 -l 启动才能读到 /etc/profile（{shell}）"
+            );
+        }
+    }
+
+    /// 不接受 `-l` 的 shell 不能加分参数，否则网页终端直接起不来。
+    /// 用 `/bin/false` 模拟「任何参数都不接受」的 shell（探测判为不支持）。
+    #[cfg(unix)]
+    #[test]
+    fn test_pty_command_omits_login_flag_for_shell_without_support() {
+        if !std::path::Path::new("/bin/false").exists() {
+            return;
+        }
+        let cmd = pty_command("/bin/false");
+        assert_eq!(
+            cmd.get_argv().len(),
+            1,
+            "不支持的 shell 不应被追加任何参数，实际 argv={:?}",
+            cmd.get_argv()
+        );
+    }
+
+    /// 验收项 3（行为层面）：经真实 PTY 起 shell，证明它**确实以登录模式运行**。
+    ///
+    /// 判据用 bash 自带的 `shopt -q login_shell`：它是 shell 自己维护的登录态，
+    /// 比看 argv 更接近「profile 真的会不会被读」这个用户实际关心的事。
+    /// `$0` 不能用来判断——只有 `argv[0]` 前导 `-` 才会改 `$0`，而 `-l` 不会
+    /// （实测 `bash -l -c 'echo $0'` 仍是 `bash`），dash 也没有任何自省手段，
+    /// 所以这条用 bash 承载；非 bash 的行为由 `exec_tests` 里的受控
+    /// `/etc/profile` 测试覆盖。
+    #[cfg(unix)]
+    #[test]
+    fn test_pty_shell_runs_in_login_mode() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            println!("SKIP test_pty_shell_runs_in_login_mode: 无 /bin/bash");
+            return;
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut shell = Shell::spawn(80, 24, "/bin/bash", "login-tab", tx).unwrap();
+        // 标记串拆开拼，避免断言命中 pty 回显的命令行本身。
+        shell
+            .write_input(
+                b"shopt -q login_shell && printf 'LOG%s\\n' IN_ON; printf 'PRO%s\\n' BE_DONE\n",
+            )
+            .unwrap();
+
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !seen.contains("PROBE_DONE") {
+            match rx.try_recv() {
+                Ok((_tab, data)) => seen.push_str(&String::from_utf8_lossy(&data)),
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert!(
+            seen.contains("PROBE_DONE"),
+            "终端无输出（shell 可能已崩）: {seen:?}"
+        );
+        assert!(
+            seen.contains("LOGIN_ON"),
+            "网页终端必须运行在登录 shell 下（否则 /etc/profile 不生效），实际输出: {seen:?}"
         );
     }
 

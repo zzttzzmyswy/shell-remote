@@ -14,6 +14,24 @@ use crate::proto::{ExecResultPayload, ExecSessionInfo};
 
 const MAX_OUTPUT_BUF: usize = 1_000_000;
 
+/// `sh` 的 argv（长会话 `exec_start` 与一次性 exec 共用同一策略）。
+#[cfg(unix)]
+fn shell_argv(cmd: &str) -> Vec<std::ffi::OsString> {
+    crate::agent::login_env::sh_exec_argv(cmd)
+}
+
+/// Windows 保持原样：登录环境是 Unix 的 `/etc/profile` 语义，Windows 不适用。
+#[cfg(not(unix))]
+fn shell_argv(cmd: &str) -> Vec<std::ffi::OsString> {
+    vec!["-c".into(), cmd.into()]
+}
+
+/// 测试用：暴露长会话路径的 argv，供 login_env 的执行级测试复用同一构造。
+#[cfg(all(test, unix))]
+pub(crate) fn shell_argv_for_test(cmd: &str) -> Vec<std::ffi::OsString> {
+    shell_argv(cmd)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ExecStatus {
     Running,
@@ -155,9 +173,12 @@ impl ExecSessionManager {
         let exec_id = Uuid::new_v4().to_string();
         let cmd_str = cmd.to_string();
 
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
+        // 与一次性 exec 共用同一条登录环境策略（agent::login_env）：Unix 上是
+        // `sh [-l] -c <用户命令>`，用户命令原样作为一个 argv；Windows 行为不变。
+        let mut shell_cmd = Command::new("sh");
+        shell_cmd.args(shell_argv(cmd));
+
+        let mut child = match shell_cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -15,6 +15,10 @@ pub mod tcp_tunnel;
 pub mod upgrade;
 pub mod web_proxy;
 
+/// Unix 登录环境策略（网页终端与 MCP exec 共用，MYS-2421）。
+#[cfg(unix)]
+pub mod login_env;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -3005,12 +3009,25 @@ async fn execute_command(
         .unwrap_or(false);
 
     let mut command = if has_script {
+        // script -c 只收一个字符串，再由 $SHELL 解释一遍，所以登录环境在内层
+        // 再套一层 `sh -l -c <用户命令>`（策略见 agent::login_env）。外层串是
+        // 固定常量，用户命令经环境变量传入——这样它只被解释一次，引号 / 换行 /
+        // $() 的语义与不加 script 时一致。
+        // `-e` 让 script 返回命令自身的退出码（util-linux 默认恒返回 0，
+        // 会把失败的命令报成成功）。
         let mut c = tokio::process::Command::new("script");
-        c.arg("-q").arg("-c").arg(&cmd).arg("/dev/null");
+        c.arg("-q")
+            .arg("-e")
+            .arg("-c")
+            .arg(crate::agent::login_env::script_wrapper_command())
+            .arg("/dev/null")
+            .env(crate::agent::login_env::MCP_CMD_ENV, &cmd);
         c
     } else {
+        // 没有 script（精简容器）时直接 `sh [-l] -c <用户命令>`，
+        // 用户命令同样是一个独立 argv、原样传入。
         let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg(&cmd);
+        c.args(crate::agent::login_env::sh_exec_argv(&cmd));
         c
     };
     command

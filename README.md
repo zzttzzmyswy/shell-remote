@@ -652,6 +652,33 @@ SSE  ← event: message  {JSON-RPC 响应}
 - `cmd` 通过 `sh -c` 执行，支持管道、重定向等完整 Shell 语法
 - 返回 stdout、stderr 和 exit code
 
+### 登录环境（`/etc/profile`）
+
+agent 由 systemd/服务直接启动，**不经过 PAM/SSH**，子进程只有 agent 自身的环境。
+设备上很多工具的 PATH 是写在 `/etc/profile` 里的（例如 Sophon 的 `bm-smi` 位于
+`/opt/sophon/libsophon-current/bin`），所以网页终端和 MCP 默认都读不到它们——
+不需要再手动 `source /etc/profile`，两条路径现在都以**登录 shell**方式启动：
+
+| 路径 | 实际启动方式 |
+|---|---|
+| 网页终端 | `<--shell 指定的 shell> -l`（如 `/bin/bash -l`） |
+| MCP `exec` / `exec_start` | `sh -l -c <你的命令>` |
+
+- **不改写你的命令**：命令始终作为一个独立 argv 原样交给 `sh`，不拼接、不加前缀。
+- **不是 `ENV`/`BASH_ENV`**：POSIX 的 `ENV` 只在**交互** shell 里被读取，实测
+  `ENV=/etc/profile sh -c '...'` 拿不到任何变量，因此走 `-l` 这一登录 shell 标准语义。
+- **`/etc/profile` 不存在时不影响任何功能**：shell 自行跳过，命令照常执行。
+- **只影响 Unix**：Windows 行为不变（无 `/etc/profile` 概念）。
+- **不注入 locale**：agent 仍然不设置 LANG/LC_*，目标机自己的 locale 原样生效。
+
+> ⚠️ 登录环境的既有语义：如果 `/etc/profile` 或其 `profile.d` 里有**只适合交互登录**
+> 的输出/命令（打印欢迎语、启动 agent、设置仅终端有意义的变量等），MCP 的结果里
+> 也可能看到这些输出。这是登录 shell 的固有行为，不是 bug；遇到干扰请调整 profile。
+
+- 若 `--shell` 指定的 shell 不接受 `-l`（如 `tcsh`/`elvish`/`nu`），agent 启动时会
+  自动探测并退回原来的非登录启动，网页终端照常可用，只是不加载 `/etc/profile`。
+  探测结果按 shell 路径缓存，每个进程只做一次。
+
 ### MCP 端文件传输
 
 大文件上传/下载走专用流式端点（不经 LLM context）：
