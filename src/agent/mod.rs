@@ -3,6 +3,10 @@ pub mod cmd_log;
 pub mod device;
                                 #[cfg(feature = "desktop")]
 pub mod desktop;
+// MYS-2425 阶段2：制品下载器（CDN 优先 / 断点续传 / 有界预算）与 DoH 解析链路。
+// 两者与桌面无关，lean 构建同样编译。
+pub mod doh;
+pub mod download;
 pub mod encoding;
 pub mod exec_sessions;
 pub mod fs;
@@ -2697,10 +2701,12 @@ async fn run_session(
 
                                 "agent:upgrade" => {
                                     // Admin panel triggered an atomic self-upgrade:
-                                    // download → verify SHA-256 → smoke test → atomic
-                                    // replace → restart with the same argv. Runs in a
-                                    // spawned task so a slow download cannot freeze the
+                                    // download（CDN 多源 → relay 兜底，Range 续传）
+                                    // → verify SHA-256 → smoke test → atomic replace
+                                    // → restart with the same argv. Runs in a spawned
+                                    // task so a slow download cannot freeze the
                                     // terminal; on success the process replaces itself.
+                                    // 任何失败都只上报，旧 agent 继续在线。
                                     let req = match crate::agent::upgrade::UpgradeRequest::from_payload(&msg.payload) {
                                         Some(r) => r,
                                         None => {
@@ -2709,7 +2715,8 @@ async fn run_session(
                                                 session_id: client.session_id.clone(),
                                                 payload: serde_json::json!({
                                                     "code": "UPGRADE_BAD_PAYLOAD",
-                                                    "message": "agent:upgrade missing version/url/sha256"
+                                                    "message": "agent:upgrade missing target_version/version, \
+                                                                filename (or url) and a 64-hex sha256"
                                                 }),
                                             };
                                             out.control(err).await;
@@ -2745,11 +2752,15 @@ async fn run_session(
                                     let ctrl = task_control_tx.clone();
                                     match self_exe.clone() {
                                         Some(exe) => {
+                                            // 升级上下文显式装配：relay 客户端与 Token
+                                            // 只交给 UpgradeContext，外部 CDN 请求由下载器
+                                            // 用另一个（无凭据的）客户端发出。
+                                            let ctx = crate::agent::upgrade::UpgradeContext::new(
+                                                http, relay_base, token, sid, ctrl, exe,
+                                            );
                                             tokio::spawn(async move {
-                                                crate::agent::upgrade::perform_upgrade(
-                                                    http, relay_base, token, sid, ctrl, req, exe,
-                                                )
-                                                .await;
+                                                crate::agent::upgrade::perform_upgrade(ctx, req)
+                                                    .await;
                                                 // Only reached on failure — success exits the process.
                                                 guard.store(
                                                     false,

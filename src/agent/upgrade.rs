@@ -1,59 +1,121 @@
 //! Agent-mode atomic self-upgrade.
 //!
-//! The relay's admin panel triggers an upgrade by sending `agent:upgrade`
-//! with the artifact URL (served by the relay itself) plus a SHA-256 digest.
-//! This module downloads the new binary, verifies it, atomically replaces the
-//! running executable, and re-executes the agent:
+//! 升级分两步，边界刻意拆开：
 //!
-//!   1. download to a temp file in the *same directory* as the real binary
-//!      (same filesystem → rename is atomic),
-//!   2. verify the SHA-256 digest (integrity: the file is what the admin
-//!      staged),
-//!   3. smoke-test the new binary on unix (`--version` must run) so a wrong-arch
-//!      or truncated artifact never replaces a working agent,
-//!   4. rename over the current executable (never a partial/corrupt file),
-//!   5. spawn the new binary with the original argv and exit this process.
+//! - [`download`](crate::agent::download)：**取字节**——多 CDN 顺序 + relay 兜底、
+//!   Range 断点续传、代理/DoH 解析、有界预算。它不碰文件系统之外的东西，也不知道
+//!   relay 协议；
+//! - 本模块：**装字节**——校验制品身份 → 冒烟测试 → 原子替换 → 重启，以及把每个
+//!   阶段转成 `agent:upgrade_progress` 上报。
 //!
-//! On Unix `rename(2)` over a running executable is atomic and safe (the old
-//! inode stays alive until this process exits). Windows cannot replace a
-//! running `.exe` directly, so there we fall back to a helper `.bat` that waits
-//! for this process to exit, swaps the file and starts the new binary.
+//! 不变式：**下载与验证全部成功之前，旧 agent 不动**。任何失败路径都只上报
+//! `failed` 并返回，进程继续在线；只有确认新二进制能在这台机器上跑起来，才会
+//! 替换并退出。
+//!
+//! 安装细节（沿用既有实现，阶段 2 不改换机语义）：
+//!
+//! 1. 校验 SHA-256 与制品身份（variant/arch/OS 必须就是本机这一份），
+//! 2. unix `--version` 冒烟测试，坏包/错架构在这里被拦住，
+//! 3. 原子 rename 覆盖（同目录同文件系统），
+//! 4. 用原 argv 拉起新进程并退出。
+//!
+//! Windows 无法覆盖运行中的 `.exe`，沿用既有 `.bat` 助手路径（阶段 3 会用
+//! `update-apply` 取代）。
 
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
-use tokio_stream::StreamExt;
 
+use crate::agent::doh::{DohConfig, RelayResolver};
+use crate::agent::download::{
+    self, DownloadBudget, Downloader, ProgressFn, ProxyConfig, RelaySource, UpgradeTask,
+};
 use crate::proto::Message;
 
-/// Overall download timeout — artifacts are single binaries, a few tens of MB.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
-/// Max silence between body chunks of an upgrade download before it fails.
-const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long to let the terminal `agent:upgrade_progress` POST flush before the
-/// process exits (the sender loop drains control messages asynchronously).
+/// 下载总预算：制品是单个二进制（几十 MB），弱网下 10 分钟足够，再久就该
+/// 明确失败让状态机解锁，而不是无限挂着。
+const DOWNLOAD_TOTAL_BUDGET: Duration = Duration::from_secs(600);
+/// 首字节预算：包含建连 + TLS 握手 + 响应头。
+const DOWNLOAD_FIRST_BYTE_BUDGET: Duration = Duration::from_secs(20);
+/// 分块静默预算：弱网断流要尽快失败并续传。
+const DOWNLOAD_CHUNK_BUDGET: Duration = Duration::from_secs(45);
+/// 终结帧（`installing` / `failed`）发出后留给发送循环的时间：它是异步排空
+/// 的，进程立刻退出会丢掉还没发出去的帧。
 const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(400);
 
-/// Upgrade directives received by the agent. All fields come from the relay,
-/// which read them from the staged artifact at trigger time.
-#[derive(Debug, Clone)]
-pub struct UpgradeRequest {
-    pub version: String,
-    /// Relative URL on the relay, e.g. `/agent/upgrade/blob/shell-remote-x86_64`.
-    pub url: String,
-    /// Hex SHA-256 the downloaded artifact must match.
-    pub sha256: String,
+/// 升级指令。阶段 2 起来自 relay 的完整任务（契约 1）；存量 relay 的三个老键
+/// 仍由 [`UpgradeTask::from_payload`] 兼容解析。
+pub use crate::agent::download::UpgradeTask as UpgradeRequest;
+
+/// 升级所需的运行上下文。字段都显式传入而不读全局，便于测试与阶段 3 复用。
+#[derive(Clone)]
+pub struct UpgradeContext {
+    /// 复用 relay 上行客户端（带 `--relay-insecure` 时能连自签 relay）。
+    pub relay_http: reqwest::Client,
+    /// relay 根地址（`http(s)://host:port`，无尾斜杠）。
+    pub relay_base: String,
+    /// rw Token：**只**用于 relay 镜像与代解析，绝不出现在外部 CDN 请求里。
+    pub token: String,
+    pub session_id: String,
+    pub ctrl_tx: Sender<String>,
+    /// 正在运行的可执行文件的规范路径（启动时解析好）。
+    pub target: std::path::PathBuf,
+    /// 本进程的制品形态；`None` 表示无法判定（不校验 variant）。
+    pub own_variant: Option<download::AgentVariant>,
+    /// 下载预算（测试可收紧）。
+    pub budget: DownloadBudget,
+    /// 代理配置（默认读环境）。
+    pub proxy: ProxyConfig,
+    /// DoH 配置（默认预置两家）。
+    pub doh: DohConfig,
+    /// 额外信任根（PEM）——仅测试注入本地 CA。
+    pub extra_roots: Vec<Vec<u8>>,
 }
 
-impl UpgradeRequest {
-    pub fn from_payload(p: &serde_json::Value) -> Option<Self> {
-        Some(Self {
-            version: p.get("version")?.as_str()?.to_string(),
-            url: p.get("url")?.as_str()?.to_string(),
-            sha256: p.get("sha256")?.as_str()?.to_string(),
-        })
+impl std::fmt::Debug for UpgradeContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Token 永不进日志。
+        f.debug_struct("UpgradeContext")
+            .field("relay_base", &self.relay_base)
+            .field("token", &"<redacted>")
+            .field("session_id", &self.session_id)
+            .field("target", &self.target)
+            .field("own_variant", &self.own_variant)
+            .finish()
+    }
+}
+
+impl UpgradeContext {
+    /// 生产配置：默认预算 + 环境代理 + 预置 DoH。
+    pub fn new(
+        relay_http: reqwest::Client,
+        relay_base: String,
+        token: String,
+        session_id: String,
+        ctrl_tx: Sender<String>,
+        target: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            relay_http,
+            relay_base,
+            token,
+            session_id,
+            ctrl_tx,
+            target,
+            own_variant: download::AgentVariant::detect(),
+            budget: DownloadBudget {
+                connect: Duration::from_secs(10),
+                first_byte: DOWNLOAD_FIRST_BYTE_BUDGET,
+                chunk: DOWNLOAD_CHUNK_BUDGET,
+                total: DOWNLOAD_TOTAL_BUDGET,
+                attempts_per_source: 2,
+                backoff: Duration::from_millis(800),
+            },
+            proxy: ProxyConfig::from_env(),
+            doh: DohConfig::default(),
+            extra_roots: Vec::new(),
+        }
     }
 }
 
@@ -65,7 +127,38 @@ struct InstallOutcome {
     restart_now: bool,
 }
 
-/// Push an `agent:upgrade_progress` frame to the relay for the admin panel.
+/// 进度上报：把下载器的 [`DownloadProgress`] 转成 `agent:upgrade_progress` 帧。
+fn progress_reporter(ctx: &UpgradeContext, version: String) -> ProgressFn {
+    let ctrl = ctx.ctrl_tx.clone();
+    let sid = ctx.session_id.clone();
+    std::sync::Arc::new(move |p: download::DownloadProgress| {
+        let ctrl = ctrl.clone();
+        let sid = sid.clone();
+        let version = version.clone();
+        // 下载器是同步回调：把发送丢给运行时，不让它阻塞字节流。
+        tokio::spawn(async move {
+            let mut payload = json!({"stage": "downloading", "version": version});
+            if let Some(pct) = p.percent {
+                payload["percent"] = json!(pct);
+            }
+            payload["detail"] = json!(p.detail);
+            send_frame(&ctrl, &sid, payload).await;
+        });
+    })
+}
+
+async fn send_frame(ctrl_tx: &Sender<String>, session_id: &str, payload: serde_json::Value) {
+    let msg = Message {
+        msg_type: "agent:upgrade_progress".to_string(),
+        session_id: session_id.to_string(),
+        payload,
+    };
+    if let Ok(s) = serde_json::to_string(&msg) {
+        let _ = ctrl_tx.send(s).await;
+    }
+}
+
+/// 推一个 `agent:upgrade_progress` 帧（admin 面板据此显示阶段/百分比）。
 async fn send_progress(
     ctrl_tx: &Sender<String>,
     session_id: &str,
@@ -81,14 +174,7 @@ async fn send_progress(
     if let Some(d) = detail {
         payload["detail"] = json!(d);
     }
-    let msg = Message {
-        msg_type: "agent:upgrade_progress".to_string(),
-        session_id: session_id.to_string(),
-        payload,
-    };
-    if let Ok(s) = serde_json::to_string(&msg) {
-        let _ = ctrl_tx.send(s).await;
-    }
+    send_frame(ctrl_tx, session_id, payload).await;
 }
 
 /// Resolve the real path of the running executable (following symlinks, so a
@@ -100,103 +186,11 @@ fn current_exe_real() -> std::io::Result<std::path::PathBuf> {
     std::env::current_exe()?.canonicalize()
 }
 
-/// Download `url` (authenticated with the agent's read-write token) to `dest`,
-/// returning the total byte count. Reports progress via `ctrl_tx`.
-async fn download_to_file(
-    http: &reqwest::Client,
-    relay_base: &str,
-    token: &str,
-    url: &str,
-    dest: &std::path::Path,
-    ctrl_tx: &Sender<String>,
-    session_id: &str,
-    version: &str,
-) -> anyhow::Result<u64> {
-    let full_url = format!("{}/{}", relay_base.trim_end_matches('/'), url.trim_start_matches('/'));
-    let resp = tokio::time::timeout(DOWNLOAD_TIMEOUT, http.get(&full_url).header("X-SR-Token", token).send())
-        .await
-        .map_err(|_| anyhow::anyhow!("download timed out after {DOWNLOAD_TIMEOUT:?}"))?
-        .map_err(|e| anyhow::anyhow!("download request failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow::anyhow!("download returned HTTP {}", resp.status()));
-    }
-    let total = resp.content_length().unwrap_or(0);
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot create temp file: {e}"))?;
-    let mut stream = resp.bytes_stream();
-    let mut written: u64 = 0;
-    let mut last_pct = 0u64;
-    // DOWNLOAD_TIMEOUT only bounds the response headers; a body that stalls
-    // mid-transfer (weak link) must fail too, or `upgrade_in_progress` stays
-    // set and blocks every later upgrade.
-    loop {
-        let chunk = match tokio::time::timeout(DOWNLOAD_STALL_TIMEOUT, stream.next()).await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "download stalled: no data for {DOWNLOAD_STALL_TIMEOUT:?}"
-                ))
-            }
-        };
-        let chunk = chunk.map_err(|e| anyhow::anyhow!("download stream error: {e}"))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| anyhow::anyhow!("write error: {e}"))?;
-        written += chunk.len() as u64;
-        let pct = if total > 0 {
-            (written * 100).min(total * 100) / total
-        } else {
-            0
-        };
-        if pct != last_pct {
-            last_pct = pct;
-            send_progress(
-                ctrl_tx,
-                session_id,
-                "downloading",
-                Some(pct),
-                None,
-                version,
-            )
-            .await;
-        }
-    }
-    file.flush().await.ok();
-    let _ = file.sync_all().await;
-    Ok(written)
-}
-
 /// Hex-encoded SHA-256 of a file, streamed to bound memory use.
-pub fn sha256_hex_file(path: &std::path::Path) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut hasher = Sha256::new();
-    let mut f = std::fs::File::open(path)?;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
+pub use crate::agent::download::sha256_hex_file;
 
 /// Constant-time digest comparison (case-insensitive hex).
-fn verify_sha256(actual: &str, expected: &str) -> bool {
-    if actual.len() != expected.len() {
-        return false;
-    }
-    let a = actual.as_bytes();
-    let e = expected.as_bytes();
-    a.iter()
-        .zip(e.iter())
-        .fold(0u8, |acc, (x, y)| acc | x.to_ascii_lowercase() ^ y.to_ascii_lowercase())
-        == 0
-}
+pub use crate::agent::download::verify_sha256;
 
 /// Unix: run the artifact once (`--version`) to ensure it actually executes on
 /// this platform before replacing the running binary. A wrong-arch or truncated
@@ -222,7 +216,10 @@ async fn smoke_test(_path: &std::path::Path) -> bool {
 
 /// Atomically replace `target` with `tmp` (same directory).
 #[cfg(not(windows))]
-fn install_binary(tmp: &std::path::Path, target: &std::path::Path) -> std::io::Result<InstallOutcome> {
+fn install_binary(
+    tmp: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<InstallOutcome> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -236,7 +233,10 @@ fn install_binary(tmp: &std::path::Path, target: &std::path::Path) -> std::io::R
 /// denied), defer the swap to a helper `.bat` that waits for this process to
 /// exit, then moves the file into place and starts the new binary.
 #[cfg(windows)]
-fn install_binary(tmp: &std::path::Path, target: &std::path::Path) -> std::io::Result<InstallOutcome> {
+fn install_binary(
+    tmp: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<InstallOutcome> {
     match std::fs::rename(tmp, target) {
         Ok(()) => Ok(InstallOutcome { restart_now: true }),
         Err(e)
@@ -270,7 +270,10 @@ fn install_binary(tmp: &std::path::Path, target: &std::path::Path) -> std::io::R
                 args = args,
             );
             std::fs::write(&bat, script)?;
-            let _ = std::process::Command::new("cmd").arg("/c").arg(&bat).spawn();
+            let _ = std::process::Command::new("cmd")
+                .arg("/c")
+                .arg(&bat)
+                .spawn();
             Ok(InstallOutcome { restart_now: false })
         }
         Err(e) => Err(e),
@@ -294,93 +297,220 @@ fn restart_process(target: &std::path::Path) -> std::io::Result<()> {
     cmd.spawn().map(|_| ())
 }
 
+/// 构造下载器：外部客户端（无任何凭据）+ relay 客户端（复用上行客户端）。
+pub fn build_downloader(ctx: &UpgradeContext, task: &UpgradeTask) -> anyhow::Result<Downloader> {
+    // 解析链：只允许本次任务的 CDN 主机；relay 代解析作为第三级。
+    let resolver = if task.allows_cdn() {
+        let relay = RelayResolver {
+            http: ctx.relay_http.clone(),
+            base: ctx.relay_base.clone(),
+            token: ctx.token.clone(),
+            timeout: crate::agent::doh::RELAY_RESOLVE_TIMEOUT,
+        };
+        let mut doh_cfg = ctx.doh.clone();
+        doh_cfg.proxy = ctx.proxy.clone();
+        doh_cfg.extra_roots = ctx.extra_roots.clone();
+        Some(download::chain_resolver(
+            task.cdn_hosts(),
+            doh_cfg,
+            Some(relay),
+        ))
+    } else {
+        None
+    };
+    let external = Downloader::build_external_client(&ctx.proxy, resolver, &ctx.budget)?;
+    let relay = task.relay_url.as_ref().map(|_| RelaySource {
+        http: ctx.relay_http.clone(),
+        base: ctx.relay_base.clone(),
+        token: ctx.token.clone(),
+    });
+    Ok(Downloader::new(
+        external,
+        relay,
+        ctx.budget.clone(),
+        progress_reporter(ctx, task.target_version.clone()),
+    ))
+}
+
 /// Orchestrate one upgrade. Sends progress frames through `ctrl_tx`; on
 /// success the process is replaced and this function never returns. On failure
 /// it reports `failed` and returns so the agent keeps running unchanged.
-///
-/// `target` is the canonical path of the running executable, resolved at agent
-/// startup — read it eagerly because `std::env::current_exe()` can fail later
-/// (e.g. the file under us was rebuilt/rotated in place, which on Linux makes
-/// the `/proc/self/exe` symlink dangle).
-pub async fn perform_upgrade(
-    http: reqwest::Client,
-    relay_base: String,
-    token: String,
-    session_id: String,
-    ctrl_tx: Sender<String>,
-    req: UpgradeRequest,
-    target: std::path::PathBuf,
-) {
-    send_progress(&ctrl_tx, &session_id, "started", None, None, &req.version).await;
+pub async fn perform_upgrade(ctx: UpgradeContext, task: UpgradeTask) {
+    let version = task.target_version.clone();
+    send_progress(
+        &ctx.ctrl_tx,
+        &ctx.session_id,
+        "checking",
+        None,
+        Some(format!(
+            "{} ({} source(s))",
+            task.filename,
+            task.sources().len()
+        )),
+        &version,
+    )
+    .await;
 
-    let Some(dir) = target.parent().map(|d| d.to_path_buf()) else {
-        report_failed(&ctrl_tx, &session_id, &req.version, "cannot locate executable directory".into()).await;
-        return;
-    };
-    let tmp = dir.join(format!(".shell-remote-upgrade-{}.new", std::process::id()));
-
-    // 1. Download (already tracks progress).
-    if let Err(e) = download_to_file(&http, &relay_base, &token, &req.url, &tmp, &ctrl_tx, &session_id, &req.version).await {
-        report_failed_cleanup(&ctrl_tx, &session_id, &req.version, &tmp, format!("download failed: {e}")).await;
+    // 0. 制品身份：形态/架构/OS 必须就是本机这一份。这一步在联网前做，任务本身
+    //    错了就没必要浪费流量，更不能把 UI 包写到 CLI 设备上。
+    if let Err(e) = download::verify_artifact_identity(&task, ctx.own_variant) {
+        report_failed(&ctx, &version, e).await;
         return;
     }
 
-    // 2. Verify integrity.
-    send_progress(&ctrl_tx, &session_id, "verifying", Some(100), None, &req.version).await;
-    let digest = match sha256_hex_file(&tmp) {
+    let Some(dir) = ctx.target.parent().map(|d| d.to_path_buf()) else {
+        report_failed(&ctx, &version, "cannot locate executable directory".into()).await;
+        return;
+    };
+    // `.part` 与目标同目录：同一文件系统，最终 rename 才能原子。
+    //
+    // 文件名按**目标制品的 SHA-256 前缀**区分（而不是 pid）：断点续传要跨
+    // 「这次下载失败 → admin 再点一次升级」也能接上，pid 命名会让每次重试都
+    // 从头下几十 MB。hash 不同则是另一个制品，不能复用旧字节。
+    let part = dir.join(format!(
+        ".shell-remote-upgrade-{}.part",
+        &task.sha256[..task.sha256.len().min(16)]
+    ));
+    // 清理历史命名遗留（旧版本用 pid 命名的临时文件），避免堆积。
+    cleanup_stale_parts(&dir).await;
+
+    // 1. 下载（多源 + 续传 + 预算，进度在下载器内部上报）。
+    let downloaded = match build_downloader(&ctx, &task) {
+        Ok(dl) => dl.fetch(&task, &part).await,
+        Err(e) => Err(format!("cannot prepare the downloader: {e}")),
+    };
+    let downloaded = match downloaded {
         Ok(d) => d,
         Err(e) => {
-            report_failed_cleanup(&ctrl_tx, &session_id, &req.version, &tmp, format!("cannot hash downloaded file: {e}")).await;
+            // 保留 `.part`：下次 admin 重试（或自动重试）能接着下。下载器自己
+            // 在校验失败/脏数据时删它；这里留下的是"没下完"的部分字节。
+            report_failed(&ctx, &version, format!("download failed: {e}")).await;
             return;
         }
     };
-    if !verify_sha256(&digest, &req.sha256) {
-        report_failed_cleanup(&ctrl_tx, &session_id, &req.version, &tmp, "SHA-256 mismatch — artifact is corrupted or wrong".into()).await;
+
+    // 2. 完整性已由下载器校验（长度 + SHA-256），这里只做一次落地复核，避免
+    //    「校验后又被动过」的窗口。
+    send_progress(
+        &ctx.ctrl_tx,
+        &ctx.session_id,
+        "verifying",
+        Some(100),
+        Some(format!(
+            "{} bytes from {} (sha256 ok)",
+            downloaded.bytes, downloaded.source
+        )),
+        &version,
+    )
+    .await;
+    let digest = match sha256_hex_file(&part) {
+        Ok(d) => d,
+        Err(e) => {
+            report_failed_cleanup(
+                &ctx,
+                &version,
+                &part,
+                format!("cannot hash downloaded file: {e}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if !verify_sha256(&digest, &task.sha256) {
+        report_failed_cleanup(
+            &ctx,
+            &version,
+            &part,
+            format!(
+                "SHA-256 mismatch after download: got {digest}, expected {}",
+                task.sha256
+            ),
+        )
+        .await;
         return;
     }
+    if task.size > 0 {
+        match tokio::fs::metadata(&part).await {
+            Ok(m) if m.len() != task.size => {
+                report_failed_cleanup(
+                    &ctx,
+                    &version,
+                    &part,
+                    format!("downloaded {} bytes, expected {}", m.len(), task.size),
+                )
+                .await;
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                report_failed_cleanup(&ctx, &version, &part, format!("cannot stat download: {e}"))
+                    .await;
+                return;
+            }
+        }
+    }
 
-    // 3. Confirm the payload runs on this platform before touching the binary.
-    // The download lands with restrictive permissions (File::create), so mark
-    // it executable first — the smoke test must exec it as-is.
+    // 3. 确认这个 payload 能在这台机器上跑起来，再动正在运行的二进制。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) =
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-        {
+        if let Err(e) = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)) {
             report_failed_cleanup(
-                &ctrl_tx,
-                &session_id,
-                &req.version,
-                &tmp,
+                &ctx,
+                &version,
+                &part,
                 format!("cannot mark artifact executable: {e}"),
             )
             .await;
             return;
         }
     }
-    if !smoke_test(&tmp).await {
-        report_failed_cleanup(&ctrl_tx, &session_id, &req.version, &tmp, "new binary does not execute on this platform".into()).await;
+    if !smoke_test(&part).await {
+        report_failed_cleanup(
+            &ctx,
+            &version,
+            &part,
+            "new binary does not execute on this platform".into(),
+        )
+        .await;
         return;
     }
 
-    // 4. Atomic replace.
-    let outcome = match install_binary(&tmp, &target) {
+    // 4. 原子替换。
+    let outcome = match install_binary(&part, &ctx.target) {
         Ok(o) => o,
         Err(e) => {
-            report_failed_cleanup(&ctrl_tx, &session_id, &req.version, &tmp, format!("cannot replace the running binary: {e}").into()).await;
+            report_failed_cleanup(
+                &ctx,
+                &version,
+                &part,
+                format!("cannot replace the running binary: {e}"),
+            )
+            .await;
             return;
         }
     };
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&part);
 
-    // 5. Restart. Give the terminal progress frame a moment to reach the relay
-    //    before this process (and its sender loop) disappears.
-    send_progress(&ctrl_tx, &session_id, "installing", None, Some("installed, restarting".to_string()), &req.version).await;
+    // 5. 重启。给终结帧一点时间到 relay，再让这个进程（和它的发送循环）消失。
+    send_progress(
+        &ctx.ctrl_tx,
+        &ctx.session_id,
+        "installing",
+        None,
+        Some(format!("installed {} from {}", version, downloaded.source)),
+        &version,
+    )
+    .await;
     tokio::time::sleep(EXIT_FLUSH_GRACE).await;
     if outcome.restart_now {
-        if let Err(e) = restart_process(&target) {
-            report_failed(&ctrl_tx, &session_id, &req.version, format!("binary replaced but restart failed: {e}")).await;
+        if let Err(e) = restart_process(&ctx.target) {
+            report_failed(
+                &ctx,
+                &version,
+                format!("binary replaced but restart failed: {e}"),
+            )
+            .await;
             return;
         }
     }
@@ -388,27 +518,51 @@ pub async fn perform_upgrade(
 }
 
 async fn report_failed_cleanup(
-    ctrl_tx: &Sender<String>,
-    session_id: &str,
+    ctx: &UpgradeContext,
     version: &str,
     tmp: &std::path::Path,
     error: String,
 ) {
-    let _ = std::fs::remove_file(tmp);
-    report_failed(ctrl_tx, session_id, version, error).await;
+    let _ = tokio::fs::remove_file(tmp).await;
+    report_failed(ctx, version, error).await;
 }
 
-async fn report_failed(ctrl_tx: &Sender<String>, session_id: &str, version: &str, error: String) {
+/// 清理可执行文件目录里过期的升级临时文件。
+///
+/// `.part` 是可复用的续传数据（按目标 hash 命名），但**别的** hash 的残片、
+/// 以及旧版本用 pid 命名的残片都是垃圾：它们永远不会再被用上，留着只是占磁盘。
+/// 只扫这一层目录、只删我们自己的命名前缀，不动用户文件。
+async fn cleanup_stale_parts(dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".shell-remote-upgrade-") || !name.ends_with(".part") {
+            continue;
+        }
+        // 一天之前的残片视为无主：升级不会跨天等待，留着只占空间。
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age > Duration::from_secs(24 * 60 * 60))
+            .unwrap_or(false);
+        if stale {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
+async fn report_failed(ctx: &UpgradeContext, version: &str, error: String) {
+    // 失败原因进日志与 admin 面板；旧 agent 继续在线，不做任何退出动作。
+    tracing::warn!(version, error = %error, "agent self-upgrade failed; staying on the current binary");
     let mut payload = json!({ "stage": "failed", "version": version });
     payload["error"] = json!(error);
-    let msg = Message {
-        msg_type: "agent:upgrade_progress".to_string(),
-        session_id: session_id.to_string(),
-        payload,
-    };
-    if let Ok(s) = serde_json::to_string(&msg) {
-        let _ = ctrl_tx.send(s).await;
-    }
+    send_frame(&ctx.ctrl_tx, &ctx.session_id, payload).await;
 }
 
 #[cfg(test)]
@@ -442,12 +596,35 @@ mod tests {
         let req = UpgradeRequest::from_payload(&json!({
             "version": "0.19.0",
             "url": "/agent/upgrade/blob/shell-remote-x86_64",
-            "sha256": "abcd",
+            "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         }))
         .unwrap();
-        assert_eq!(req.version, "0.19.0");
-        assert_eq!(req.sha256, "abcd");
+        assert_eq!(req.target_version, "0.19.0");
+        assert_eq!(
+            req.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         assert!(UpgradeRequest::from_payload(&json!({"version": "1"})).is_none());
+    }
+
+    #[test]
+    fn test_context_never_prints_token() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        let ctx = UpgradeContext::new(
+            reqwest::Client::new(),
+            "https://relay.test".into(),
+            "rw-super-secret".into(),
+            "sess".into(),
+            tx,
+            std::path::PathBuf::from("/usr/local/bin/shell-remote"),
+        );
+        let rendered = format!("{ctx:?}");
+        assert!(
+            !rendered.contains("rw-super-secret"),
+            "Token 不得进入 Debug 输出: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("https://relay.test"));
     }
 
     #[cfg(unix)]
@@ -496,10 +673,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_smoke_test_accepts_working_script() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sr-upg-smoke-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("fake-bin");
+        std::fs::write(&f, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(smoke_test(&f).await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_current_exe_real_points_at_something() {
         let p = current_exe_real().unwrap();
         assert!(p.is_absolute());
         assert!(p.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_parts_only_touches_our_old_files() {
+        let dir = std::env::temp_dir().join(format!("sr-upg-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join(".shell-remote-upgrade-aaa.part");
+        let old = dir.join(".shell-remote-upgrade-bbb.part");
+        let unrelated = dir.join("shell-remote");
+        let other_tmp = dir.join("notes.txt");
+        for p in [&fresh, &old, &unrelated, &other_tmp] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        // 把 old 的 mtime 推到 2 天前（= 无主残片）。
+        let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+        set_mtime(&old, two_days_ago);
+
+        cleanup_stale_parts(&dir).await;
+
+        assert!(fresh.exists(), "刚写的续传残片必须保留");
+        assert!(!old.exists(), "过期残片应被清理");
+        assert!(unrelated.exists(), "运行中的二进制绝不能被删");
+        assert!(other_tmp.exists(), "无关文件绝不能被删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 把文件 mtime 设为指定时间（`std::fs::File::set_modified` 稳定可用）。
+    fn set_mtime(path: &std::path::Path, t: std::time::SystemTime) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
     }
 }
