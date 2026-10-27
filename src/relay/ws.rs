@@ -1535,102 +1535,207 @@ impl Drop for AgentEventsCleanup {
 
 // ── Agent self-upgrade artifact download ─────────────────────────────
 
-/// Serve a staged agent upgrade artifact to the agent performing its atomic
-/// self-upgrade. Auth mirrors the file-transfer endpoints: an `X-SR-Token`
-/// header carrying a valid read-write token (the agent sends its own).
-pub async fn upgrade_blob_handler(
-    State(state): State<Arc<SharedState>>,
-    axum::extract::Path(filename): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-) -> Response {
+/// 从请求头取 rw Token 并校验。返回 `Err(response)` 表示已经该直接回给调用方。
+///
+/// 升级相关的两个 agent 端点（制品下载、代解析）共用它，保证鉴权语义一致：
+/// ro Token → 403，无效/缺失 → 401。
+async fn require_rw_token(
+    state: &Arc<SharedState>,
+    headers: &axum::http::HeaderMap,
+) -> Result<String, Response> {
     let token = headers
         .get("x-sr-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     match state.sessions.authenticate(token).await {
-        Some((_sid, Permission::ReadWrite)) => {}
-        Some((_, Permission::ReadOnly)) => {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(json!({"error": "read-write token required"})),
-            )
-                .into_response();
-        }
-        None => {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "invalid token"})),
-            )
-                .into_response();
+        Some((sid, Permission::ReadWrite)) => Ok(sid),
+        Some((_, Permission::ReadOnly)) => Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({"error": "read-write token required"})),
+        )
+            .into_response()),
+        None => Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid token"})),
+        )
+            .into_response()),
+    }
+}
+
+/// Serve a staged agent upgrade artifact to the agent performing its atomic
+/// self-upgrade. Auth mirrors the file-transfer endpoints: an `X-SR-Token`
+/// header carrying a valid read-write token (the agent sends its own).
+///
+/// MYS-2425：支持 `Range`（206 / 416）以便 agent 断点续传，并与
+/// `/download/<filename>` 共享同一份制品存储。
+pub async fn upgrade_blob_handler(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(resp) = require_rw_token(&state, &headers).await {
+        return resp;
+    }
+    // 制品库是否可用由 `serve_upgrade_blob` 判定（未配置 → 404）。这里不再看
+    // `upgrade_dir`：合并存储后它只是兼容别名，权威来源是 `artifact_store`，
+    // 两个来源同时判断会漏配一个就误报"升级已关闭"。
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    crate::relay::serve_upgrade_blob(&state, &filename, range.as_deref()).await
+}
+
+// ── /agent/resolve：relay 代解析（DNS 污染降级链路第三级）────────────
+
+/// `GET /agent/resolve?host=<CDN 主机>`：为无法完成系统 DNS / DoH 的 agent
+/// 提供 CDN 主机的解析结果。
+///
+/// 这是**受限**代理，不是通用 DNS：
+/// - rw Token 鉴权（与制品下载同一把钥匙，agent 已持有）；
+/// - `host` 必须是当前升级任务的 CDN 白名单（`--upgrade-cdn` + 官方 origin），
+///   裸主机名形态，任何其它主机一律 403；
+/// - 返回 `addresses` + `expires_at`，并做短期缓存（正/负缓存都有 TTL 上限）；
+/// - 单次查询有超时，地址数有上限。
+///
+/// DNS 结果本身不被信任：agent 仍须用原主机名做 SNI/证书校验，最终以制品
+/// SHA-256 为准。
+pub async fn agent_resolve_handler(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(resp) = require_rw_token(&state, &headers).await {
+        return resp;
+    }
+    // 拒绝重复 key，避免「白名单主机 + 攻击者主机」的歧义解析。
+    let mut host: Option<String> = None;
+    for (k, v) in &params {
+        if k == "host" {
+            if host.is_some() {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "duplicated host parameter"})),
+                )
+                    .into_response();
+            }
+            host = Some(v.clone());
         }
     }
-    if !crate::relay::admin::valid_artifact_filename(&filename) {
+    // 不做 trim：带空白的 host 是非法主机名，不能靠静默修剪变成白名单主机。
+    let Some(host) = host.map(|h| h.to_ascii_lowercase()) else {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid artifact name"})),
+            Json(json!({"error": "missing host parameter"})),
+        )
+            .into_response();
+    };
+    let cdn = state.upgrade_cdn_base_urls.clone();
+    if !crate::relay::is_resolvable_host(&host, &cdn) {
+        // 明确不回显允许列表——不给探测者提供枚举素材。
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({"error": "host is not in the upgrade CDN allowlist"})),
         )
             .into_response();
     }
-    let dir = match &*state.upgrade_dir.read().await {
-        Some(d) => d.clone(),
-        None => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(json!({"error": "upgrades disabled"})),
-            )
+
+    let now = now_unix();
+    // 命中未过期缓存直接返回。
+    {
+        let cache = state.resolve_cache.read().await;
+        if let Some(e) = cache.get(&host) {
+            if e.expires_at_unix > now {
+                return Json(crate::relay::ResolveResponse {
+                    host,
+                    addresses: e.addresses.clone(),
+                    expires_at: e.expires_at_unix,
+                    cached: true,
+                })
                 .into_response();
+            }
+        }
+    }
+
+    let lookup = tokio::time::timeout(
+        crate::relay::RESOLVE_LOOKUP_TIMEOUT,
+        tokio::net::lookup_host((host.clone(), 443)),
+    )
+    .await;
+
+    let (addresses, ttl) = match lookup {
+        Ok(Ok(iter)) => {
+            let mut ips: Vec<String> = Vec::new();
+            for addr in iter {
+                let ip = addr.ip().to_string();
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+                if ips.len() >= crate::relay::RESOLVE_MAX_ADDRESSES {
+                    break;
+                }
+            }
+            if ips.is_empty() {
+                (Vec::new(), crate::relay::RESOLVE_NEGATIVE_TTL_SECS)
+            } else {
+                (ips, crate::relay::RESOLVE_TTL_SECS)
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(host = %host, error = %e, "agent resolve: lookup failed");
+            (Vec::new(), crate::relay::RESOLVE_NEGATIVE_TTL_SECS)
+        }
+        Err(_) => {
+            tracing::warn!(host = %host, "agent resolve: lookup timed out");
+            (Vec::new(), crate::relay::RESOLVE_NEGATIVE_TTL_SECS)
         }
     };
-    let path = dir.join(&filename);
-    match tokio::fs::File::open(&path).await {
-        Ok(file) => {
-            let metadata = match file.metadata().await {
-                Ok(m) => m,
-                Err(_) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "cannot stat artifact"})),
-                    )
-                        .into_response();
-                }
-            };
-            // 下行带宽（MYS-2287）：升级包是大文件，按 chunk 取令牌。限速时
-            // agent 侧下载变慢（自升级本身有超时/重试），不会丢字节。
-            let limiter = state.bandwidth.clone();
-            let stream = async_stream::stream! {
-                let mut inner = tokio_util::io::ReaderStream::new(file);
-                while let Some(chunk) = inner.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            limiter.down.acquire(bytes.len()).await;
-                            yield Ok::<_, std::io::Error>(bytes);
-                        }
-                        Err(e) => {
-                            yield Err(e);
-                            break;
-                        }
-                    }
-                }
-            };
-            axum::http::Response::builder()
-                .status(axum::http::StatusCode::OK)
-                .header(
-                    axum::http::header::CONTENT_TYPE,
-                    "application/octet-stream",
-                )
-                .header(
-                    axum::http::header::CONTENT_LENGTH,
-                    metadata.len().to_string(),
-                )
-                .body(axum::body::Body::from_stream(stream))
-                .unwrap()
+
+    let expires_at = now + ttl;
+    {
+        let mut cache = state.resolve_cache.write().await;
+        // 容量上限 + 顺手清理过期项，避免被大量不同主机撑爆。
+        cache.retain(|_, e| e.expires_at_unix > now);
+        if cache.len() >= crate::relay::RESOLVE_CACHE_CAP {
+            cache.clear();
         }
-        Err(_) => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(json!({"error": "artifact not found"})),
-        )
-            .into_response(),
+        cache.insert(
+            host.clone(),
+            crate::relay::ResolveCacheEntry {
+                addresses: addresses.clone(),
+                expires_at_unix: expires_at,
+            },
+        );
     }
+
+    if addresses.is_empty() {
+        // 解析失败也给 expires_at：agent 应在 TTL 后重试，而不是永久放弃该源。
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "no address resolved for host",
+                "host": host,
+                "addresses": [],
+                "expires_at": expires_at,
+            })),
+        )
+            .into_response();
+    }
+
+    Json(crate::relay::ResolveResponse {
+        host,
+        addresses,
+        expires_at,
+        cached: false,
+    })
+    .into_response()
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ── Agent SSE handler (GET, for HTTP-mode agent receive) ─────────────
@@ -4726,5 +4831,212 @@ mod tests {
             Some(&false),
             "agent disconnect must mark desktop stopped"
         );
+    }
+
+    // ── /agent/resolve：鉴权与 host 白名单（MYS-2425）─────────────────
+
+    /// 配置了 CDN 白名单的 state。
+    fn resolve_state(cdns: &[&str]) -> Arc<SharedState> {
+        let mut st = SharedState::new(
+            "".to_string(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+            None,
+        );
+        st.upgrade_cdn_base_urls = cdns.iter().map(|s| s.to_string()).collect();
+        Arc::new(st)
+    }
+
+    fn rw_headers(state: &Arc<SharedState>, token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-sr-token", token.parse().unwrap());
+        let _ = state;
+        h
+    }
+
+    fn query_of(host: &str) -> axum::extract::Query<Vec<(String, String)>> {
+        axum::extract::Query(vec![("host".to_string(), host.to_string())])
+    }
+
+    #[tokio::test]
+    async fn test_agent_resolve_requires_rw_token() {
+        let state = resolve_state(&["https://github.com"]);
+        // 无 Token → 401
+        let r = agent_resolve_handler(
+            State(state.clone()),
+            query_of("github.com"),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(r.status(), 401, "代解析必须要求 Token");
+
+        // ro Token → 403
+        let ro = state.sessions.register(None, "ro", None).await.unwrap();
+        let r = agent_resolve_handler(
+            State(state.clone()),
+            query_of("github.com"),
+            rw_headers(&state, &ro.tokens[0].0),
+        )
+        .await;
+        assert_eq!(r.status(), 403, "代解析必须要求 rw 权限");
+
+        // 无效 Token → 401
+        let r = agent_resolve_handler(
+            State(state.clone()),
+            query_of("github.com"),
+            rw_headers(&state, "bogus-token"),
+        )
+        .await;
+        assert_eq!(r.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_agent_resolve_rejects_host_outside_allowlist() {
+        let state = resolve_state(&["https://gh-proxy.com", "https://edgeone.gh-proxy.com"]);
+        let rw = state.sessions.register(None, "rw", None).await.unwrap();
+        let token = rw.tokens[0].0.clone();
+
+        for host in [
+            "evil.example",
+            "localhost",
+            "127.0.0.1",
+            "internal.corp.lan",
+            // 白名单主机的子域不属于白名单（避免 *.cdn 全开）
+            "x.gh-proxy.com",
+            // 带端口 / 路径 / 空白都不接受
+            "gh-proxy.com:8080",
+            "gh-proxy.com/evil",
+            " gh-proxy.com",
+            // 路径元字符
+            "..",
+            "gh-proxy..com",
+        ] {
+            let r = agent_resolve_handler(
+                State(state.clone()),
+                query_of(host),
+                rw_headers(&state, &token),
+            )
+            .await;
+            assert_eq!(r.status(), 403, "host {host:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_resolve_missing_and_duplicated_host() {
+        let state = resolve_state(&["https://github.com"]);
+        let rw = state.sessions.register(None, "rw", None).await.unwrap();
+        let token = rw.tokens[0].0.clone();
+
+        // 缺 host → 400
+        let r = agent_resolve_handler(
+            State(state.clone()),
+            axum::extract::Query(Vec::new()),
+            rw_headers(&state, &token),
+        )
+        .await;
+        assert_eq!(r.status(), 400);
+
+        // 重复 host → 400（避免白名单主机与攻击者主机的歧义解析）
+        let q = axum::extract::Query(vec![
+            ("host".to_string(), "github.com".to_string()),
+            ("host".to_string(), "evil.example".to_string()),
+        ]);
+        let r = agent_resolve_handler(State(state.clone()), q, rw_headers(&state, &token)).await;
+        assert_eq!(r.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_agent_resolve_allowlisted_host_returns_addresses_and_ttl() {
+        // `localhost` 不在白名单，但测试需要可控的真实解析：把白名单设成
+        // 一个必然可解析的主机名（`localhost` 形态由 is_resolvable_host 拒绝，
+        // 因此用 ip6-localhost 之类不可靠 —— 这里改用白名单内的
+        // `github.com` 并只断言"要么成功带 TTL，要么明确失败带 TTL"，
+        // 不依赖外网可达性。
+        let state = resolve_state(&["https://github.com"]);
+        let rw = state.sessions.register(None, "rw", None).await.unwrap();
+        let token = rw.tokens[0].0.clone();
+
+        let r = agent_resolve_handler(
+            State(state.clone()),
+            query_of("github.com"),
+            rw_headers(&state, &token),
+        )
+        .await;
+        let status = r.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        if status == 200 {
+            assert_eq!(body["host"], "github.com");
+            let addrs = body["addresses"].as_array().unwrap();
+            assert!(!addrs.is_empty(), "200 must carry addresses");
+            assert!(addrs.len() <= crate::relay::RESOLVE_MAX_ADDRESSES);
+            let expires = body["expires_at"].as_u64().unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert!(expires > now, "expires_at must be in the future");
+            assert!(
+                expires <= now + crate::relay::RESOLVE_TTL_SECS + 5,
+                "TTL must be capped"
+            );
+            // 缓存命中时 cached=true
+            let r2 = agent_resolve_handler(
+                State(state.clone()),
+                query_of("github.com"),
+                rw_headers(&state, &token),
+            )
+            .await;
+            assert_eq!(r2.status(), 200);
+            let b2: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(r2.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(b2["cached"], true, "第二次查询必须命中缓存");
+        } else {
+            // 沙箱无外网 DNS → 明确失败，但仍给 expires_at 让 agent 重试。
+            assert_eq!(status, 503, "unexpected status {status}: {body}");
+            assert_eq!(body["addresses"].as_array().unwrap().len(), 0);
+            assert!(body["expires_at"].as_u64().unwrap() > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_resolve_negative_cache_is_bounded() {
+        // 白名单里放一个必然解析失败的主机名（保留域名 .invalid 不可解析）。
+        // `is_resolvable_host` 白名单匹配只看是否在列表中，因此这里能走到
+        // 解析失败分支。
+        let state = resolve_state(&["https://nonexistent-host.invalid"]);
+        let rw = state.sessions.register(None, "rw", None).await.unwrap();
+        let token = rw.tokens[0].0.clone();
+        let r = agent_resolve_handler(
+            State(state.clone()),
+            query_of("nonexistent-host.invalid"),
+            rw_headers(&state, &token),
+        )
+        .await;
+        assert_eq!(r.status(), 503);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body["expires_at"].as_u64().unwrap() > 0, "负缓存也要有 TTL");
+        // 负缓存写入了：第二次直接命中缓存且仍是 503
+        assert!(state
+            .resolve_cache
+            .read()
+            .await
+            .contains_key("nonexistent-host.invalid"));
     }
 }

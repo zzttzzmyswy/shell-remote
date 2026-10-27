@@ -100,8 +100,11 @@ cargo build --release --no-default-features
 | `--bind` | `0.0.0.0:3000` | 监听地址 |
 | `--auth` | 无默认值 | 服务器密码（必填） |
 | `--record-dir` | 无 | 终端会话录制目录（asciinema cast v2）；不设则不录制 |
-| `--download-dir` | 无 | 离线二进制分发目录：目录内按文件名（如 `shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`、`shell-remote-x86_64.exe`，以及同名的 `shell-remote-ui-*` 桌面版）放置各平台 agent 二进制，经 `/download/<文件名>` 对外提供；**安装脚本会优先从本 relay 下载**，GitHub 镜像仅作回退（适合内网/镜像受限环境） |
-| `--agent-upgrade-dir` | 无 | agent 自升级制品目录（`shell-remote-<arch>[.exe]` 与 `shell-remote-ui-<arch>[.exe]`，可选 `shell-remote-<arch>.version` 标注版本）；不设则"设备"页升级功能不可用 |
+| `--download-dir` | 无 | **统一制品库目录**（离线二进制分发 + agent 自升级共用同一份字节）。目录内按发布制品名放置各平台二进制：`shell-remote-<arch>[.exe]`（CLI）与 `shell-remote-ui-<arch>[.exe]`（桌面版），可选 `<文件名去掉 .exe>.version` 标注版本。公开入口 `/download/<文件名>` 供安装脚本使用（安装脚本优先本 relay，GitHub 镜像仅作回退）；鉴权入口 `/agent/upgrade/blob/<文件名>` 供已注册 agent 自升级。两个端点支持 `Range` 断点续传 |
+| `--agent-upgrade-dir` | 无 | `--download-dir` 的**兼容别名**（迁移期）。两者同时指定且指向不同目录会拒绝启动；只设其一即可，此时"设备"页升级功能可用 |
+| `--upgrade-cdn` | 内置官方 + 镜像列表 | 升级任务下发给 agent 的外部 CDN 基础地址（可重复或逗号分隔，每项为纯 origin 如 `https://gh-proxy.com`）。每项的 `origin + official_path` 即完整下载 URL。这些主机名同时构成 `/agent/resolve` 代解析白名单 |
+| `--allow-custom-upgrade` | 关闭 | 允许为**没有官方 digest 来源**的本地镜像生成升级任务（任务标记 `source: custom`，且不提供外部 CDN）。默认关闭：不批准就不下发 |
+| `--manifest-api-base` | `https://api.github.com` | 官方 release API 根，仅用于内网镜像或测试 |
 | `--bandwidth-down-mbps` | `0`（不限） | relay 整体**下行**（relay 出站）带宽上限，单位 Mbit/s。优先级：settings 文件里的同名字段 > 本参数 > 不限。后台"设置 → 带宽限制"修改后即时生效并写回 settings 文件 |
 | `--bandwidth-up-mbps` | `0`（不限） | relay 整体**上行**（relay 入站）带宽上限，单位 Mbit/s，优先级同上 |
 | `--settings-file` | `~/.shell-remote/relay-settings.json` | 带宽设置的持久化文件（JSON）。后台每次保存都会先写临时文件再 rename 覆盖（原子写）；文件损坏或缺失时按"未配置"处理并退回 CLI 值 |
@@ -548,22 +551,103 @@ shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
 
 ## Agent 原子自升级
 
-Relay 加 `--agent-upgrade-dir <目录>` 启用；然后把新版本 agent 二进制放入该目录（命名与发布制品一致，见 `tools/build-dist.sh`）：CLI 为 `shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`，Windows 为 `shell-remote-x86_64.exe`；桌面版 UI agent 为对应的 `shell-remote-ui-<arch>[.exe]`。可选写一个 `shell-remote-<arch>.version` 文件标注版本号（如 `0.19.0`），后台会把它显示为目标版本。
+### 一份制品库，两个入口
 
-后台"设备"面板每台在线设备都有一个 **升级** 按钮，点击后：
+relay 加 `--download-dir <目录>` 启用（`--agent-upgrade-dir` 是它的兼容别名，只设一个即可）。目录里放与发布制品同名的文件（见 `tools/build-dist.sh`）：
 
-1. relay 按设备上报的架构挑出对应制品，计算 SHA-256，向该 agent 下发 `agent:upgrade`；
-2. agent 从 relay 下载制品（凭自身 rw token 鉴权），边下边上报进度（百分比）；
-3. 校验 SHA-256 —— 不匹配即失败，保留原二进制；
-4. Unix 上先跑一次 `--version` 冒烟测试，确认新制品能在本机执行（防架构不匹配/截断文件）；Windows 跳过（以 SHA-256 为准）；
-5. 同目录原子替换（Unix `rename` 原子；Windows 对占用文件的场景回退为辅助 `.bat` 延迟替换），随后以原有启动参数重新拉起新进程并退出旧进程。
+| 形态 | 文件名 |
+|---|---|
+| CLI（lean，仅终端转发） | `shell-remote-x86_64`、`shell-remote-aarch64`、`shell-remote-armv7`、`shell-remote-x86_64.exe` |
+| UI（桌面 agent + 窗口面板） | `shell-remote-ui-<arch>[.exe]` |
+
+可选写一个 `<文件名去掉 .exe>.version` 标注版本号（如 `0.59.2`）。也可以把版本归档到 `releases/v<版本>/<文件名>`（读取优先于扁平名），这样多个版本可以并存而不互相覆盖。官方清单缓存在 `.metadata/manifests/`，**不通过 `/download` 暴露**。
+
+同一批字节有两个读取入口，权限边界不合并：
+
+| 入口 | 用途 | 鉴权 |
+|---|---|---|
+| `/download/<文件名>` | 安装脚本公开下载 | 无 |
+| `/agent/upgrade/blob/<文件名>` | 已注册 agent 自升级 | rw Token（`X-SR-Token`） |
+
+两者都支持 `Range`：命中区间回 `206` 且带正确的 `Content-Range`/`Content-Length`，非法或越界区间回 `416` + `Content-Range: bytes */<len>`，供 agent 用 `.part` 文件断点续传。
+
+### 升级任务怎么来的
+
+**relay 不能仅凭版本号就编出一个 hash。** 判定分两步：
+
+1. **是否需要升级**：`semver(relay 版本) > semver(agent 注册上报的版本)`。相等不升级，更低不降级，agent 未上报或非法版本只显示"版本未知"（不自动升级）。预发布按 semver 规则（`0.59.2-beta.1 < 0.59.2`）。
+2. **升级到哪一份确切字节**：按 relay 自身版本取官方 GitHub release 清单（`GET /repos/zzttzzmyswy/shell-remote/releases/tags/v<版本>`），只采用带 `digest: sha256:…` 且资产名精确匹配的条目。按设备上报的 arch 与 `capabilities` 选 CLI 或 UI 制品：只认 agent 显式声明的 `variant:cli` / `variant:ui`，其次用 relay 的 `--upgrade-variant`；两者都没有时**拒绝升级**（`409 variant_unknown`）。不设默认形态是有意的——升级是原地替换二进制，猜错就是把 UI 设备换成 lean CLI（`desktop:*` 不能作为判据：lean CLI 二进制同样会无条件上报 `desktop:gray` 等）。阶段 2 的 agent 会自带 `variant:*`，届时无需配置。
+
+制品来源按下面这张表决定（`asset` = 官方清单里的对应资产，`local` = 库内实测 hash 的副本）：
+
+| asset | local | 结果 |
+|---|---|---|
+| 有 | hash/size 一致 | `source: local`，CDN 优先 + relay 镜像兜底 |
+| 有 | hash/size 不一致 | **拒绝下发**（发布异常，不静默换 hash） |
+| 有 | 无 | `source: official`，仅 CDN |
+| 无 | 有且已 `--allow-custom-upgrade` | `source: custom`，仅 relay 镜像，不提供 CDN |
+| 无 | 有但未批准 | 拒绝，提示需要 `--allow-custom-upgrade` |
+| 无 | 无 | 拒绝（`目标档案不存在`） |
+
+GitHub 不可达时：已缓存的清单继续可用（不因网络波动让已验证任务失效）；同版本 digest 与缓存不一致则标记发布异常并拒绝该版本；无缓存且无本地镜像则不生成任务。
+
+### 下发字段
+
+`agent:upgrade` 的 `payload`：
+
+```json
+{
+  "upgrade_id": "4f2c…",
+  "target_version": "0.59.2",
+  "filename": "shell-remote-ui-aarch64",
+  "size": 16956344,
+  "sha256": "e8233ca1…d851",
+  "official_path": "/zzttzzmyswy/shell-remote/releases/download/v0.59.2/shell-remote-ui-aarch64",
+  "cdn_base_urls": ["https://github.com", "https://edgeone.gh-proxy.com", "…"],
+  "relay_url": "/agent/upgrade/blob/shell-remote-ui-aarch64",
+  "relay_fallback": true,
+  "source": "local",
+  "official_release": true,
+  "variant": "ui",
+  "arch": "aarch64",
+  "windows": false,
+  "version": "0.59.2",
+  "url": "/agent/upgrade/blob/shell-remote-ui-aarch64"
+}
+```
+
+`version` / `url` 是给存量 agent（≤ v0.59.2，只认这三个键加 `sha256`）的兼容别名。没有 relay 副本时不给 `url`，admin 响应里的 `legacy_compatible: false` 会提示老 agent 无法完成这次升级。
+
+### 代解析端点
+
+`GET /agent/resolve?host=<CDN 主机>`（rw Token 鉴权）供系统 DNS 与 DoH 都不可用时使用。它**不是**通用 DNS 代理：只解析 `--upgrade-cdn` 列出的主机（外加官方 `github.com`），裸主机名形态，其他一律 403。返回：
+
+```json
+{ "host": "gh-proxy.com", "addresses": ["1.2.3.4"], "expires_at": 1793000000, "cached": false }
+```
+
+TTL 上限 300s，解析失败有 15s 负缓存（仍带 `expires_at`，让 agent 在 TTL 后重试而不是永久封死该源）。
+
+### 执行流程
+
+后台"设备"面板的 **升级** 按钮（或 `POST <admin>/api/agent/upgrade`，`{"session_id": "…", "force": false}`）触发后：
+
+1. relay 做版本决策、取清单、定位制品并交叉校验，生成不可变任务下发 `agent:upgrade`；
+2. agent 下载制品（外部请求不带 relay Token；relay 请求沿用 rw Token），边下边上报进度；
+3. 校验 SHA-256 —— 不匹配即失败，保留原二进制；长度不符同样失败；
+4. Unix 上先跑一次 `--version` 冒烟测试（防架构不匹配/截断）；Windows 跳过（以 SHA-256 为准）；
+5. 同目录原子替换后以原有启动参数拉起新进程并退出旧进程。
+
+`GET <admin>/api/agent/upgrade/plan?session_id=…` 只做版本决策与制品定位，**不**下发指令、不退出任何进程，供设备列表显示"是否需要升级/能否升级"。
 
 升级全程在设备行的"版本"列实时显示状态（已触发 / 下载中 n% / 校验中 / 安装重启中 / 失败原因）；升级完成后显示绿色"已升级 v<版本>"，device 版本列同步刷新。
 
 注意事项：
 
-- agent 所在目录必须可写（`rename` 需要该目录的写权限）；失败会在后台明确提示。
+- 制品目录必须可读（relay 需要现场算 hash）；agent 所在目录必须可写（替换需要该目录写权限），失败会在后台明确提示。
+- **旧 agent（≤ v0.59.2）只认 relay 的 `url`**：收到仅含外部 CDN 的任务时它会解析失败、只回一个错误帧，旧进程根本不会升级。因此没有本地镜像时 relay 会对这类 agent 返回 `409 legacy_agent_needs_relay_mirror`（明确提示先把制品放入 `--download-dir`），而不是白发送。它们同样不会上报 `variant:*`，未配 `--upgrade-variant` 时返回 `409 variant_unknown`。
 - 重新拉起的新进程会按 `--key` 固定密钥重新注册，身份保持；若原 agent 使用临时令牌启动（未指定 `--key`），重启后会签发新令牌，旧令牌失效。
+- **信任边界**：hash 来自官方 release 的 asset digest，能证明字节与 GitHub 上已上传的资产一致；它**不能**抵御官方仓库或 release 资产被恶意替换。需要这个保证要另加发布签名（不在当前范围）。CDN、DoH、代解析只解决可达性，不参与版本与字节决策。
 
 ## 会话录制
 

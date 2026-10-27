@@ -73,7 +73,11 @@ cargo build --release
 | `--auth` | none | Server password (required) |
 | `--record-dir` | none | Directory to record terminal sessions (asciinema cast v2); unset disables |
 | `--download-dir` | none | Offline binary distribution directory: place per-platform agent binaries by file name (e.g. `shell-remote-x86_64`, `shell-remote-aarch64`, `shell-remote-armv7`, `shell-remote-x86_64.exe`), served at `/download/<name>`. The install scripts download from this relay **first**, falling back to GitHub mirrors — for intranet / restricted networks |
-| `--agent-upgrade-dir` | none | Directory with staged agent upgrade artifacts (`shell-remote-<arch>[.exe]`, optional `shell-remote-<arch>.version` companion); unset disables the upgrade button |
+| `--download-dir` | none | Unified artifact store (public install downloads + authenticated agent self-upgrade). `--agent-upgrade-dir` is a compatibility alias; setting both to different paths refuses to start |
+| `--upgrade-cdn` | built-in list | External CDN origins for upgrade tasks (repeatable / comma-separated, bare origins like `https://gh-proxy.com`). These hosts also form the `/agent/resolve` allowlist |
+| `--allow-custom-upgrade` | off | Allow tasks for local mirrors with no official digest source (`source: custom`, no external CDN) |
+| `--upgrade-variant` | none | Artifact variant (`cli`/`ui`) for agents that do not report `variant:*`. **Unset means such agents are refused** (`variant_unknown`) rather than guessed |
+| `--manifest-api-base` | `https://api.github.com` | Official release API root (mirrors/testing) |
 | `--bandwidth-down-mbps` | `0` (unlimited) | Relay-wide **downlink** (relay egress) cap in Mbit/s. Priority: same field in the settings file > this flag > unlimited. Changes made in the admin panel's Settings → Bandwidth limit section take effect immediately and are written back to the settings file |
 | `--bandwidth-up-mbps` | `0` (unlimited) | Relay-wide **uplink** (relay ingress) cap in Mbit/s, same priority rules |
 | `--settings-file` | `~/.shell-remote/relay-settings.json` | Persistence file for the bandwidth settings (JSON). Every admin save writes a temp file and renames it over the target (atomic); a missing or corrupt file is treated as "not configured" and the CLI values apply |
@@ -282,7 +286,11 @@ Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in 
 
 ## Atomic Agent Self-Upgrade
 
-Enable with `--agent-upgrade-dir <dir>` on the relay, then stage new agent binaries in that directory with the same naming as the release artifacts (see `scripts/build-releases.sh`): `shell-remote-x86_64`, `shell-remote-aarch64`, `shell-remote-armv7`, or `shell-remote-x86_64.exe` on Windows. An optional `shell-remote-<arch>.version` file (e.g. `0.19.0`) labels the target version in the UI.
+Upgrades prefer external CDNs and use the relay mirror only as a conditional fallback. Enable the store with `--download-dir <dir>` (`--agent-upgrade-dir` is a compatibility alias; setting both to different paths refuses to start). Stage artifacts with the release naming (see `tools/build-dist.sh`): CLI is `shell-remote-<arch>[.exe]`, desktop is `shell-remote-ui-<arch>[.exe]`; an optional same-named `.version` file labels the target version. `releases/v<version>/` keeps multiple versions side by side.
+
+Two read entry points share this one store but keep separate auth boundaries: `/download/<filename>` (public, for install scripts) and `/agent/upgrade/blob/<filename>` (rw token, for agents). Both support `Range`.
+
+> **Compatibility note:** agents released before the CDN protocol (≤ v0.59.2) only understand a relay `url`. For those agents an upgrade requires a local mirror; without one the relay returns `409 legacy_agent_needs_relay_mirror` instead of sending a task they cannot consume. They also cannot report `variant:cli`/`variant:ui`, so the relay refuses with `409 variant_unknown` unless you set `--upgrade-variant`.
 
 Every online device in the admin **Devices** tab has an **Upgrade** button. Clicking it:
 

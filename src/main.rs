@@ -5,9 +5,27 @@
 //   （capture="none"，浏览器端不显示桌面按钮）。
 // - 发布产物建议用 `--no-default-features` lean 构建：不编译桌面代码
 //   （无 openh264/x11rb/enigo/str0m/AV1 等重依赖），便于快速交叉编译。
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use shell_remote::{agent, proto::TokenType, relay};
+
+/// `--upgrade-variant` 的取值：把 CLI 参数映射到 relay 的制品形态。
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum UpgradeVariantArg {
+    /// lean CLI 二进制（shell-remote-<arch>）
+    Cli,
+    /// 桌面 UI 二进制（shell-remote-ui-<arch>）
+    Ui,
+}
+
+impl From<UpgradeVariantArg> for shell_remote::relay::artifact_store::Variant {
+    fn from(v: UpgradeVariantArg) -> Self {
+        match v {
+            UpgradeVariantArg::Cli => Self::Cli,
+            UpgradeVariantArg::Ui => Self::Ui,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "shell-remote", about = "Collaborative remote shell tool", version)]
@@ -48,9 +66,11 @@ enum Command {
         record_dir: Option<String>,
 
         /// Directory with staged agent upgrade artifacts
-        /// (`shell-remote-<arch>[.exe]`, plus an optional
-        /// `shell-remote-<arch>.version` companion). When set, the admin
-        /// device panel can trigger atomic agent self-upgrades.
+        /// (`shell-remote-<arch>[.exe]`, `shell-remote-ui-<arch>[.exe]`, plus an
+        /// optional `<filename 去掉 .exe>.version` companion).
+        ///
+        /// 与 `--download-dir` 是**同一个**统一制品库的别名：只设一个即可，
+        /// 两个都设且指向不同目录会被拒绝启动。
         #[arg(long)]
         agent_upgrade_dir: Option<String>,
 
@@ -60,8 +80,35 @@ enum Command {
         /// shell-remote-darwin-aarch64). When set, the install scripts download
         /// from this relay first and only fall back to GitHub mirrors;
         /// binaries can be staged out-of-band (e.g. scp/CI) into this dir.
+        ///
+        /// 这是统一制品库的主参数：公开安装下载与 rw Token 鉴权的 agent 自升级
+        /// 共享同一份字节。
         #[arg(long)]
         download_dir: Option<String>,
+
+        /// 升级任务下发给 agent 的外部 CDN 基础地址（可重复）。每项是
+        /// 「前缀 + 官方 release 相对路径」，如 `https://gh-proxy.com`。
+        /// 未指定时用内置的官方 origin + 镜像列表。这些域名同时构成
+        /// `/agent/resolve` 代解析的白名单。
+        #[arg(long = "upgrade-cdn", value_delimiter = ',')]
+        upgrade_cdn: Vec<String>,
+
+        /// 允许为没有官方 digest 来源的本地镜像生成升级任务（任务会标记
+        /// `source: custom`，且不提供外部 CDN）。默认关闭——不批准就不下发。
+        #[arg(long)]
+        allow_custom_upgrade: bool,
+
+        /// 当 agent 未声明 `variant:cli` / `variant:ui` 能力时，按此形态挑升级
+        /// 制品。**未指定时这类 agent 会被拒绝升级**（409 `variant_unknown`）：
+        /// 升级是原地替换二进制，猜错就是能力丢失（把 UI 设备换成 lean CLI），
+        /// 所以不设默认值。lean CLI 二进制也会上报 `desktop:*`，不能用它推断
+        /// 桌面形态。阶段 2 的 agent 会自带 `variant:*`，届时无需本参数。
+        #[arg(long, value_enum)]
+        upgrade_variant: Option<UpgradeVariantArg>,
+
+        /// 官方 release API 根（默认 https://api.github.com）。仅用于镜像/测试。
+        #[arg(long)]
+        manifest_api_base: Option<String>,
 
         /// PEM certificate for HTTPS (must be paired with --tls-key).
         /// Unset = auto-generate a self-signed certificate and persist it
@@ -183,6 +230,10 @@ async fn main() -> anyhow::Result<()> {
             bandwidth_down_mbps,
             bandwidth_up_mbps,
             settings_file,
+            upgrade_cdn,
+            allow_custom_upgrade,
+            upgrade_variant,
+            manifest_api_base,
         } => {
             relay::start(
                 bind,
@@ -201,6 +252,12 @@ async fn main() -> anyhow::Result<()> {
                 bandwidth_down_mbps,
                 bandwidth_up_mbps,
                 settings_file,
+                relay::UpgradeSettings {
+                    cdn_base_urls: upgrade_cdn,
+                    allow_custom_upgrade,
+                    upgrade_variant_override: upgrade_variant.map(Into::into),
+                    manifest_api_base,
+                },
             )
             .await?;
         }

@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 
 pub mod admin;
+pub mod artifact_store;
 pub mod auth;
 pub mod bandwidth;
 pub mod desktop;
@@ -66,6 +67,11 @@ pub struct SharedState {
     pub last_activity: RwLock<HashMap<String, Instant>>,
     /// Directory served at `/download/<filename>` (optional offline binary
     /// distribution; the install scripts try this relay before GitHub).
+    ///
+    /// MYS-2425：`--download-dir` 与 `--agent-upgrade-dir` 已合并为**同一个**
+    /// [`artifact_store::ArtifactStore`]；两个 HTTP 入口共享这批字节，但保留各自
+    /// 的权限边界（公开安装 / rw Token 升级）。字段名保持 `download_dir` 只是为了
+    /// 少改调用点，语义见 [`Self::artifact_store`]。
     pub download_dir: Option<std::path::PathBuf>,
     /// Server access password (`--auth`). Wrapped in a RwLock so the admin
     /// panel can rotate it live; reads on the hot auth path take a read lock.
@@ -123,7 +129,32 @@ pub struct SharedState {
     /// Directory holding staged agent upgrade artifacts
     /// (`shell-remote-<arch>[.exe]`, plus an optional `shell-remote-<arch>.version`
     /// companion). `None` when `--agent-upgrade-dir` is unset (upgrades off).
+    ///
+    /// MYS-2425：默认与 [`Self::download_dir`] 指向同一目录。显式配置成两个
+    /// 不同路径属于配置错误，`start` 会拒绝启动——一份制品库，两种读取入口。
     pub upgrade_dir: RwLock<Option<std::path::PathBuf>>,
+    /// 统一制品库（MYS-2425）。`None` 表示未配置制品目录（`/download` 与
+    /// agent 自升级都不可用）。与 `download_dir` / `upgrade_dir` 同源，方便
+    /// 各 handler 直接用带校验的定位/枚举能力。
+    pub artifact_store: Option<artifact_store::ArtifactStore>,
+    /// 升级任务可用的外部 CDN 入口（`--upgrade-cdn`，缺省为
+    /// [`artifact_store::DEFAULT_CDN_BASE_URLS`]）。这些域名同时构成
+    /// `/agent/resolve` 的代解析白名单。
+    pub upgrade_cdn_base_urls: Vec<String>,
+    /// `--allow-custom-upgrade`：允许为没有官方 digest 来源的本地镜像生成升级
+    /// 任务（标记 `source: custom`，只走 relay 镜像）。默认关闭。
+    pub allow_custom_upgrade: bool,
+    /// `--upgrade-variant`：当 agent 未声明 `variant:*` 能力时，按此形态选制品。
+    /// `None` 表示按 CLI 处理（保守默认，见 `admin::variant_for_device`）。
+    pub upgrade_variant_override: Option<artifact_store::Variant>,
+    /// 官方 release 清单抓取的边界参数（测试注入本地 mock 地址）。
+    pub manifest_fetch: artifact_store::ManifestFetchConfig,
+    /// 每个版本最近一次取清单的结果，用于在 admin 概览里解释"为什么不能升级"。
+    /// key 为版本串，value 为 `{"ok":bool,"detail":str,"cached":bool}`。
+    pub manifest_status: RwLock<HashMap<String, serde_json::Value>>,
+    /// `/agent/resolve` 的短期解析缓存：`host → (addresses, expires_at_unix)`。
+    /// 带 TTL 上限与负缓存，且只对白名单主机生效。
+    pub resolve_cache: RwLock<HashMap<String, ResolveCacheEntry>>,
     /// Agent 心跳 KPI 历史（R5 丙111/140：admin KPI 曲线数据源）。每 session
     /// 一个定长 VecDeque（agent 心跳 15s × [`KPI_HISTORY_CAP`] = 30min 窗口），
     /// 由 `route_agent_message` 拦截 `ping` 消息时采样心跳 payload 的 `kpi`
@@ -175,6 +206,137 @@ pub struct AgentKpiSample {
 
 /// KPI 历史窗口长度：agent 心跳 15s × 120 = 30min。
 pub const KPI_HISTORY_CAP: usize = 120;
+
+// ── /agent/resolve（代解析）──────────────────────────────────────────
+
+/// `/agent/resolve` 结果缓存上限（条数）。
+pub const RESOLVE_CACHE_CAP: usize = 512;
+/// `/agent/resolve` 返回的 IP 有效期上限（秒）。DNS 变更再快也不该被一次解析
+/// 永久封死，因此 agent 侧必须遵守 `expires_at`。
+pub const RESOLVE_TTL_SECS: u64 = 300;
+/// 解析失败（无地址）的负缓存时长（秒）——避免把 CDN 短暂故障变成持续风暴。
+pub const RESOLVE_NEGATIVE_TTL_SECS: u64 = 15;
+/// 单次 `getaddrinfo` 的超时。
+pub const RESOLVE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// 单主机返回的最大地址数（IPv4+IPv6）。
+pub const RESOLVE_MAX_ADDRESSES: usize = 8;
+
+/// `/agent/resolve` 的一条缓存。
+#[derive(Debug, Clone)]
+pub struct ResolveCacheEntry {
+    pub addresses: Vec<String>,
+    pub expires_at_unix: u64,
+}
+
+/// 缺省 CDN 入口列表（可在 `--upgrade-cdn` 覆盖）。
+pub fn default_cdn_base_urls() -> Vec<String> {
+    artifact_store::DEFAULT_CDN_BASE_URLS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// 把 `--upgrade-cdn` 的原始字符串规范化成 base URL 列表，并校验形态。
+///
+/// 只接受 `http://` / `https://` 且无路径（镜像约定是「前缀 + official_path」）、
+/// 无凭据、无查询串。任一条目不合法即报错——一个坏条目会让所有 agent 静默
+/// 下载失败，宁可在启动时失败。
+pub fn normalize_cdn_base_urls(raw: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for item in raw {
+        let url = item.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("--upgrade-cdn {url:?}: only http:// or https:// is accepted")
+            })?;
+        // 容忍用户写的结尾斜杠（`https://cdn.example/` 与不带斜杠等价），
+        // 之后再校验形态：主机名必须有，且不能带凭据/路径/查询/片段。
+        let rest = rest.trim_end_matches('/');
+        if rest.is_empty()
+            || rest.contains('@')
+            || rest.contains('/')
+            || rest.contains('?')
+            || rest.contains('#')
+            || rest.contains('\\')
+        {
+            return Err(anyhow::anyhow!(
+                "--upgrade-cdn {url:?}: must be a bare origin like https://cdn.example"
+            ));
+        }
+        let host = rest
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return Err(anyhow::anyhow!("--upgrade-cdn {url:?}: invalid host"));
+        }
+        out.push(url.trim_end_matches('/').to_string());
+    }
+    if out.is_empty() {
+        anyhow::bail!("--upgrade-cdn: at least one CDN origin is required");
+    }
+    Ok(out)
+}
+
+/// 从 base URL 取主机名（`https://gh-proxy.com` → `gh-proxy.com`）。
+pub fn cdn_host(base_url: &str) -> Option<String> {
+    let rest = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))?;
+    let host = rest.split('/').next()?.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// `/agent/resolve` 的白名单：升级任务可用 CDN 的主机名，外加官方下载 origin。
+///
+/// 令牌大小写不敏感比较。**不包含**任意其它主机——这个接口不能成为内网 DNS
+/// 代理。`host` 参数只接受裸主机名（无端口/路径/空白），杜绝 `host:port` 走私
+/// 与非 HTTP 用途的解析请求。
+pub fn is_resolvable_host(host: &str, cdn_base_urls: &[String]) -> bool {
+    // 不 trim：空白本身就该被判为非法主机名（`host=" gh-proxy.com"` 不是
+    // `gh-proxy.com` 的别名，静默修剪只会让"看起来通过"的输入混进白名单）。
+    let h = host.to_ascii_lowercase();
+    if h.is_empty()
+        || h.len() > 253
+        || !h
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        || h.starts_with('.')
+        || h.ends_with('.')
+        || h.contains("..")
+    {
+        return false;
+    }
+    let official = cdn_host(&format!("https://{}", artifact_store::OFFICIAL_DOWNLOAD_BASE
+        .trim_start_matches("https://")))
+    .unwrap_or_default();
+    let mut allowed: Vec<String> = cdn_base_urls.iter().filter_map(|u| cdn_host(u)).collect();
+    if !official.is_empty() {
+        allowed.push(official);
+    }
+    allowed.iter().any(|a| a == &h)
+}
+
+/// 一次 `/agent/resolve` 的响应体（同时也是 agent 侧要遵守的契约）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResolveResponse {
+    pub host: String,
+    pub addresses: Vec<String>,
+    /// Unix 秒。agent 必须在此之后重新解析，不能长期缓存。
+    pub expires_at: u64,
+    /// 命中 relay 缓存时为 true（agent 可用于诊断，不影响正确性）。
+    pub cached: bool,
+}
 
 /// One entry in the access audit trail. `conn` is the session id, `prefix` is
 /// the first 8 chars of the token (never the full secret), `permission` is
@@ -325,6 +487,13 @@ impl SharedState {
             desktop_proto: RwLock::new(HashMap::new()),
             agent_upgrades: RwLock::new(HashMap::new()),
             upgrade_dir: RwLock::new(None),
+            artifact_store: None,
+            upgrade_cdn_base_urls: default_cdn_base_urls(),
+            allow_custom_upgrade: false,
+            upgrade_variant_override: None,
+            manifest_fetch: artifact_store::ManifestFetchConfig::default(),
+            manifest_status: RwLock::new(HashMap::new()),
+            resolve_cache: RwLock::new(HashMap::new()),
             kpi_history: RwLock::new(HashMap::new()),
             bandwidth: Arc::new(bandwidth::BandwidthLimiter::new()),
             web_proxy: Arc::new(web_proxy::WebProxyStore::new()),
@@ -851,6 +1020,30 @@ mod tests {
         assert!(rd2 < gh2, "ps1 must try relay download first:\n{seg2}");
     }
 
+    /// 构造一个配好统一制品库的 state（`--download-dir` / `--agent-upgrade-dir`
+    /// 合并后的唯一入口）。
+    fn state_with_artifacts(dir: std::path::PathBuf) -> Arc<SharedState> {
+        let mut st = SharedState::new(
+            "".into(),
+            100 * 1024 * 1024,
+            None,
+            String::new(),
+            String::new(),
+            None,
+        );
+        st.download_dir = Some(dir.clone());
+        st.artifact_store = Some(crate::relay::artifact_store::ArtifactStore::new(dir));
+        Arc::new(st)
+    }
+
+    fn range_headers(range: Option<&str>) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        if let Some(r) = range {
+            h.insert(axum::http::header::RANGE, r.parse().unwrap());
+        }
+        h
+    }
+
     #[tokio::test]
     async fn test_download_handler_serves_and_protects() {
         let dir = std::env::temp_dir().join(format!("sr-dl-{}", std::process::id()));
@@ -858,38 +1051,209 @@ mod tests {
         std::fs::write(dir.join("shell-remote-x86_64"), b"\x7fELF-fake-bin").unwrap();
         std::fs::write(dir.join("shell-remote-x86_64.exe"), b"MZ-fake-exe").unwrap();
 
-        let mk = || {
-            let mut st = SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None);
-            st.download_dir = Some(dir.clone());
-            Arc::new(st)
-        };
+        let mk = || state_with_artifacts(dir.clone());
 
         // 正常下载
-        let resp = download_handler(State(mk()), axum::extract::Path("shell-remote-x86_64".into()))
-            .await
-            .into_response();
+        let resp = download_handler(
+            State(mk()),
+            axum::extract::Path("shell-remote-x86_64".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), 200);
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(&bytes[..], b"\x7fELF-fake-bin");
 
         // 路径穿越被拒
-        let resp = download_handler(State(mk()), axum::extract::Path("../secret".into()))
-            .await
-            .into_response();
+        let resp = download_handler(
+            State(mk()),
+            axum::extract::Path("../secret".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), 400);
 
-        // 不存在的文件
-        let resp = download_handler(State(mk()), axum::extract::Path("nope.bin".into()))
-            .await
-            .into_response();
+        // 合法制品名但不存在
+        let resp = download_handler(
+            State(mk()),
+            axum::extract::Path("shell-remote-riscv64".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), 404);
 
-        // 未配置 download-dir → 404
+        // 非发布制品名 → 400（统一制品库只服务发布产物，不是任意文件读取口）
+        let resp = download_handler(
+            State(mk()),
+            axum::extract::Path("nope.bin".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 400);
+
+        // 未配置制品库 → 404
         let state_no = Arc::new(SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None));
-        let resp = download_handler(State(state_no), axum::extract::Path("shell-remote-x86_64".into()))
-            .await
-            .into_response();
+        let resp = download_handler(
+            State(state_no),
+            axum::extract::Path("shell-remote-x86_64".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_download_handler_range_206_200_416() {
+        let dir = std::env::temp_dir().join(format!("sr-dl-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: Vec<u8> = (0..=255u8).collect();
+        std::fs::write(dir.join("shell-remote-aarch64"), &body).unwrap();
+        let state = state_with_artifacts(dir.clone());
+
+        // 无 Range → 200 + 全量长度 + Accept-Ranges
+        let resp = download_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-aarch64".into()),
+            range_headers(None),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["accept-ranges"], "bytes");
+        assert_eq!(resp.headers()["content-length"], "256");
+        assert!(resp.headers().get("content-range").is_none());
+        let got = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(got.len(), 256);
+
+        // 区间 → 206 + 正确的 Content-Range / Content-Length + 正确字节
+        let resp = download_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-aarch64".into()),
+            range_headers(Some("bytes=10-19")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 206);
+        assert_eq!(resp.headers()["content-range"], "bytes 10-19/256");
+        assert_eq!(resp.headers()["content-length"], "10");
+        let got = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(&got[..], &body[10..20]);
+
+        // 开区间到末尾 → 206，Content-Range 截到 len-1
+        let resp = download_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-aarch64".into()),
+            range_headers(Some("bytes=250-")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 206);
+        assert_eq!(resp.headers()["content-range"], "bytes 250-255/256");
+        let got = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(&got[..], &body[250..=255]);
+
+        // 后缀区间（断点续传常用）→ 206
+        let resp = download_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-aarch64".into()),
+            range_headers(Some("bytes=-4")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 206);
+        assert_eq!(resp.headers()["content-range"], "bytes 252-255/256");
+        let got = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(&got[..], &body[252..=255]);
+
+        // 越界区间 → 416 + `bytes */len`
+        let resp = download_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-aarch64".into()),
+            range_headers(Some("bytes=999-")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 416);
+        assert_eq!(resp.headers()["content-range"], "bytes */256");
+        assert_eq!(resp.headers()["accept-ranges"], "bytes");
+
+        // start > end → 416
+        let resp = download_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-aarch64".into()),
+            range_headers(Some("bytes=20-10")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 416);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_blob_range_and_token_auth() {
+        let dir = std::env::temp_dir().join(format!("sr-blob-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: Vec<u8> = (0..=99u8).collect();
+        std::fs::write(dir.join("shell-remote-ui-x86_64"), &body).unwrap();
+        let state = state_with_artifacts(dir.clone());
+        *state.upgrade_dir.write().await = Some(dir.clone());
+
+        let reg = state.sessions.register(None, "rw", None).await.unwrap();
+        let rw_token = reg.tokens[0].0.clone();
+        let mut auth = axum::http::HeaderMap::new();
+        auth.insert("x-sr-token", rw_token.parse().unwrap());
+
+        // rw Token + Range → 206
+        let mut h = auth.clone();
+        h.insert(axum::http::header::RANGE, "bytes=0-9".parse().unwrap());
+        let resp = super::ws::upgrade_blob_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-ui-x86_64".into()),
+            h,
+        )
+        .await;
+        assert_eq!(resp.status(), 206);
+        assert_eq!(resp.headers()["content-range"], "bytes 0-9/100");
+        let got = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(&got[..], &body[0..10]);
+
+        // rw Token 无 Range → 200
+        let resp = super::ws::upgrade_blob_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-ui-x86_64".into()),
+            auth.clone(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+
+        // 无 Token → 401
+        let resp = super::ws::upgrade_blob_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-ui-x86_64".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), 401);
+
+        // ro Token → 403
+        let ro = state.sessions.register(None, "ro", None).await.unwrap();
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-sr-token", ro.tokens[0].0.parse().unwrap());
+        let resp = super::ws::upgrade_blob_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-ui-x86_64".into()),
+            h,
+        )
+        .await;
+        assert_eq!(resp.status(), 403);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1288,6 +1652,170 @@ mod tests {
         assert_eq!(replay[0].0, 2);
     }
 
+    // ── 统一制品库 / CDN / 代解析配置（MYS-2425）────────────────────
+
+    #[tokio::test]
+    async fn test_upgrade_blob_works_with_only_download_dir_configured() {
+        // 回归：合并存储后只配 `--download-dir` 时，升级下载端点必须可用。
+        // 曾经的实现里 `upgrade_dir` 单独判断，导致配了统一目录却报
+        // "upgrades disabled"（真实冒烟中 agent 收到 400）。
+        let dir = std::env::temp_dir().join(format!("sr-blob-dlonly-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shell-remote-x86_64"), b"payload").unwrap();
+
+        // 模拟 start() 的落地结果：只给 download_dir，artifact_store 与
+        // upgrade_dir 别名都指向同一目录。
+        let state = {
+            let mut st = SharedState::new(
+                "".into(),
+                100 * 1024 * 1024,
+                None,
+                String::new(),
+                String::new(),
+                None,
+            );
+            st.download_dir = Some(dir.clone());
+            st.upgrade_dir = RwLock::new(Some(dir.clone()));
+            st.artifact_store = Some(crate::relay::artifact_store::ArtifactStore::new(dir.clone()));
+            Arc::new(st)
+        };
+
+        let reg = state.sessions.register(None, "rw", None).await.unwrap();
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-sr-token", reg.tokens[0].0.parse().unwrap());
+        let resp = super::ws::upgrade_blob_handler(
+            State(state.clone()),
+            axum::extract::Path("shell-remote-x86_64".into()),
+            h,
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "只配 download-dir 时升级下载必须可用");
+        let got = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(&got[..], b"payload");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_artifact_dir_alias_semantics() {
+        // 只给一个 → 用它（两个参数互为别名）
+        assert_eq!(
+            resolve_artifact_dir(Some("/srv/art"), None).unwrap(),
+            Some(std::path::PathBuf::from("/srv/art"))
+        );
+        assert_eq!(
+            resolve_artifact_dir(None, Some("/srv/art")).unwrap(),
+            Some(std::path::PathBuf::from("/srv/art"))
+        );
+        // 都给且相同 → 用它
+        assert_eq!(
+            resolve_artifact_dir(Some("/srv/art"), Some("/srv/art")).unwrap(),
+            Some(std::path::PathBuf::from("/srv/art"))
+        );
+        // 空串按"未设置"处理
+        assert_eq!(resolve_artifact_dir(Some(""), Some("  ")).unwrap(), None);
+        assert_eq!(resolve_artifact_dir(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_artifact_dir(Some("/srv/art"), Some("")).unwrap(),
+            Some(std::path::PathBuf::from("/srv/art"))
+        );
+        // 不同路径 → 必须报错（合并存储的语义不能靠"哪个生效"来猜）
+        let err = resolve_artifact_dir(Some("/srv/a"), Some("/srv/b")).unwrap_err();
+        assert!(err.to_string().contains("different"), "{err}");
+    }
+
+    #[test]
+    fn test_normalize_cdn_base_urls_accepts_and_normalizes() {
+        let got = normalize_cdn_base_urls(&[
+            "https://gh-proxy.com/".to_string(),
+            "  http://mirror.example:8443  ".to_string(),
+            "".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "https://gh-proxy.com".to_string(),
+                "http://mirror.example:8443".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_normalize_cdn_base_urls_rejects_malformed() {
+        for bad in [
+            "ftp://cdn.example",       // 非 http(s)
+            "cdn.example",             // 缺 scheme
+            "https://cdn.example/path",// 带路径（镜像约定是纯 origin）
+            "https://cdn.example/?q=1",// 带查询
+            "https://user:pw@cdn.example", // 带凭据
+            "https:///x",              // 空主机
+            "https://cd n.example",    // 主机里有空白
+        ] {
+            assert!(
+                normalize_cdn_base_urls(&[bad.to_string()]).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // 全空 → 报错（不允许"零个 CDN"的静默配置）
+        assert!(normalize_cdn_base_urls(&["".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_default_cdn_urls_have_at_least_two_independent_origins() {
+        let cdns = default_cdn_base_urls();
+        assert!(cdns.len() >= 2, "首期至少两个独立入口: {cdns:?}");
+        // 每项都是合法 origin
+        assert_eq!(normalize_cdn_base_urls(&cdns).unwrap(), cdns);
+        // 主机名去重后仍然 >= 2（不是同一个故障点）
+        let mut hosts: Vec<String> = cdns.iter().filter_map(|u| cdn_host(u)).collect();
+        hosts.sort();
+        hosts.dedup();
+        assert!(hosts.len() >= 2, "CDN 必须是不同主机: {cdns:?}");
+        // 官方 origin 在列表里
+        assert!(hosts.contains(&"github.com".to_string()));
+    }
+
+    #[test]
+    fn test_cdn_host_extraction() {
+        assert_eq!(cdn_host("https://gh-proxy.com").as_deref(), Some("gh-proxy.com"));
+        assert_eq!(
+            cdn_host("http://mirror.example:8443").as_deref(),
+            Some("mirror.example")
+        );
+        assert_eq!(cdn_host("ftp://x"), None);
+        assert_eq!(cdn_host("https://").as_deref(), None);
+    }
+
+    #[test]
+    fn test_is_resolvable_host_allowlist() {
+        let cdns = vec![
+            "https://gh-proxy.com".to_string(),
+            "https://edgeone.gh-proxy.com".to_string(),
+        ];
+        // 白名单内（大小写不敏感）
+        assert!(is_resolvable_host("gh-proxy.com", &cdns));
+        assert!(is_resolvable_host("GH-Proxy.COM", &cdns));
+        assert!(is_resolvable_host("edgeone.gh-proxy.com", &cdns));
+        // 官方 origin 无条件允许
+        assert!(is_resolvable_host("github.com", &cdns));
+
+        // 非白名单
+        assert!(!is_resolvable_host("evil.example", &cdns));
+        assert!(!is_resolvable_host("x.gh-proxy.com", &cdns), "子域不在白名单");
+        assert!(!is_resolvable_host("gh-proxy.com.evil.example", &cdns));
+        // 形态非法
+        assert!(!is_resolvable_host("", &cdns));
+        assert!(!is_resolvable_host("gh-proxy.com:443", &cdns));
+        assert!(!is_resolvable_host("gh-proxy.com/path", &cdns));
+        assert!(!is_resolvable_host("gh-proxy.com ", &cdns));
+        assert!(!is_resolvable_host(".gh-proxy.com", &cdns));
+        assert!(!is_resolvable_host("gh-proxy.com.", &cdns));
+        assert!(!is_resolvable_host("a..b", &cdns));
+        assert!(!is_resolvable_host(&"a".repeat(254), &cdns), "超长主机名");
+        assert!(!is_resolvable_host("内网.example", &cdns), "非 ASCII");
+    }
+
     // ── HTTPS / 自签证书（MYS-886）─────────────────────────────
 
     /// 自签证书生成：PEM 可被 rustls 加载（这是 HTTPS listener 实际
@@ -1612,28 +2140,40 @@ pub async fn install_script_ps1_handler(
     )
 }
 
-/// Serve binaries staged in `--download-dir` at `/download/<filename>` — the
-/// first place the install scripts try (they fall back to GitHub mirrors).
-/// Path traversal is rejected up front (single file name only).
-pub async fn download_handler(
-    State(state): State<Arc<SharedState>>,
-    axum::extract::Path(filename): axum::extract::Path<String>,
+/// 定位制品文件的统一入口。
+///
+/// MYS-2425：`--download-dir` 与 `--agent-upgrade-dir` 已合并为一份存储，因此
+/// 这里不再直接拼 `dir.join(filename)`，而是走 [`artifact_store::ArtifactStore`]
+/// 的带校验定位（扁平名兼容 + 版本目录优先）。未配置制品库时返回 `None`，
+/// 由调用方决定 404 还是 400。
+///
+/// 文件名必须是合法发布制品名：`/download` 历史上放行任意扁平文件名，但统一
+/// 制品库之后只服务发布产物，避免它被当成任意文件读取入口。
+fn locate_artifact(
+    state: &SharedState,
+    filename: &str,
+) -> Option<(std::path::PathBuf, artifact_store::ArtifactRef)> {
+    let store = state.artifact_store.as_ref()?;
+    let artifact = artifact_store::parse_artifact_ref(filename)?;
+    // 版本目录查找需要目标版本；relay 自身版本即"当前版本"，扁平名兜底让
+    // 未按版本归档的存量部署继续可用。
+    let path = store.locate(env!("CARGO_PKG_VERSION"), filename)?;
+    Some((path, artifact))
+}
+
+/// 用 `Content-Range` 语义打开一个文件并返回流式响应。
+///
+/// `Range` 支持是 agent 断点续传的前提：206 时必须给正确的 `Content-Range`
+/// 与截断后的 `Content-Length`，非法/不可满足的区间必须 416 并带
+/// `Content-Range: bytes */<len>`（RFC 7233 §4.4）。无 Range 头时行为与旧版一致
+/// （200 + 全量 `Content-Length`）。
+async fn serve_artifact_file(
+    state: &Arc<SharedState>,
+    path: std::path::PathBuf,
+    range_header: Option<&str>,
 ) -> axum::response::Response {
-    let Some(dir) = &state.download_dir else {
-        return (axum::http::StatusCode::NOT_FOUND, "downloads not enabled").into_response();
-    };
-    if filename.is_empty()
-        || filename.contains('/')
-        || filename.contains('\\')
-        || filename.contains("..")
-    {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid filename",
-        )
-        .into_response();
-    }
-    let path = dir.join(&filename);
+    use artifact_store::RangeRequest;
+
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(_) => {
@@ -1650,11 +2190,46 @@ pub async fn download_handler(
                 .into_response();
         }
     };
-    // 带宽限速（MYS-2287）：整文件读入内存 → `ReaderStream` 流式发送，
-    // 每个 chunk 先过下行 `acquire`。限速时形成稳定背压，也让一个 100MB
-    // 的 agent 二进制不再把 relay 峰值内存翻倍。
+
+    let (status, start, end) = match artifact_store::parse_byte_range(range_header, len) {
+        RangeRequest::Full => (axum::http::StatusCode::OK, 0, len.saturating_sub(1)),
+        RangeRequest::Partial { start, end } => (axum::http::StatusCode::PARTIAL_CONTENT, start, end),
+        RangeRequest::Unsatisfiable => {
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(
+                    axum::http::header::CONTENT_RANGE,
+                    artifact_store::unsatisfied_range_value(len),
+                )
+                .header(axum::http::header::ACCEPT_RANGES, "bytes")
+                .header(axum::http::header::CONTENT_LENGTH, "0")
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+    };
+    let sending = if status == axum::http::StatusCode::PARTIAL_CONTENT {
+        end - start + 1
+    } else {
+        len
+    };
+
+    let mut file = file;
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        if let Err(_) = file.seek(std::io::SeekFrom::Start(start)).await {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot seek artifact",
+            )
+                .into_response();
+        }
+    }
+    // 只发送 [start, end] 这一段：206 的 Content-Length 必须是区间长度，
+    // 否则 agent 的 `.part` 续传会等不到预期字节数。
+    let limited = tokio::io::AsyncReadExt::take(file, sending);
+    // 带宽限速（MYS-2287）：每个 chunk 先过下行 `acquire`，形成稳定背压。
     let limiter = state.bandwidth.clone();
-    let chunks = tokio_util::io::ReaderStream::new(file);
+    let chunks = tokio_util::io::ReaderStream::new(limited);
     let stream = async_stream::stream! {
         let mut chunks = chunks;
         while let Some(chunk) = chunks.next().await {
@@ -1670,16 +2245,132 @@ pub async fn download_handler(
             }
         }
     };
-    axum::response::Response::builder()
-        .status(axum::http::StatusCode::OK)
+    let mut builder = axum::response::Response::builder()
+        .status(status)
         .header(
             axum::http::header::CONTENT_TYPE,
             "application/octet-stream",
         )
-        .header(axum::http::header::CONTENT_LENGTH, len.to_string())
-        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .header(axum::http::header::CONTENT_LENGTH, sending.to_string())
+        .header(axum::http::header::ACCEPT_RANGES, "bytes")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache");
+    if status == axum::http::StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            axum::http::header::CONTENT_RANGE,
+            artifact_store::content_range_value(start, end, len),
+        );
+    }
+    builder
         .body(axum::body::Body::from_stream(stream))
         .unwrap()
+}
+
+/// Serve binaries staged in `--download-dir` at `/download/<filename>` — the
+/// first place the install scripts try (they fall back to GitHub mirrors).
+///
+/// 公开入口：无鉴权（安装脚本尚未持有 Token）。只服务发布制品名，且与
+/// `/agent/upgrade/blob/<filename>` 共享同一份存储。支持 `Range` 以便 agent
+/// 走 relay 兜底时也能断点续传。
+pub async fn download_handler(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if state.download_dir.is_none() || state.artifact_store.is_none() {
+        return (axum::http::StatusCode::NOT_FOUND, "downloads not enabled").into_response();
+    }
+    let Some((path, _artifact)) = locate_artifact(&state, &filename) else {
+        // 非法制品名 → 400；合法但不存在 → 404。保持旧行为对调用方的可读性。
+        if artifact_store::parse_artifact_ref(&filename).is_none() {
+            return (axum::http::StatusCode::BAD_REQUEST, "invalid filename").into_response();
+        }
+        return (axum::http::StatusCode::NOT_FOUND, "binary not found").into_response();
+    };
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    serve_artifact_file(&state, path, range.as_deref()).await
+}
+
+/// 供 `/agent/upgrade/blob/<filename>` 复用：带 Range 的鉴权下载。
+pub async fn serve_upgrade_blob(
+    state: &Arc<SharedState>,
+    filename: &str,
+    range_header: Option<&str>,
+) -> axum::response::Response {
+    if !crate::relay::admin::valid_artifact_filename(filename) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid artifact name"})),
+        )
+            .into_response();
+    }
+    let Some((path, _artifact)) = locate_artifact(state, filename) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "artifact not staged"})),
+        )
+            .into_response();
+    };
+    serve_artifact_file(state, path, range_header).await
+}
+
+/// 制品库与升级任务相关的启动配置（MYS-2425）。
+///
+/// 单独打包而不是继续往 `start` 加位置参数：`start` 已经有十几个参数，且这些
+/// 字段只在升级链路上使用，聚在一起更容易在运维文档里对齐。
+#[derive(Debug, Clone, Default)]
+pub struct UpgradeSettings {
+    /// `--upgrade-cdn`（可重复或逗号分隔）。空 = 用
+    /// [`artifact_store::DEFAULT_CDN_BASE_URLS`]。
+    pub cdn_base_urls: Vec<String>,
+    /// `--allow-custom-upgrade`：允许下发没有官方 digest 来源的本地镜像。
+    pub allow_custom_upgrade: bool,
+    /// `--upgrade-variant`：agent 未声明 `variant:*` 能力时的形态兜底。
+    pub upgrade_variant_override: Option<artifact_store::Variant>,
+    /// `--manifest-api-base`：官方 release API 根（运维内网镜像/测试用）。
+    pub manifest_api_base: Option<String>,
+}
+
+/// 决定统一制品库的实际目录，并拒绝矛盾配置。
+///
+/// - 只给 `--download-dir` → 用它；
+/// - 只给 `--agent-upgrade-dir` → 用它（迁移期的等价别名）；
+/// - 两个都给且解析到同一路径（含相对/绝对混写指向同一处）→ 用它；
+/// - 两个都给但不同 → 报错。合并存储的语义不能靠"哪个生效"来猜。
+pub fn resolve_artifact_dir(
+    download_dir: Option<&str>,
+    agent_upgrade_dir: Option<&str>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let norm = |s: &str| -> Option<std::path::PathBuf> {
+        let s = s.trim();
+        (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+    };
+    let dl = download_dir.and_then(norm);
+    let up = agent_upgrade_dir.and_then(norm);
+    match (dl, up) {
+        (Some(a), Some(b)) => {
+            // `PathBuf` 比较对 `foo` 与 `./foo` 不等价 → 先 canonicalize 已知存在
+            // 的路径，不存在时退回词法比较（启动时目录可能还没建）。
+            let ca = std::fs::canonicalize(&a).unwrap_or_else(|_| a.clone());
+            let cb = std::fs::canonicalize(&b).unwrap_or_else(|_| b.clone());
+            if ca == cb {
+                Ok(Some(a))
+            } else {
+                Err(anyhow::anyhow!(
+                    "--download-dir {:?} and --agent-upgrade-dir {:?} point to different \
+                     directories; they are aliases of the same unified artifact store — \
+                     set only one, or make them identical",
+                    a,
+                    b
+                ))
+            }
+        }
+        (Some(a), None) => Ok(Some(a)),
+        (None, Some(b)) => Ok(Some(b)),
+        (None, None) => Ok(None),
+    }
 }
 
 pub async fn start(
@@ -1699,6 +2390,7 @@ pub async fn start(
     bandwidth_down_mbps: Option<f64>,
     bandwidth_up_mbps: Option<f64>,
     settings_file: Option<String>,
+    upgrade: UpgradeSettings,
 ) -> anyhow::Result<()> {
     let auth = match server_auth {
         Some(a) if !a.is_empty() => a,
@@ -1752,11 +2444,40 @@ pub async fn start(
         admin_pass_v.clone().unwrap_or_default(),
         recorder,
     );
-    // Optional offline binary distribution over `/download/<name>`
-    // (`--download-dir`); the install scripts prefer this relay first.
-    st.download_dir = download_dir
-        .filter(|d| !d.is_empty())
-        .map(std::path::PathBuf::from);
+    // ── 统一制品库（MYS-2425）────────────────────────────────────────
+    // `--download-dir` 是唯一制品目录；`--agent-upgrade-dir` 作为迁移期别名。
+    // 两者同时给出且路径不同 → 拒绝启动（否则运维会以为"新版本放另一个目录
+    // 也会被看到"）。两者都没有 → 制品库关闭，`/download` 与 agent 自升级都
+    // 不可用。
+    let resolved_artifact_dir = resolve_artifact_dir(
+        download_dir.as_deref(),
+        agent_upgrade_dir.as_deref(),
+    )?;
+    if let Some(dir) = resolved_artifact_dir {
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact dir {:?}: {}", dir, e))?;
+        let store = artifact_store::ArtifactStore::new(dir.clone());
+        tracing::info!(
+            dir = %dir.display(),
+            "unified artifact store enabled (/download + /agent/upgrade/blob)"
+        );
+        st.download_dir = Some(dir.clone());
+        // 兼容别名同步：老代码/外部脚本仍会读 `upgrade_dir`，让它与统一制品库
+        // 指向同一目录，避免"配了 --download-dir 但升级端点报未启用"。
+        st.upgrade_dir = RwLock::new(Some(dir.clone()));
+        st.artifact_store = Some(store);
+    }
+    // 外部 CDN 入口（默认两项以上；relay 可覆盖）。这些域名同时是
+    // `/agent/resolve` 的白名单。
+    if !upgrade.cdn_base_urls.is_empty() {
+        st.upgrade_cdn_base_urls = normalize_cdn_base_urls(&upgrade.cdn_base_urls)?;
+    }
+    st.allow_custom_upgrade = upgrade.allow_custom_upgrade;
+    st.upgrade_variant_override = upgrade.upgrade_variant_override;
+    if let Some(addr) = upgrade.manifest_api_base.filter(|s| !s.is_empty()) {
+        st.manifest_fetch.api_base = addr;
+    }
     st.set_registration_rate_limit(registration_rate_limit);
     st.set_strict_agent_auth(strict_agent_auth);
     if strict_agent_auth {
@@ -1786,18 +2507,6 @@ pub async fn start(
     .await;
     // 1s ticker：维护 1s / 10s 平均吞吐（admin 实时曲线与概览卡片）。
     state.bandwidth.spawn_sampler();
-
-    // Agent self-upgrade artifacts: `--agent-upgrade-dir` stages binaries
-    // (`shell-remote-<arch>[.exe]`). Create the dir up front so a bad path
-    // fails fast at startup.
-    if let Some(dir) = agent_upgrade_dir.filter(|d| !d.is_empty()) {
-        let dir = std::path::PathBuf::from(dir);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| anyhow::anyhow!("--agent-upgrade-dir {:?}: {}", dir, e))?;
-        tracing::info!(dir = %dir.display(), "agent self-upgrade artifacts enabled");
-        *state.upgrade_dir.write().await = Some(dir);
-    }
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -1868,6 +2577,9 @@ pub async fn start(
             "/agent/upgrade/blob/:filename",
             get(ws::upgrade_blob_handler),
         )
+        // MYS-2425：relay 代解析（DNS 污染时的第三级兜底）。rw Token 鉴权 +
+        // CDN 主机白名单，不是通用 DNS 代理。
+        .route("/agent/resolve", get(ws::agent_resolve_handler))
         .route("/agent/install", get(install_script_handler))
         .route("/agent/install.ps1", get(install_script_ps1_handler))
         .route("/download/:filename", get(download_handler))
@@ -1911,6 +2623,7 @@ pub async fn start(
             .route(&format!("{}/api/recordings/content", ap), get(admin::recording_content_handler))
             .route(&format!("{}/api/recordings/delete", ap), axum::routing::delete(admin::recording_delete_handler))
             .route(&format!("{}/api/agent/upgrade", ap), axum::routing::post(admin::agent_upgrade_handler))
+            .route(&format!("{}/api/agent/upgrade/plan", ap), get(admin::agent_upgrade_plan_handler))
             .route(&format!("{}/api/agent/upgrade/artifacts", ap), get(admin::upgrade_artifacts_handler))
     } else {
         app

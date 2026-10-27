@@ -548,7 +548,7 @@
       <span class="spacer"></span>
       <button class="btn btn-sm" id="upgRefresh" data-i18n="refresh">Refresh</button>
     </div>
-    <div class="muted" style="margin-bottom:10px; font-size:12px;" data-i18n="upg_hint">Stage new agent binaries in the relay's --agent-upgrade-dir, then upgrade devices from the Devices tab.</div>
+    <div class="muted" style="margin-bottom:10px; font-size:12px;" data-i18n="upg_hint">Upgrades prefer external CDNs; artifacts staged in the relay's --download-dir provide the fallback mirror.</div>
     <div id="upgList"></div>
   </div>
   </section>
@@ -723,13 +723,16 @@
       dev_count_x: "共 {n} 台",
       upg: "升级",
       upg_offline: "设备离线",
-      upg_not_enabled: "未启用升级（需 --agent-upgrade-dir）",
+      upg_not_enabled: "未启用升级（需 --download-dir）",
       upg_no_artifact: "无匹配升级文件",
+      upg_variant_unknown: "无法判定制品形态（agent 未上报 variant:cli/ui）——请设置 relay 的 --upgrade-variant",
+      upg_legacy_needs_mirror: "该 agent 版本不支持外部 CDN 升级，且 relay 没有本地镜像——请先把制品放入 --download-dir",
       upg_confirm: "确定升级设备 {id}？将下载并校验、原子替换 agent 二进制，随后 agent 自动重启（版本 {v}）。",
+      upg_confirm_cdn: "确定升级设备 {id} 到版本 {v}？relay 无本地镜像，agent 将从外部 CDN 下载 {f} 并校验 SHA-256（由 relay 依据官方 release digest 下发），随后自动重启。",
       upg_err: "升级失败：",
       upg_artifacts: "Agent 升级",
-      upg_hint: "将新版本二进制放到 relay 的 --agent-upgrade-dir 目录（命名 shell-remote-<arch>，Windows 为 .exe，可选 shell-remote-<arch>.version 标注版本），再到「设备」页对目标设备点击升级。",
-      upg_no_artifacts: "未启用（--agent-upgrade-dir）或无升级文件。",
+      upg_hint: "升级默认优先走外部 CDN，relay 本地镜像只是条件兜底：把制品放到 relay 的 --download-dir（公开安装下载与鉴权升级共享同一目录）即可提供兜底。文件名按发布制品命名：CLI 为 shell-remote-<arch>，桌面版为 shell-remote-ui-<arch>（Windows 加 .exe），可选同名 .version 标注版本；也可放在 releases/v<版本>/ 下多版本并存。未镜像时，不支持 CDN 升级的旧 agent 无法升级。",
+      upg_no_artifacts: "未启用（--download-dir）或无本地镜像；仍可对外部 CDN 升级，但旧 agent 需要本地镜像。",
       upg_dir: "目录：",
       upg_stage_started: "已触发",
       upg_stage_downloading: "下载中",
@@ -895,13 +898,16 @@
       dev_count_x: "{n} devices",
       upg: "Upgrade",
       upg_offline: "device offline",
-      upg_not_enabled: "upgrades disabled (needs --agent-upgrade-dir)",
+      upg_not_enabled: "upgrades disabled (needs --download-dir)",
       upg_no_artifact: "no matching artifact",
+      upg_variant_unknown: "cannot determine artifact variant (agent did not report variant:cli/ui) — set the relay's --upgrade-variant",
+      upg_legacy_needs_mirror: "this agent predates CDN upgrades and the relay has no local mirror — stage the artifact into --download-dir first",
       upg_confirm: "Upgrade device {id}? The agent will download, verify and atomically replace its binary, then restart (version {v}).",
+      upg_confirm_cdn: "Upgrade device {id} to version {v}? The relay has no local mirror, so the agent will fetch {f} from an external CDN and verify the SHA-256 supplied by the relay from the official release digest, then restart.",
       upg_err: "Upgrade failed: ",
       upg_artifacts: "Agent updates",
-      upg_hint: "Stage new agent binaries in the relay's --agent-upgrade-dir (named shell-remote-<arch>, .exe on Windows; an optional shell-remote-<arch>.version marks the version), then click Upgrade on the device.",
-      upg_no_artifacts: "Not enabled (no --agent-upgrade-dir) or no artifacts staged.",
+      upg_hint: "Upgrades prefer external CDNs; the relay mirror is only a conditional fallback. Drop artifacts into the relay's --download-dir (shared by public install downloads and authenticated upgrades): CLI is shell-remote-<arch>, desktop is shell-remote-ui-<arch> (.exe on Windows), with an optional same-named .version. releases/v<version>/ keeps multiple versions side by side. Without a mirror, agents too old for CDN upgrades cannot be upgraded.",
+      upg_no_artifacts: "Not enabled (no --download-dir) or no local mirror; CDN upgrades still work, but legacy agents need a mirror.",
       upg_dir: "Dir: ",
       upg_stage_started: "started",
       upg_stage_downloading: "downloading",
@@ -1491,18 +1497,65 @@
     return k;
   }
 
-  function artifactFor(s) {
+  // 制品形态与后端 variant_for_device 保持一致：agent 显式声明的 `variant:*`
+  // 能力优先，其次 relay 的 --upgrade-variant，两者都没有就是**未知**——
+  // 不能默认成 cli（会静默把 UI 设备换成 lean CLI）。这里只做预判，真正的
+  // 决策在后端，所以后端拒绝时仍以它的错误为准。
+  function deviceVariant(s) {
+    const caps = (s.capabilities || []);
+    for (const c of caps) {
+      if (c === 'variant:cli') return 'cli';
+      if (c === 'variant:ui') return 'ui';
+    }
+    return (upgradeArtifacts && upgradeArtifacts.upgrade_variant) || null;
+  }
+
+  // agent 是否认 CDN 优先协议。存量 agent（≤ v0.59.2）只认 relay 的 `url`，
+  // 收到 CDN-only 任务只会回错误帧，旧进程不会升级。
+  function agentSupportsV2(s) {
+    return (s.capabilities || []).includes('upgrade:v2');
+  }
+
+  // 本地制品库里是否有该设备的镜像（决定任务是否带 relay_url）。
+  function localArtifactFor(s) {
     if (!upgradeArtifacts || !upgradeArtifacts.enabled) return null;
     const d = s.device || {};
     const key = artifactArchKey(d.arch);
     const win = d.platform === 'windows';
-    return (upgradeArtifacts.artifacts || []).find(a => a.arch === key && a.windows === win) || null;
+    const variant = deviceVariant(s);
+    if (!variant) return null;
+    const all = upgradeArtifacts.artifacts || [];
+    return all.find(a => a.arch === key && a.windows === win && (a.variant || 'cli') === variant) || null;
   }
 
+  // 目标版本/制品描述：有本地镜像用它的标注，否则用 relay 版本 + 官方制品名。
+  function upgradeTarget(s) {
+    const art = localArtifactFor(s);
+    if (art) return { version: art.version || '', filename: art.filename || '' };
+    const d = s.device || {};
+    const key = artifactArchKey(d.arch);
+    const win = d.platform === 'windows' ? '.exe' : '';
+    const variant = deviceVariant(s);
+    const prefix = variant === 'ui' ? 'shell-remote-ui' : 'shell-remote';
+    return {
+      version: (upgradeArtifacts && upgradeArtifacts.relay_version) || '',
+      filename: key ? prefix + '-' + key + win : ''
+    };
+  }
+
+  // 与后端 upgradeEligible / blocked_reason 同构：
+  // - CDN 优先：没有本地镜像也允许点（任务走外部 CDN）；
+  // - 但旧 agent 没有 relay 镜像就升不了 → 禁用并解释；
+  // - 形态未知 → 禁用并提示配 --upgrade-variant。
   function upgradeEligible(s) {
     if (!s.online) return { ok: false, reason: t('upg_offline') };
-    if (!upgradeArtifacts || !upgradeArtifacts.enabled) return { ok: false, reason: t('upg_not_enabled') };
-    if (!artifactFor(s)) return { ok: false, reason: t('upg_no_artifact') };
+    if (!upgradeArtifacts || !upgradeArtifacts.enabled) {
+      return { ok: false, reason: t('upg_not_enabled') };
+    }
+    if (!deviceVariant(s)) return { ok: false, reason: t('upg_variant_unknown') };
+    if (!localArtifactFor(s) && !agentSupportsV2(s)) {
+      return { ok: false, reason: t('upg_legacy_needs_mirror') };
+    }
     return { ok: true, reason: '' };
   }
 
@@ -1534,9 +1587,14 @@
   }
 
   async function onUpgrade(s) {
-    const art = artifactFor(s);
-    if (!art) return;
-    const ok = await UI.confirm(t('upg_confirm', { id: s.session_id || '', v: art.version || s.agent_version || '' }), {
+    // 不再依赖本地镜像：CDN 优先时制品库里可以什么都没有。
+    const target = upgradeTarget(s);
+    const viaCdn = !localArtifactFor(s);
+    const ok = await UI.confirm(t(viaCdn ? 'upg_confirm_cdn' : 'upg_confirm', {
+      id: s.session_id || '',
+      v: target.version || s.agent_version || '',
+      f: target.filename || ''
+    }), {
       title: t('dlg_title_upgrade'),
       okLabel: t('dlg_confirm'), cancelLabel: t('dlg_cancel')
     });
@@ -1575,7 +1633,9 @@
     for (const a of items) {
       const li = document.createElement('li');
       const arch = document.createElement('span'); arch.className = 'mono';
-      arch.textContent = a.arch + (a.windows ? ' (win)' : '');
+      // 标注制品形态：同一架构下 CLI 与 UI 是两份不同的制品，只显示 arch
+      // 会让管理员分不清升级会换掉哪一种。
+      arch.textContent = (a.variant === 'ui' ? 'UI ' : 'CLI ') + a.arch + (a.windows ? ' (win)' : '');
       const meta = document.createElement('span'); meta.className = 'muted';
       meta.textContent = ' — ' + a.filename + ' · ' + fmtBytes(a.size) + ' · ' + a.version;
       li.appendChild(arch); li.appendChild(meta);
