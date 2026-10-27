@@ -729,36 +729,86 @@ fn artifact_version(store: &crate::relay::artifact_store::ArtifactStore, artifac
         .unwrap_or_else(|| "v?".to_string())
 }
 
-/// 决定设备该拿哪个制品形态。
+/// 设备的制品形态判定结果。
+///
+/// **未知形态必须拒绝，不能猜。** 老 agent 不上报 `variant:*`，此时无论默认
+/// 成哪个都可能是错的：默认 CLI 会把现有 UI 设备换成 lean CLI（静默丢掉桌面
+/// 能力），默认 UI 会给 CLI 设备换上 30MB 桌面包。两者都不是"安全的保守值"，
+/// 因为升级是**原地替换二进制**，猜错就是能力丢失。因此第三档改为
+/// [`VariantResolution::Unknown`]，由调用方回 409 并要求管理员显式配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariantResolution {
+    /// 已确定形态，附带判定依据（`capability` / `override`）。
+    Known {
+        variant: Variant,
+        source: &'static str,
+    },
+    /// agent 未声明 `variant:*`，且没有 `--upgrade-variant` 兜底。
+    Unknown,
+}
+
+impl VariantResolution {
+    pub fn variant(self) -> Option<Variant> {
+        match self {
+            Self::Known { variant, .. } => Some(variant),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn source(self) -> &'static str {
+        match self {
+            Self::Known { source, .. } => source,
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// 决定设备该拿哪个制品形态（见 [`VariantResolution`]）。
 ///
 /// **不能用 `desktop:*` capability 判断**：`build_capabilities` 把
 /// `desktop:gray` / `desktop:quality` 等无条件写入，lean CLI 二进制（名义上
 /// "仅终端转发"）也会上报这些串——实测 `shell-remote` CLI 注册后的
 /// capabilities 里同样有 `desktop:gray`。以它判断会把 CLI 误判成 UI。
 ///
-/// 因此按可信度降级：
+/// 判定顺序：
 ///
-/// 1. agent 显式声明的 `variant:cli` / `variant:ui`（新 agent 会带）——最可靠；
-/// 2. 否则按 `admin_variant_override`（运维显式指定）；
-/// 3. 否则 `Variant::Cli`：升级成 lean CLI 会丢掉桌面能力，但这是"少给一层
-///    能力"，而误判成 UI 会把不存在的 UI 制品当成目标、或给 CLI 设备换上
-///    重 30MB 的桌面包。宁可保守，并在 plan/handler 的响应里把
-///    `variant_source` 标出来，让管理员看到这是推断而非事实。
+/// 1. agent 显式声明的 `variant:cli` / `variant:ui`——最可靠；
+/// 2. 否则运维显式指定的 `--upgrade-variant`；
+/// 3. 否则 [`VariantResolution::Unknown`]——**不猜**。
 ///
-/// 老 agent 不报 variant → 同样落到第 3 步。
-pub fn variant_for_device(caps: &[String], override_variant: Option<Variant>) -> (Variant, &'static str) {
+/// 阶段 2 会给 CLI/UI 注册补上 `variant:cli|ui`，届时新 agent 恒走第 1 步。
+pub fn variant_for_device(
+    caps: &[String],
+    override_variant: Option<Variant>,
+) -> VariantResolution {
     // 显式能力声明优先：`variant:ui` / `variant:cli`
     for c in caps {
         if let Some(v) = c.strip_prefix("variant:") {
             if let Some(parsed) = Variant::parse(v) {
-                return (parsed, "capability");
+                return VariantResolution::Known {
+                    variant: parsed,
+                    source: "capability",
+                };
             }
         }
     }
-    if let Some(v) = override_variant {
-        return (v, "override");
+    if let Some(variant) = override_variant {
+        return VariantResolution::Known {
+            variant,
+            source: "override",
+        };
     }
-    (Variant::Cli, "default")
+    VariantResolution::Unknown
+}
+
+/// agent 是否声明了 `upgrade:v2`——即能理解 CDN 优先的升级任务协议。
+///
+/// 存量 agent（≤ v0.59.2）的 `UpgradeRequest::from_payload` 硬性要求 `url`，
+/// 只认"从 relay 下载"这一条路：给它一个 CDN-only（无 `relay_url`）的任务，
+/// 它会解析失败、只回一个错误帧，旧进程根本不升级。所以 CDN-only 任务必须
+/// 先确认对端是新协议 agent，否则明确拒绝而不是白发送。
+pub fn supports_upgrade_v2(caps: &[String]) -> bool {
+    caps.iter().any(|c| c == "upgrade:v2")
 }
 
 /// List the staged agent upgrade artifacts. Purely file-metadata based (no
@@ -793,6 +843,9 @@ pub async fn upgrade_artifacts_handler(
         "dir": store.root().display().to_string(),
         "relay_version": env!("CARGO_PKG_VERSION"),
         "allow_custom_upgrade": state.allow_custom_upgrade,
+        // `--upgrade-variant` 的值（未配置为 null）：UI 用它判断"形态未知"的
+        // 设备能否升级，与后端 variant_for_device 保持一致。
+        "upgrade_variant": state.upgrade_variant_override.map(|v| v.as_str()),
         "cdn_base_urls": state.upgrade_cdn_base_urls,
         "artifacts": artifacts,
     }))
@@ -905,17 +958,18 @@ pub async fn agent_upgrade_handler(
         )
             .into_response();
     }
-    // 制品形态由 agent 自报能力决定：不要把桌面 agent 换成 CLI。
-    let (variant, variant_source) =
-        variant_for_device(&info.capabilities, state.upgrade_variant_override);
-    let windows = platform.as_deref() == Some("windows");
-    let Some(artifact) = ArtifactRef::new(variant, &arch, windows) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"ok": false, "error": format!("unusable device arch {arch:?}")})),
-        )
-            .into_response();
-    };
+    // 先确认 agent 在线：离线时没有必要做后续任何判断（也不该去抓官方清单），
+    // 并保持"agent offline → 409"的既有语义。
+    {
+        let broadcast = state.agent_broadcast.read().await;
+        if broadcast.get(&sid).and_then(|cm| cm.agent.as_ref()).is_none() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"ok": false, "error": "agent offline"})),
+            )
+                .into_response();
+        }
+    }
 
     // ── 版本决策 ────────────────────────────────────────────────────
     let relay_version = env!("CARGO_PKG_VERSION");
@@ -946,18 +1000,35 @@ pub async fn agent_upgrade_handler(
             .into_response();
     };
 
-    // 先确认 agent 在线：离线时没有必要去抓官方清单（一次网络往返白花），
-    // 也保持"agent offline → 409"的既有语义。
-    {
-        let broadcast = state.agent_broadcast.read().await;
-        if broadcast.get(&sid).and_then(|cm| cm.agent.as_ref()).is_none() {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"ok": false, "error": "agent offline"})),
-            )
-                .into_response();
-        }
-    }
+    // 制品形态由 agent 自报能力决定：不要把桌面 agent 换成 CLI，也不猜。
+    let variant_res = variant_for_device(&info.capabilities, state.upgrade_variant_override);
+    let Some(variant) = variant_res.variant() else {
+        // 未知形态 → 拒绝。原地替换猜错就是能力丢失（UI→CLI），不能"按保守值"
+        // 处理。管理员显式配 --upgrade-variant 或等 agent 上报 variant:* 后再试。
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": "device variant unknown: agent did not report `variant:cli`/`variant:ui` \
+                          and --upgrade-variant is unset; refusing to guess (a wrong guess would \
+                          swap a UI agent for lean CLI). Set --upgrade-variant, or upgrade this \
+                          agent manually first.",
+                "code": "variant_unknown",
+                "relay_version": relay_version,
+                "agent_capabilities": info.capabilities,
+            })),
+        )
+            .into_response();
+    };
+    let variant_source = variant_res.source();
+    let windows = platform.as_deref() == Some("windows");
+    let Some(artifact) = ArtifactRef::new(variant, &arch, windows) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": format!("unusable device arch {arch:?}")})),
+        )
+            .into_response();
+    };
 
     // ── 取清单 + 本地镜像 hash ──────────────────────────────────────
     let manifest = load_manifest(&state, &store, relay_version).await;
@@ -987,6 +1058,7 @@ pub async fn agent_upgrade_handler(
     let upgrade_id = uuid::Uuid::new_v4().to_string();
     let task = match a::build_task(
         upgrade_id.clone(),
+        relay_version,
         &artifact,
         manifest.as_ref(),
         local.as_ref(),
@@ -1008,6 +1080,31 @@ pub async fn agent_upgrade_handler(
                 .into_response();
         }
     };
+
+    // ── 对端能力校验（必须在 deliver 之前）──────────────────────────
+    // 存量 agent 的 UpgradeRequest::from_payload 硬性要求 `url`：CDN-only 任务
+    // 发过去它只会解析失败、回一个错误帧，旧进程不会升级——看起来"已触发"，
+    // 实际什么都没发生。所以没有 relay 副本时必须确认对端是新协议 agent，
+    // 否则明确 409 并告诉管理员去镜像制品。
+    if !task.legacy_compatible() && !supports_upgrade_v2(&info.capabilities) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": format!(
+                    "agent cannot consume a CDN-only upgrade task: it does not advertise \
+                     `upgrade:v2` and there is no relay mirror for {}. Stage {} into the relay \
+                     artifact dir (--download-dir) so the task carries a relay_url, then retry.",
+                    task.filename, task.filename
+                ),
+                "code": "legacy_agent_needs_relay_mirror",
+                "filename": task.filename,
+                "official_path": task.official_path,
+                "agent_capabilities": info.capabilities,
+            })),
+        )
+            .into_response();
+    }
 
     let text = serde_json::to_string(&json!({
         "type": "agent:upgrade",
@@ -1087,13 +1184,25 @@ pub async fn agent_upgrade_plan_handler(
         Some(d) => (d.arch.clone().unwrap_or_default(), d.platform.clone()),
         None => (String::new(), None),
     };
-    let (variant, variant_source) =
-        variant_for_device(&info.capabilities, state.upgrade_variant_override);
-    let target = ArtifactRef::new(variant, &arch, platform.as_deref() == Some("windows"));
+    let variant_res = variant_for_device(&info.capabilities, state.upgrade_variant_override);
+    let variant = variant_res.variant();
+    let target = variant.and_then(|v| {
+        ArtifactRef::new(v, &arch, platform.as_deref() == Some("windows"))
+    });
     let local_present = target
         .as_ref()
         .and_then(|t| state.artifact_store.as_ref()?.locate(relay_version, &t.filename()))
         .is_some();
+    // 没有本地镜像 → 任务会是 CDN-only；旧 agent 消费不了（它的
+    // `from_payload` 需要 `url`）。这里提前把结论给 UI，别让管理员点了才 409。
+    let upgrade_v2 = supports_upgrade_v2(&info.capabilities);
+    let blocked_reason = if variant.is_none() {
+        Some("variant_unknown")
+    } else if !local_present && !upgrade_v2 {
+        Some("legacy_agent_needs_relay_mirror")
+    } else {
+        None
+    };
 
     Json(json!({
         "ok": true,
@@ -1103,8 +1212,12 @@ pub async fn agent_upgrade_plan_handler(
         "decision": format!("{decision:?}"),
         "needs_upgrade": decision.needs_upgrade(),
         "reason": decision.reason(),
-        "variant": variant.as_str(),
-        "variant_source": variant_source,
+        "variant": variant.map(|v| v.as_str()),
+        "variant_source": variant_res.source(),
+        "variant_unknown": variant.is_none(),
+        "supports_upgrade_v2": upgrade_v2,
+        // `None` = 可下发；否则是 admin 会返回的错误码，UI 据此禁用并解释。
+        "blocked_reason": blocked_reason,
         "arch": arch,
         "target_filename": target.as_ref().map(|t| t.filename()),
         "local_artifact_present": local_present,
@@ -1746,6 +1859,28 @@ mod tests {
         dir
     }
 
+    /// 阶段 2 之后新 agent 会声明的能力集（含形态与新协议标记）。
+    /// 升级相关用例默认用它，代表"能正常参与升级的新 agent"。
+    const NEW_AGENT_CAPS: &[&str] = &[
+        "codec:h264",
+        "backend:x11",
+        "variant:cli",
+        "upgrade:v2",
+    ];
+
+    /// 阶段 1 时的存量 agent：不上报 `variant:*`，也不认 CDN 优先协议。
+    const LEGACY_AGENT_CAPS: &[&str] = &[
+        "web:proxy-v1",
+        "net:tcp-v1",
+        "codec:h264",
+        "backend:x11",
+        "desktop:gray",
+        "desktop:quality",
+        "desktop:clipboard",
+        "desktop:cursor",
+        "desktop:test-delay",
+    ];
+
     /// 把 state 的 admin session 置为已登录。
     async fn login(state: &Arc<SharedState>) -> HeaderMap {
         state
@@ -1898,7 +2033,15 @@ mod tests {
         let dir = upgrade_dir_with_artifacts();
         let state = state_without_manifest(&dir);
         let h = login(&state).await;
-        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let sid = register_device(
+            &state,
+            "devbox9",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
 
         // No agent channel → offline → 409.
         let r = agent_upgrade_handler(State(state.clone()), h.clone(), Json(json!({"session_id": sid})))
@@ -2003,7 +2146,15 @@ mod tests {
         let state = state_with_manifest_mock(&dir, local_bytes).await;
         let h = login(&state).await;
         // agent 版本更低 → 需要升级
-        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let sid = register_device(
+            &state,
+            "devbox9",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
         let mut rx = attach_agent_channel(&state, &sid).await;
 
         let r = agent_upgrade_handler(
@@ -2082,7 +2233,7 @@ mod tests {
             "devbox9",
             "x86_64",
             "linux",
-            &[],
+            NEW_AGENT_CAPS,
             Some(env!("CARGO_PKG_VERSION")),
         )
         .await;
@@ -2130,31 +2281,56 @@ mod tests {
         .collect();
         assert_eq!(
             variant_for_device(&lean_cli_caps, None),
-            (Variant::Cli, "default"),
-            "desktop:* 不能推出 UI"
+            VariantResolution::Unknown,
+            "desktop:* 不构成形态证据；无 variant 声明时必须拒绝猜"
         );
-        assert_eq!(variant_for_device(&[], None), (Variant::Cli, "default"));
+        assert_eq!(variant_for_device(&[], None), VariantResolution::Unknown);
 
         // 新 agent 显式声明 variant:* 时以它为准
         assert_eq!(
             variant_for_device(&["variant:ui".into(), "desktop:gray".into()], None),
-            (Variant::Ui, "capability")
+            VariantResolution::Known {
+                variant: Variant::Ui,
+                source: "capability"
+            }
         );
         assert_eq!(
             variant_for_device(&["variant:cli".into()], Some(Variant::Ui)),
-            (Variant::Cli, "capability"),
+            VariantResolution::Known {
+                variant: Variant::Cli,
+                source: "capability"
+            },
             "显式声明优先于运维 override"
         );
         // 无声明时用 override
         assert_eq!(
             variant_for_device(&lean_cli_caps, Some(Variant::Ui)),
-            (Variant::Ui, "override")
+            VariantResolution::Known {
+                variant: Variant::Ui,
+                source: "override"
+            }
         );
-        // 非法 variant 串被忽略
+        // 非法 variant 串被忽略 → 仍然未知（不能因此回落成 CLI）
         assert_eq!(
             variant_for_device(&["variant:desktop".into()], None),
-            (Variant::Cli, "default")
+            VariantResolution::Unknown
         );
+        assert!(variant_for_device(&[], None).variant().is_none());
+        assert_eq!(variant_for_device(&[], None).source(), "unknown");
+    }
+
+    #[test]
+    fn test_supports_upgrade_v2() {
+        assert!(!supports_upgrade_v2(&[]), "老 agent 没有该能力");
+        assert!(!supports_upgrade_v2(&[
+            "codec:h264".to_string(),
+            "desktop:gray".to_string()
+        ]));
+        assert!(supports_upgrade_v2(&["upgrade:v2".to_string()]));
+        assert!(supports_upgrade_v2(&[
+            "codec:h264".to_string(),
+            "upgrade:v2".to_string()
+        ]));
     }
 
     #[tokio::test]
@@ -2230,7 +2406,7 @@ mod tests {
             "deskbox",
             "x86_64",
             "linux",
-            &["desktop:gray"],
+            &["variant:cli", "desktop:gray"],
             Some("0.59.1"),
         )
         .await;
@@ -2262,7 +2438,15 @@ mod tests {
         // mock 清单声明的是 "official-bytes"，本地文件是 "new-binary-x86"
         let state = state_with_manifest_mock(&dir, b"official-bytes").await;
         let h = login(&state).await;
-        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let sid = register_device(
+            &state,
+            "devbox9",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
         let mut rx = attach_agent_channel(&state, &sid).await;
 
         let r = agent_upgrade_handler(State(state.clone()), h, Json(json!({"session_id": sid})))
@@ -2281,12 +2465,238 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── 验收回归（MYS-2425 阶段1 review）────────────────────────────
+
+    /// 回归 1 的前置条件：旧 agent 且未配 override 时，先被 variant_unknown 拦下
+    /// ——两条拒绝路径都在 deliver 之前，都不会白发送。
+    #[tokio::test]
+    async fn test_legacy_agent_without_variant_is_refused_before_delivery() {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-upg-cdnonly-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_with_manifest_mock(&dir, b"irrelevant").await;
+        let h = login(&state).await;
+        // 旧 agent：有 desktop:*，但没有 variant:* 也没有 upgrade:v2
+        let sid = register_device(
+            &state,
+            "oldbox",
+            "x86_64",
+            "linux",
+            LEGACY_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        let r = agent_upgrade_handler(State(state.clone()), h, Json(json!({"session_id": sid})))
+            .await;
+        assert_eq!(r.status(), 409);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], "variant_unknown");
+        assert!(rx.try_recv().is_err(), "不得下发任何指令");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归 1 的核心路径：形态已知（override）+ 旧 agent + CDN-only → 409 且
+    /// 错误信息指向"去 relay 镜像制品"。
+    #[tokio::test]
+    async fn test_cdn_only_task_refused_when_legacy_agent_has_no_relay_mirror() {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-upg-cdnonly2-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 官方清单由本地 mock 提供；制品库里没有 x86_64 制品 → 任务必然 CDN-only。
+        let (api_base, mock) = spawn_manifest_mock(env!("CARGO_PKG_VERSION"), b"official").await;
+        std::mem::forget(mock);
+        let state = state_with_admin_artifacts_tuned(&dir, |st| {
+            // 形态由 --upgrade-variant 兜底，绕开 variant_unknown，
+            // 从而单独验证"CDN-only + 旧 agent"这条拒绝路径。
+            st.upgrade_variant_override = Some(Variant::Cli);
+            st.manifest_fetch.api_base = api_base;
+        });
+        let h = login(&state).await;
+        // 旧 agent：无 upgrade:v2，也无 variant（形态靠 override）
+        let sid = register_device(
+            &state,
+            "oldbox2",
+            "x86_64",
+            "linux",
+            &["codec:h264", "desktop:gray"],
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        let r = agent_upgrade_handler(State(state.clone()), h, Json(json!({"session_id": sid})))
+            .await;
+        assert_eq!(
+            r.status(),
+            409,
+            "CDN-only 任务绝不能发给不认新协议的旧 agent"
+        );
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], "legacy_agent_needs_relay_mirror");
+        let err = body["error"].as_str().unwrap();
+        assert!(err.contains("--download-dir"), "必须说清怎么修: {err}");
+        assert!(err.contains("shell-remote-x86_64"), "必须点名缺哪个制品: {err}");
+        assert!(
+            rx.try_recv().is_err(),
+            "拒绝时不得下发任何指令（否则旧 agent 只会回错误帧）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归 3：老 UI 设备不能被默认当成 CLI 而误降级。未知形态 → 409
+    /// `variant_unknown`，响应里带上 agent 上报的能力，便于管理员判断。
+    #[tokio::test]
+    async fn test_unknown_variant_refused_instead_of_defaulting_to_cli() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_admin_artifacts(&dir);
+        let h = login(&state).await;
+        // 典型老 UI agent：一堆 desktop:* 能力，但没有 variant:*
+        let sid = register_device(
+            &state,
+            "oldui1",
+            "x86_64",
+            "linux",
+            LEGACY_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        let r = agent_upgrade_handler(State(state.clone()), h.clone(), Json(json!({"session_id": sid})))
+            .await;
+        assert_eq!(r.status(), 409);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], "variant_unknown");
+        assert!(
+            body["error"].as_str().unwrap().contains("--upgrade-variant"),
+            "必须告诉管理员显式配置: {body}"
+        );
+        // 能力回显：管理员能据此看出"这是台老 UI 设备"
+        let caps = body["agent_capabilities"].as_array().unwrap();
+        assert!(caps.iter().any(|c| c == "desktop:gray"));
+        assert!(rx.try_recv().is_err(), "未知形态时不得下发，避免 UI→CLI 误降级");
+
+        // 显式 --upgrade-variant ui 后即可正常下发 UI 制品
+        let state2 = state_with_admin_artifacts_tuned(&dir, |st| {
+            st.upgrade_variant_override = Some(Variant::Ui);
+            st.manifest_fetch.api_base = "http://127.0.0.1:1".to_string();
+            st.manifest_fetch.timeout = std::time::Duration::from_millis(400);
+            st.manifest_fetch.connect_timeout = std::time::Duration::from_millis(200);
+            st.allow_custom_upgrade = true;
+        });
+        std::fs::write(dir.join("shell-remote-ui-x86_64"), b"ui-bytes").unwrap();
+        let h2 = login(&state2).await;
+        let sid2 = register_device(
+            &state2,
+            "oldui2",
+            "x86_64",
+            "linux",
+            LEGACY_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx2 = attach_agent_channel(&state2, &sid2).await;
+        let r = agent_upgrade_handler(State(state2.clone()), h2, Json(json!({"session_id": sid2})))
+            .await;
+        assert_eq!(r.status(), 200);
+        let got = rx2.try_recv().expect("override 后应下发");
+        let v: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["payload"]["filename"], "shell-remote-ui-x86_64");
+        assert_eq!(v["payload"]["variant"], "ui");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// plan 端点也要给出同样的可下发判断，供 UI 提前禁用而不是点了才 409。
+    #[tokio::test]
+    async fn test_plan_reports_blocked_reason() {
+        let dir = upgrade_dir_with_artifacts();
+        // 情况 A：未知形态
+        let state = state_with_admin_artifacts(&dir);
+        let h = login(&state).await;
+        let sid = register_device(
+            &state,
+            "oldui1",
+            "x86_64",
+            "linux",
+            LEGACY_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        let q = axum::extract::Query(vec![("session_id".to_string(), sid.clone())]);
+        let r = agent_upgrade_plan_handler(State(state.clone()), h.clone(), q).await;
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["blocked_reason"], "variant_unknown");
+        assert_eq!(v["variant"], Value::Null);
+        assert_eq!(v["variant_unknown"], true);
+        assert_eq!(v["supports_upgrade_v2"], false);
+
+        // 情况 B：形态已知 + 有本地镜像 + 旧 agent → 可下发（relay 兜底可用）
+        let state2 = state_with_admin_artifacts_tuned(&dir, |st| {
+            st.upgrade_variant_override = Some(Variant::Cli);
+        });
+        let h2 = login(&state2).await;
+        let sid2 = register_device(
+            &state2,
+            "oldcli1",
+            "x86_64",
+            "linux",
+            &["codec:h264"],
+            Some("0.59.1"),
+        )
+        .await;
+        let q = axum::extract::Query(vec![("session_id".to_string(), sid2.clone())]);
+        let r = agent_upgrade_plan_handler(State(state2.clone()), h2, q).await;
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["blocked_reason"], Value::Null, "有 relay 镜像时旧 agent 也能升");
+        assert_eq!(v["local_artifact_present"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn test_agent_upgrade_plan_reports_decision_without_dispatching() {
         let dir = upgrade_dir_with_artifacts();
         let state = state_with_admin_artifacts(&dir);
         let h = login(&state).await;
-        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let sid = register_device(
+            &state,
+            "devbox9",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
         let mut rx = attach_agent_channel(&state, &sid).await;
 
         let q = axum::extract::Query(vec![("session_id".to_string(), sid.clone())]);
@@ -2322,7 +2732,15 @@ mod tests {
         std::fs::write(dir.join("shell-remote-armv7"), b"x").unwrap();
         let state = state_without_manifest(&dir);
         let h = login(&state).await;
-        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let sid = register_device(
+            &state,
+            "devbox9",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
         let mut rx = attach_agent_channel(&state, &sid).await;
         let r = agent_upgrade_handler(State(state.clone()), h, Json(json!({"session_id": sid}))).await;
         assert_eq!(r.status(), 404);

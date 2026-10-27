@@ -576,7 +576,7 @@ relay 加 `--download-dir <目录>` 启用（`--agent-upgrade-dir` 是它的兼�
 **relay 不能仅凭版本号就编出一个 hash。** 判定分两步：
 
 1. **是否需要升级**：`semver(relay 版本) > semver(agent 注册上报的版本)`。相等不升级，更低不降级，agent 未上报或非法版本只显示"版本未知"（不自动升级）。预发布按 semver 规则（`0.59.2-beta.1 < 0.59.2`）。
-2. **升级到哪一份确切字节**：按 relay 自身版本取官方 GitHub release 清单（`GET /repos/zzttzzmyswy/shell-remote/releases/tags/v<版本>`），只采用带 `digest: sha256:…` 且资产名精确匹配的条目。按设备上报的 arch 与 `capabilities` 选 CLI 或 UI 制品（声明了 `desktop:*` 就是 UI，避免把桌面 agent 换成 CLI 而丢掉桌面能力）。
+2. **升级到哪一份确切字节**：按 relay 自身版本取官方 GitHub release 清单（`GET /repos/zzttzzmyswy/shell-remote/releases/tags/v<版本>`），只采用带 `digest: sha256:…` 且资产名精确匹配的条目。按设备上报的 arch 与 `capabilities` 选 CLI 或 UI 制品：只认 agent 显式声明的 `variant:cli` / `variant:ui`，其次用 relay 的 `--upgrade-variant`；两者都没有时**拒绝升级**（`409 variant_unknown`）。不设默认形态是有意的——升级是原地替换二进制，猜错就是把 UI 设备换成 lean CLI（`desktop:*` 不能作为判据：lean CLI 二进制同样会无条件上报 `desktop:gray` 等）。阶段 2 的 agent 会自带 `variant:*`，届时无需配置。
 
 制品来源按下面这张表决定（`asset` = 官方清单里的对应资产，`local` = 库内实测 hash 的副本）：
 
@@ -645,6 +645,7 @@ TTL 上限 300s，解析失败有 15s 负缓存（仍带 `expires_at`，让 agen
 注意事项：
 
 - 制品目录必须可读（relay 需要现场算 hash）；agent 所在目录必须可写（替换需要该目录写权限），失败会在后台明确提示。
+- **旧 agent（≤ v0.59.2）只认 relay 的 `url`**：收到仅含外部 CDN 的任务时它会解析失败、只回一个错误帧，旧进程根本不会升级。因此没有本地镜像时 relay 会对这类 agent 返回 `409 legacy_agent_needs_relay_mirror`（明确提示先把制品放入 `--download-dir`），而不是白发送。它们同样不会上报 `variant:*`，未配 `--upgrade-variant` 时返回 `409 variant_unknown`。
 - 重新拉起的新进程会按 `--key` 固定密钥重新注册，身份保持；若原 agent 使用临时令牌启动（未指定 `--key`），重启后会签发新令牌，旧令牌失效。
 - **信任边界**：hash 来自官方 release 的 asset digest，能证明字节与 GitHub 上已上传的资产一致；它**不能**抵御官方仓库或 release 资产被恶意替换。需要这个保证要另加发布签名（不在当前范围）。CDN、DoH、代解析只解决可达性，不参与版本与字节决策。
 

@@ -99,8 +99,10 @@ enum Command {
         allow_custom_upgrade: bool,
 
         /// 当 agent 未声明 `variant:cli` / `variant:ui` 能力时，按此形态挑升级
-        /// 制品。未指定按 CLI 处理（保守默认；lean CLI 二进制也会上报
-        /// `desktop:*`，因此不能用它推断桌面形态）。
+        /// 制品。**未指定时这类 agent 会被拒绝升级**（409 `variant_unknown`）：
+        /// 升级是原地替换二进制，猜错就是能力丢失（把 UI 设备换成 lean CLI），
+        /// 所以不设默认值。lean CLI 二进制也会上报 `desktop:*`，不能用它推断
+        /// 桌面形态。阶段 2 的 agent 会自带 `variant:*`，届时无需本参数。
         #[arg(long, value_enum)]
         upgrade_variant: Option<UpgradeVariantArg>,
 

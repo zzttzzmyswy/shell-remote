@@ -799,8 +799,14 @@ impl TaskRefusal {
 /// | 无 | 有且允许 custom | `Custom` 源，仅 relay 镜像 |
 /// | 无 | 有但未批准 | [`TaskRefusal::CustomNotAllowed`] |
 /// | 无 | 无 | [`TaskRefusal::NoArtifact`] |
+///
+/// `target_version` 是**正在比较的 relay 版本**（触发升级时由 `env!(
+/// CARGO_PKG_VERSION)` 提供）。没有官方清单时任务也要带非空版本——custom 分支
+/// 曾经回落到 `""`，agent 侧日志/上报会显示空版本，且"升级到哪个版本"这件事
+/// 本身仍然成立：目标就是与 agent 版本比较过的那个 relay 版本。
 pub fn build_task(
     upgrade_id: String,
+    target_version: &str,
     artifact: &ArtifactRef,
     manifest: Option<&OfficialManifest>,
     local: Option<&LocalArtifact>,
@@ -808,7 +814,12 @@ pub fn build_task(
     allow_custom: bool,
 ) -> Result<UpgradeTask, TaskRefusal> {
     let asset = manifest.and_then(|m| m.asset(artifact));
-    let version = manifest.map(|m| m.version.clone()).unwrap_or_default();
+    // 清单里的版本是权威的（它就是为了这个版本抓的）；没有清单时用目标版本，
+    // 绝不留空。
+    let version = manifest
+        .map(|m| m.version.clone())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| target_version.to_string());
 
     let (source, size, sha256, official_path) = match (asset, local) {
         (Some(a), Some(l)) => {
@@ -1395,7 +1406,7 @@ mod tests {
     fn test_build_task_official_only_has_cdn_and_no_relay_url() {
         let m = sample_manifest("0.59.2");
         let art = ArtifactRef::new(Variant::Cli, "aarch64", false).unwrap();
-        let t = build_task("u1".into(), &art, Some(&m), None, &cdns(), false).unwrap();
+        let t = build_task("u1".into(), "0.59.2", &art, Some(&m), None, &cdns(), false).unwrap();
         assert_eq!(t.source, ArtifactSource::Official);
         assert_eq!(t.target_version, "0.59.2");
         assert_eq!(t.filename, "shell-remote-aarch64");
@@ -1437,7 +1448,16 @@ mod tests {
             size,
             sha256: Some(digest.clone()),
         };
-        let t = build_task("u2".into(), &art, Some(&m), Some(&local), &cdns(), false).unwrap();
+        let t = build_task(
+            "u2".into(),
+            "0.59.2",
+            &art,
+            Some(&m),
+            Some(&local),
+            &cdns(),
+            false,
+        )
+        .unwrap();
         assert_eq!(t.source, ArtifactSource::Local);
         assert_eq!(t.sha256, digest);
         assert_eq!(t.size, size);
@@ -1463,8 +1483,16 @@ mod tests {
             size: 6_596_656,
             sha256: Some("1".repeat(64)),
         };
-        let err =
-            build_task("u3".into(), &art, Some(&m), Some(&local), &cdns(), false).unwrap_err();
+        let err = build_task(
+            "u3".into(),
+            "0.59.2",
+            &art,
+            Some(&m),
+            Some(&local),
+            &cdns(),
+            false,
+        )
+        .unwrap_err();
         match err {
             TaskRefusal::HashConflict { local, official } => {
                 assert!(local.contains(&"1".repeat(64)), "{local}");
@@ -1485,12 +1513,30 @@ mod tests {
         };
 
         // 未批准 → 明确拒绝
-        let err = build_task("u4".into(), &art, None, Some(&local), &cdns(), false).unwrap_err();
+        let err = build_task(
+            "u4".into(),
+            "0.59.2",
+            &art,
+            None,
+            Some(&local),
+            &cdns(),
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(err, TaskRefusal::CustomNotAllowed { .. }));
         assert!(err.message().contains("--allow-custom-upgrade"));
 
         // 批准 → custom 明确标记，且不提供官方 CDN
-        let t = build_task("u4".into(), &art, None, Some(&local), &cdns(), true).unwrap();
+        let t = build_task(
+            "u4".into(),
+            "0.59.2",
+            &art,
+            None,
+            Some(&local),
+            &cdns(),
+            true,
+        )
+        .unwrap();
         assert_eq!(t.source, ArtifactSource::Custom);
         assert_eq!(t.source.as_str(), "custom");
         assert!(!t.official_release);
@@ -1498,6 +1544,16 @@ mod tests {
         assert!(t.official_path.is_none());
         assert_eq!(t.sha256, "2".repeat(64));
         assert_eq!(t.size, 42);
+        // 无官方清单时版本必须回落成"正在比较的 relay 目标版本"，不能为空。
+        assert_eq!(
+            t.target_version, "0.59.2",
+            "custom 分支的 target_version 不能是空串"
+        );
+        assert!(!t.target_version.is_empty());
+        // 序列化后 agent 也要看到非空版本
+        let wire = t.wire_payload();
+        assert_eq!(wire["target_version"], "0.59.2");
+        assert_eq!(wire["version"], "0.59.2");
         assert_eq!(
             t.relay_url.as_deref(),
             Some("/agent/upgrade/blob/shell-remote-x86_64")
@@ -1508,7 +1564,7 @@ mod tests {
     #[test]
     fn test_build_task_refuses_when_nothing_available() {
         let art = ArtifactRef::new(Variant::Ui, "armv7", false).unwrap();
-        let err = build_task("u5".into(), &art, None, None, &cdns(), true).unwrap_err();
+        let err = build_task("u5".into(), "0.59.2", &art, None, None, &cdns(), true).unwrap_err();
         assert_eq!(err, TaskRefusal::NoArtifact);
     }
 
@@ -1517,7 +1573,8 @@ mod tests {
         // 清单里只有 CLI，UI 请求不应被静默映射到 CLI 制品。
         let m = sample_manifest("0.59.2");
         let art = ArtifactRef::new(Variant::Ui, "x86_64", false).unwrap();
-        let err = build_task("u6".into(), &art, Some(&m), None, &cdns(), false).unwrap_err();
+        let err =
+            build_task("u6".into(), "0.59.2", &art, Some(&m), None, &cdns(), false).unwrap_err();
         assert_eq!(err, TaskRefusal::NoArtifact);
     }
 
@@ -1525,7 +1582,7 @@ mod tests {
     fn test_upgrade_task_serializes_expected_wire_fields() {
         let m = sample_manifest("0.59.2");
         let art = ArtifactRef::new(Variant::Cli, "aarch64", false).unwrap();
-        let t = build_task("u7".into(), &art, Some(&m), None, &cdns(), false).unwrap();
+        let t = build_task("u7".into(), "0.59.2", &art, Some(&m), None, &cdns(), false).unwrap();
         let v = serde_json::to_value(&t).unwrap();
         for k in [
             "upgrade_id",
@@ -1559,7 +1616,7 @@ mod tests {
             size: 7,
             sha256: Some("9".repeat(64)),
         };
-        let t = build_task("u8".into(), &art, None, Some(&local), &[], true).unwrap();
+        let t = build_task("u8".into(), "0.59.2", &art, None, Some(&local), &[], true).unwrap();
         let p = t.wire_payload();
         assert_eq!(p["version"], t.target_version);
         assert_eq!(p["url"], "/agent/upgrade/blob/shell-remote-aarch64");
@@ -1583,7 +1640,7 @@ mod tests {
 
         // 只有 CDN、没有 relay 副本 → 不给 `url`，并标记老 agent 不兼容。
         let m = sample_manifest("0.59.2");
-        let t2 = build_task("u9".into(), &art, Some(&m), None, &cdns(), false).unwrap();
+        let t2 = build_task("u9".into(), "0.59.2", &art, Some(&m), None, &cdns(), false).unwrap();
         let p2 = t2.wire_payload();
         assert!(p2.get("url").is_none(), "没有 relay 副本就不该给 url");
         assert_eq!(p2["version"], t2.target_version, "version 仍然给");
