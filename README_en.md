@@ -400,6 +400,12 @@ terminal and MCP therefore start as a **login shell**, so no manual
   detects this at startup and falls back to the previous non-login startup: the
   terminal still works, it just does not load `/etc/profile`. The probe result is
   cached per shell path, so it runs once per process.
+- **Two `script` implementations**: when MCP runs a command and `script` exists, it is
+  used to allocate a PTY. util-linux's `script` needs `-e` to pass the command's exit
+  code through, whereas **busybox's `script` rejects `-e`** (unknown option → usage +
+  exit 1), which is common on Alpine and minimal containers. The agent probes the
+  target `script` at startup and omits `-e` when unsupported — commands still run, only
+  the exit code is always 0 (the same behaviour as before login environments existed).
 
 ## Token Permissions
 

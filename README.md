@@ -678,6 +678,11 @@ agent 由 systemd/服务直接启动，**不经过 PAM/SSH**，子进程只有 a
 - 若 `--shell` 指定的 shell 不接受 `-l`（如 `tcsh`/`elvish`/`nu`），agent 启动时会
   自动探测并退回原来的非登录启动，网页终端照常可用，只是不加载 `/etc/profile`。
   探测结果按 shell 路径缓存，每个进程只做一次。
+- **`script` 的两种实现**：MCP 执行时若系统有 `script`，会用它分配 PTY。util-linux
+  的 `script` 需要 `-e` 才能透传命令退出码，而 **busybox 的 `script` 不认 `-e`**
+  （收到未知选项直接 usage + exit 1），Alpine / 精简容器上很常见。agent 启动时会
+  探测目标 `script`，不支持就不加 `-e`——命令照常执行，只是退出码恒为 0（与引入
+  登录环境之前的行为一致）。
 
 ### MCP 端文件传输
 

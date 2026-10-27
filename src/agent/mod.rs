@@ -3013,14 +3013,13 @@ async fn execute_command(
         // 再套一层 `sh -l -c <用户命令>`（策略见 agent::login_env）。外层串是
         // 固定常量，用户命令经环境变量传入——这样它只被解释一次，引号 / 换行 /
         // $() 的语义与不加 script 时一致。
-        // `-e` 让 script 返回命令自身的退出码（util-linux 默认恒返回 0，
-        // 会把失败的命令报成成功）。
+        //
+        // `-e` 让 script 返回命令自身的退出码（util-linux 默认恒返回 0，会把失败
+        // 的命令报成成功），但 **busybox 的 script 不认 `-e`**，收到就 usage + exit 1。
+        // busybox 环境里 `which script` 一定成功，所以这里拦不住，必须先探测再加：
+        // 不然每条 MCP 命令都会变成「exit 1 + 空 stdout」。
         let mut c = tokio::process::Command::new("script");
-        c.arg("-q")
-            .arg("-e")
-            .arg("-c")
-            .arg(crate::agent::login_env::script_wrapper_command())
-            .arg("/dev/null")
+        c.args(crate::agent::login_env::script_command_argv())
             .env(crate::agent::login_env::MCP_CMD_ENV, &cmd);
         c
     } else {
