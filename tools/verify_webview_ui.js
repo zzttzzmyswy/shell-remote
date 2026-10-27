@@ -222,7 +222,6 @@ async function waitPort(port, timeout) {
         try {
           sessionStorage.setItem('shell-remote-token', t);
           sessionStorage.setItem('shell-remote-auth', a);
-          sessionStorage.setItem('shell-remote-permission', p);
           localStorage.setItem('sr-theme', 'dark');
         } catch (e) {}
         if (noSw) {

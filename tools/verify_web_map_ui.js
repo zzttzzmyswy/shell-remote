@@ -455,7 +455,6 @@ async function makePage(browser, base, token, perm, opts) {
     try {
       sessionStorage.setItem('shell-remote-token', t);
       sessionStorage.setItem('shell-remote-auth', a);
-      sessionStorage.setItem('shell-remote-permission', p);
     } catch (e) {}
     // 模拟"浏览器没有 Service Worker"：v2 条件之一不满足 → 应回落到 v1 并
     // 说明原因（真实场景：旧 WebView、隐私模式禁用 SW）。
