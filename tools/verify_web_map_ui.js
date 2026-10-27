@@ -508,10 +508,27 @@ async function openUrl(page, url) {
 /// 等 iframe 里出现某个元素且满足条件（`expr` 是在 iframe 上下文里求值的
 /// JS 表达式字符串）。
 async function waitFrame(page, expr, timeout) {
-  const f = await findFrame(page);
+  // iframe 可能还停在 about:blank（刚切进网页视图）：先轮询等它出现。
+  const deadline = Date.now() + (timeout || 40000);
+  let f = await findFrame(page);
+  while (!f && Date.now() < deadline) {
+    await sleep(200);
+    f = await findFrame(page);
+  }
   if (!f) return false;
-  return f.waitForFunction(expr, null, { timeout: timeout || 40000 })
+  return f.waitForFunction(expr, null, { timeout: Math.max(1000, deadline - Date.now()) })
     .then(() => true).catch(() => false);
+}
+
+/// 等映射首页**完整**加载：状态区报「已加载」且脚本已执行、视图已渲染。
+/// 只等 `#view-name` 会被上一次加载残留的旧文档提前满足（重复打开时的竞态）。
+const SPA_READY = `document.body && document.body.getAttribute('data-script') === 'ran' &&
+  (document.getElementById('view-name') || {}).textContent === 'root-view'`;
+async function waitSpaReady(page) {
+  await page.waitForFunction(() => /已加载/.test(
+    (document.getElementById('webview-status') || {}).textContent || ''),
+    null, { timeout: 40000 }).catch(() => {});
+  return waitFrame(page, SPA_READY);
 }
 
 /// 找映射页面的 frame：非主 frame，且不是 about:blank。
@@ -624,8 +641,7 @@ async function frameEval(page, fn, arg) {
     // ══════════════ [2] SPA 渲染、脚本执行、样式 ══════════════
     console.log('\n[2] SPA 首页：脚本执行、样式、根路径资源');
     await openUrl(rwPage, SITE + '/');
-    const okIndex = await waitFrame(rwPage,
-      `document.getElementById('view-name') !== null`);
+    const okIndex = await waitSpaReady(rwPage);
     check('SPA 首页渲染（#view-name 出现）', okIndex);
     // 等 Service Worker 接管并完成第二次导航（首次进入 → 302 → 原始路径）。
     const frameUrl = await rwPage.evaluate(() => {
@@ -809,8 +825,7 @@ async function frameEval(page, fn, arg) {
     await rwPage.waitForSelector('#terminal-container .xterm', { timeout: 30000 });
     await enterWebView(rwPage, SITE + '/');
     await openUrl(rwPage, SITE + '/');
-    const afterReloadSession = await waitFrame(rwPage,
-      `document.getElementById('view-name') !== null`);
+    const afterReloadSession = await waitSpaReady(rwPage);
     check('刷新会话页后 v2 仍能打开映射页面（SW 跨刷新有效）', afterReloadSession);
     const afterReloadSessionDoc = await frameEval(rwPage, () => ({
       path: location.pathname,

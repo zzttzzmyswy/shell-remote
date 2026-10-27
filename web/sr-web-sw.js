@@ -472,6 +472,12 @@
 
     // 非导航：来自映射页面才处理。稳态下这里是同步判定，shell-remote
     // 自身的 SSE / 上传 / 静态资源完全不经 SW（不调用 respondWith）。
+    // SW 冷启动、状态还没从 IndexedDB 读完时无法按 clientId 判定：shell-remote
+    // 自身的 API（`/agent/…`，映射前缀除外）直接放行，长连接 SSE 绝不经 SW。
+    if (!state.loaded && url.origin === self.location.origin &&
+        url.pathname.indexOf('/agent/') === 0 && url.pathname.indexOf(PREFIX + '/') !== 0) {
+      return;
+    }
     if (!maybeMapped(event.clientId)) return;
     event.respondWith(handleSubresource(event, url));
   }
