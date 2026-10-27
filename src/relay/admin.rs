@@ -15,6 +15,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::proto::Permission;
+use crate::relay::artifact_store::{ArtifactRef, Variant};
 use crate::relay::auth::constant_time_eq;
 use crate::relay::SharedState;
 
@@ -695,63 +696,73 @@ pub async fn recording_delete_handler(
 /// Canonical artifact arch key for a device-reported arch. Release binaries
 /// are named `shell-remote-{key}` with key x86_64 / aarch64 / armv7 — the
 /// `uname -m` variants (armv7l, amd64, arm64, …) map onto them.
+///
+/// 实现在 [`artifact_store::normalize_arch`]（统一制品库的产物命名规则是唯一
+/// 真相源），这里保留函数名以不动既有调用点与测试。
 pub fn artifact_arch_key(arch: &str) -> String {
-    match arch.trim().to_ascii_lowercase().as_str() {
-        "x86_64" | "amd64" | "x64" => "x86_64".to_string(),
-        "aarch64" | "arm64" => "aarch64".to_string(),
-        "armv7l" | "armv7" => "armv7".to_string(),
-        other => other.to_string(),
-    }
+    crate::relay::artifact_store::normalize_arch(arch)
 }
 
-/// Parse a staged artifact filename into (arch key, windows). Returns `None`
-/// for anything that is not `shell-remote-<arch>[.exe]`.
+/// Parse a staged artifact filename into (arch key, windows).
+///
+/// **兼容语义**：历史版本这里只认 CLI 名（`shell-remote-<arch>[.exe]`）。
+/// MYS-2425 起 UI 制品（`shell-remote-ui-<arch>`）也是合法升级制品，因此本
+/// 函数对两者都返回 `true`，`arch` 为归一化后的架构 key。需要区分形态的调用方
+/// 请用 [`crate::relay::artifact_store::parse_artifact_ref`]。
 pub fn parse_artifact_name(name: &str) -> Option<(String, bool)> {
-    let rest = name.strip_prefix("shell-remote-")?;
-    let windows = rest.ends_with(".exe");
-    let arch = rest.strip_suffix(".exe").unwrap_or(rest);
-    if arch.is_empty() || arch.contains('.') || arch.contains('/') || arch.contains('\\') {
-        return None;
-    }
-    Some((arch.to_string(), windows))
+    let r = crate::relay::artifact_store::parse_artifact_ref(name)?;
+    Some((r.arch, r.windows))
 }
 
 /// True when `name` is a valid staged artifact filename. The blob download
 /// endpoint uses this as its only path guard — it must reject every traversal
 /// or separator trick.
 pub fn valid_artifact_filename(name: &str) -> bool {
-    parse_artifact_name(name).is_some()
+    crate::relay::artifact_store::parse_artifact_ref(name).is_some()
 }
 
-/// File a device with `arch`/`platform` should upgrade from, if staged.
-fn artifact_file_for(
-    dir: &std::path::Path,
-    arch: &str,
-    platform: Option<&str>,
-) -> Option<std::path::PathBuf> {
-    let key = artifact_arch_key(arch);
-    if platform == Some("windows") {
-        let p = dir.join(format!("shell-remote-{key}.exe"));
-        p.is_file().then_some(p)
-    } else {
-        let p = dir.join(format!("shell-remote-{key}"));
-        p.is_file().then_some(p)
-    }
-}
-
-/// Version label for a staged artifact: the `shell-remote-<key>.version`
-/// companion file if present, else a generic label.
-fn artifact_version(dir: &std::path::Path, key: &str) -> String {
-    std::fs::read_to_string(dir.join(format!("shell-remote-{key}.version")))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+/// 版本标签：优先用制品库里的 `<filename 去掉 .exe>.version` 伴随文件，其次用
+/// 官方清单里的版本，最后退回 `v?`。
+fn artifact_version(store: &crate::relay::artifact_store::ArtifactStore, artifact: &ArtifactRef) -> String {
+    store
+        .declared_version(artifact)
         .unwrap_or_else(|| "v?".to_string())
 }
 
-/// List the staged agent upgrade artifacts (`--agent-upgrade-dir`). Purely
-/// file-metadata based (no hashing) so it is cheap enough for the admin page's
-/// periodic refresh.
+/// 决定设备该拿哪个制品形态。
+///
+/// **不能用 `desktop:*` capability 判断**：`build_capabilities` 把
+/// `desktop:gray` / `desktop:quality` 等无条件写入，lean CLI 二进制（名义上
+/// "仅终端转发"）也会上报这些串——实测 `shell-remote` CLI 注册后的
+/// capabilities 里同样有 `desktop:gray`。以它判断会把 CLI 误判成 UI。
+///
+/// 因此按可信度降级：
+///
+/// 1. agent 显式声明的 `variant:cli` / `variant:ui`（新 agent 会带）——最可靠；
+/// 2. 否则按 `admin_variant_override`（运维显式指定）；
+/// 3. 否则 `Variant::Cli`：升级成 lean CLI 会丢掉桌面能力，但这是"少给一层
+///    能力"，而误判成 UI 会把不存在的 UI 制品当成目标、或给 CLI 设备换上
+///    重 30MB 的桌面包。宁可保守，并在 plan/handler 的响应里把
+///    `variant_source` 标出来，让管理员看到这是推断而非事实。
+///
+/// 老 agent 不报 variant → 同样落到第 3 步。
+pub fn variant_for_device(caps: &[String], override_variant: Option<Variant>) -> (Variant, &'static str) {
+    // 显式能力声明优先：`variant:ui` / `variant:cli`
+    for c in caps {
+        if let Some(v) = c.strip_prefix("variant:") {
+            if let Some(parsed) = Variant::parse(v) {
+                return (parsed, "capability");
+            }
+        }
+    }
+    if let Some(v) = override_variant {
+        return (v, "override");
+    }
+    (Variant::Cli, "default")
+}
+
+/// List the staged agent upgrade artifacts. Purely file-metadata based (no
+/// hashing) so it is cheap enough for the admin page's periodic refresh.
 pub async fn upgrade_artifacts_handler(
     State(state): State<Arc<SharedState>>,
     headers: HeaderMap,
@@ -759,45 +770,112 @@ pub async fn upgrade_artifacts_handler(
     if !check_admin(&state, &headers).await {
         return unauthorized();
     }
-    let Some(dir) = state.upgrade_dir.read().await.clone() else {
+    let Some(store) = state.artifact_store.clone() else {
         return Json(json!({"enabled": false, "artifacts": []})).into_response();
     };
-    let mut artifacts: Vec<Value> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some((arch, windows)) = parse_artifact_name(&name) {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        artifacts.push(json!({
-                            "arch": arch,
-                            "filename": name,
-                            "size": meta.len(),
-                            "windows": windows,
-                            "version": artifact_version(&dir, &arch),
-                        }));
-                    }
-                }
-            }
-        }
-    }
-    artifacts.sort_by(|a, b| a["arch"].as_str().cmp(&b["arch"].as_str()));
+    let artifacts: Vec<Value> = store
+        .list()
+        .into_iter()
+        .map(|local| {
+            let version = artifact_version(&store, &local.artifact);
+            json!({
+                "arch": local.artifact.arch,
+                "variant": local.artifact.variant.as_str(),
+                "filename": local.artifact.filename(),
+                "size": local.size,
+                "windows": local.artifact.windows,
+                "version": version,
+            })
+        })
+        .collect();
     Json(json!({
         "enabled": true,
-        "dir": dir.display().to_string(),
+        "dir": store.root().display().to_string(),
+        "relay_version": env!("CARGO_PKG_VERSION"),
+        "allow_custom_upgrade": state.allow_custom_upgrade,
+        "cdn_base_urls": state.upgrade_cdn_base_urls,
         "artifacts": artifacts,
     }))
     .into_response()
 }
 
-/// Trigger an atomic self-upgrade for one device: hash the staged artifact for
-/// the device's arch and deliver `agent:upgrade` over the session's agent
-/// channel. The agent then downloads, verifies and atomically replaces itself.
+/// 取某个版本的官方清单：优先缓存，否则按配置抓取；
+/// 抓取失败时回落缓存（网络波动不应让已验证的任务失效）。
+///
+/// 同版本 digest 与缓存不一致 → 标记发布异常并拒绝使用新清单（不静默换 hash）。
+/// 结果同时写进 `manifest_status`，供 admin 概览解释原因。
+pub async fn load_manifest(
+    state: &Arc<SharedState>,
+    store: &crate::relay::artifact_store::ArtifactStore,
+    version: &str,
+) -> Option<crate::relay::artifact_store::OfficialManifest> {
+    use crate::relay::artifact_store as a;
+
+    let cached = a::read_cached_manifest(store, version);
+    let fetched = a::fetch_official_manifest(&state.manifest_fetch, version).await;
+
+    let (manifest, detail, is_cached) = match (cached, fetched) {
+        (Some(c), Ok(incoming)) => {
+            if let Some(conflict) = a::manifest_conflict(&c, &incoming) {
+                tracing::error!(
+                    version = %version,
+                    conflict = %conflict,
+                    "official manifest conflicts with cache — refusing this version"
+                );
+                state.manifest_status.write().await.insert(
+                    version.to_string(),
+                    json!({"ok": false, "cached": true, "detail": conflict}),
+                );
+                return None;
+            }
+            (c, "cache hit".to_string(), true)
+        }
+        (None, Ok(f)) => {
+            if let Err(e) = a::write_manifest_atomic(store, &f) {
+                tracing::warn!(version = %version, error = %e, "cannot cache official manifest");
+            }
+            (f, "fetched from GitHub".to_string(), false)
+        }
+        (Some(c), Err(e)) => {
+            tracing::warn!(
+                version = %version,
+                error = %e,
+                "official manifest unreachable — using cached copy"
+            );
+            (c, format!("cache hit (fetch failed: {e})"), true)
+        }
+        (None, Err(e)) => {
+            state.manifest_status.write().await.insert(
+                version.to_string(),
+                json!({"ok": false, "cached": false, "detail": e}),
+            );
+            return None;
+        }
+    };
+    state.manifest_status.write().await.insert(
+        version.to_string(),
+        json!({"ok": true, "cached": is_cached, "detail": detail}),
+    );
+    Some(manifest)
+}
+
+/// 触发一台设备的自升级（MYS-2425：版本决策 + 可信任务）。
+///
+/// 流程：
+/// 1. 版本决策：`semver(relay) > semver(agent)` 才继续（相等/更低/未知都不自动
+///    升级；`force` 只对"管理员明确要求重装同版本"生效，仍不允许降级以外的
+///    猜测）。
+/// 2. 取官方清单（缓存优先，GitHub 不可达时回落缓存）。
+/// 3. 按设备上报的 capabilities 选 CLI/UI 制品，本地镜像现场算 hash 并交叉校验。
+/// 4. 生成不可变任务（version + filename + size + sha256 + official_path +
+///    cdn_base_urls + relay_url + source）下发 `agent:upgrade`。
 pub async fn agent_upgrade_handler(
     State(state): State<Arc<SharedState>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    use crate::relay::artifact_store as a;
+
     if !check_admin(&state, &headers).await {
         return unauthorized();
     }
@@ -827,49 +905,114 @@ pub async fn agent_upgrade_handler(
         )
             .into_response();
     }
-    let Some(dir) = state.upgrade_dir.read().await.clone() else {
+    // 制品形态由 agent 自报能力决定：不要把桌面 agent 换成 CLI。
+    let (variant, variant_source) =
+        variant_for_device(&info.capabilities, state.upgrade_variant_override);
+    let windows = platform.as_deref() == Some("windows");
+    let Some(artifact) = ArtifactRef::new(variant, &arch, windows) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"ok": false, "error": "agent upgrades disabled (--agent-upgrade-dir unset)"})),
+            Json(json!({"ok": false, "error": format!("unusable device arch {arch:?}")})),
         )
             .into_response();
     };
-    let Some(path) = artifact_file_for(&dir, &arch, platform.as_deref()) else {
-        let key = artifact_arch_key(&arch);
-        let want = if platform.as_deref() == Some("windows") {
-            format!("shell-remote-{key}.exe")
-        } else {
-            format!("shell-remote-{key}")
-        };
+
+    // ── 版本决策 ────────────────────────────────────────────────────
+    let relay_version = env!("CARGO_PKG_VERSION");
+    let force = body["force"].as_bool().unwrap_or(false);
+    let decision = a::version_decision(relay_version, info.agent_version.as_deref());
+    // `force` 允许重装同一版本，但绝不降级、也不在版本未知时瞎猜。
+    let allowed = decision.needs_upgrade()
+        || (force && matches!(decision, a::VersionDecision::UpToDate));
+    if !allowed {
         return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"ok": false, "error": format!("no upgrade artifact for arch {arch} (expected {want} in {})", dir.display())})),
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": format!("no upgrade needed: {}", decision.reason()),
+                "relay_version": relay_version,
+                "agent_version": info.agent_version,
+                "decision": format!("{decision:?}"),
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(store) = state.artifact_store.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "agent upgrades disabled (no artifact dir configured)"})),
         )
             .into_response();
     };
-    // Hash + version at trigger time (one-shot, per click).
-    let sha256 = match crate::agent::upgrade::sha256_hex_file(&path) {
-        Ok(h) => h,
+
+    // 先确认 agent 在线：离线时没有必要去抓官方清单（一次网络往返白花），
+    // 也保持"agent offline → 409"的既有语义。
+    {
+        let broadcast = state.agent_broadcast.read().await;
+        if broadcast.get(&sid).and_then(|cm| cm.agent.as_ref()).is_none() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"ok": false, "error": "agent offline"})),
+            )
+                .into_response();
+        }
+    }
+
+    // ── 取清单 + 本地镜像 hash ──────────────────────────────────────
+    let manifest = load_manifest(&state, &store, relay_version).await;
+    let local = store
+        .locate(relay_version, &artifact.filename())
+        .map(|path| {
+            a::LocalArtifact {
+                artifact: artifact.clone(),
+                path,
+                size: 0,
+                sha256: None,
+            }
+            .with_hash()
+        })
+        .transpose();
+    let local = match local {
+        Ok(l) => l,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"ok": false, "error": format!("cannot hash artifact: {e}")})),
+                Json(json!({"ok": false, "error": format!("cannot hash local artifact: {e}")})),
             )
                 .into_response();
         }
     };
-    let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let arch_key = artifact_arch_key(&arch);
-    let version = artifact_version(&dir, &arch_key);
+
+    let upgrade_id = uuid::Uuid::new_v4().to_string();
+    let task = match a::build_task(
+        upgrade_id.clone(),
+        &artifact,
+        manifest.as_ref(),
+        local.as_ref(),
+        &state.upgrade_cdn_base_urls,
+        state.allow_custom_upgrade,
+    ) {
+        Ok(t) => t,
+        Err(refusal) => {
+            // 明确拒绝的原因，而不是给一个"猜出来的" hash。
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "ok": false,
+                    "error": refusal.message(),
+                    "refusal": format!("{refusal:?}"),
+                    "manifest": state.manifest_status.read().await.get(relay_version),
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let text = serde_json::to_string(&json!({
         "type": "agent:upgrade",
         "session_id": sid,
-        "payload": {
-            "version": version,
-            "url": format!("/agent/upgrade/blob/{}", filename),
-            "sha256": sha256,
-        }
+        "payload": task.wire_payload(),
     }))
     .unwrap_or_default();
     {
@@ -889,9 +1032,87 @@ pub async fn agent_upgrade_handler(
     // progress frame replaces this entry.
     state.agent_upgrades.write().await.insert(
         sid.clone(),
-        json!({"stage": "started", "version": version, "detail": "upgrade triggered"}),
+        json!({
+            "stage": "started",
+            "version": task.target_version,
+            "upgrade_id": task.upgrade_id,
+            "source": task.source.as_str(),
+            "detail": "upgrade triggered",
+        }),
     );
-    Json(json!({"ok": true, "version": version, "arch": arch_key})).into_response()
+    Json(json!({
+        "ok": true,
+        "upgrade_id": task.upgrade_id,
+        "version": task.target_version,
+        "filename": task.filename,
+        "variant": task.variant.as_str(),
+        "variant_source": variant_source,
+        "arch": task.arch,
+        "source": task.source.as_str(),
+        "relay_fallback": task.relay_fallback,
+        "cdn_count": task.cdn_base_urls.len(),
+        // 老 agent 只会从 relay 下载；没有 relay 副本时它无法完成升级。
+        "legacy_compatible": task.legacy_compatible(),
+    }))
+    .into_response()
+}
+
+/// `GET <admin>/api/agent/upgrade/plan?session_id=…`：只做版本决策与制品定位，
+/// **不**下发指令、不退出任何进程。设备列表用它显示"是否需要升级 / 能否升级"。
+pub async fn agent_upgrade_plan_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>,
+) -> Response {
+    use crate::relay::artifact_store as a;
+
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let sid = params
+        .iter()
+        .find(|(k, _)| k == "session_id")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let Some(info) = state.sessions.get(&sid).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": "session not found"})),
+        )
+            .into_response();
+    };
+    let relay_version = env!("CARGO_PKG_VERSION");
+    let decision = a::version_decision(relay_version, info.agent_version.as_deref());
+    let (arch, platform) = match info.device.as_ref() {
+        Some(d) => (d.arch.clone().unwrap_or_default(), d.platform.clone()),
+        None => (String::new(), None),
+    };
+    let (variant, variant_source) =
+        variant_for_device(&info.capabilities, state.upgrade_variant_override);
+    let target = ArtifactRef::new(variant, &arch, platform.as_deref() == Some("windows"));
+    let local_present = target
+        .as_ref()
+        .and_then(|t| state.artifact_store.as_ref()?.locate(relay_version, &t.filename()))
+        .is_some();
+
+    Json(json!({
+        "ok": true,
+        "session_id": sid,
+        "relay_version": relay_version,
+        "agent_version": info.agent_version,
+        "decision": format!("{decision:?}"),
+        "needs_upgrade": decision.needs_upgrade(),
+        "reason": decision.reason(),
+        "variant": variant.as_str(),
+        "variant_source": variant_source,
+        "arch": arch,
+        "target_filename": target.as_ref().map(|t| t.filename()),
+        "local_artifact_present": local_present,
+        "allow_custom_upgrade": state.allow_custom_upgrade,
+        "cdn_base_urls": state.upgrade_cdn_base_urls,
+        "manifest": state.manifest_status.read().await.get(relay_version),
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1502,6 +1723,12 @@ mod tests {
         assert!(valid_artifact_filename("shell-remote-x86_64.exe"));
     }
 
+    /// 配好统一制品库的 admin state。`--download-dir` 与 `--agent-upgrade-dir`
+    /// 合并后，`upgrade_dir` 只是兼容别名，`artifact_store` 才是权威来源。
+    fn state_with_admin_artifacts(dir: &std::path::Path) -> Arc<SharedState> {
+        state_with_admin_artifacts_tuned(dir, |_| {})
+    }
+
     fn upgrade_dir_with_artifacts() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "sr-upg-admin-{}",
@@ -1519,17 +1746,83 @@ mod tests {
         dir
     }
 
-    #[tokio::test]
-    async fn test_upgrade_artifacts_handler_lists_staged_binaries() {
-        let dir = upgrade_dir_with_artifacts();
-        let state = state_with_admin("admin", "s3cret");
-        *state.upgrade_dir.write().await = Some(dir.clone());
+    /// 把 state 的 admin session 置为已登录。
+    async fn login(state: &Arc<SharedState>) -> HeaderMap {
         state
             .admin_sessions
             .write()
             .await
             .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
-        let h = cookie_headers("tok");
+        cookie_headers("tok")
+    }
+
+    /// 注册一台设备并写入 device + capabilities + agent_version。
+    async fn register_device(
+        state: &Arc<SharedState>,
+        name: &str,
+        arch: &str,
+        platform: &str,
+        capabilities: &[&str],
+        agent_version: Option<&str>,
+    ) -> String {
+        let reg = state
+            .sessions
+            .register(None, "rw", Some(name.to_string()))
+            .await
+            .unwrap();
+        state
+            .sessions
+            .set_device(
+                &reg.session_id,
+                Some(crate::proto::DeviceInfo {
+                    hostname: None,
+                    platform: Some(platform.to_string()),
+                    arch: Some(arch.to_string()),
+                    os: None,
+                    kernel: None,
+                    cpu_model: None,
+                }),
+            )
+            .await;
+        state
+            .sessions
+            .set_agent_version(&reg.session_id, agent_version.map(|v| v.to_string()))
+            .await;
+        if !capabilities.is_empty() {
+            state
+                .sessions
+                .update_capabilities(
+                    &reg.session_id,
+                    capabilities.iter().map(|s| s.to_string()).collect(),
+                )
+                .await;
+        }
+        reg.session_id
+    }
+
+    /// 给会话挂一个在线的 agent 通道，返回接收端。
+    async fn attach_agent_channel(
+        state: &Arc<SharedState>,
+        sid: &str,
+    ) -> tokio::sync::mpsc::Receiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+        state.agent_broadcast.write().await.insert(
+            sid.to_string(),
+            crate::relay::ChannelMap {
+                agent: Some(tx),
+                agent_bulk: None,
+                browser_sessions: std::collections::HashMap::new(),
+                browser_tokens: std::collections::HashMap::new(),
+            },
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_artifacts_handler_lists_staged_binaries() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_admin_artifacts(&dir);
+        let h = login(&state).await;
 
         let r = upgrade_artifacts_handler(State(state.clone()), h.clone()).await;
         let v: Value = serde_json::from_slice(
@@ -1537,6 +1830,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["enabled"], true);
+        assert_eq!(v["relay_version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            v["cdn_base_urls"].as_array().unwrap().len() >= 2,
+            "首期至少两个独立 CDN 入口"
+        );
         let arts = v["artifacts"].as_array().unwrap();
         assert_eq!(arts.len(), 3, "noise files must be excluded");
         let x86 = arts
@@ -1544,6 +1842,7 @@ mod tests {
             .find(|a| a["arch"] == "x86_64")
             .expect("x86_64 artifact listed");
         assert_eq!(x86["filename"], "shell-remote-x86_64");
+        assert_eq!(x86["variant"], "cli");
         assert_eq!(x86["version"], "0.20.0", "companion .version file is used");
         assert_eq!(x86["windows"], false);
         let win = arts
@@ -1585,113 +1884,176 @@ mod tests {
         assert_eq!(r.status(), 401);
     }
 
-    #[tokio::test]
-    async fn test_agent_upgrade_handler_offline_agent_is_conflict() {
-        let dir = upgrade_dir_with_artifacts();
-        let state = state_with_admin("admin", "s3cret");
-        *state.upgrade_dir.write().await = Some(dir.clone());
-        state
-            .admin_sessions
-            .write()
-            .await
-            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
-        let h = cookie_headers("tok");
-
-        let reg = state
-            .sessions
-            .register(None, "rw", Some("devbox9".to_string()))
-            .await
-            .unwrap();
-        state
-            .sessions
-            .set_device(
-                &reg.session_id,
-                Some(crate::proto::DeviceInfo {
-                    hostname: None,
-                    platform: Some("linux".to_string()),
-                    arch: Some("x86_64".to_string()),
-                    os: None,
-                    kernel: None,
-                    cpu_model: None,
-                }),
-            )
-            .await;
-
-        // No agent channel → offline → 409.
-        let r = agent_upgrade_handler(
-            State(state.clone()),
-            h.clone(),
-            Json(json!({"session_id": reg.session_id})),
-        )
-        .await;
-        assert_eq!(r.status(), 409);
-        let _ = std::fs::remove_dir_all(&dir);
+    /// 制品库齐全但官方清单不可达的 state（模拟 GitHub 被墙）。
+    fn state_without_manifest(dir: &std::path::Path) -> Arc<SharedState> {
+        state_with_admin_artifacts_tuned(dir, |st| {
+            st.manifest_fetch.api_base = "http://127.0.0.1:1".to_string();
+            st.manifest_fetch.timeout = std::time::Duration::from_millis(400);
+            st.manifest_fetch.connect_timeout = std::time::Duration::from_millis(200);
+        })
     }
 
     #[tokio::test]
-    async fn test_agent_upgrade_handler_delivers_upgrade_message() {
+    async fn test_agent_upgrade_handler_offline_agent_is_conflict() {
         let dir = upgrade_dir_with_artifacts();
-        let expected_digest = crate::agent::upgrade::sha256_hex_file(&dir.join("shell-remote-x86_64"))
-            .unwrap();
-        let state = state_with_admin("admin", "s3cret");
-        *state.upgrade_dir.write().await = Some(dir.clone());
-        state
-            .admin_sessions
-            .write()
-            .await
-            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
-        let h = cookie_headers("tok");
+        let state = state_without_manifest(&dir);
+        let h = login(&state).await;
+        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
 
-        let reg = state
-            .sessions
-            .register(None, "rw", Some("devbox9".to_string()))
-            .await
-            .unwrap();
-        state
-            .sessions
-            .set_device(
-                &reg.session_id,
-                Some(crate::proto::DeviceInfo {
-                    hostname: None,
-                    platform: Some("linux".to_string()),
-                    arch: Some("x86_64".to_string()),
-                    os: None,
-                    kernel: None,
-                    cpu_model: None,
-                }),
-            )
+        // No agent channel → offline → 409.
+        let r = agent_upgrade_handler(State(state.clone()), h.clone(), Json(json!({"session_id": sid})))
             .await;
+        assert_eq!(r.status(), 409);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"], "agent offline");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // A live agent SSE channel so the relay can deliver the message.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
-        state.agent_broadcast.write().await.insert(
-            reg.session_id.clone(),
-            crate::relay::ChannelMap {
-                agent: Some(tx.clone()),
-                agent_bulk: None,
-                browser_sessions: std::collections::HashMap::new(),
-                browser_tokens: std::collections::HashMap::new(),
-            },
+    /// 起一个本地 release-API mock，只服务 `v<version>`，清单里列出的
+    /// `shell-remote-x86_64` 资产 digest/size 与给定字节精确匹配。
+    async fn spawn_manifest_mock(version: &'static str, bytes: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::routing::get;
+        use axum::Router;
+
+        let (size, digest) = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(bytes);
+            (bytes.len() as u64, hex::encode(h.finalize()))
+        };
+        let body = json!({
+            "tag_name": format!("v{version}"),
+            "assets": [{
+                "name": "shell-remote-x86_64",
+                "size": size,
+                "digest": format!("sha256:{digest}"),
+                "browser_download_url": format!(
+                    "https://github.com/zzttzzmyswy/shell-remote/releases/download/v{version}/shell-remote-x86_64"
+                ),
+            }],
+        });
+        let app = Router::new().route(
+            "/repos/:owner/:repo/releases/tags/:tag",
+            get(move |axum::extract::Path((_o, _r, tag)): axum::extract::Path<(String, String, String)>| {
+                let body = body.clone();
+                let want = format!("v{version}");
+                async move {
+                    if tag == want {
+                        (axum::http::StatusCode::OK, axum::Json(body))
+                    } else {
+                        (
+                            axum::http::StatusCode::NOT_FOUND,
+                            axum::Json(json!({"message": "Not Found"})),
+                        )
+                    }
+                }
+            }),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// 带本地清单 mock 的 admin state。
+    async fn state_with_manifest_mock(
+        dir: &std::path::Path,
+        bytes: &'static [u8],
+    ) -> Arc<SharedState> {
+        let (api_base, mock) = spawn_manifest_mock(env!("CARGO_PKG_VERSION"), bytes).await;
+        // mock 任务必须在整个测试期间存活；测试进程结束时随之退出。
+        std::mem::forget(mock);
+        state_with_admin_artifacts_tuned(dir, |st| {
+            st.manifest_fetch.api_base = api_base;
+        })
+    }
+
+    /// 构造统一制品库 state，允许在包成 `Arc` 之前调整启动配置。
+    fn state_with_admin_artifacts_tuned(
+        dir: &std::path::Path,
+        tune: impl FnOnce(&mut SharedState),
+    ) -> Arc<SharedState> {
+        let mut st = SharedState::new(
+            "relay-pw".to_string(),
+            100 * 1024 * 1024,
+            Some("/admin-test".to_string()),
+            "admin".to_string(),
+            "s3cret".to_string(),
+            None,
+        );
+        st.download_dir = Some(dir.to_path_buf());
+        st.artifact_store = Some(crate::relay::artifact_store::ArtifactStore::new(
+            dir.to_path_buf(),
+        ));
+        tune(&mut st);
+        Arc::new(st)
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_delivers_full_task_with_official_digest() {
+        // 官方清单由本地 HTTP mock 提供（不依赖外网），digest 与本地镜像一致
+        // → 任务应为 `source: local`，同时带 CDN 与 relay 兜底。
+        let dir = upgrade_dir_with_artifacts();
+        let local_bytes = b"new-binary-x86";
+        let state = state_with_manifest_mock(&dir, local_bytes).await;
+        let h = login(&state).await;
+        // agent 版本更低 → 需要升级
+        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
 
         let r = agent_upgrade_handler(
             State(state.clone()),
             h.clone(),
-            Json(json!({"session_id": reg.session_id})),
+            Json(json!({"session_id": sid})),
         )
         .await;
         assert_eq!(r.status(), 200);
         let got = rx.try_recv().expect("agent channel must receive the upgrade msg");
         let v: Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v["type"], "agent:upgrade");
-        assert_eq!(v["session_id"], reg.session_id);
-        let payload = &v["payload"];
-        assert_eq!(payload["version"], "0.20.0");
-        assert_eq!(payload["url"], "/agent/upgrade/blob/shell-remote-x86_64");
-        assert_eq!(payload["sha256"], expected_digest);
+        assert_eq!(v["session_id"], sid);
+
+        let p = &v["payload"];
+        // 任务字段齐全且与官方 digest 一致
+        assert_eq!(p["target_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(p["filename"], "shell-remote-x86_64");
+        assert_eq!(p["size"], local_bytes.len() as u64);
+        assert_eq!(
+            p["sha256"],
+            {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(local_bytes);
+                hex::encode(hasher.finalize())
+            }
+        );
+        assert_eq!(
+            p["official_path"],
+            format!(
+                "/zzttzzmyswy/shell-remote/releases/download/v{}/shell-remote-x86_64",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(p["source"], "local");
+        assert_eq!(p["official_release"], true);
+        assert_eq!(p["variant"], "cli");
+        assert_eq!(p["arch"], "x86_64");
+        assert_eq!(p["windows"], false);
+        assert_eq!(p["relay_url"], "/agent/upgrade/blob/shell-remote-x86_64");
+        assert_eq!(p["relay_fallback"], true);
+        assert!(
+            p["cdn_base_urls"].as_array().unwrap().len() >= 2,
+            "至少两个独立 CDN 入口"
+        );
+        assert!(p["upgrade_id"].as_str().unwrap().len() >= 32);
 
         // Trigger is reflected in the overview immediately.
-        let resp = overview_handler(State(state.clone()), h.clone()).await;
+        let resp = overview_handler(State(state.clone()), h).await;
         let ov: Value = serde_json::from_slice(
             &axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap(),
         )
@@ -1700,10 +2062,249 @@ mod tests {
             .as_array()
             .unwrap()
             .into_iter()
-            .find(|s| s["session_id"] == reg.session_id)
+            .find(|s| s["session_id"] == sid)
             .unwrap();
         assert_eq!(sess["upgrade"]["stage"], "started");
-        assert_eq!(sess["upgrade"]["version"], "0.20.0");
+        assert_eq!(sess["upgrade"]["source"], "local");
+        assert_eq!(sess["upgrade"]["version"], env!("CARGO_PKG_VERSION"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_refuses_when_agent_version_not_lower() {
+        // 版本相等 → 不自动升级（409），这是"只升级更高 semver"的硬约束。
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_manifest_mock(&dir, b"new-binary-x86").await;
+        let h = login(&state).await;
+        let sid = register_device(
+            &state,
+            "devbox9",
+            "x86_64",
+            "linux",
+            &[],
+            Some(env!("CARGO_PKG_VERSION")),
+        )
+        .await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        let r = agent_upgrade_handler(
+            State(state.clone()),
+            h.clone(),
+            Json(json!({"session_id": sid})),
+        )
+        .await;
+        assert_eq!(r.status(), 409);
+        assert!(rx.try_recv().is_err(), "同版本不得下发任何指令");
+
+        // 显式 force 允许重装同版本
+        let r = agent_upgrade_handler(
+            State(state.clone()),
+            h,
+            Json(json!({"session_id": sid, "force": true})),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        assert!(rx.try_recv().is_ok(), "force 应当下发任务");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_variant_mapping_ignores_desktop_capabilities() {
+        // lean CLI 二进制也会上报 desktop:* （build_capabilities 无条件写入），
+        // 因此它**不能**作为 UI 的判据——否则 CLI 设备会被换成 30MB 桌面包。
+        let lean_cli_caps: Vec<String> = [
+            "web:proxy-v1",
+            "net:tcp-v1",
+            "codec:h264",
+            "backend:x11",
+            "desktop:gray",
+            "desktop:quality",
+            "desktop:clipboard",
+            "desktop:cursor",
+            "desktop:test-delay",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            variant_for_device(&lean_cli_caps, None),
+            (Variant::Cli, "default"),
+            "desktop:* 不能推出 UI"
+        );
+        assert_eq!(variant_for_device(&[], None), (Variant::Cli, "default"));
+
+        // 新 agent 显式声明 variant:* 时以它为准
+        assert_eq!(
+            variant_for_device(&["variant:ui".into(), "desktop:gray".into()], None),
+            (Variant::Ui, "capability")
+        );
+        assert_eq!(
+            variant_for_device(&["variant:cli".into()], Some(Variant::Ui)),
+            (Variant::Cli, "capability"),
+            "显式声明优先于运维 override"
+        );
+        // 无声明时用 override
+        assert_eq!(
+            variant_for_device(&lean_cli_caps, Some(Variant::Ui)),
+            (Variant::Ui, "override")
+        );
+        // 非法 variant 串被忽略
+        assert_eq!(
+            variant_for_device(&["variant:desktop".into()], None),
+            (Variant::Cli, "default")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_serves_ui_artifact_when_variant_declared() {
+        // 显式声明 variant:ui → 选 UI 制品；清单不可达 + 已批准 custom →
+        // 任务 source=custom，仅走 relay 镜像。
+        let dir = upgrade_dir_with_artifacts();
+        std::fs::write(dir.join("shell-remote-ui-x86_64"), b"ui-bytes").unwrap();
+        let state = state_with_admin_artifacts_tuned(&dir, |st| {
+            st.manifest_fetch.api_base = "http://127.0.0.1:1".to_string();
+            st.manifest_fetch.timeout = std::time::Duration::from_millis(400);
+            st.manifest_fetch.connect_timeout = std::time::Duration::from_millis(200);
+            st.allow_custom_upgrade = true;
+        });
+        let h = login(&state).await;
+        let sid = register_device(
+            &state,
+            "deskbox",
+            "x86_64",
+            "linux",
+            &["codec:h264", "desktop:gray", "variant:ui"],
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        let r = agent_upgrade_handler(State(state.clone()), h, Json(json!({"session_id": sid})))
+            .await;
+        assert_eq!(r.status(), 200);
+        let got = rx.try_recv().expect("upgrade msg");
+        let v: Value = serde_json::from_str(&got).unwrap();
+        let p = &v["payload"];
+        assert_eq!(
+            p["filename"], "shell-remote-ui-x86_64",
+            "声明 variant:ui 的 agent 必须拿 UI 制品"
+        );
+        assert_eq!(p["variant"], "ui");
+        assert_eq!(p["source"], "custom");
+        assert_eq!(p["official_release"], false);
+        assert!(
+            p["cdn_base_urls"].as_array().unwrap().is_empty(),
+            "custom 不走外部 CDN"
+        );
+        assert!(p.get("official_path").is_none());
+        // custom 的 hash 来自本地实测，必须等于文件真实 digest。
+        assert_eq!(
+            p["sha256"],
+            {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(b"ui-bytes");
+                hex::encode(hasher.finalize())
+            }
+        );
+        assert_eq!(p["relay_url"], "/agent/upgrade/blob/shell-remote-ui-x86_64");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_refuses_unapproved_custom_build() {
+        // 同样的场景但不批准 custom → 明确拒绝，且不下发任何 hash。
+        let dir = upgrade_dir_with_artifacts();
+        std::fs::write(dir.join("shell-remote-ui-x86_64"), b"ui-bytes").unwrap();
+        let state = state_with_admin_artifacts_tuned(&dir, |st| {
+            st.manifest_fetch.api_base = "http://127.0.0.1:1".to_string();
+            st.manifest_fetch.timeout = std::time::Duration::from_millis(400);
+            st.manifest_fetch.connect_timeout = std::time::Duration::from_millis(200);
+        });
+        let h = login(&state).await;
+        let sid = register_device(
+            &state,
+            "deskbox",
+            "x86_64",
+            "linux",
+            &["desktop:gray"],
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        let r = agent_upgrade_handler(State(state.clone()), h, Json(json!({"session_id": sid})))
+            .await;
+        assert_eq!(r.status(), 404);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("--allow-custom-upgrade"),
+            "错误信息必须告诉管理员怎么批准: {body}"
+        );
+        assert!(rx.try_recv().is_err(), "拒绝时不得下发指令");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_handler_rejects_local_hash_mismatch() {
+        // 本地镜像与官方 digest 不一致 → 发布异常，拒绝下发（不静默换 hash）。
+        let dir = upgrade_dir_with_artifacts();
+        // mock 清单声明的是 "official-bytes"，本地文件是 "new-binary-x86"
+        let state = state_with_manifest_mock(&dir, b"official-bytes").await;
+        let h = login(&state).await;
+        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        let r = agent_upgrade_handler(State(state.clone()), h, Json(json!({"session_id": sid})))
+            .await;
+        assert_eq!(r.status(), 404);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("digest"),
+            "必须报 hash 冲突: {body}"
+        );
+        assert!(rx.try_recv().is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_agent_upgrade_plan_reports_decision_without_dispatching() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_admin_artifacts(&dir);
+        let h = login(&state).await;
+        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        let q = axum::extract::Query(vec![("session_id".to_string(), sid.clone())]);
+        let r = agent_upgrade_plan_handler(State(state.clone()), h, q).await;
+        assert_eq!(r.status(), 200);
+        let v: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["needs_upgrade"], true);
+        assert_eq!(v["decision"], "Upgrade");
+        assert_eq!(v["agent_version"], "0.59.1");
+        assert_eq!(v["relay_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["variant"], "cli");
+        assert_eq!(v["target_filename"], "shell-remote-x86_64");
+        assert_eq!(v["local_artifact_present"], true);
+        assert!(rx.try_recv().is_err(), "plan 只读，不得下发任何指令");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1719,49 +2320,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // only an armv7 artifact — an x86_64 device must be told explicitly.
         std::fs::write(dir.join("shell-remote-armv7"), b"x").unwrap();
-        let state = state_with_admin("admin", "s3cret");
-        *state.upgrade_dir.write().await = Some(dir.clone());
-        state
-            .admin_sessions
-            .write()
-            .await
-            .insert("tok".to_string(), Instant::now() + ADMIN_SESSION_TTL);
-        let reg = state
-            .sessions
-            .register(None, "rw", Some("devbox9".to_string()))
-            .await
-            .unwrap();
-        state
-            .sessions
-            .set_device(
-                &reg.session_id,
-                Some(crate::proto::DeviceInfo {
-                    hostname: None,
-                    platform: Some("linux".to_string()),
-                    arch: Some("x86_64".to_string()),
-                    os: None,
-                    kernel: None,
-                    cpu_model: None,
-                }),
-            )
-            .await;
-        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
-        state.agent_broadcast.write().await.insert(
-            reg.session_id.clone(),
-            crate::relay::ChannelMap {
-                agent: Some(tx),
-                agent_bulk: None,
-                browser_sessions: std::collections::HashMap::new(),
-                browser_tokens: std::collections::HashMap::new(),
-            },
-        );
-        let r = agent_upgrade_handler(
-            State(state.clone()),
-            cookie_headers("tok"),
-            Json(json!({"session_id": reg.session_id})),
-        )
-        .await;
+        let state = state_without_manifest(&dir);
+        let h = login(&state).await;
+        let sid = register_device(&state, "devbox9", "x86_64", "linux", &[], Some("0.59.1")).await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+        let r = agent_upgrade_handler(State(state.clone()), h, Json(json!({"session_id": sid}))).await;
         assert_eq!(r.status(), 404);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("目标档案不存在"),
+            "必须明确说明没有可用制品: {body}"
+        );
+        assert!(rx.try_recv().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

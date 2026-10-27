@@ -1491,12 +1491,27 @@
     return k;
   }
 
+  // 制品形态与后端 variant_for_device 保持一致：agent 显式声明的
+  // `variant:*` 能力优先，否则按 cli（lean CLI 二进制也上报 desktop:*，
+  // 不能用它推断桌面形态）。这里只用于"能不能点升级"的预判，真正的形态
+  // 决策在后端——所以后端拒绝时仍以它的错误为准。
+  function deviceVariant(s) {
+    const caps = (s.capabilities || []);
+    for (const c of caps) {
+      if (c === 'variant:cli') return 'cli';
+      if (c === 'variant:ui') return 'ui';
+    }
+    return 'cli';
+  }
+
   function artifactFor(s) {
     if (!upgradeArtifacts || !upgradeArtifacts.enabled) return null;
     const d = s.device || {};
     const key = artifactArchKey(d.arch);
     const win = d.platform === 'windows';
-    return (upgradeArtifacts.artifacts || []).find(a => a.arch === key && a.windows === win) || null;
+    const variant = deviceVariant(s);
+    const all = upgradeArtifacts.artifacts || [];
+    return all.find(a => a.arch === key && a.windows === win && (a.variant || 'cli') === variant) || null;
   }
 
   function upgradeEligible(s) {
@@ -1575,7 +1590,9 @@
     for (const a of items) {
       const li = document.createElement('li');
       const arch = document.createElement('span'); arch.className = 'mono';
-      arch.textContent = a.arch + (a.windows ? ' (win)' : '');
+      // 标注制品形态：同一架构下 CLI 与 UI 是两份不同的制品，只显示 arch
+      // 会让管理员分不清升级会换掉哪一种。
+      arch.textContent = (a.variant === 'ui' ? 'UI ' : 'CLI ') + a.arch + (a.windows ? ' (win)' : '');
       const meta = document.createElement('span'); meta.className = 'muted';
       meta.textContent = ' — ' + a.filename + ' · ' + fmtBytes(a.size) + ' · ' + a.version;
       li.appendChild(arch); li.appendChild(meta);
