@@ -245,6 +245,20 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
         if crate::relay::web_proxy::route_agent_message(state, session_id, &proto_msg).await {
             return;
         }
+        // 纯 TCP 管道回包（MYS-2383 阶段6）：`tcp:opened/data/ack/eof/closed/error`
+        // 按 (session_id, conn_id) 投递给对应的 TunnelStream。与网页代理同样必须
+        // 在广播/录制/MCP 分支**之前**拦截——管道字节流既不能污染终端 SSE，也
+        // 不能进录制或 MCP oneshot。
+        if crate::relay::tcp_tunnel::route_agent_message(
+            state,
+            session_id,
+            &proto_msg,
+            text_str.len(),
+        )
+        .await
+        {
+            return;
+        }
         // 上行带宽记账（MYS-2287）：agent 上行的每条消息都计入上行用量，只记账
         // 不等待（交互/控制消息不能因限速变慢）。桌面视频例外——它在自己的分支
         // 里按解码后的帧字节 `try_acquire`/`consume`，这里再记会重复计数。
@@ -1466,6 +1480,27 @@ impl Drop for AgentEventsCleanup {
                                 revoked,
                                 cancelled,
                                 "web proxy: session tickets revoked and in-flight requests cancelled on agent disconnect"
+                            );
+                        }
+                        // 网页映射 v2（MYS-2383 阶段6）：agent 断线 → 撤销映射 +
+                        // 让全部管道读写报错。挂接点与 web ticket 撤销相同。
+                        let maps = state.web_maps.revoke_session(&session_id);
+                        if !maps.is_empty() {
+                            state
+                                .web_map_runtimes
+                                .forget_many(maps.iter().map(|s| s.as_str()));
+                            tracing::info!(
+                                session = %session_id,
+                                count = maps.len(),
+                                "web map: mappings revoked on agent disconnect"
+                            );
+                        }
+                        let tunnels = state.tcp_tunnels.close_session(&session_id);
+                        if tunnels > 0 {
+                            tracing::info!(
+                                session = %session_id,
+                                tunnels,
+                                "tcp tunnel: connections closed on agent disconnect"
                             );
                         }
                         // No newer connection replaced this one → the agent is

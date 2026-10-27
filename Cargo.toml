@@ -52,6 +52,14 @@ x11rb = { version = "0.14", features = ["image", "composite", "shm", "randr"], o
 enigo = { version = "0.6.1", default-features = false, features = ["x11rb"], optional = true }
 tokio-tungstenite = { version = "0.23", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 futures-util = "0.3.34"
+# 同源网页映射 v2（MYS-2383 阶段6）：在 agent 的纯 TCP 管道上跑 HTTP/1.1
+# 客户端 + WebSocket 升级透传。三者都已在 Cargo.lock 里作为传递依赖存在
+# （hyper 1.10 / hyper-util 0.1.20 / tokio-rustls 0.26），这里只是提升为直接
+# 依赖；不引入第二套 HTTP 栈，也不引 openssl。lean 构建（--no-default-features）
+# 同样包含——relay 在 CLI 二进制里。
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = { version = "0.26", default-features = false }
 # Wayland 原生捕获（可选 feature，Linux 才有意义）: xdg-desktop-portal
 # ScreenCast D-Bus 会话 + PipeWire 视频流（经 gstreamer appsink 读帧）。
 zbus = { version = "3", optional = true }
