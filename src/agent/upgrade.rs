@@ -71,6 +71,10 @@ pub struct UpgradeContext {
     pub doh: DohConfig,
     /// 额外信任根（PEM）——仅测试注入本地 CA。
     pub extra_roots: Vec<Vec<u8>>,
+    /// `--relay-insecure`：relay 用自签/过期证书时跳过校验。上行客户端按此
+    /// 配置，**下载客户端也必须按此配置**——否则「CDN 全部不可用 → 走 relay」
+    /// 这条最需要兜底的路径会在握手阶段必然失败。
+    pub relay_insecure: bool,
 }
 
 impl std::fmt::Debug for UpgradeContext {
@@ -88,6 +92,9 @@ impl std::fmt::Debug for UpgradeContext {
 
 impl UpgradeContext {
     /// 生产配置：默认预算 + 环境代理 + 预置 DoH。
+    ///
+    /// `relay_insecure` 必须与 relay 上行客户端同源（`--relay-insecure`）：
+    /// 下载侧的 relay 兜底走同一个 relay，TLS 策略不一致会让兜底必然失败。
     pub fn new(
         relay_http: reqwest::Client,
         relay_base: String,
@@ -95,6 +102,7 @@ impl UpgradeContext {
         session_id: String,
         ctrl_tx: Sender<String>,
         target: std::path::PathBuf,
+        relay_insecure: bool,
     ) -> Self {
         Self {
             relay_http,
@@ -115,6 +123,7 @@ impl UpgradeContext {
             proxy: ProxyConfig::from_env(),
             doh: DohConfig::default(),
             extra_roots: Vec::new(),
+            relay_insecure,
         }
     }
 }
@@ -297,7 +306,36 @@ fn restart_process(target: &std::path::Path) -> std::io::Result<()> {
     cmd.spawn().map(|_| ())
 }
 
-/// 构造下载器：外部客户端（无任何凭据）+ relay 客户端（复用上行客户端）。
+/// 建 relay 兜底下载用的客户端：**禁止重定向**，TLS 策略与 relay 上行一致。
+///
+/// 两个约束必须同时满足，缺一个都会在真实现场出问题：
+///
+/// - 禁重定向：这个客户端带 rw Token，跟一个 302 就等于把 Token 送到别的主机
+///   （relay 的制品端点正常永远是 200/206，没有合法跨源跳转）。
+/// - TLS 策略跟随 `--relay-insecure`：自签证书 relay 部署下，上行能连上而下载
+///   兜底握手失败，等于把「CDN 全都不可用 → 回源 relay」这条最需要兜底的路径
+///   整条掐掉，而常规 CDN 测试全绿也发现不了。
+///
+/// 不复用 `ctx.relay_http`：reqwest 的 `Client` 无法在已有实例上叠加重定向策略，
+/// 也不暴露其 TLS 配置，所以这里按同一份语义重建，而不是只建一个裸 builder
+/// （那样会丢掉 TLS 配置——正是本函数存在的原因）。
+fn build_relay_download_client(ctx: &UpgradeContext) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        // 与上行客户端同值：连不上的 relay 不该把整个下载预算耗在建连上。
+        .connect_timeout(ctx.budget.connect)
+        .tcp_keepalive(Duration::from_secs(30));
+    if ctx.relay_insecure {
+        crate::tlsutil::install_rustls_provider();
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("cannot build the relay download client: {e}"))
+}
+
+/// 构造下载器：外部客户端（无任何凭据）+ relay 客户端（禁重定向、TLS 同源的
+/// 独立客户端）。
 pub fn build_downloader(ctx: &UpgradeContext, task: &UpgradeTask) -> anyhow::Result<Downloader> {
     // 解析链：只允许本次任务的 CDN 主机；relay 代解析作为第三级。
     let resolver = if task.allows_cdn() {
@@ -318,24 +356,16 @@ pub fn build_downloader(ctx: &UpgradeContext, task: &UpgradeTask) -> anyhow::Res
     } else {
         None
     };
-    // relay 客户端**禁止重定向**：它带 rw Token，跟随一个 302 就把 Token 送到
-    // 别的主机（relay 自身没有合法的跨源跳转，正常路径永远是 200/206）。
     let external =
         Downloader::build_external_client(&ctx.proxy, resolver, &ctx.budget, task.cdn_hosts())?;
     let relay = match task.relay_url.as_ref() {
-        Some(_) => {
-            // 建不出「不跟随重定向」的客户端就**整体失败**，绝不回退到会跟随
-            // 重定向的客户端——那等于让 Token 处于可被 302 带走的状态。
-            let http = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|e| anyhow::anyhow!("cannot build the relay download client: {e}"))?;
-            Some(RelaySource {
-                http,
-                base: ctx.relay_base.clone(),
-                token: ctx.token.clone(),
-            })
-        }
+        // 建不出来就**整体失败**，绝不回退到会跟随重定向的客户端——那等于让
+        // Token 处于可被 302 带走的状态。
+        Some(_) => Some(RelaySource {
+            http: build_relay_download_client(ctx)?,
+            base: ctx.relay_base.clone(),
+            token: ctx.token.clone(),
+        }),
         None => None,
     };
     Ok(Downloader::new(
@@ -583,6 +613,234 @@ async fn report_failed(ctx: &UpgradeContext, version: &str, error: String) {
 mod tests {
     use super::*;
 
+    // ── relay 兜底的可达性（`--relay-insecure`）─────────────────────
+    //
+    // 这组用例针对一次真实回归：为满足「relay 下载禁止重定向」，兜底客户端
+    // 曾改成裸 `Client::builder()...build()`，把上行客户端上的
+    // `danger_accept_invalid_certs` 一并丢了。自签证书 relay 部署下 CDN 全挂
+    // 之后回源必然握手失败——正是最需要兜底的场景，而常规 CDN 用例全绿也发现
+    // 不了。两个用例成对存在：一个证明 TLS 放行真的生效，一个证明修 TLS 时
+    // 没有把禁重定向改回去。
+
+    /// 一个自签证书的 HTTPS relay mock，记录收到的请求（路径 + 是否带 Token）。
+    struct MockRelay {
+        port: u16,
+        hits: std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+        _srv: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockRelay {
+        /// `redirect_to` 非空时，所有请求都回 302 到该地址（模拟被劫持的 relay）。
+        async fn start(bytes: Vec<u8>, redirect_to: Option<String>) -> Self {
+            use axum::response::{IntoResponse, Response};
+            let pki = crate::agent::test_tls::make_pki("localhost");
+            let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = hits.clone();
+            let (port, _srv) = crate::agent::test_tls::spawn_tls_server(
+                &pki,
+                move |req: axum::extract::Request| {
+                    let seen = seen.clone();
+                    let bytes = bytes.clone();
+                    let redirect_to = redirect_to.clone();
+                    async move {
+                        let token = req
+                            .headers()
+                            .get("x-sr-token")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        seen.lock()
+                            .unwrap()
+                            .push((req.uri().path().to_string(), token));
+                        if let Some(target) = redirect_to {
+                            return Response::builder()
+                                .status(axum::http::StatusCode::FOUND)
+                                .header("location", target)
+                                .header("content-length", "0")
+                                .body(axum::body::Body::empty())
+                                .unwrap()
+                                .into_response();
+                        }
+                        Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header("content-length", bytes.len().to_string())
+                            .body(axum::body::Body::from(bytes))
+                            .unwrap()
+                            .into_response()
+                    }
+                },
+            )
+            .await;
+            Self { port, hits, _srv }
+        }
+
+        fn base(&self) -> String {
+            format!("https://localhost:{}", self.port)
+        }
+
+        fn hits(&self) -> Vec<(String, Option<String>)> {
+            self.hits.lock().unwrap().clone()
+        }
+    }
+
+    /// 制品名必须与测试机身份匹配，否则 `verify_artifact_identity` 先拦下来。
+    fn local_artifact_name() -> String {
+        format!(
+            "shell-remote-{}{}",
+            download::own_arch_key(),
+            if cfg!(windows) { ".exe" } else { "" }
+        )
+    }
+
+    /// 只有 relay 源的升级任务（CDN 全部不可用后的兜底形态）。
+    fn relay_only_task(relay_path: &str, bytes: &[u8]) -> UpgradeTask {
+        use sha2::Digest;
+        UpgradeTask {
+            upgrade_id: "up-relay".into(),
+            target_version: "9.9.9".into(),
+            filename: local_artifact_name(),
+            size: bytes.len() as u64,
+            sha256: hex::encode(sha2::Sha256::digest(bytes)),
+            official_path: None,
+            cdn_base_urls: Vec::new(),
+            relay_url: Some(relay_path.to_string()),
+            relay_fallback: true,
+            source: "local".into(),
+        }
+    }
+
+    fn relay_ctx(relay_base: String, insecure: bool) -> UpgradeContext {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+        let mut ctx = UpgradeContext::new(
+            reqwest::Client::new(),
+            relay_base,
+            "rw-secret".into(),
+            "sess".into(),
+            tx,
+            std::path::PathBuf::from("/nonexistent/shell-remote"),
+            insecure,
+        );
+        ctx.budget = DownloadBudget {
+            connect: Duration::from_secs(5),
+            first_byte: Duration::from_secs(5),
+            chunk: Duration::from_secs(5),
+            total: Duration::from_secs(20),
+            attempts_per_source: 1,
+            backoff: Duration::from_millis(10),
+        };
+        // 自签 relay 的 CA 不注入信任库：`--relay-insecure` 是唯一的放行手段，
+        // 否则这条用例会因为「恰好被 CA 信任」而假通过。
+        ctx.proxy = ProxyConfig::empty();
+        ctx
+    }
+
+    fn tmp_download(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sr-upg-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("artifact.part")
+    }
+
+    const RELAY_ARTIFACT: &[u8] = b"#!fake-binary served by a self-signed relay\n0123456789";
+
+    /// `--relay-insecure` 下，自签证书 relay 的兜底下载必须成功；同一份上下文
+    /// 去掉 insecure 后必须因证书校验失败而失败——后半段证明前者的成功确实来自
+    /// TLS 放行，而不是「本来就信任这个证书」。
+    #[tokio::test]
+    async fn test_relay_fallback_downloads_from_self_signed_relay_when_insecure() {
+        let relay = MockRelay::start(RELAY_ARTIFACT.to_vec(), None).await;
+        let name = local_artifact_name();
+        let task = relay_only_task(&format!("/agent/upgrade/blob/{name}"), RELAY_ARTIFACT);
+
+        // insecure：必须成功。
+        let ctx = relay_ctx(relay.base(), true);
+        let part = tmp_download("relay-insecure");
+        let got = build_downloader(&ctx, &task)
+            .expect("insecure relay client must be constructible")
+            .fetch(&task, &part)
+            .await
+            .unwrap_or_else(|e| panic!("--relay-insecure 下兜底下载必须成功: {e}"));
+        assert_eq!(got.source, "relay");
+        assert_eq!(std::fs::read(&part).unwrap(), RELAY_ARTIFACT);
+        // 兜底路径仍是带 Token 的 relay 请求（Token 只在 relay 源出现）。
+        let hits = relay.hits();
+        assert_eq!(hits.len(), 1, "只应请求一次 relay: {hits:?}");
+        assert_eq!(hits[0].0, format!("/agent/upgrade/blob/{name}"));
+        assert_eq!(hits[0].1.as_deref(), Some("rw-secret"));
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+
+        // 同一 mock、同一任务，仅关掉 insecure：必须因证书失败。
+        let ctx = relay_ctx(relay.base(), false);
+        let part = tmp_download("relay-secure");
+        let err = build_downloader(&ctx, &task)
+            .unwrap()
+            .fetch(&task, &part)
+            .await
+            .expect_err("未信任的自签证书必须被拒绝");
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("certificate")
+                || lower.contains("tls")
+                || lower.contains("invalid peer")
+                || lower.contains("handshake"),
+            "失败原因必须是证书/握手，而不是别的问题: {err}"
+        );
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    /// 修 TLS 不能把「relay 请求禁止重定向」改回去：即使 insecure 放行了证书，
+    /// 302 也不得被跟随（否则 rw Token 会被送到跳转目标）。
+    #[tokio::test]
+    async fn test_relay_download_never_follows_redirect_even_when_insecure() {
+        // 跳转目标：一个明文 HTTP 收集器，记录收到的请求头。
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = hits.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(format!(
+                    "{} token={:?}",
+                    req.uri().path(),
+                    req.headers()
+                        .get("x-sr-token")
+                        .and_then(|v| v.to_str().ok())
+                ));
+                axum::response::Response::new(axum::body::Body::from("stolen"))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let relay = MockRelay::start(
+            RELAY_ARTIFACT.to_vec(),
+            Some(format!("{sink}/stolen-artifact")),
+        )
+        .await;
+        let name = local_artifact_name();
+        let task = relay_only_task(&format!("/agent/upgrade/blob/{name}"), RELAY_ARTIFACT);
+        let ctx = relay_ctx(relay.base(), true);
+        let part = tmp_download("relay-noredir");
+        let err = build_downloader(&ctx, &task)
+            .unwrap()
+            .fetch(&task, &part)
+            .await
+            .expect_err("302 不得被跟随（Token 会外泄）");
+        // 核心断言先跑：跳转目标一次都没被请求过，Token 自然也没出去。放在
+        // 「错误文案」断言之前，因为跟随了重定向的实现可能在下游以别的形式失败
+        // （长度不符、hash 不符），那种失败仍然意味着 Token 已经泄漏了。
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "重定向目标不得收到任何请求（Token 会随之泄漏）: {:?}",
+            hits.lock().unwrap()
+        );
+        assert!(
+            err.contains("302") || err.contains("FOUND") || err.contains("redirect"),
+            "失败应是 302 未跟随，而不是别的错误: {err}"
+        );
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
     #[test]
     fn test_sha256_hex_file_known_vector() {
         let dir = std::env::temp_dir().join(format!("sr-upg-sha-{}", std::process::id()));
@@ -631,6 +889,7 @@ mod tests {
             "sess".into(),
             tx,
             std::path::PathBuf::from("/usr/local/bin/shell-remote"),
+            false,
         );
         let rendered = format!("{ctx:?}");
         assert!(

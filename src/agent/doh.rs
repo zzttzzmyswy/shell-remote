@@ -1147,68 +1147,9 @@ mod tests {
 
     // ── 真实 TLS mock：DoH over HTTPS ─────────────────────────
 
-    mod tls_mock {
-        use super::*;
-        use std::sync::Arc;
-
-        pub struct TestPki {
-            pub ca_pem: Vec<u8>,
-            pub leaf_pem: Vec<u8>,
-            pub key_pem: Vec<u8>,
-        }
-
-        /// 生成「测试 CA + 指定 SAN 的叶子证书」。CA 只信任在测试客户端的
-        /// `extra_roots` 里，不污染进程级信任库。
-        pub fn make_pki(san: &str) -> TestPki {
-            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
-
-            let ca_key = KeyPair::generate().unwrap();
-            let mut ca_params = CertificateParams::new(vec!["test-ca".to_string()]).unwrap();
-            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-            let leaf_key = KeyPair::generate().unwrap();
-            let leaf_params = CertificateParams::new(vec![san.to_string()]).unwrap();
-            let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
-            TestPki {
-                ca_pem: ca_cert.pem().into_bytes(),
-                leaf_pem: leaf_cert.pem().into_bytes(),
-                key_pem: leaf_key.serialize_pem().into_bytes(),
-            }
-        }
-
-        /// 起一个 HTTPS mock：每个请求交给 `handler` 处理。
-        pub async fn spawn_tls_server<F, Fut>(
-            pki: &TestPki,
-            handler: F,
-        ) -> (u16, tokio::task::JoinHandle<()>)
-        where
-            F: Fn(axum::extract::Request) -> Fut + Clone + Send + Sync + 'static,
-            Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
-        {
-            use axum::Router;
-            crate::tlsutil::install_rustls_provider();
-            let app = Router::new().fallback(move |req: axum::extract::Request| {
-                let handler = handler.clone();
-                async move { handler(req).await }
-            });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let config = axum_server::tls_rustls::RustlsConfig::from_pem(
-                pki.leaf_pem.clone(),
-                pki.key_pem.clone(),
-            )
-            .await
-            .unwrap();
-            let listener = listener.into_std().unwrap();
-            let handle = tokio::spawn(async move {
-                let _ = axum_server::from_tcp_rustls(listener, config)
-                    .serve(app.into_make_service())
-                    .await;
-            });
-            (port, handle)
-        }
-    }
+    // 复用 `crate::agent::test_tls`（测试 CA + 指定 SAN 的叶子证书 + HTTPS 服务）：
+    // 同一套设施也给 `upgrade` 的自签 relay 用例用。
+    use crate::agent::test_tls as tls_mock;
 
     /// DoH 全链路：真实 TLS（证书只对 `doh.test` 有效），预置 IP 指向 127.0.0.1。
     /// 能成功说明我们**没有**把 TLS 校验目标换成 IP。

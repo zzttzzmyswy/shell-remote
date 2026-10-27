@@ -16,6 +16,10 @@ pub mod lan;
 pub mod p2p;
 pub mod shell;
 pub mod tcp_tunnel;
+// MYS-2425 阶段2 review：本地 TLS mock（测试 CA + 指定 SAN 证书），
+// `doh` 与 `upgrade` 的测试共用，避免各自维护一份。
+#[cfg(test)]
+mod test_tls;
 pub mod upgrade;
 pub mod web_proxy;
 
@@ -2750,13 +2754,23 @@ async fn run_session(
                                         .unwrap_or_default();
                                     let sid = client.session_id.clone();
                                     let ctrl = task_control_tx.clone();
+                                    // `--relay-insecure` 由上行客户端自身携带，直接取它，
+                                    // 不在下载侧另行推断（推断错了就会让自签 relay 的兜底
+                                    // 下载必然握手失败）。
+                                    let relay_insecure = client.insecure_tls;
                                     match self_exe.clone() {
                                         Some(exe) => {
                                             // 升级上下文显式装配：relay 客户端与 Token
                                             // 只交给 UpgradeContext，外部 CDN 请求由下载器
                                             // 用另一个（无凭据的）客户端发出。
                                             let ctx = crate::agent::upgrade::UpgradeContext::new(
-                                                http, relay_base, token, sid, ctrl, exe,
+                                                http,
+                                                relay_base,
+                                                token,
+                                                sid,
+                                                ctrl,
+                                                exe,
+                                                relay_insecure,
                                             );
                                             tokio::spawn(async move {
                                                 crate::agent::upgrade::perform_upgrade(ctx, req)
