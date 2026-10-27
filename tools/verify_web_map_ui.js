@@ -85,6 +85,9 @@ const AUTH = process.env.RELAY_PASSWORD || 'mapui-e2e-pass';
 const OUT = process.env.OUT || path.join(ROOT, 'artifacts', 'mys2383-g');
 
 const RW_KEY = 'mapuirw001';
+// 第二个并发 agent：验证"两个会话同时映射"时 SW 的 clientId 归属互不串台。
+const RW2_KEY = 'mapuirw002';
+const RW2_SID = 'mapuirwdev2';
 const RO_KEY = 'mapuiro001';
 const RW_SID = 'mapuirwdev';
 const RO_SID = 'mapuirodevi';
@@ -570,6 +573,8 @@ async function frameEval(page, fn, arg) {
     // ── agent：本仓库新构建（含 net:tcp-v1）+ ro token + 旧版 ──
     procs.push(startProc(['agent', '--relay-url', BASE, '--key', RW_KEY,
       '--session-id', RW_SID, '--root', roots, '--shell', '/bin/sh'], 'agent-rw'));
+    procs.push(startProc(['agent', '--relay-url', BASE, '--key', RW2_KEY,
+      '--session-id', RW2_SID, '--root', roots, '--shell', '/bin/sh'], 'agent-rw2'));
     procs.push(startProc(['agent', '--relay-url', RO_BASE, '--key', RO_KEY,
       '--token-type', 'ro', '--session-id', RO_SID, '--root', roots, '--shell', '/bin/sh'], 'agent-ro'));
     if (haveOld) {
@@ -814,6 +819,53 @@ async function frameEval(page, fn, arg) {
     check('刷新会话页后地址仍是原始路径且脚本执行',
       !!afterReloadSessionDoc && afterReloadSessionDoc.path === '/' &&
       afterReloadSessionDoc.script === 'ran', afterReloadSessionDoc);
+
+    // ══════════════ [10b] 并发：两个会话同时映射，子资源与 fetch 不串台 ══════════════
+    // SW 的 scope 是 `/`，两个会话页共享同一个 SW。归属靠 clientId，因此必须
+    // 证明两个会话页各自 iframe 里的 fetch / 子资源都只走自己的 map_id。
+    console.log('\n[10b] 并发多会话：clientId 归属不串台');
+    const s2Ctx = await makePage(browser, BASE, RW2_KEY, 'rw');
+    await s2Ctx.page.waitForSelector('#terminal-container .xterm', { timeout: 30000 });
+    // 两个会话页同时打开同一个目标站（relay 侧各自一个映射）。
+    await enterWebView(s2Ctx.page, SITE + '/');
+    await openUrl(s2Ctx.page, SITE + '/');
+    await waitFrame(s2Ctx.page, `document.getElementById('view-name') !== null`);
+    await openUrl(rwPage, SITE + '/');
+    await waitFrame(rwPage, `document.getElementById('view-name') !== null`);
+
+    // 各自登录（Cookie 属于目标站，但每个 iframe 的请求必须走自己的映射）。
+    const me1 = await frameEval(rwPage, () => window.apiLogin());
+    const me2 = await frameEval(s2Ctx.page, () => window.apiLogin());
+    check('两个会话页并发映射同一目标站都能登录', me1 === 'user=alice' && me2 === 'user=alice',
+      [me1, me2]);
+    // 两个 iframe 的 map_id 不同（relay 按 session 隔离映射）。
+    const mapIds = await Promise.all([rwPage, s2Ctx.page].map((pg) => pg.evaluate(() => {
+      const f = document.getElementById('webview-frame');
+      return f ? f.getAttribute('src') : '';
+    })));
+    check('两个会话页各自持有独立的映射入口',
+      mapIds[0] !== mapIds[1], mapIds);
+    // 并发压一轮：各 5 次绝对地址 fetch，结果都必须是 pong（没串到对方/超时）。
+    const pings = await Promise.all([
+      frameEval(rwPage, async (origin) => {
+        const out = [];
+        for (let i = 0; i < 5; i += 1) out.push(await window.apiPing(origin));
+        return out;
+      }, SITE),
+      frameEval(s2Ctx.page, async (origin) => {
+        const out = [];
+        for (let i = 0; i < 5; i += 1) out.push(await window.apiPing(origin));
+        return out;
+      }, SITE),
+    ]);
+    check('并发 fetch 全部成功（5+5）',
+      Array.isArray(pings[0]) && Array.isArray(pings[1]) &&
+      pings[0].length === 5 && pings[1].length === 5 &&
+      pings[0].every((v) => v === 'pong') && pings[1].every((v) => v === 'pong'),
+      pings);
+    await rwPage.screenshot({ path: path.join(OUT, 'concurrent-a.png') });
+    await s2Ctx.page.screenshot({ path: path.join(OUT, 'concurrent-b.png') });
+    await s2Ctx.ctx.close();
 
     // ══════════════ [11] 降级：ro token → v1 静态模式 ══════════════
     console.log('\n[11] 降级：ro token → v1 静态模式');
