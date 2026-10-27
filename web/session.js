@@ -15,11 +15,17 @@
     let desktopEnabled = false;   // agent 能力可用
     let desktopActive = false;    // 当前处于桌面视图
     let desktopStarting = false;  // 已发 desktop:start 等待回复
-    // 网页视图状态（MYS-2383-C）：与桌面同级的独立视图，互不覆盖 DOM。
-    // webAvailable 只看 `session:capabilities` 里的 `web:proxy-v1`——绝不按
-    // agent 版本或 desktop 能力猜测；断开/重连后无该能力则保持隐藏。
+    // 网页视图状态（MYS-2383-C / MYS-2383-G）：与桌面同级的独立视图，互不覆盖
+    // DOM。模式判定只看 `session:capabilities` 里的能力字符串 + 当前 token 权限
+    // + 是否安全上下文——绝不按 agent 版本猜测。
+    //   v2：`net:tcp-v1` + rw + 安全上下文 + 有 SW（Service Worker 路由）；
+    //   v1：只有 `web:proxy-v1`（v0.58 静态模式），或 v2 条件不满足但 v1 可用；
+    //   none：都不满足 → 入口隐藏。
     let webAvailable = false;
     let webActive = false;
+    let webMode = 'none';        // 'v2' | 'v1' | 'none'
+    let webModeReason = '';      // 降级原因（v1 时用于状态区说明）
+    let webCaps = [];            // 最近一次 session:capabilities
     const term = new TerminalManager('terminal-container');
     const files = new FileManager('file-tree');
     const desktopView = new DesktopView();
@@ -267,7 +273,7 @@
     let currentView = 'terminal';
 
     // 网页视图控制器：地址栏/状态区/iframe 都从 DOM 取；鉴权头复用 sse.js 的
-    // authHeaders（X-Auth 只在内存里拼进 ticket 请求，绝不进 URL）。
+    // authHeaders（X-Auth 只在内存里拼进 ticket / map 请求，绝不进 URL）。
     const webView = (typeof WebView === 'function') ? new WebView({
         frame: webviewFrame,
         statusEl: webviewStatusEl,
@@ -275,6 +281,94 @@
         token: token,
         getAuthHeaders: function () { return window.shellRemoteAuthHeaders ? window.shellRemoteAuthHeaders({}) : {}; }
     }) : null;
+    // v2 控制器（MYS-2383-G）：Service Worker 路由 + 映射管理。与 v1 共用同一个
+    // iframe 与地址栏，靠 setWebMode 切换 iframe 属性。
+    const webMapV2 = (typeof WebMapV2 === 'function') ? new WebMapV2({
+        frame: webviewFrame,
+        statusEl: webviewStatusEl,
+        inputEl: webviewInput,
+        token: token,
+        getAuthHeaders: function () { return window.shellRemoteAuthHeaders ? window.shellRemoteAuthHeaders({}) : {}; }
+    }) : null;
+
+    /// 计算并应用当前模式。能力数组变化、token 权限变化、SW 不可用时都会重算。
+    function detectAndApplyMode(caps) {
+        const detected = (typeof WebViewDetectMode === 'function')
+            ? WebViewDetectMode({
+                caps: caps,
+                permission: sessionStorage.getItem('shell-remote-permission') || 'ro',
+                isSecureContext: !!window.isSecureContext,
+                hasServiceWorker: !!navigator.serviceWorker
+            })
+            : { mode: caps.indexOf('web:proxy-v1') >= 0 ? 'v1' : 'none', reason: '' };
+        setWebMode(detected.mode, detected.reason);
+    }
+
+    /// 应用模式：隐藏/显示入口、切换 iframe 属性、给出降级说明。
+    function setWebMode(mode, reason) {
+        const prev = webMode;
+        webMode = mode;
+        webModeReason = reason || '';
+        // 切换模式必须重建页面：v1 的 srcdoc 与 v2 的 SW 路由不能混用。
+        if (prev !== mode && prev !== 'none' && webView) webView.reset();
+        if (prev !== mode && prev !== 'none' && webMapV2) webMapV2.reset();
+        applyFrameSandbox(mode);
+        setWebEnabled(mode !== 'none');
+        updateWebHint();
+        return mode;
+    }
+
+    /// v2 需要运行脚本/表单/同源存储 → 去掉 sandbox 与 no-referrer；
+    /// v1 保持 `allow-same-origin`（远端脚本一律不执行）。
+    function applyFrameSandbox(mode) {
+        if (!webviewFrame) return;
+        if (mode === 'v2') {
+            webviewFrame.removeAttribute('sandbox');
+            webviewFrame.removeAttribute('referrerpolicy');
+        } else {
+            webviewFrame.setAttribute('sandbox', 'allow-same-origin');
+            webviewFrame.setAttribute('referrerpolicy', 'no-referrer');
+        }
+    }
+
+    /// 视图内的说明文案：v1 / v2 各自一套，降级时补一句原因。
+    function updateWebHint() {
+        // 模式徽标：让用户一眼看出当前是完整映射还是静态模式。
+        const badge = document.getElementById('webview-mode');
+        if (badge) {
+            if (webAvailable || webMode !== 'none') {
+                badge.classList.remove('hidden');
+                badge.classList.toggle('v2', webMode === 'v2');
+                badge.textContent = webMode === 'v2' ? '完整模式' : '静态模式';
+                badge.title = webMode === 'v2'
+                    ? 'Service Worker 完整映射：支持脚本、SPA 路由、Cookie 登录、POST 与 WebSocket'
+                    : '静态模式：只重写 HTML/CSS 后渲染，不执行远端脚本';
+            } else {
+                badge.classList.add('hidden');
+                badge.textContent = '';
+            }
+        }
+        const hintEl = document.getElementById('webview-hint');
+        if (!hintEl) return;
+        if (webMode === 'v2') {
+            hintEl.innerHTML =
+                '地址在<strong>远程设备侧</strong>解析，可直接访问设备自身的服务（如 ' +
+                '<code>http://127.0.0.1/</code>）或同网段内网地址。' +
+                '完整映射支持脚本、SPA 路由、Cookie 登录、POST 与 WebSocket。' +
+                '<br><span class="web-hint-warn">映射页面与 shell-remote 同源运行，' +
+                '其脚本可读取本页会话凭据；只访问可信设备。仅 rw Token 可用。</span>';
+            hintEl.className = 'webview-hint webview-hint-v2';
+            return;
+        }
+        const base =
+            '地址在<strong>远程设备侧</strong>解析，可直接访问设备自身的服务（如 ' +
+            '<code>http://127.0.0.1/</code>）或同网段内网地址。' +
+            '仅支持普通静态/轻量页面；复杂 SPA、WebSocket、下载与非 GET 表单不受支持。';
+        const why = webModeReason && window.WebViewModeReasons
+            ? window.WebViewModeReasons[webModeReason] : '';
+        hintEl.innerHTML = base + (why ? '<br><span class="web-hint-warn">' + why + '</span>' : '');
+        hintEl.className = 'webview-hint';
+    }
 
     function showDesktopView() {
         hideWebView(false);
@@ -307,7 +401,8 @@
     // 进入网页视图：只隐藏终端/桌面 DOM，不碰桌面流生命周期（desktopActive
     // 保持原值），因此从网页回到桌面能无缝继续。
     function showWebView() {
-        if (!webAvailable || !webView) return;
+        if (!webAvailable) return;
+        if (webMode === 'v2' ? !webMapV2 : !webView) return;
         currentView = 'web';
         webActive = true;
         terminalArea.classList.add('hidden');
@@ -318,8 +413,9 @@
         if (bar) bar.classList.add('hidden');
         if (webviewInput && !webviewInput.value) webviewInput.value = WebViewDEFAULT_URL;
         // 首次进入才自动打开默认地址；之后切回来保留用户当前页面。
-        if (!webView.url) {
-            webView.navigate(webviewInput.value || WebViewDEFAULT_URL);
+        const opened = webMode === 'v2' ? webMapV2.url : webView.url;
+        if (!opened) {
+            navigateWeb(webviewInput.value || WebViewDEFAULT_URL);
         }
     }
 
@@ -328,24 +424,53 @@
     function hideWebView(discard) {
         webActive = false;
         webviewContainer.classList.add('hidden');
-        if (discard && webView) webView.reset();
+        if (discard) {
+            if (webView) webView.reset();
+            if (webMapV2) webMapV2.reset();
+        }
         if (toggleWebBtn) toggleWebBtn.textContent = '网页';
     }
 
-    // 能力门控：只有 `session:capabilities` 明确含 web:proxy-v1 才显示入口。
-    // 不可用时如果正在网页视图里，立刻退出并清理（断线后不应留下旧页面）。
+    /// 按当前模式打开地址。v2 失败时按错误码决定是否回退到 v1：
+    /// 404/405（旧 relay 或旧 agent）与 403（只读 token）都回退静态模式并提示。
+    function navigateWeb(raw) {
+        if (webMode === 'v2' && webMapV2) {
+            return webMapV2.open(raw).then(function (res) {
+                if (!res || res.ok) return res;
+                if (res.code === 'V2_UNSUPPORTED' || res.code === 'V2_READONLY') {
+                    showToast((window.WebViewModeReasons &&
+                        window.WebViewModeReasons[res.code === 'V2_READONLY' ? 'read-only' : 'agent-version']) ||
+                        '已回退到静态模式', 'warning');
+                    // 能力/权限层面已无法支持 v2：直接切到 v1 并重开同一个地址。
+                    setWebMode('v1', res.code === 'V2_READONLY' ? 'read-only' : 'agent-version');
+                    return navigateWeb(raw);
+                }
+                return res;
+            });
+        }
+        if (webView) return webView.navigate(raw).then(function (ok) {
+            return { ok: !!ok };
+        });
+        return Promise.resolve({ ok: false, code: 'NO_VIEW' });
+    }
+
+    // 能力门控：`session:capabilities` 给出的能力数组决定模式，模式决定入口是否
+    // 显示。不可用时如果正在网页视图里，立刻退出并清理（断线后不应留下旧页面）。
     function setWebEnabled(available) {
-        webAvailable = !!available && !!webView;
+        webAvailable = !!available && (webMode === 'v2' ? !!webMapV2 : !!webView);
         if (!webAvailable) {
             if (webActive) showTerminalView();
             if (webView) webView.reset();
+            if (webMapV2) webMapV2.reset();
         }
         if (!toggleWebBtn) return;
         toggleWebBtn.classList.toggle('hidden', !webAvailable);
         toggleWebBtn.disabled = !webAvailable;
-        toggleWebBtn.title = webAvailable
-            ? '浏览远端设备网络中的网页'
-            : '当前设备的 agent 不支持网页映射（需要新版 agent）';
+        toggleWebBtn.title = !webAvailable
+            ? '当前设备的 agent 不支持网页映射（需要新版 agent）'
+            : (webMode === 'v2'
+                ? '浏览远端设备网络中的网页（完整模式：支持脚本/SPA/WebSocket）'
+                : '浏览远端设备网络中的网页（静态模式）');
         toggleWebBtn.textContent = webActive ? '终端' : '网页';
     }
 
@@ -367,18 +492,23 @@
         webviewInput.addEventListener('keydown', function (e) {
             if (e.key !== 'Enter') return;
             e.preventDefault();
-            if (webView) webView.navigate(webviewInput.value);
+            navigateWeb(webviewInput.value);
         });
     }
     const webOpenBtn = document.getElementById('webview-open-btn');
     if (webOpenBtn) {
         webOpenBtn.addEventListener('click', function () {
-            if (webView) webView.navigate(webviewInput ? webviewInput.value : WebViewDEFAULT_URL);
+            navigateWeb(webviewInput ? webviewInput.value : WebViewDEFAULT_URL);
         });
     }
     const webRefreshBtn = document.getElementById('webview-refresh-btn');
     if (webRefreshBtn) {
         webRefreshBtn.addEventListener('click', function () {
+            if (webMode === 'v2' && webMapV2) {
+                // v2 的刷新走 iframe 内部 reload：保留目标站当前路由与登录态。
+                if (!webMapV2.reload()) navigateWeb(webviewInput ? webviewInput.value : WebViewDEFAULT_URL);
+                return;
+            }
             if (webView) webView.refresh();
         });
     }
@@ -387,6 +517,18 @@
         webBackBtn.addEventListener('click', function () {
             showTerminalView();
             if (toggleWebBtn) toggleWebBtn.textContent = '网页';
+        });
+    }
+
+    // iframe load：v2 下同步地址栏（同源可读，显示目标站原始路径）。
+    // 顺带把 loading 状态收尾，避免状态区一直停在"正在加载"。
+    if (webviewFrame) {
+        webviewFrame.addEventListener('load', function () {
+            if (webMode === 'v2' && webMapV2) {
+                webMapV2.onFrameLoad();
+                return;
+            }
+            if (webMode === 'v1' && webView) webView.loading = false;
         });
     }
 
@@ -876,15 +1018,24 @@
     });
 
     // 网页映射能力协商（MYS-2383）：relay 在浏览器 SSE 握手时补发
-    // `session:capabilities {capabilities:[...]}`。只有数组里出现
-    // `web:proxy-v1` 才显示「网页」入口——旧 agent（v0.57.0 及更早）没有这个
-    // 字符串，入口完全不出现；desktop 能力与本入口无关，绝不互相推导。
+    // `session:capabilities {capabilities:[...]}`。
+    //
+    // 入口是否出现、走哪种模式，完全由能力数组 + token 权限 + 安全上下文决定，
+    // 不按版本号猜测：
+    //   - `net:tcp-v1` + rw + 安全上下文 + SW → v2 完整模式（脚本/SPA/WebSocket）；
+    //   - 只有 `web:proxy-v1`（v0.58 及更早的新增能力）或 v2 条件不满足但 v1
+    //     可用 → v1 静态模式，并在状态区说明降级原因；
+    //   - 都没有 → 入口隐藏（v0.57.0 及更早的 agent）。
     // 每次重连都会重新收到（agent 重新注册会覆盖能力），因此这里直接以最新
-    // 数组为准：不带该能力的重连会把入口重新隐藏。
+    // 数组为准：不带能力的重连会把入口重新隐藏。
     window.shellRemote.on('session:capabilities', function(msg) {
         const caps = (msg && msg.payload && msg.payload.capabilities) || [];
-        setWebEnabled(Array.isArray(caps) && caps.indexOf('web:proxy-v1') >= 0);
+        webCaps = Array.isArray(caps) ? caps.slice() : [];
+        detectAndApplyMode(webCaps);
     });
+    // 初始判定一次：万一 session:capabilities 早于本脚本的订阅到达，入口至少
+    // 按"无能力"隐藏，而不是残留上一次的模式。
+    detectAndApplyMode(webCaps);
 
     window.shellRemote.on('desktop:capabilities', function(msg) {
         clearJoinWatchdog();
@@ -1154,9 +1305,12 @@
 
     window.shellRemote.on('session:agent_disconnect', function(msg) {
         clearJoinWatchdog();
-        // agent 断线：relay 已撤销该会话的 ticket，网页视图必须立即收起并清空
-        // （否则用户会盯着一份不可刷新的静态页面）。能力本身保留在 relay，
-        // 重连后由新的 session:capabilities 决定入口是否再出现。
+        // agent 断线：relay 已撤销该会话的 ticket 与全部映射，网页视图必须立即
+        // 收起并清空（否则用户会盯着一份不可刷新的静态页面）。v2 还要通知 SW
+        // 丢掉 client 归属，避免 iframe 里的残留导航仍被 lastActive 拉进映射。
+        if (webMapV2) webMapV2.clearSwState();
+        webCaps = [];
+        setWebMode('none', '');
         setWebEnabled(false);
         desktopView.disconnect();
         showTerminalView();

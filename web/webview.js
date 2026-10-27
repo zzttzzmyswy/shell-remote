@@ -22,6 +22,9 @@
   var DEFAULT_URL = 'http://127.0.0.1/';
   var PROXY_PATH = '/agent/web/proxy';
   var TICKET_PATH = '/agent/web/ticket';
+  // v2（MYS-2383-G）：映射入口前缀与建映射接口，与 src/relay/web_map.rs 对齐。
+  var MAP_PATH = '/agent/web/map';
+  var MAP_PREFIX = '/agent/web/m';
   // ticket 提前刷新余量：子资源是浏览器自己发的，我们只能保证「渲染时」的
   // ticket 还有足够寿命。
   var TICKET_MARGIN_MS = 15000;
@@ -648,19 +651,385 @@
       '</pre></body></html>';
   }
 
+  // ══════════════════════ 网页映射 v2（MYS-2383-G） ══════════════════════
+  //
+  // v2 不再由本文件重写 HTML：浏览器里的 Service Worker（`/sr-web-sw.js`）把
+  // 映射页面的请求转到 relay 反代 `/agent/web/m/<map_id>/…`，映射页面在 iframe
+  // 中以**目标站点的原始路径**运行。因此脚本、CSS、Cookie、POST、WebSocket 全部
+  // 由浏览器原生处理，本文件只负责建映射、注册 SW、把 iframe 指到入口。
+  //
+  // 模式判定与降级原因都在 detectMode 里，纯函数、可单测。
+
+  var SW_PATH = '/sr-web-sw.js';
+  var SW_SCOPE = '/';
+  var MAP_PATH = '/agent/web/map';
+  // 给 SW 写 IndexedDB 的时间窗口：写完才回 ack，超时就用默认放行策略继续。
+  var SW_ACK_TIMEOUT_MS = 2000;
+
+  /// 模式判定。三档：
+  ///   - `v2`：agent 支持 TCP 管道 + rw token + 安全上下文有 SW；
+  ///   - `v1`：agent 只支持 `web:proxy-v1`（v0.58 静态模式），或 v2 条件不满足
+  ///     但 v1 可用；
+  ///   - `none`：两者都不行（旧 agent，入口隐藏）。
+  /// 返回 `{mode, reason}`，reason 用于状态区说明降级原因。
+  function detectMode(opts) {
+    opts = opts || {};
+    var caps = Array.isArray(opts.caps) ? opts.caps : [];
+    var permission = opts.permission || '';
+    var secure = !!opts.isSecureContext;
+    var hasSw = !!opts.hasServiceWorker;
+    var hasTcp = caps.indexOf('net:tcp-v1') >= 0;
+    var hasV1 = caps.indexOf('web:proxy-v1') >= 0;
+
+    if (hasTcp && permission === 'rw' && secure && hasSw) {
+      return { mode: 'v2', reason: '' };
+    }
+    if (!hasV1) return { mode: 'none', reason: '' };
+    // v1 可用：说明为什么没走 v2（只读 token / 非安全上下文 / agent 版本旧）。
+    if (!hasTcp) return { mode: 'v1', reason: 'agent-version' };
+    if (permission !== 'rw') return { mode: 'v1', reason: 'read-only' };
+    if (!secure) return { mode: 'v1', reason: 'insecure-context' };
+    return { mode: 'v1', reason: 'no-service-worker' };
+  }
+
+  var MODE_REASON_TEXT = {
+    'agent-version': '当前设备的 agent 不支持完整映射（需要新版 agent），已回退静态模式',
+    'read-only': '只读 token 仅支持静态模式（完整映射可修改设备配置）',
+    'insecure-context': '当前页面不是安全上下文（需要受信证书的 https 或 localhost），已回退静态模式',
+    'no-service-worker': '当前浏览器不支持 Service Worker，已回退静态模式'
+  };
+
+  /// v2 控制器。
+  ///
+  /// 生命周期：ensureServiceWorker() → open(url) → iframe 里由 SW 接管。
+  /// 打开失败按错误码回退到 v1（由调用方决定是否回退）。
+  function WebMapV2(opts) {
+    opts = opts || {};
+    this.frame = opts.frame || null;
+    this.statusEl = opts.statusEl || null;
+    this.inputEl = opts.inputEl || null;
+    this.token = opts.token || '';
+    this.origin = opts.origin || '';
+    this.getAuthHeaders = opts.getAuthHeaders || function () { return {}; };
+    this.fetchImpl = opts.fetch || null;
+    // 单测可注入：默认用浏览器的 navigator.serviceWorker。
+    this.swContainer = opts.swContainer || null;
+    this.onStatus = opts.onStatus || null;
+
+    this.registration = null;
+    this.ready = false;
+    this.mapId = '';
+    this.targetOrigin = '';
+    this.url = '';            // 目标站点的原始地址（地址栏显示的形态）
+    this.lastError = '';
+    this.loading = false;
+    this.generation = 0;
+    this._ack = null;
+    this._onSwMessage = null;
+  }
+
+  WebMapV2.prototype._sw = function () {
+    if (this.swContainer) return this.swContainer;
+    if (typeof navigator !== 'undefined' && navigator.serviceWorker) return navigator.serviceWorker;
+    return null;
+  };
+
+  WebMapV2.prototype._fetch = function () {
+    if (this.fetchImpl) return this.fetchImpl;
+    if (typeof window !== 'undefined' && window.fetch) return window.fetch.bind(window);
+    throw fail('NETWORK', 'fetch unavailable');
+  };
+
+  WebMapV2.prototype._setStatus = function (text, kind) {
+    if (this.statusEl) {
+      this.statusEl.textContent = text || '';
+      this.statusEl.className = 'web-status' + (kind ? ' ' + kind : '');
+    }
+    if (this.onStatus) {
+      try { this.onStatus(text || '', kind || ''); } catch (e) {}
+    }
+  };
+
+  /// 注册（或复用）我们的 SW 并等它 activate。scope `/` 覆盖整个源，但 fetch
+  /// 分流的放行逻辑保证 shell-remote 自身的请求零影响（见 sr-web-sw.js）。
+  WebMapV2.prototype.ensureServiceWorker = function () {
+    var self = this;
+    if (this.registration && this.ready) return Promise.resolve(this.registration);
+    var sw = this._sw();
+    if (!sw) return Promise.reject(fail('NO_SW', 'service worker unavailable'));
+    return Promise.resolve()
+      .then(function () {
+        return sw.register(SW_PATH, { scope: SW_SCOPE, updateViaCache: 'none' });
+      })
+      .then(function (reg) {
+        self.registration = reg;
+        self._listen();
+        // `ready` 只在该 scope 已有 active worker 时 resolve。
+        return sw.ready.then(function (r) { return r || reg; });
+      })
+      .then(function (reg) {
+        if (reg) self.registration = reg;
+        self.ready = true;
+        return self.registration;
+      })
+      .catch(function (e) {
+        self.ready = false;
+        throw fail('NO_SW', (e && e.message) || 'service worker registration failed');
+      });
+  };
+
+  /// 监听 SW 的 ack。只保留一个监听器，避免多次打开后回调堆积。
+  WebMapV2.prototype._listen = function () {
+    var self = this;
+    var sw = this._sw();
+    if (!sw || this._onSwMessage) return;
+    this._onSwMessage = function (ev) {
+      var data = (ev && ev.data) || {};
+      if (data.type !== 'sr-web-map-ok') return;
+      if (self._ack && self._ack.mapId === data.mapId) {
+        var ack = self._ack;
+        self._ack = null;
+        ack.resolve(data);
+      }
+    };
+    try { sw.addEventListener('message', this._onSwMessage); } catch (e) {}
+  };
+
+  /// 把映射登记到 SW，最多等 2s。超时不算失败：SW 的 lastActive 兜底策略
+  /// 仍然能把 iframe 的导航归到这个映射，只是多一次整页跳转。
+  WebMapV2.prototype._registerMap = function (mapId, targetOrigin) {
+    var self = this;
+    var sw = this._sw();
+    var worker = this.registration && (this.registration.active || this.registration.waiting ||
+      this.registration.installing);
+    if (!sw || !worker || typeof worker.postMessage !== 'function') return Promise.resolve(false);
+    return new Promise(function (resolve) {
+      var timer = null;
+      var done = function (v) {
+        if (timer) clearTimeout(timer);
+        timer = null;
+        if (self._ack && self._ack.mapId === mapId) self._ack = null;
+        resolve(v);
+      };
+      self._ack = { mapId: mapId, resolve: function () { done(true); } };
+      timer = setTimeout(function () { done(false); }, SW_ACK_TIMEOUT_MS);
+      try {
+        worker.postMessage({ type: 'sr-web-map', mapId: mapId, targetOrigin: targetOrigin });
+      } catch (e) {
+        done(false);
+      }
+    });
+  };
+
+  /// 切回静态模式 / 断线时通知 SW 丢掉 client 归属。
+  WebMapV2.prototype.clearSwState = function () {
+    var sw = this._sw();
+    var worker = this.registration && this.registration.active;
+    if (!sw || !worker || typeof worker.postMessage !== 'function') return;
+    try { worker.postMessage({ type: 'sr-web-clear' }); } catch (e) {}
+  };
+
+  /// 建映射（同一会话同一目标复用）。错误码：
+  ///   403 → 只读 token；404/405 → 旧 relay 或旧 agent；503 → agent 离线。
+  WebMapV2.prototype.createMap = function (target) {
+    var self = this;
+    var headers = { 'Content-Type': 'application/json', 'X-SR-Token': this.token };
+    var extra = {};
+    try { extra = this.getAuthHeaders() || {}; } catch (e) { extra = {}; }
+    for (var k in extra) {
+      if (Object.prototype.hasOwnProperty.call(extra, k)) headers[k] = extra[k];
+    }
+    return Promise.resolve()
+      .then(function () {
+        return self._fetch()((self.origin || '') + MAP_PATH, {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({ url: target }),
+          credentials: 'omit'
+        });
+      })
+      .catch(function (e) {
+        if (e && e.code) throw e;
+        throw fail('NETWORK', (e && e.message) || 'map request failed');
+      })
+      .then(function (resp) {
+        if (resp.status === 200 || resp.ok) return resp.json();
+        if (resp.status === 401) throw fail('AUTH', 'map rejected');
+        if (resp.status === 403) throw fail('V2_READONLY', 'read-only token');
+        if (resp.status === 404 || resp.status === 405) {
+          throw fail('V2_UNSUPPORTED', 'web mapping v2 unavailable');
+        }
+        if (resp.status === 503) throw fail('V2_OFFLINE', 'agent offline');
+        if (resp.status === 400) throw fail('V2_BAD_URL', 'target url rejected');
+        throw fail('V2_HTTP_' + resp.status, 'map HTTP ' + resp.status);
+      })
+      .then(function (data) {
+        var mapId = data && data.map_id;
+        if (!mapId) throw fail('V2_EMPTY', 'empty map_id');
+        return {
+          mapId: String(mapId),
+          base: String(data.base || (MAP_PREFIX + '/' + mapId + '/')),
+          targetOrigin: String(data.target_origin || '')
+        };
+      });
+  };
+
+  /// 打开一个目标地址：建映射 → 通知 SW → iframe 指到入口。
+  ///
+  /// iframe.src 用的是**带前缀的入口**：SW 会把它 302 到目标站原始路径，之后
+  /// 页面里的相对资源、history 路由、整页跳转都由 SW 在后台改写。
+  WebMapV2.prototype.open = function (raw) {
+    var self = this;
+    var target = normalizeInput(raw);
+    if (!target) {
+      this._setStatus('地址无效：请填写远端设备网络中的 http:// 或 https:// 绝对地址', 'error');
+      return Promise.resolve({ ok: false, code: 'V2_BAD_URL' });
+    }
+    this.generation += 1;
+    var gen = this.generation;
+    this.loading = true;
+    this.lastError = '';
+    this._setStatus('正在建立映射 ' + target + ' …', 'loading');
+
+    return this.ensureServiceWorker()
+      .then(function () { return self.createMap(target); })
+      .then(function (map) {
+        if (gen !== self.generation) return { ok: false, code: 'CANCELLED' };
+        self.mapId = map.mapId;
+        self.targetOrigin = map.targetOrigin;
+        return self._registerMap(map.mapId, map.targetOrigin).then(function (acked) {
+          if (gen !== self.generation) return { ok: false, code: 'CANCELLED' };
+          self.url = target;
+          if (self.inputEl) self.inputEl.value = target;
+          self._setFrameSrc(entryUrl(map.base, target));
+          self._setStatus(acked
+            ? '映射已就绪，正在加载 ' + target + ' …'
+            : '映射已就绪（SW 未应答，使用兜底归属），正在加载 ' + target + ' …', 'loading');
+          return { ok: true, mapId: map.mapId, targetOrigin: map.targetOrigin };
+        });
+      })
+      .catch(function (err) {
+        if (gen !== self.generation) return { ok: false, code: 'CANCELLED' };
+        self.loading = false;
+        var code = (err && err.code) || 'NETWORK';
+        self.lastError = code;
+        self._setStatus(describeMapError(code), 'error');
+        return { ok: false, code: code };
+      });
+  };
+
+  WebMapV2.prototype._setFrameSrc = function (src) {
+    var frame = this.frame;
+    if (!frame) return;
+    // v2：不加 sandbox（需要执行脚本、提交表单、使用同源存储），也不加
+    // no-referrer（目标站的防盗链/防 CSRF 往往依赖 Referer）。
+    setAttr(frame, 'sandbox', null);
+    setAttr(frame, 'referrerpolicy', null);
+    setAttr(frame, 'srcdoc', null);
+    setAttr(frame, 'src', src);
+  };
+
+  /// iframe load：地址栏同步成目标站原始地址（同源可读）。
+  WebMapV2.prototype.onFrameLoad = function () {
+    var frame = this.frame;
+    if (!frame) return null;
+    var loc = null;
+    try {
+      var win = frame.contentWindow;
+      loc = win ? win.location : null;
+      if (loc && loc.href === 'about:blank') return null;
+      var p = loc.pathname || '/';
+      var s = loc.search || '';
+      if (p.indexOf(MAP_PREFIX + '/') === 0) {
+        // 还在入口（SW 未接管）：不覆盖地址栏，等下一次 load。
+        return null;
+      }
+      this.loading = false;
+      var shown = (this.targetOrigin || '') + p + s;
+      this.url = shown;
+      if (this.inputEl) this.inputEl.value = shown;
+      this._setStatus('已加载 ' + shown, 'ok');
+      return shown;
+    } catch (e) {
+      // 跨源（目标站自己跳到别的源）：无法读取，保持上一次的地址。
+      this.loading = false;
+      return null;
+    }
+  };
+
+  /// 「刷新」= iframe 内部真实刷新（保留目标站的当前路由与 POST 结果）。
+  WebMapV2.prototype.reload = function () {
+    var frame = this.frame;
+    try {
+      if (frame && frame.contentWindow) {
+        frame.contentWindow.location.reload();
+        return true;
+      }
+    } catch (e) {}
+    if (this.url) return this.open(this.url).then(function (r) { return r.ok; });
+    return Promise.resolve(false);
+  };
+
+  WebMapV2.prototype.reset = function () {
+    this.generation += 1;
+    this.mapId = '';
+    this.targetOrigin = '';
+    this.url = '';
+    this.loading = false;
+    this.lastError = '';
+    this._ack = null;
+    if (this.statusEl) {
+      this.statusEl.textContent = '';
+      this.statusEl.className = 'web-status';
+    }
+    if (this.frame) {
+      setAttr(this.frame, 'srcdoc', null);
+      setAttr(this.frame, 'src', 'about:blank');
+    }
+  };
+
+  /// 入口路径：`base` 已含尾斜杠，拼去掉首斜杠的 pathname 与 query。
+  function entryUrl(base, target) {
+    var u = null;
+    try { u = new URL(target); } catch (e) { return base; }
+    return base + u.pathname.replace(/^\/+/, '') + u.search;
+  }
+
+  function describeMapError(code) {
+    if (code === 'V2_READONLY') return MODE_REASON_TEXT['read-only'];
+    if (code === 'V2_UNSUPPORTED') return '当前设备不支持网页映射 v2，已回退静态模式';
+    if (code === 'V2_OFFLINE') return '设备 agent 离线，暂不可访问';
+    if (code === 'V2_BAD_URL') return '地址无效（需要 http:// 或 https:// 绝对地址）';
+    if (code === 'AUTH') return '鉴权失败：会话密钥或服务器口令无效';
+    if (code === 'NO_SW') return '当前环境无法注册 Service Worker，已回退静态模式';
+    if (code === 'NETWORK') return '请求失败：网络不稳定或设备已离线';
+    return '加载失败（' + code + '）';
+  }
+
   var api = {
     DEFAULT_URL: DEFAULT_URL,
     PROXY_PATH: PROXY_PATH,
     TICKET_PATH: TICKET_PATH,
+    MAP_PATH: MAP_PATH,
+    MAP_PREFIX: MAP_PREFIX,
+    SW_PATH: SW_PATH,
     Rewrite: Rewrite,
     WebView: WebView,
+    WebMapV2: WebMapV2,
+    detectMode: detectMode,
+    describeMapError: describeMapError,
+    entryUrl: entryUrl,
+    MODE_REASON_TEXT: MODE_REASON_TEXT,
     normalizeInput: normalizeInput
   };
 
   if (typeof window !== 'undefined') {
     window.WebView = WebView;
+    window.WebMapV2 = WebMapV2;
+    window.WebViewDetectMode = detectMode;
     window.WebViewRewrite = Rewrite;
     window.WebViewDEFAULT_URL = DEFAULT_URL;
+    window.WebViewModeReasons = MODE_REASON_TEXT;
   }
   // node 单测入口（tools/test_webview.js）；浏览器里 module 未定义，不受影响。
   if (typeof module !== 'undefined' && module.exports) {
