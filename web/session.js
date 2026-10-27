@@ -291,12 +291,21 @@
         getAuthHeaders: function () { return window.shellRemoteAuthHeaders ? window.shellRemoteAuthHeaders({}) : {}; }
     }) : null;
 
+    /// 当前 token 权限（'rw' | 'ro'）。在 `connected` 到达前保守视为 'ro'。
+    function currentPermission() {
+        const p = window.shellRemote && typeof window.shellRemote.getPermission === 'function'
+            ? window.shellRemote.getPermission() : '';
+        return p === 'rw' ? 'rw' : 'ro';
+    }
+
     /// 计算并应用当前模式。能力数组变化、token 权限变化、SW 不可用时都会重算。
     function detectAndApplyMode(caps) {
         const detected = (typeof WebViewDetectMode === 'function')
             ? WebViewDetectMode({
                 caps: caps,
-                permission: sessionStorage.getItem('shell-remote-permission') || 'ro',
+                // 权限以 relay 在 SSE `connected` 事件里下发的为准（sse.js 记录）；
+                // 登录流程从不写 sessionStorage 的 permission，不能以它为准。
+                permission: currentPermission(),
                 isSecureContext: !!window.isSecureContext,
                 hasServiceWorker: !!navigator.serviceWorker
             })
@@ -913,6 +922,9 @@
         }
         disconnectOverlay.classList.add('hidden');
         armJoinWatchdog();
+        // `connected` 带出 relay 认定的 token 权限：据此重算网页映射模式
+        // （无论它早于还是晚于 session:capabilities 到达，结果都正确）。
+        detectAndApplyMode(webCaps);
         term.focus();
         term.onResize((cols, rows) => {
             window.shellRemote.send('terminal:resize', {
