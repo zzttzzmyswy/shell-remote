@@ -135,29 +135,27 @@ impl Default for Limits {
     }
 }
 
-/// 取消令牌：一次连接一个。`notify_one` 会存一张许可，因此先取消后等待也不会
-/// 错过（`notify_waiters` 会，故不用它）。
+/// 取消令牌：一次连接一个，读、写两个方向的 task 同时等待它。
+///
+/// 必须**唤醒全部等待者**：`Notify::notify_one` 只唤醒一个，另一个方向会挂在
+/// 空闲 socket 上直到目标再发数据（空闲 WebSocket / keep-alive 连接 = 永久泄漏
+/// task 与 fd）。`CancellationToken` 既唤醒全部，也不会错过先取消后等待。
 #[derive(Default)]
 struct CancelFlag {
-    cancelled: AtomicBool,
-    notify: tokio::sync::Notify,
+    token: tokio_util::sync::CancellationToken,
 }
 
 impl CancelFlag {
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        self.notify.notify_one();
+        self.token.cancel();
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.token.is_cancelled()
     }
 
     async fn cancelled(&self) {
-        if self.is_cancelled() {
-            return;
-        }
-        self.notify.notified().await;
+        self.token.cancelled().await;
     }
 }
 
@@ -2159,5 +2157,27 @@ mod tests {
             quick.is_ok(),
             "dispatch blocked on a full uplink queue — main loop would stall"
         );
+    }
+
+    /// 一次 cancel 必须同时唤醒读、写两个方向（回归：`notify_one` 只唤醒一个，
+    /// 另一方向在空闲连接上永久挂起）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_cancel_wakes_both_halves() {
+        let c = Arc::new(CancelFlag::default());
+        let (a, b) = (c.clone(), c.clone());
+        let h1 = tokio::spawn(async move { a.cancelled().await });
+        let h2 = tokio::spawn(async move { b.cancelled().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.cancel();
+        let r = tokio::time::timeout(Duration::from_secs(2), async {
+            h1.await.unwrap();
+            h2.await.unwrap();
+        })
+        .await;
+        assert!(r.is_ok(), "cancel() must wake every waiter");
+        // 先取消后等待同样立即返回。
+        tokio::time::timeout(Duration::from_millis(100), c.cancelled())
+            .await
+            .expect("cancelled() after cancel() must return immediately");
     }
 }
