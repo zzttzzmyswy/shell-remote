@@ -48,6 +48,11 @@ sha2 = "0.10"
 # 与 `0.9.0 < 0.59.2` 这类数字序）。已在 Cargo.lock 里作为传递依赖存在，
 # 这里只是提升为直接依赖；不引入新下载。
 semver = "1"
+# 标准 URL 解析（MYS-2425 阶段2 review）：升级任务里的 CDN base / 官方 path /
+# relay 下载路径必须按 URL 语法校验（userinfo、query、fragment、`//host` 走私
+# 都要挡住），字符串前缀判断不够。已在 Cargo.lock 里作为 reqwest 的传递依赖
+# 存在，这里只是提升为直接依赖。
+url = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 # 桌面转发依赖（仅 desktop feature 编译，UI 二进制用）。CLI 二进制 lean
 # 构建（--no-default-features）完全不引入这些重依赖。

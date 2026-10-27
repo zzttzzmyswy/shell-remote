@@ -160,6 +160,14 @@ fn build_capabilities() -> Vec<String> {
     caps.push(crate::agent::web_proxy::CAPABILITY.to_string());
     // 纯 TCP 字节管道（MYS-2383 阶段2）：同上，与 feature 无关，lean 构建也声明。
     caps.push(crate::agent::tcp_tunnel::CAPABILITY.to_string());
+    // 升级协议（MYS-2425 阶段2）：声明能消费 CDN 优先的完整任务（契约 1），
+    // relay 据此允许下发 CDN-only 任务；没有它 relay 必须要求本地镜像兜底。
+    caps.push(crate::agent::download::CAPABILITY_UPGRADE_V2.to_string());
+    // 制品形态：不能靠 desktop:* 推断（lean CLI 也上报 desktop:*）。名字无法
+    // 判定时**不声明**，让 relay 按其契约显式拒绝，而不是冒充某个形态被换错包。
+    if let Some(variant) = crate::agent::download::AgentVariant::detect() {
+        caps.push(variant.capability().to_string());
+    }
     caps.push("codec:h264".to_string());
     #[cfg(feature = "av1")]
     caps.push("codec:av1".to_string());
