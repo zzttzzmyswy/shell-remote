@@ -1,15 +1,17 @@
 #![allow(unused_imports)]
 
-pub mod auth;
-pub mod mcp;
-pub mod session;
-pub mod ws;
 pub mod admin;
-pub mod recorder;
+pub mod auth;
 pub mod bandwidth;
 pub mod desktop;
 pub mod file_transfer;
+pub mod mcp;
+pub mod recorder;
+pub mod session;
+pub mod tcp_tunnel;
+pub mod web_map;
 pub mod web_proxy;
+pub mod ws;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -134,6 +136,14 @@ pub struct SharedState {
     /// `download_streams` 同构但**完全独立**——网页流量不得混进终端/MCP
     /// 通道，因此不共享 sink、不共享清理路径。
     pub web_proxy: Arc<web_proxy::WebProxyStore>,
+    /// 纯 TCP 管道表（MYS-2383 阶段6）：`web_map` 的 HTTP 反代与 WebSocket 透传
+    /// 都建在它之上。与 `web_proxy` 完全独立：`tcp:*` 流量既不进广播，也不进
+    /// v0.58 的网页 GET 通道。
+    pub tcp_tunnels: Arc<tcp_tunnel::TunnelStore>,
+    /// 同源网页映射表（MYS-2383 阶段6）：`/agent/web/m/<map_id>/…`。
+    pub web_maps: Arc<web_map::MapStore>,
+    /// 每映射的连接池与在途配额（与 `web_maps` 同生命周期）。
+    pub web_map_runtimes: Arc<web_map::RuntimeStore>,
 }
 
 /// Agent 心跳采样的一帧桌面 KPI（`agent/mod.rs sender_loop` 心跳 payload 的
@@ -318,6 +328,9 @@ impl SharedState {
             kpi_history: RwLock::new(HashMap::new()),
             bandwidth: Arc::new(bandwidth::BandwidthLimiter::new()),
             web_proxy: Arc::new(web_proxy::WebProxyStore::new()),
+            tcp_tunnels: Arc::new(tcp_tunnel::TunnelStore::new()),
+            web_maps: Arc::new(web_map::MapStore::new()),
+            web_map_runtimes: Arc::new(web_map::RuntimeStore::default()),
         }
     }
 
@@ -385,6 +398,20 @@ pub async fn remove_session_state(state: &SharedState, sid: &str) {
     // agent 已经不在（kick / 空闲回收 / 注册驱逐），这里只摘 sink，不发 cancel。
     state.web_proxy.revoke_session_tickets(sid).await;
     state.web_proxy.cancel_session(sid).await;
+    // 网页映射 v2（MYS-2383 阶段6）：撤销该会话的全部映射、掐掉全部管道。
+    // 映射被撤销后即使有浏览器还拿着 map_id，反代也会先撞 404。
+    let revoked = state.web_maps.revoke_session(sid);
+    if !revoked.is_empty() {
+        state
+            .web_map_runtimes
+            .forget_many(revoked.iter().map(|s| s.as_str()));
+        // 有意不打印 map_id：它就是访问凭据。
+        tracing::info!(session = %sid, count = revoked.len(), "web map: mappings revoked");
+    }
+    let tunnels = state.tcp_tunnels.close_session(sid);
+    if tunnels > 0 {
+        tracing::info!(session = %sid, tunnels, "tcp tunnel: session connections closed");
+    }
 }
 
 use axum::body::Body;
@@ -1778,6 +1805,26 @@ pub async fn start(
             axum::routing::post(web_proxy::ticket_handler),
         )
         .route("/agent/web/proxy", get(web_proxy::proxy_handler))
+        // MYS-2383-F：同源网页映射 v2（TCP 管道上的 HTTP/1.1 反代 + WebSocket）。
+        // 反代用 `any`：所有方法都要透传；请求体必须能流式（上传 ≠ 2MiB 上限），
+        // 因此这条路由关掉 axum 的默认体积限制。
+        .route(
+            "/agent/web/map",
+            axum::routing::post(web_map::create_map_handler),
+        )
+        .route(
+            "/agent/web/m/:map_id",
+            axum::routing::any(web_map::proxy_root_handler),
+        )
+        .route(
+            "/agent/web/m/:map_id/",
+            axum::routing::any(web_map::proxy_root_handler),
+        )
+        .route(
+            "/agent/web/m/:map_id/*rest",
+            axum::routing::any(web_map::proxy_handler)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .route(
             "/agent/desktop/stream",
             get(crate::relay::desktop::stream_handler),
@@ -1933,6 +1980,17 @@ pub async fn start(
                         "web proxy: swept expired tickets / orphaned requests"
                     );
                 }
+
+                // 网页映射 v2 周期清理（MYS-2383 阶段6）：过期映射 + 已无对应
+                // 映射的运行时（连接池/信号量）。正常路径由会话清理负责，这里是
+                // 兜底。
+                let maps = state_clone.web_maps.sweep();
+                if maps > 0 {
+                    tracing::debug!(maps, "web map: swept expired mappings");
+                }
+                state_clone
+                    .web_map_runtimes
+                    .retain_only(|id| state_clone.web_maps.contains(id));
             }
         });
     }
