@@ -318,12 +318,26 @@ pub fn build_downloader(ctx: &UpgradeContext, task: &UpgradeTask) -> anyhow::Res
     } else {
         None
     };
-    let external = Downloader::build_external_client(&ctx.proxy, resolver, &ctx.budget)?;
-    let relay = task.relay_url.as_ref().map(|_| RelaySource {
-        http: ctx.relay_http.clone(),
-        base: ctx.relay_base.clone(),
-        token: ctx.token.clone(),
-    });
+    // relay 客户端**禁止重定向**：它带 rw Token，跟随一个 302 就把 Token 送到
+    // 别的主机（relay 自身没有合法的跨源跳转，正常路径永远是 200/206）。
+    let external =
+        Downloader::build_external_client(&ctx.proxy, resolver, &ctx.budget, task.cdn_hosts())?;
+    let relay = match task.relay_url.as_ref() {
+        Some(_) => {
+            // 建不出「不跟随重定向」的客户端就**整体失败**，绝不回退到会跟随
+            // 重定向的客户端——那等于让 Token 处于可被 302 带走的状态。
+            let http = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| anyhow::anyhow!("cannot build the relay download client: {e}"))?;
+            Some(RelaySource {
+                http,
+                base: ctx.relay_base.clone(),
+                token: ctx.token.clone(),
+            })
+        }
+        None => None,
+    };
     Ok(Downloader::new(
         external,
         relay,

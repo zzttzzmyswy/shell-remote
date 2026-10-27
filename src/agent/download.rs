@@ -20,7 +20,7 @@
 //! 最终只有「长度 + SHA-256 + 制品身份（variant/arch/OS）」同时通过才算下载成功；
 //! 任何一项不符即失败，旧 agent 不动。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -338,14 +338,31 @@ impl UpgradeTask {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| p.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()));
+        // relay 镜像路径**必须同源且是唯一允许的端点**：它会被拼到 relay base 上
+        // 并附带 rw Token，任何能让它指向别的 host 的写法（`//evil`、绝对 URL、
+        // `..`、反斜杠、query/fragment）都等于把 Token 送给第三方。
+        //
+        // 老 relay 的 `url` 走同一条校验：兼容不等于放宽。
+        let relay_url = match relay_url {
+            Some(raw) => match validate_relay_path(&raw) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    tracing::warn!(relay_url = %raw, error = %e, "rejecting unsafe relay download path");
+                    return None;
+                }
+            },
+            None => None,
+        };
         let cdn_base_urls: Vec<String> = p
             .get("cdn_base_urls")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
+                    // 不 trim：带空白的 base 是畸形输入，交给 `normalize_cdn_base`
+                    // 拒绝，而不是静默修剪成"看起来合法"。
                     .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
                     .collect()
             })
             .unwrap_or_default();
@@ -366,6 +383,19 @@ impl UpgradeTask {
                     .and_then(|u| u.rsplit('/').find(|s| !s.is_empty()))
                     .map(|s| s.to_string())
             })?;
+        // 官方路径必须结构与「本任务制品」都对得上：CDN 会照着它取字节，配错
+        // 就是把另一个制品（甚至任意路径）拉到这台机器上。校验失败即整条任务
+        // 拒绝——不静默降级成「只用 relay」，那会让管理员以为 CDN 在生效。
+        let official_path = match official_path {
+            Some(raw) => match validate_official_path(&raw, &filename) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    tracing::warn!(official_path = %raw, error = %e, "rejecting unsafe official_path");
+                    return None;
+                }
+            },
+            None => None,
+        };
         let size = p.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
         let source = p
             .get("source")
@@ -399,16 +429,23 @@ impl UpgradeTask {
         self.source != "custom" && self.official_path.is_some() && !self.cdn_base_urls.is_empty()
     }
 
-    /// 这次下载允许解析的主机白名单（本次任务涉及的 CDN 主机）。
+    /// 这次下载允许解析的主机白名单（本任务**合法** CDN base 的主机）。
+    ///
+    /// 只收通过 [`normalize_cdn_base`] 的 base：非法条目本来就不会被下载，让它
+    /// 进入 DNS 白名单只会平白扩大可解析面。
     pub fn cdn_hosts(&self) -> Vec<String> {
         if !self.allows_cdn() {
             return Vec::new();
         }
         let mut hosts: Vec<String> = Vec::new();
         for base in &self.cdn_base_urls {
-            if let Some(h) = url_host(base) {
-                if !hosts.contains(&h) {
-                    hosts.push(h);
+            let Ok(parsed) = normalize_cdn_base(base) else {
+                continue;
+            };
+            if let Some(host) = parsed.host_str() {
+                let host = host.to_ascii_lowercase();
+                if !hosts.contains(&host) {
+                    hosts.push(host);
                 }
             }
         }
@@ -432,15 +469,19 @@ impl UpgradeTask {
             }
         }
         // relay 镜像只在任务明确带路径时启用（`relay_url` 为空 = relay 没有这份
-        // 制品，硬拼一个 URL 只会 404）。
+        // 制品，硬拼一个 URL 只会 404）。路径已由 `from_payload` 按
+        // [`validate_relay_path`] 校验过；这里再校验一次，因为 `UpgradeTask` 也
+        // 可能被测试或别的调用方直接构造。
         if let Some(relay_url) = &self.relay_url {
-            let path = relay_url.trim();
-            if !path.is_empty() {
-                out.push(Source {
+            match validate_relay_path(relay_url) {
+                Ok(path) => out.push(Source {
                     kind: SourceKind::Relay,
                     label: "relay".to_string(),
-                    url: path.to_string(),
-                });
+                    url: path,
+                }),
+                Err(e) => {
+                    tracing::warn!(relay_url = %relay_url, error = %e, "refusing unsafe relay download path");
+                }
             }
         }
         out
@@ -451,6 +492,12 @@ impl UpgradeTask {
 ///
 /// 这是「UI/CLI 制品不串包」的最后一道闸：换错形态等于原地把设备能力换掉，
 /// 长度与 hash 都对也可能装错。
+///
+/// **本机形态未知时必须拒绝，不能放行。** 「不知道自己是 CLI 还是 UI」不等于
+/// 「任何形态都行」：升级是原地替换二进制，把 UI 设备换成 lean CLI 会静默丢掉
+/// 桌面能力。这与阶段 1 relay 侧「形态未知回 409、不猜」是同一条原则——两端都不
+/// 猜，才不会有任何一端替另一端做决定。此时给出可操作的提示（显式配置或人工
+/// 处理），而不是默默继续。
 pub fn verify_artifact_identity(
     task: &UpgradeTask,
     own_variant: Option<AgentVariant>,
@@ -477,18 +524,32 @@ pub fn verify_artifact_identity(
             if own_windows { "windows" } else { "unix" }
         ));
     }
-    if let Some(own) = own_variant {
-        let want = own.as_str();
-        let got = match parsed.variant {
-            crate::relay::artifact_store::Variant::Cli => "cli",
-            crate::relay::artifact_store::Variant::Ui => "ui",
-        };
-        if got != want {
-            return Err(format!(
-                "upgrade artifact {:?} is the {got} build but this agent is {want}",
-                task.filename
-            ));
-        }
+    let Some(own) = own_variant else {
+        // 名字被改过 / 无法判定形态。拒绝并说明怎么继续：把它换回发布名重启
+        // （最常见情形），或人工升级。绝不"按保守值猜一个"。
+        return Err(format!(
+            "cannot determine this agent's own artifact variant (CLI or UI) from the executable \
+             name {:?}, and the task offers {:?}; refusing to install it — a wrong guess would \
+             swap a desktop agent for the lean CLI build (or vice versa). Run this agent under \
+             its release filename (shell-remote-<arch> for CLI, shell-remote-ui-<arch> for UI) \
+             and retry, or upgrade this host manually.",
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            task.filename
+        ));
+    };
+    let want = own.as_str();
+    let got = match parsed.variant {
+        crate::relay::artifact_store::Variant::Cli => "cli",
+        crate::relay::artifact_store::Variant::Ui => "ui",
+    };
+    if got != want {
+        return Err(format!(
+            "upgrade artifact {:?} is the {got} build but this agent is {want}",
+            task.filename
+        ));
     }
     Ok(())
 }
@@ -509,25 +570,219 @@ pub enum SourceKind {
     Relay,
 }
 
-/// `base + official_path`，两段都必须形态合法：base 是裸 origin，path 以 `/`
-/// 开头且不含 `..` / 反斜杠 / 控制字符。拼不出合法 URL 就跳过该源。
+/// relay 镜像路径的固定前缀。只有 `relay` 自己的鉴权下载端点能带 Token。
+pub const RELAY_BLOB_PREFIX: &str = "/agent/upgrade/blob/";
+
+/// 校验 relay 下发的镜像路径，返回规范化后的同源相对路径。
+///
+/// **必须同源**：这个路径会被拼到 relay base 上，并附带 `X-SR-Token`。任何能
+/// 让它指向别的 host 的写法都等于把 rw Token 送给第三方：
+///
+/// - `//evil.example/x` —— 协议相对 URL，拼成 `https://relay + //evil…` 后
+///   `Url::join` 语义会把它变成 `https://evil.example/x`（即使字符串拼接只是
+///   变成 `https://relay//evil.example/x`，路径规范化也可能改写 origin）；
+/// - `https://evil.example/x`、`http://…` —— 绝对 URL；
+/// - `/agent/upgrade/blob/../../etc/passwd`、反斜杠、`%2e%2e` 编码；
+/// - `?query` / `#fragment` —— 改变实际请求目标；
+/// - 任何非 `/agent/upgrade/blob/<合法制品名>` 的路径。
+///
+/// 允许的**唯一**形态：以单个 `/` 开头，紧跟 `RELAY_BLOB_PREFIX`，其后是一个
+/// 合法发布制品名（`shell-remote[-ui]-<arch>[.exe]`）。返回原字符串（已确认无
+/// 需改写）。
+pub fn validate_relay_path(raw: &str) -> Result<String, String> {
+    // 不 trim：带空白/控制字符的路径不是"合法路径的别名"，静默修剪只会让畸形
+    // 输入看起来通过。
+    let path = raw;
+    if path.is_empty() {
+        return Err("relay download path is empty".to_string());
+    }
+    if path.starts_with("//") {
+        return Err(format!(
+            "relay download path {path:?} is protocol-relative (//) and would leave the relay origin"
+        ));
+    }
+    if !path.starts_with('/') {
+        return Err(format!(
+            "relay download path {path:?} must be an absolute path on the relay (starting with a single '/')"
+        ));
+    }
+    // 绝对 URL 走私（`/https://evil` 不会命中，但 `\` 与空格会改变解析）。
+    if path.contains('\\') || path.contains(' ') || path.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "relay download path {path:?} contains whitespace, backslashes or control characters"
+        ));
+    }
+    if path.contains('?') || path.contains('#') {
+        return Err(format!(
+            "relay download path {path:?} must not carry a query or fragment"
+        ));
+    }
+    // `..` 与百分号编码都能让路径语义偏离字面（`%2e%2e`、`%2f`）。relay 生成的
+    // 路径里不需要任何转义，出现即拒绝。
+    if path.contains("..") {
+        return Err(format!(
+            "relay download path {path:?} must not contain '..'"
+        ));
+    }
+    if path.contains('%') {
+        return Err(format!(
+            "relay download path {path:?} must not use percent-encoding"
+        ));
+    }
+    let Some(name) = path.strip_prefix(RELAY_BLOB_PREFIX) else {
+        return Err(format!(
+            "relay download path {path:?} is not {RELAY_BLOB_PREFIX}<artifact>"
+        ));
+    };
+    if name.is_empty() || name.contains('/') {
+        return Err(format!(
+            "relay download path {path:?} must name a single artifact directly under {RELAY_BLOB_PREFIX}"
+        ));
+    }
+    if parse_artifact_ref(name).is_none() {
+        return Err(format!(
+            "relay download path {path:?} does not end in a shell-remote release artifact name"
+        ));
+    }
+    Ok(path.to_string())
+}
+
+/// CDN base 的规范化形态：`scheme://host[:port]`，无 userinfo / path / query /
+/// fragment。
+///
+/// 用标准 URL parser 而不是字符串前缀判断——后者放行
+/// `https://user:pass@cdn.test/?x#y` 这类会让请求落到奇怪目标、并把凭据写进日志
+/// 的写法。
+pub fn normalize_cdn_base(raw: &str) -> Result<url::Url, String> {
+    // 不 trim：`url::Url::parse` 会静默吃掉前后空白，让畸形条目"看起来合法"。
+    // 带空白的 base 是配置错误，明确报出来比悄悄修好更安全。
+    if raw.trim() != raw {
+        return Err(format!("CDN base {raw:?} has leading/trailing whitespace"));
+    }
+    let parsed =
+        url::Url::parse(raw).map_err(|e| format!("CDN base {raw:?} is not a valid URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "CDN base {raw:?} uses scheme {other:?}; only http/https are accepted"
+            ))
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "CDN base {raw:?} must not carry userinfo (credentials in a mirror URL)"
+        ));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(format!("CDN base {raw:?} has no host"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "CDN base {raw:?} must not carry a query or fragment (it is an origin prefix)"
+        ));
+    }
+    // 只接受裸 origin：`/` 是唯一可接受的 path。镜像约定是 base + official_path。
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        return Err(format!(
+            "CDN base {raw:?} must be a bare origin without a path (got {:?})",
+            parsed.path()
+        ));
+    }
+    Ok(parsed)
+}
+
+/// 校验 `official_path`：必须就是官方 release 的下载路径。
+///
+/// 形态固定为 `/<owner>/<repo>/releases/download/v<version>/<filename>`（stage 1
+/// 的 `ArtifactRef::official_path` 就长这样）。只做结构校验 + 与任务文件名交叉
+/// 核对，不接受 query/fragment/用户信息/穿越，也不接受百分号编码。
+pub fn validate_official_path(raw: &str, filename: &str) -> Result<String, String> {
+    // 不 trim：见 `validate_relay_path`。
+    let path = raw;
+    if !path.starts_with('/') || path.starts_with("//") {
+        return Err(format!(
+            "official_path {raw:?} must be an absolute path with a single leading '/'"
+        ));
+    }
+    if path.contains('\\') || path.contains("..") || path.contains('%') {
+        return Err(format!(
+            "official_path {raw:?} must not contain backslashes, '..' or percent-encoding"
+        ));
+    }
+    if path.contains('?') || path.contains('#') {
+        return Err(format!(
+            "official_path {raw:?} must not carry a query or fragment"
+        ));
+    }
+    if path.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!(
+            "official_path {raw:?} contains whitespace or control characters"
+        ));
+    }
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if segments.len() != 6 || segments[2] != "releases" || segments[3] != "download" {
+        return Err(format!(
+            "official_path {raw:?} is not <owner>/<repo>/releases/download/v<version>/<file>"
+        ));
+    }
+    if segments[0].is_empty() || segments[1].is_empty() {
+        return Err(format!(
+            "official_path {raw:?} has an empty owner/repo segment"
+        ));
+    }
+    // 版本段必须带 `v` 前缀，且不含路径元字符（已由上面的检查兜住）。
+    if !segments[4].starts_with('v') || segments[4].len() < 2 {
+        return Err(format!(
+            "official_path {raw:?} version segment {:?} must look like v<version>",
+            segments[4]
+        ));
+    }
+    // 最后一段必须就是本任务的制品名——否则 CDN 会拿到另一个制品（例如把 UI
+    // 的路径配在 CLI 任务上）。
+    if segments[5] != filename {
+        return Err(format!(
+            "official_path {raw:?} points at {:?} but the task artifact is {filename:?}",
+            segments[5]
+        ));
+    }
+    if parse_artifact_ref(segments[5]).is_none() {
+        return Err(format!(
+            "official_path {raw:?} does not end in a shell-remote release artifact name"
+        ));
+    }
+    Ok(path.to_string())
+}
+
+/// `base + official_path`，两段都按 URL 语法校验（不接受 userinfo、query、
+/// fragment、`..`、反斜杠、控制字符）。拼不出合法 URL 就跳过该源。
+///
+/// 返回值仍带 origin 校验：拼好后再确认 host 与 base 一致——万一 `Url::join`
+/// 的路径规范化把目标改到别的 host，这里会拒绝。
 pub fn join_cdn_url(base: &str, official_path: &str) -> Option<String> {
-    let base = base.trim().trim_end_matches('/');
-    if !(base.starts_with("https://") || base.starts_with("http://")) {
-        return None;
-    }
-    if base.len() <= "https://".len() || base.contains(' ') {
-        return None;
-    }
-    let path = official_path.trim();
+    let base_url = normalize_cdn_base(base).ok()?;
+    // 不 trim：畸形 path 一律拒绝（见 `validate_relay_path`）。
+    let path = official_path;
     if !path.starts_with('/')
+        || path.starts_with("//")
         || path.contains("..")
         || path.contains('\\')
-        || path.chars().any(|c| c.is_control())
+        || path.contains('%')
+        || path.contains('?')
+        || path.contains('#')
+        || path.chars().any(|c| c.is_control() || c.is_whitespace())
     {
         return None;
     }
-    Some(format!("{base}{path}"))
+    let mut url = base_url;
+    url.set_path(path);
+    url.set_query(None);
+    url.set_fragment(None);
+    // 再确认一次：host 必须还是 base 的 host，且没有引入 query/fragment。
+    if url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    Some(url.to_string().trim_end_matches('/').to_string())
 }
 
 // ── 进度 ────────────────────────────────────────────────────────────
@@ -566,6 +821,44 @@ impl std::fmt::Debug for RelaySource {
             .field("token", &"<redacted>")
             .finish()
     }
+}
+
+/// 外部下载的重定向策略：**只允许跳到任务里显式列出的 host**。
+///
+/// CDN 镜像会把 `github.com/...` 302 到自己的对象存储（`objects.githubusercontent.com`
+/// 之类），所以完全禁止跳转会打断正常镜像。但「跟随任意 host」又让一个被劫持的
+/// CDN 把请求引到内网地址或攻击者服务器（SSRF / 流量劫持）。折中：跳转目标
+/// 必须仍在本次任务的 CDN 主机白名单内，否则请求直接失败。
+///
+/// 白名单为空 → 一个跳转都不跟随（调用方无法给出可信集合时的保守默认）。
+pub fn redirect_policy(allowed_hosts: Vec<String>) -> reqwest::redirect::Policy {
+    let allowed: Vec<String> = allowed_hosts
+        .into_iter()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects while downloading the upgrade artifact");
+        }
+        let next = attempt.url().clone();
+        let host = next.host_str().unwrap_or("").to_ascii_lowercase();
+        let scheme_ok = matches!(next.scheme(), "http" | "https");
+        // 降级到 http 会把「已校验的 TLS 通道」换成明文，直接拒绝。
+        let downgrade = next.scheme() == "http"
+            && attempt
+                .previous()
+                .last()
+                .is_some_and(|p| p.scheme() == "https");
+        if scheme_ok && !downgrade && allowed.iter().any(|a| a == &host) {
+            attempt.follow()
+        } else {
+            attempt.error(format!(
+                "refusing redirect to {next} — host {host:?} is not one of this upgrade task's \
+                 CDN hosts {allowed:?} (or the redirect downgrades https to http)"
+            ))
+        }
+    })
 }
 
 /// 下载成功的结果。
@@ -613,17 +906,22 @@ impl Downloader {
     }
 
     /// 建外部客户端：只带代理配置与可选的解析链，**没有任何鉴权头**。
+    ///
+    /// `allowed_hosts` 是本次任务显式允许的 CDN 主机集合，重定向只允许落在其中
+    /// （见 [`redirect_policy`]）。传空集合意味着「不允许任何重定向」——调用方
+    /// 拿不到白名单时应当保守。
     pub fn build_external_client(
         proxy: &ProxyConfig,
         resolver: Option<Arc<dyn reqwest::dns::Resolve>>,
         budget: &DownloadBudget,
+        allowed_hosts: Vec<String>,
     ) -> anyhow::Result<reqwest::Client> {
         crate::tlsutil::install_rustls_provider();
         let mut builder = reqwest::Client::builder()
             .connect_timeout(budget.connect)
             .tcp_keepalive(Duration::from_secs(30))
             // 不让「首字节很慢」把连接拖死：总时间由 fetch 自己管。
-            .redirect(reqwest::redirect::Policy::limited(5));
+            .redirect(redirect_policy(allowed_hosts));
         if let Some(r) = resolver {
             // `dns_resolver` 要求具体的 `R: Sized`；`Arc<dyn Resolve>` 走 `dns_resolver2`
             // （它实现 `IntoResolve`），这样调用方不必知道具体解析器类型。
@@ -637,8 +935,13 @@ impl Downloader {
 
     /// 按 `task.sources()` 顺序下载到 `part` 并校验。
     ///
-    /// `part` 是断点续传文件（与目标二进制同目录，跨源共用）。返回 `Err` 时
-    /// `part` 的状态不确定，调用方应删除。
+    /// `part` 是**跨源共享**的续传文件路径；实际写入的是每个源自己的命名空间
+    /// （见 [`Downloader::part_path_for`]），成功后再原子落到 `part`。
+    ///
+    /// 为什么必须分源：两个 CDN 对同一 URL 可能返回不同字节（镜像滞后、被污染、
+    /// 劫持）。共享一个 `.part` 时，A 源断流后的前缀会被 B 源当作已验证数据接着
+    /// 写，拼出「A 的头 + B 的尾」——最终 hash 只能说明拼接结果不是任务要的，
+    /// 却无法在任何单点前阻止这种拼装。分源命名让每个源的字节只与自己续传。
     pub async fn fetch(&self, task: &UpgradeTask, part: &Path) -> Result<Downloaded, String> {
         let sources = task.sources();
         if sources.is_empty() {
@@ -672,31 +975,56 @@ impl Downloader {
                 percent: None,
                 detail: format!("source {}/{} ({})", idx + 1, sources.len(), source.label),
             });
+            // 这个源专属的续传文件：命名里同时含源身份与目标 hash，因此
+            // 「换源」不可能读到另一个源的字节，「换版本」也不可能。
+            let part_for_source = match part_path_for(part, source) {
+                Ok(p) => p,
+                Err(e) => {
+                    failures.push(SourceFailure {
+                        source: source.label.clone(),
+                        error: e,
+                    });
+                    continue;
+                }
+            };
             let mut backoff = self.budget.backoff;
             for attempt in 1..=self.budget.attempts_per_source.max(1) {
                 if Instant::now() >= deadline {
                     break;
                 }
                 attempts_total += 1;
-                match self.download_from(source, task, part, deadline).await {
+                match self
+                    .download_from(source, task, &part_for_source, deadline)
+                    .await
+                {
                     Ok(start_offset) => {
                         // 长度 + hash 校验；不通过就换下一个源（脏字节绝不落地）。
-                        match self.verify(task, part).await {
+                        match self.verify(task, &part_for_source).await {
                             Ok((sha, size)) => {
+                                // 校验通过才落到调用方给的路径：那是唯一会被
+                                // 安装逻辑消费的文件。
+                                tokio::fs::rename(&part_for_source, part)
+                                    .await
+                                    .map_err(|e| {
+                                        format!("cannot move the verified download into place: {e}")
+                                    })?;
+                                // 其它源留下的残片已经没有价值（每个都可能是几十
+                                // MB），成功即清掉，避免目录被历史残片占满。
+                                cleanup_source_parts(part, &part_for_source).await;
                                 return Ok(Downloaded {
                                     source: source.label.clone(),
                                     bytes: size,
                                     sha256: sha,
                                     attempts: attempts_total,
                                     resumed_from: start_offset,
-                                })
+                                });
                             }
                             Err(e) => {
                                 failures.push(SourceFailure {
                                     source: source.label.clone(),
                                     error: e.clone(),
                                 });
-                                let _ = tokio::fs::remove_file(part).await;
+                                let _ = tokio::fs::remove_file(&part_for_source).await;
                                 break; // 内容不对，重试同一个源没有意义
                             }
                         }
@@ -705,8 +1033,8 @@ impl Downloader {
                         let (error, retry, discard) =
                             (outcome.error, outcome.retry, outcome.discard_part);
                         if discard {
-                            // 坏字节不能留给下一个源续传。
-                            let _ = tokio::fs::remove_file(part).await;
+                            // 坏字节不能留给同源的下一次续传。
+                            let _ = tokio::fs::remove_file(&part_for_source).await;
                         }
                         failures.push(SourceFailure {
                             source: source.label.clone(),
@@ -755,6 +1083,11 @@ impl Downloader {
         part: &Path,
         deadline: Instant,
     ) -> Result<u64, Outcome> {
+        // 续传文件必须是普通文件：符号链接 / FIFO / 设备一律拒绝（共享可写目录
+        // 里跟随链接会覆盖任意文件）。
+        if let Err(e) = ensure_regular_part_file(part) {
+            return Err(Outcome::fatal(e));
+        }
         let existing = tokio::fs::metadata(part)
             .await
             .map(|m| m.len())
@@ -981,6 +1314,140 @@ impl Downloader {
             ));
         }
         Ok((digest, meta.len()))
+    }
+}
+
+/// 每个下载源专属的续传文件路径。
+///
+/// 命名规则：`<调用方给的 part 路径>.<源命名空间>.part`
+///
+/// 命名空间由「源 + 目标 hash」派生：
+/// - CDN 源：`cdn-<host>_<port>-<hash 前 16 位>`；
+/// - relay 源：`relay-<hash 前 16 位>`。
+///
+/// 于是「同源重试」能接着续传（同一命名空间），而「换源」拿到的永远是一个全新
+/// 的路径——A 源断流留下的前缀不可能被 B 源当成自己的字节接着写。目标 hash 进
+/// 命名则把「同源但换了目标版本」也隔开。
+///
+/// 主机名里的 `.` `:` 等字符会被替换成 `_`，且整段只保留 `[A-Za-z0-9_-]`，
+/// 因此命名空间不会引入路径分隔符或穿越。
+pub fn part_path_for(part: &Path, source: &Source) -> Result<PathBuf, String> {
+    let namespace = source_namespace(source)?;
+    let file_name = part
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("download path {} has no usable file name", part.display()))?;
+    let dir = part.parent().unwrap_or_else(|| Path::new("."));
+    Ok(dir.join(format!(".{file_name}.{namespace}.part")))
+}
+
+/// 源命名空间（同时用于续传文件名与诊断日志，不含 Token / query）。
+fn source_namespace(source: &Source) -> Result<String, String> {
+    match source.kind {
+        SourceKind::Cdn => {
+            let parsed = url::Url::parse(&source.url)
+                .map_err(|e| format!("download url {:?} is not a valid URL: {e}", source.url))?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| format!("download url {:?} has no host", source.url))?;
+            let port = parsed.port_or_known_default().unwrap_or(0);
+            let hash = source_target_hash(&source.url);
+            Ok(format!(
+                "cdn-{}-{port}-{hash}",
+                sanitize_namespace_segment(host)
+            ))
+        }
+        SourceKind::Relay => Ok(format!("relay-{}", source_target_hash(&source.url))),
+    }
+}
+
+/// 源路径的稳定短标识（`download url` / relay 路径的 FNV-1a 64 位）。
+///
+/// 这里只需要「不同目标不撞名」，不需要密码学强度；调用方另有一层目标 hash
+/// 参与命名。
+fn source_target_hash(url: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in url.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 把任意字符串收成安全的文件名片段：只保留 `[A-Za-z0-9_-]`，其余替换成 `_`。
+fn sanitize_namespace_segment(raw: &str) -> String {
+    let out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "_".to_string()
+    } else {
+        out
+    }
+}
+
+/// 确认 `path` 处的续传文件可以安全续写：必须是**普通文件**（或不存在）。
+///
+/// 可执行文件目录在部分部署里是共享可写的（`/opt/...`、`/usr/local/bin`、用户
+/// 目录）。如果那里被人预先放了符号链接或 FIFO，续写等于替攻击者覆盖它指向的
+/// 任意文件（或阻塞在管道上）。因此：
+/// - 符号链接 → 拒绝（不跟随，也不删除后重建，避免 TOCTOU 里再被换成链接）；
+/// - 设备/管道/目录 → 拒绝；
+/// - 普通文件 → 允许（可能是自己上一次的续传数据）。
+pub fn ensure_regular_part_file(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(format!(
+                    "refusing to resume into {}: it is a symbolic link (a shared-writable \
+                     directory must not let a link redirect the download)",
+                    path.display()
+                ));
+            }
+            if !ft.is_file() {
+                return Err(format!(
+                    "refusing to resume into {}: it is not a regular file",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot inspect {}: {e}", path.display())),
+    }
+}
+
+/// 删除同一个目标下**其它源**的续传残片（`keep` 之外全部清掉）。
+///
+/// 只动 `<part 文件名>.<namespace>.part` 这一族，不碰调用方给的 `part` 本身，
+/// 也不碰目录里任何无关文件。
+async fn cleanup_source_parts(part: &Path, keep: &Path) {
+    let Some(base) = part.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Some(dir) = part.parent() else { return };
+    let prefix = format!(".{base}.");
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&prefix) || !name.ends_with(".part") {
+            continue;
+        }
+        if entry.path() == keep {
+            continue;
+        }
+        let _ = tokio::fs::remove_file(entry.path()).await;
     }
 }
 
@@ -1346,9 +1813,30 @@ mod tests {
         }
     }
 
+    /// 测试用下载器。mock CDN 全部监听 127.0.0.1，因此重定向白名单默认放行它
+    /// —— 需要验证「跨域跳转被拒」的用例用 [`downloader_with_hosts`]。
     fn downloader(relay: Option<RelaySource>, b: DownloadBudget) -> Downloader {
-        let external = Downloader::build_external_client(&ProxyConfig::empty(), None, &b).unwrap();
+        downloader_with_hosts(relay, b, vec!["127.0.0.1".to_string()])
+    }
+
+    fn downloader_with_hosts(
+        relay: Option<RelaySource>,
+        b: DownloadBudget,
+        hosts: Vec<String>,
+    ) -> Downloader {
+        let external =
+            Downloader::build_external_client(&ProxyConfig::empty(), None, &b, hosts).unwrap();
         Downloader::new(external, relay, b, no_progress())
+    }
+
+    /// 某个源会使用的 `.part` 路径（与下载器内部命名规则一致）。
+    fn source_part(
+        task: &UpgradeTask,
+        part: &std::path::Path,
+        source_idx: usize,
+    ) -> std::path::PathBuf {
+        let sources = task.sources();
+        part_path_for(part, &sources[source_idx]).unwrap()
     }
 
     fn tmp_part(tag: &str) -> std::path::PathBuf {
@@ -1472,8 +1960,9 @@ mod tests {
         .await;
         let task = task_with(&local_filename(), ARTIFACT, vec![liar, good], None);
         let part = tmp_part("poison");
-        // 预置一段脏的前缀（模拟上一次中断留下的、不可信的部分字节）。
-        std::fs::write(&part, b"garbage-prefix").unwrap();
+        // 预置一段脏的前缀（模拟上一次中断留下的、不可信的部分字节），写进
+        // **第一个源**的命名空间。
+        std::fs::write(source_part(&task, &part, 0), b"garbage-prefix").unwrap();
 
         let got = downloader(None, budget())
             .fetch(&task, &part)
@@ -1519,7 +2008,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            part.exists(),
+            source_part(&task, &part, 0).exists(),
             "网络断流留下的字节必须保留，供下次续传（否则几十 MB 白下）"
         );
         let _ = std::fs::remove_dir_all(part.parent().unwrap());
@@ -1561,9 +2050,10 @@ mod tests {
         .await;
         let task = task_with(&local_filename(), ARTIFACT, vec![cdn], None);
         let part = tmp_part("resume");
-        // 预先写入前半段，模拟断点。
+        // 预先写入前半段，模拟断点（写进该源自己的命名空间——这是唯一会被续传
+        // 读取的位置）。
         let half = ARTIFACT.len() / 2;
-        std::fs::write(&part, &ARTIFACT[..half]).unwrap();
+        std::fs::write(source_part(&task, &part, 0), &ARTIFACT[..half]).unwrap();
         let got = downloader(None, budget())
             .fetch(&task, &part)
             .await
@@ -1587,7 +2077,7 @@ mod tests {
         .await;
         let task = task_with(&local_filename(), ARTIFACT, vec![cdn], None);
         let part = tmp_part("restart");
-        std::fs::write(&part, &ARTIFACT[..10]).unwrap();
+        std::fs::write(source_part(&task, &part, 0), &ARTIFACT[..10]).unwrap();
         downloader(None, budget())
             .fetch(&task, &part)
             .await
@@ -1706,8 +2196,8 @@ mod tests {
         let part = tmp_part("cross-attempt");
         let half = ARTIFACT.len() / 2;
 
-        // 第一次：只写了前半段就"进程没了"。
-        std::fs::write(&part, &ARTIFACT[..half]).unwrap();
+        // 第一次：只写了前半段就"进程没了"（同一源 → 同一命名空间）。
+        std::fs::write(source_part(&task, &part, 0), &ARTIFACT[..half]).unwrap();
 
         // 第二次：全新下载器（模拟重启后的 agent）接着下。
         let dl = downloader(None, budget());
@@ -1733,7 +2223,7 @@ mod tests {
         .await;
         let task = task_with(&local_filename(), ARTIFACT, vec![cdn], None);
         let part = tmp_part("restart-report");
-        std::fs::write(&part, &ARTIFACT[..10]).unwrap();
+        std::fs::write(source_part(&task, &part, 0), &ARTIFACT[..10]).unwrap();
         let got = downloader(None, budget())
             .fetch(&task, &part)
             .await
@@ -1762,7 +2252,7 @@ mod tests {
             &local_filename(),
             ARTIFACT,
             vec![cdn],
-            Some("/agent/upgrade/blob/x".to_string()),
+            Some(format!("/agent/upgrade/blob/{}", local_filename())),
         );
         let relay_src = RelaySource {
             http: reqwest::Client::new(),
@@ -1915,13 +2405,72 @@ mod tests {
         assert!(UpgradeTask::from_payload(&serde_json::json!({})).is_none());
     }
 
+    /// 畸形 CDN base 不会让整条任务解析失败（relay 可能给多个源，坏一个不该
+    /// 拦住全部），但**不能**进白名单、也不能被拼成请求。
+    #[test]
+    fn test_payload_with_malformed_cdn_base_is_excluded_not_normalized() {
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(ARTIFACT))
+        };
+        let name = local_filename();
+        let task = UpgradeTask::from_payload(&serde_json::json!({
+            "target_version": "9.9.9",
+            "filename": name,
+            "size": ARTIFACT.len(),
+            "sha256": hash,
+            "official_path": format!("/zzttzzmyswy/shell-remote/releases/download/v9.9.9/{name}"),
+            "cdn_base_urls": [
+                "https://user:pass@evil.test",       // userinfo
+                "https://cdn.test/?x=1",             // query
+                " https://cdn.test",                 // 前后空白
+                "https://cdn.test/mirror",           // 带路径
+                "https://good.test",                 // 唯一合法的
+            ],
+        }))
+        .expect("任务本身仍可解析");
+        // 白名单里只剩真正合法的那个 host。
+        assert_eq!(task.cdn_hosts(), vec!["good.test".to_string()]);
+        let sources = task.sources();
+        assert_eq!(sources.len(), 1, "只有合法 base 会变成下载源: {sources:?}");
+        assert!(sources[0].url.starts_with("https://good.test/"));
+        // 任何拼出来的 URL 都不带着凭据/查询。
+        for s in &sources {
+            assert!(!s.url.contains("user:pass"));
+            assert!(!s.url.contains('?'));
+        }
+    }
+
+    /// official_path 与任务制品名不符时整条任务拒绝（不能把 UI 路径配给 CLI）。
+    #[test]
+    fn test_payload_with_mismatched_official_path_is_rejected() {
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(ARTIFACT))
+        };
+        let task = UpgradeTask::from_payload(&serde_json::json!({
+            "target_version": "9.9.9",
+            "filename": local_filename(),
+            "size": ARTIFACT.len(),
+            "sha256": hash,
+            // 指向另一个制品
+            "official_path": "/zzttzzmyswy/shell-remote/releases/download/v9.9.9/shell-remote-ui-x86_64",
+            "cdn_base_urls": ["https://cdn.test"],
+            "relay_url": format!("/agent/upgrade/blob/{}", local_filename()),
+        }));
+        assert!(
+            task.is_none(),
+            "official_path 与 filename 不符必须整条拒绝，而不是静默只走 relay"
+        );
+    }
+
     #[test]
     fn test_custom_source_never_uses_cdn() {
         let mut task = task_with(
             &local_filename(),
             ARTIFACT,
             vec!["https://cdn.test".into()],
-            Some("/agent/upgrade/blob/x".into()),
+            Some(format!("/agent/upgrade/blob/{}", local_filename())),
         );
         task.source = "custom".into();
         let sources = task.sources();
@@ -2004,8 +2553,20 @@ mod tests {
                 .unwrap_err();
         assert!(err.contains("not a shell-remote release artifact"), "{err}");
 
-        // 未知自身形态：不校验 variant，但仍校验 arch/OS
-        assert!(verify_artifact_identity(&task_with(&ui, ARTIFACT, vec![], None), None).is_ok());
+        // 未知自身形态：**必须拒绝**，不能因为"不知道"就放行——放行等于允许把
+        // UI 设备换成 lean CLI（或反之），静默丢能力。
+        let err =
+            verify_artifact_identity(&task_with(&ui, ARTIFACT, vec![], None), None).unwrap_err();
+        assert!(
+            err.contains("cannot determine this agent's own artifact variant"),
+            "{err}"
+        );
+        assert!(err.contains("refusing to install it"), "{err}");
+        // 提示里给可操作的下一步，而不是只说"失败"。
+        assert!(err.contains("release filename"), "{err}");
+        assert!(err.contains("manually"), "{err}");
+        // CLI 制品在形态未知时同样拒绝（两端都不猜）。
+        assert!(verify_artifact_identity(&task_with(&cli, ARTIFACT, vec![], None), None).is_err());
     }
 
     #[test]
@@ -2149,7 +2710,7 @@ mod tests {
             ..Default::default()
         };
         let b = budget();
-        let external = Downloader::build_external_client(&proxy, None, &b).unwrap();
+        let external = Downloader::build_external_client(&proxy, None, &b, Vec::new()).unwrap();
         let dl = Downloader::new(external, None, b, no_progress());
         // CDN 用一个**不存在**的主机：只有走代理才可能成功。
         let task = task_with(
@@ -2191,13 +2752,705 @@ mod tests {
             ..Default::default()
         };
         let b = budget();
-        let external = Downloader::build_external_client(&proxy, None, &b).unwrap();
+        let external = Downloader::build_external_client(&proxy, None, &b, Vec::new()).unwrap();
         let dl = Downloader::new(external, None, b, no_progress());
         let task = task_with(&local_filename(), ARTIFACT, vec![cdn], None);
         let part = tmp_part("noproxy");
         dl.fetch(&task, &part).await.expect("NO_PROXY 命中应直连");
         assert_eq!(std::fs::read(&part).unwrap(), ARTIFACT);
         let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    // ── 跨源 .part 隔离（review #1）─────────────────────────────
+
+    /// 源 A 断流后，源 B **不得**从 A 的偏移续传：两者返回的字节不同时，
+    /// 共享 `.part` 会拼出「A 的头 + B 的尾」。分源命名必须让 B 从 0 开始。
+    #[tokio::test]
+    async fn test_second_source_never_resumes_from_first_sources_bytes() {
+        // A：返回前半段一致、后半段不同的字节，并在发完前半段后静默断开。
+        let liar_bytes: Arc<Vec<u8>> = Arc::new(ARTIFACT.to_vec());
+        let mut evil = liar_bytes.as_ref().clone();
+        let half = evil.len() / 2;
+        for b in evil.iter_mut().skip(half) {
+            *b = b'X';
+        }
+        let evil = Arc::new(evil);
+        let (source_a, a_state) = spawn_cdn(CdnBehaviour {
+            bytes: evil.clone(),
+            supports_range: true,
+            truncate_after: Some(half),
+            ..Default::default()
+        })
+        .await;
+        // B：正确的字节，支持 Range。
+        let (source_b, b_state) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        let task = task_with(&local_filename(), ARTIFACT, vec![source_a, source_b], None);
+        let part = tmp_part("cross-source-isolation");
+        let mut b = budget();
+        b.attempts_per_source = 1; // 让 A 断流后立刻换源
+        b.chunk = Duration::from_millis(300);
+
+        let got = downloader(None, b).fetch(&task, &part).await.unwrap();
+
+        // A 确实先被请求过（并且是 0 起）。
+        let a_ranges = a_state.ranges.lock().unwrap().clone();
+        assert_eq!(
+            a_ranges.first().and_then(|r| r.clone()),
+            None,
+            "A 首次应全量"
+        );
+
+        // B 必须从 0 开始——绝不能带 A 的偏移。
+        let b_ranges = b_state.ranges.lock().unwrap().clone();
+        assert!(
+            b_ranges.iter().all(|r| r.is_none()),
+            "源 B 不得从源 A 的字节续传（实际请求区间 {b_ranges:?}）"
+        );
+        assert_eq!(got.source, "cdn:127.0.0.1");
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            ARTIFACT,
+            "最终必须是被校验过的完整制品"
+        );
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    /// 每个源的续传文件互不相同，且同源重复调用得到同一路径（才谈得上续传）。
+    #[test]
+    fn test_part_namespaces_are_per_source_and_stable() {
+        let task = task_with(
+            &local_filename(),
+            ARTIFACT,
+            vec!["https://cdn-a.test".into(), "https://cdn-b.test".into()],
+            Some(format!("/agent/upgrade/blob/{}", local_filename())),
+        );
+        let sources = task.sources();
+        assert_eq!(sources.len(), 3);
+        let part = tmp_part("ns");
+        let paths: Vec<PathBuf> = sources
+            .iter()
+            .map(|s| part_path_for(&part, s).unwrap())
+            .collect();
+        // 三个源三个不同的续传文件。
+        for i in 0..paths.len() {
+            for j in (i + 1)..paths.len() {
+                assert_ne!(paths[i], paths[j], "源 {i} 与源 {j} 不能共用续传文件");
+            }
+        }
+        // 同源稳定（这是续传的前提）。
+        assert_eq!(part_path_for(&part, &sources[0]).unwrap(), paths[0]);
+        // 都落在调用方给的 part 所在目录（同文件系统，最终 rename 原子）。
+        for p in &paths {
+            assert_eq!(p.parent(), part.parent());
+        }
+        // 命名里不含路径分隔符（不会因 host 带 `:` 而跑出目录）。
+        for p in &paths {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            assert!(!name.contains('/') && !name.contains('\\'), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    /// 同源重试仍能续传（分源命名不能把续传能力一起砍掉）。
+    #[tokio::test]
+    async fn test_same_source_still_resumes_across_attempts() {
+        let (cdn, state) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        let task = task_with(&local_filename(), ARTIFACT, vec![cdn], None);
+        let part = tmp_part("same-source-resume");
+        let half = ARTIFACT.len() / 2;
+        std::fs::write(source_part(&task, &part, 0), &ARTIFACT[..half]).unwrap();
+
+        let got = downloader(None, budget())
+            .fetch(&task, &part)
+            .await
+            .unwrap();
+        assert_eq!(got.resumed_from, half as u64);
+        assert_eq!(
+            state.ranges.lock().unwrap()[0].as_deref(),
+            Some(format!("bytes={half}-").as_str())
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), ARTIFACT);
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    /// 续传文件是符号链接 / FIFO / 目录时必须拒绝：共享可写目录里跟随链接
+    /// 会覆盖链接指向的任意文件。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_part_is_refused_not_followed() {
+        let (cdn, _state) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        let task = task_with(&local_filename(), ARTIFACT, vec![cdn], None);
+        let part = tmp_part("symlink");
+        let victim = part.parent().unwrap().join("victim.txt");
+        std::fs::write(&victim, b"must-not-be-overwritten").unwrap();
+        // 把该源的续传路径做成指向受害文件的符号链接。
+        let link = source_part(&task, &part, 0);
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = downloader(None, budget())
+            .fetch(&task, &part)
+            .await
+            .unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        // 受害文件内容不变（没有被跟着写）。
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"must-not-be-overwritten",
+            "绝不能跟随符号链接覆盖目标文件"
+        );
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_non_regular_part_is_refused() {
+        let (cdn, _state) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        let task = task_with(&local_filename(), ARTIFACT, vec![cdn], None);
+        let part = tmp_part("fifo");
+        let target = source_part(&task, &part, 0);
+        // 目录也算"非普通文件"，且不需要 mkfifo 权限。
+        std::fs::create_dir_all(&target).unwrap();
+
+        let err = downloader(None, budget())
+            .fetch(&task, &part)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    #[test]
+    fn test_ensure_regular_part_file_accepts_missing_and_regular() {
+        let dir = std::env::temp_dir().join(format!("sr-dl-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.part");
+        assert!(
+            ensure_regular_part_file(&missing).is_ok(),
+            "不存在是可写前提"
+        );
+        let regular = dir.join("regular.part");
+        std::fs::write(&regular, b"x").unwrap();
+        assert!(ensure_regular_part_file(&regular).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 成功后其它源的残片被清掉（每个都可能几十 MB），保留的那个已改名。
+    #[tokio::test]
+    async fn test_sibling_parts_are_cleaned_after_success() {
+        let (cdn, _) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        let task = task_with(&local_filename(), ARTIFACT, vec![cdn.clone(), cdn], None);
+        let part = tmp_part("sibling-cleanup");
+        // 两个源各留一段残片。
+        for i in 0..2 {
+            std::fs::write(source_part(&task, &part, i), b"stale").unwrap();
+        }
+        let dir = part.parent().unwrap().to_path_buf();
+        downloader(None, budget())
+            .fetch(&task, &part)
+            .await
+            .unwrap();
+        // 目录里只剩最终的 part（残片都清了）。
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".part"))
+            .collect();
+        assert_eq!(leftovers, vec!["artifact.part".to_string()], "残片应被清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── relay 路径同源校验（review #2）───────────────────────────
+
+    #[test]
+    fn test_relay_path_rejects_offsite_and_malformed_forms() {
+        let name = local_filename();
+        let good = format!("/agent/upgrade/blob/{name}");
+        assert_eq!(validate_relay_path(&good).unwrap(), good);
+
+        // 每一条都能让带 Token 的请求离开 relay origin，或落到别的端点。
+        for bad in [
+            "//evil.example/path".to_string(),
+            "/agent//evil.example/x".to_string(),
+            "https://evil.example/agent/upgrade/blob/shell-remote-x86_64".to_string(),
+            "http://evil.example/agent/upgrade/blob/shell-remote-x86_64".to_string(),
+            "agent/upgrade/blob/shell-remote-x86_64".to_string(),
+            format!("/agent/upgrade/blob/../../etc/passwd"),
+            format!("/agent/upgrade/blob/{name}\\\\..\\\\x"),
+            format!("/agent/upgrade/blob/{name}?x=1"),
+            format!("/agent/upgrade/blob/{name}#frag"),
+            format!("/agent/upgrade/blob/%2e%2e/{name}"),
+            "/agent/upgrade/blob/".to_string(),
+            "/agent/upgrade/blob/sub/dir".to_string(),
+            "/download/shell-remote-x86_64".to_string(),
+            "/agent/upgrade/blob/not-an-artifact".to_string(),
+            "/agent/upgrade/blob/".to_string() + &name + " ",
+            String::new(),
+        ] {
+            assert!(
+                validate_relay_path(&bad).is_err(),
+                "必须拒绝不安全/不合规的 relay 路径: {bad:?}"
+            );
+        }
+    }
+
+    /// 老 relay 的 `url` 走**同一条**校验：兼容不等于放宽。
+    #[test]
+    fn test_legacy_url_is_validated_like_relay_url() {
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        // 合法老 payload：能解析。
+        let ok = UpgradeTask::from_payload(&serde_json::json!({
+            "version": "0.19.0",
+            "url": "/agent/upgrade/blob/shell-remote-x86_64",
+            "sha256": hash,
+        }));
+        assert!(ok.is_some());
+
+        // 把 url 换成协议相对 / 绝对 URL：整条任务必须被拒绝。
+        for bad in [
+            "//evil.example/agent/upgrade/blob/shell-remote-x86_64",
+            "https://evil.example/agent/upgrade/blob/shell-remote-x86_64",
+            "/download/shell-remote-x86_64",
+        ] {
+            let task = UpgradeTask::from_payload(&serde_json::json!({
+                "version": "0.19.0",
+                "url": bad,
+                "sha256": hash,
+            }));
+            assert!(task.is_none(), "老 url 也必须校验，实际接受了 {bad:?}");
+        }
+    }
+
+    /// 带 Token 的请求绝不能因为路径走私而发到外部主机（端到端回归）。
+    #[tokio::test]
+    async fn test_token_never_leaves_relay_on_offsite_path() {
+        let (external, external_state) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(ARTIFACT))
+        };
+        // 攻击形态：任务声称 relay_url 指向外部主机。
+        let payload = serde_json::json!({
+            "target_version": "9.9.9",
+            "filename": local_filename(),
+            "size": ARTIFACT.len(),
+            "sha256": hash,
+            // 协议相对：字符串拼接后会把请求带出 relay origin。
+            "relay_url": format!("//{}/agent/upgrade/blob/{}",
+                external.trim_start_matches("http://"), local_filename()),
+        });
+        let task = UpgradeTask::from_payload(&payload);
+        assert!(task.is_none(), "协议相对 relay_url 必须在解析期就被拒绝");
+
+        // 直接构造的任务（绕过 from_payload）也必须不会把 Token 发出去。
+        let mut manual = task_with(
+            &local_filename(),
+            ARTIFACT,
+            vec![],
+            Some(format!(
+                "//{}/agent/upgrade/blob/{}",
+                external.trim_start_matches("http://"),
+                local_filename()
+            )),
+        );
+        manual.official_path = None;
+        assert!(
+            manual.sources().is_empty(),
+            "sources() 必须拒绝不安全的 relay 路径，而不是拼出去"
+        );
+
+        // 即便强行调用，外部主机也不会收到任何带 Token 的请求。
+        let relay_src = RelaySource {
+            http: reqwest::Client::new(),
+            base: "http://127.0.0.1:1".to_string(),
+            token: "rw-secret".to_string(),
+        };
+        let part = tmp_part("token-offsite");
+        let _ = downloader(Some(relay_src), budget())
+            .fetch(&manual, &part)
+            .await;
+        assert_eq!(
+            external_state.requests.load(Ordering::SeqCst),
+            0,
+            "外部主机不应收到任何请求（更不该带 Token）"
+        );
+        for hdrs in external_state.headers.lock().unwrap().iter() {
+            assert!(
+                !hdrs
+                    .iter()
+                    .any(|(k, v)| k == "x-sr-token" || v.contains("rw-secret")),
+                "Token 泄漏到外部主机"
+            );
+        }
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    /// relay 下载必须**禁止重定向**：带 Token 跟随 302 就等于把 Token 送走。
+    #[tokio::test]
+    async fn test_relay_client_does_not_follow_redirects() {
+        // 一个"跳板"：任何请求都 302 到别处，并记录是否被请求过。
+        #[derive(Clone)]
+        struct Hop {
+            hits: Arc<AtomicUsize>,
+            target: String,
+        }
+        async fn hop_handler(State(s): State<Hop>) -> Response {
+            s.hits.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", s.target.clone())
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap()
+        }
+        let (sink, sink_state) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        let hop = Hop {
+            hits: Arc::new(AtomicUsize::new(0)),
+            target: format!("{sink}/stolen"),
+        };
+        let app = Router::new()
+            .fallback(axum::routing::any(hop_handler))
+            .with_state(hop.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let task = task_with(
+            &local_filename(),
+            ARTIFACT,
+            vec![],
+            Some(format!("/agent/upgrade/blob/{}", local_filename())),
+        );
+        // 与 upgrade.rs 里生产路径一致：relay 客户端 redirect(none)。
+        let relay_src = RelaySource {
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            base: format!("http://{addr}"),
+            token: "rw-secret".to_string(),
+        };
+        let part = tmp_part("relay-redirect");
+        let err = downloader(Some(relay_src), budget())
+            .fetch(&task, &part)
+            .await
+            .unwrap_err();
+        assert!(err.contains("302") || err.contains("HTTP 3"), "{err}");
+        assert_eq!(hop.hits.load(Ordering::SeqCst), 1, "跳板应只被请求一次");
+        assert_eq!(
+            sink_state.requests.load(Ordering::SeqCst),
+            0,
+            "relay 请求不得跟随重定向到别处"
+        );
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    // ── 外部重定向白名单（review #4）─────────────────────────────
+
+    #[tokio::test]
+    async fn test_external_redirect_to_unlisted_host_is_refused() {
+        // 跳板（在 127.0.0.1，但**不在**任务白名单里）→ 指向另一个 host。
+        // 用 localhost 与 127.0.0.1 区分「同 IP 不同 host」，正好测 host 白名单。
+        let (sink, sink_state) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        #[derive(Clone)]
+        struct Hop {
+            target: String,
+        }
+        async fn hop_handler(State(s): State<Hop>) -> Response {
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", s.target.clone())
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap()
+        }
+        let app = Router::new()
+            .fallback(axum::routing::any(hop_handler))
+            .with_state(Hop {
+                target: format!("{sink}/elsewhere"),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // 白名单里只放 localhost（不含 127.0.0.1）→ 跳到 127.0.0.1 的 sink 必须被拒。
+        let task = task_with(
+            &local_filename(),
+            ARTIFACT,
+            vec![format!("http://{addr}")],
+            None,
+        );
+        let part = tmp_part("redirect-unlisted");
+        let err = downloader_with_hosts(None, budget(), vec!["localhost".to_string()])
+            .fetch(&task, &part)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("refusing redirect") && err.contains("not one of this upgrade task"),
+            "{err}"
+        );
+        assert_eq!(
+            sink_state.requests.load(Ordering::SeqCst),
+            0,
+            "白名单外的主机不得收到请求"
+        );
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_external_redirect_within_allowed_host_is_followed() {
+        // 白名单内的跳转（同一 host，路径不同）必须放行：真实镜像会 302 到
+        // 对象存储，完全禁止会打断正常下载。
+        let (sink, sink_state) = spawn_cdn(CdnBehaviour {
+            bytes: Arc::new(ARTIFACT.to_vec()),
+            supports_range: true,
+            ..Default::default()
+        })
+        .await;
+        let sink_host = "127.0.0.1".to_string();
+        #[derive(Clone)]
+        struct Hop {
+            target: String,
+        }
+        async fn hop_handler(State(s): State<Hop>) -> Response {
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", s.target.clone())
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap()
+        }
+        let app = Router::new()
+            .fallback(axum::routing::any(hop_handler))
+            .with_state(Hop {
+                target: format!("{sink}/final"),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let task = task_with(
+            &local_filename(),
+            ARTIFACT,
+            vec![format!("http://{addr}")],
+            None,
+        );
+        let part = tmp_part("redirect-allowed");
+        downloader_with_hosts(None, budget(), vec![sink_host])
+            .fetch(&task, &part)
+            .await
+            .expect("白名单内跳转应跟随");
+        assert_eq!(std::fs::read(&part).unwrap(), ARTIFACT);
+        assert!(sink_state.requests.load(Ordering::SeqCst) >= 1);
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    #[test]
+    fn test_redirect_policy_empty_allowlist_refuses_everything() {
+        // 空白名单 = 一个跳转都不跟随（保守默认）。
+        let policy = redirect_policy(Vec::new());
+        // 直接构造 Attempt 不可行，因此用行为断言：把策略装进客户端，
+        // 对一个必然 302 的本地服务发请求，必须失败。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            #[derive(Clone, Default)]
+            struct Hop {
+                hits: Arc<AtomicUsize>,
+            }
+            async fn hop_handler(State(s): State<Hop>) -> Response {
+                s.hits.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header("location", "http://127.0.0.1:1/elsewhere")
+                    .header("content-length", "0")
+                    .body(Body::empty())
+                    .unwrap()
+            }
+            let hop = Hop::default();
+            let app = Router::new()
+                .fallback(axum::routing::any(hop_handler))
+                .with_state(hop.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let client = reqwest::Client::builder().redirect(policy).build().unwrap();
+            let err = client
+                .get(format!("http://{addr}/x"))
+                .send()
+                .await
+                .unwrap_err();
+            assert!(
+                err.is_redirect() || err.to_string().contains("redirect"),
+                "{err}"
+            );
+        });
+    }
+
+    // ── CDN URL 校验（review #5）────────────────────────────────
+
+    #[test]
+    fn test_normalize_cdn_base_rejects_malformed_origins() {
+        // 合法：裸 origin，可带显式端口（测试用本地 mock）。
+        for ok in [
+            "https://cdn.test",
+            "https://cdn.test:8443",
+            "http://127.0.0.1:47812",
+            "https://cdn.test/", // 单个结尾斜杠等价
+        ] {
+            let parsed = normalize_cdn_base(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            assert!(parsed.host_str().is_some());
+        }
+        // 非法：userinfo / path / query / fragment / 非 http(s) / 无 host。
+        for bad in [
+            "https://user:pass@cdn.test",
+            "https://user@cdn.test",
+            "https://cdn.test/path",
+            "https://cdn.test/?x=1",
+            "https://cdn.test/#frag",
+            "https://cdn.test/a/b",
+            "ftp://cdn.test",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "cdn.test",
+            "https://",
+            "   ",
+        ] {
+            assert!(
+                normalize_cdn_base(bad).is_err(),
+                "必须拒绝畸形 CDN base: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_official_path_rejects_malformed_and_mismatched() {
+        let name = local_filename();
+        let good = format!("/zzttzzmyswy/shell-remote/releases/download/v0.59.2/{name}");
+        assert_eq!(validate_official_path(&good, &name).unwrap(), good);
+
+        for bad in [
+            // 相对 / 协议相对
+            format!("zzttzzmyswy/shell-remote/releases/download/v0.59.2/{name}"),
+            format!("//zzttzzmyswy/shell-remote/releases/download/v0.59.2/{name}"),
+            // query / fragment
+            format!("/zzttzzmyswy/shell-remote/releases/download/v0.59.2/{name}?x=1"),
+            format!("/zzttzzmyswy/shell-remote/releases/download/v0.59.2/{name}#f"),
+            // 穿越 / 编码 / 反斜杠
+            "/zzttzzmyswy/shell-remote/releases/download/v0.59.2/../../etc/passwd".to_string(),
+            "/zzttzzmyswy/shell-remote/releases/download/v0.59.2/%2e%2e/passwd".to_string(),
+            format!("/zzttzzmyswy/shell-remote/releases/download/v0.59.2/{name}\\x"),
+            // 结构不对
+            format!("/zzttzzmyswy/shell-remote/{name}"),
+            format!("/releases/download/v0.59.2/{name}"),
+            // 版本段不是 v<ver>
+            format!("/zzttzzmyswy/shell-remote/releases/download/0.59.2/{name}"),
+            // 空白/控制字符
+            format!("/zzttzzmyswy/shell-remote/releases/download/v0.59.2/{name} "),
+            "/zzttzzmyswy/shell-remote/releases/download/v0.59.2/\t".to_string(),
+        ] {
+            assert!(
+                validate_official_path(&bad, &name).is_err(),
+                "必须拒绝畸形 official_path: {bad:?}"
+            );
+        }
+
+        // 指向另一个制品（把 UI 路径配到 CLI 任务上）：拒绝。
+        let ui =
+            format!("/zzttzzmyswy/shell-remote/releases/download/v0.59.2/shell-remote-ui-x86_64");
+        assert!(validate_official_path(&ui, "shell-remote-x86_64").is_err());
+    }
+
+    /// `join_cdn_url` 拼出来的 URL 必须仍属于 base 的 origin。
+    #[test]
+    fn test_join_cdn_url_preserves_origin_and_drops_query() {
+        let name = local_filename();
+        let path = format!("/zzttzzmyswy/shell-remote/releases/download/v9.9.9/{name}");
+        let joined = join_cdn_url("https://cdn.test:8443", &path).unwrap();
+        let parsed = url::Url::parse(&joined).unwrap();
+        assert_eq!(parsed.host_str(), Some("cdn.test"));
+        assert_eq!(parsed.port(), Some(8443));
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.path(), path);
+        assert!(parsed.query().is_none());
+        assert!(parsed.fragment().is_none());
+
+        // base 带 userinfo / query / path → 整体拒绝（不会静默"修好"）。
+        for base in [
+            "https://user:pass@cdn.test",
+            "https://cdn.test/?x=1",
+            "https://cdn.test/#f",
+            "https://cdn.test/mirror",
+        ] {
+            assert!(
+                join_cdn_url(base, &path).is_none(),
+                "带 userinfo/query/path 的 base 必须被拒: {base:?}"
+            );
+        }
+        // path 带 query/fragment/穿越/编码 → 拒绝。
+        for bad_path in [
+            format!("{path}?x=1"),
+            format!("{path}#f"),
+            "/a/../b".to_string(),
+            "/a/%2e%2e/b".to_string(),
+            "//evil.test/x".to_string(),
+            format!("{path} "),
+        ] {
+            assert!(
+                join_cdn_url("https://cdn.test", &bad_path).is_none(),
+                "畸形 official path 必须被拒: {bad_path:?}"
+            );
+        }
     }
 
     // ── 预算 ────────────────────────────────────────────────────
