@@ -151,8 +151,9 @@
                 <button type="button" id="webview-open-btn" class="btn btn-small" title="打开地址">打开</button>
                 <button type="button" id="webview-refresh-btn" class="btn btn-small" title="重新加载当前页面">刷新</button>
                 <button type="button" id="webview-back-btn" class="btn btn-small" title="返回终端视图">返回终端</button>
+                <span id="webview-mode" class="web-mode-badge hidden" role="status"></span>
             </div>
-            <div class="webview-hint">
+            <div id="webview-hint" class="webview-hint">
                 地址在<strong>远程设备侧</strong>解析，可直接访问设备自身的服务（如 <code>http://127.0.0.1/</code>）
                 或同网段内网地址。仅支持普通静态/轻量页面；复杂 SPA、WebSocket、下载与非 GET 表单不受支持。
             </div>

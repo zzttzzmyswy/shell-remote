@@ -560,6 +560,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_static_handler_sr_web_sw_js() {
+        // MYS-2383-G：Service Worker 与注入脚本同样必须可取到，且必须是
+        // `application/javascript`——SW 的 MIME 不对时浏览器直接拒绝注册
+        // （`Service-Worker-Allowed`/MIME 校验），页面会静默回退到静态模式。
+        for name in ["/sr-web-sw.js", "/sr-web-shim.js"] {
+            let uri = name.parse::<Uri>().unwrap();
+            let resp = static_handler(uri, HeaderMap::new()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{name} 必须可访问");
+            let ctype = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                ctype.contains("javascript"),
+                "{name} 必须以 JS MIME 返回，实际 {ctype}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_static_handler_not_found() {
         let uri = "/nonexistent".parse::<Uri>().unwrap();
         let resp = static_handler(uri, HeaderMap::new()).await;
@@ -612,6 +633,9 @@ mod tests {
             "session.js",
             // MYS-2383-C：会话页「网页」视图（重写器 + WebView 控制器）。
             "webview.js",
+            // MYS-2383-G：网页映射 v2 的 Service Worker 与注入脚本。
+            "sr-web-sw.js",
+            "sr-web-shim.js",
             "install.sh",
         ];
         for name in assets {
@@ -659,6 +683,9 @@ mod tests {
             .route("/session.js", get(static_handler))
             // MYS-2383-C：会话页「网页」视图（WebView 控制器 + 重写器）。
             .route("/webview.js", get(static_handler))
+            // MYS-2383-G：网页映射 v2 的 SW 与注入脚本（scope `/`）。
+            .route("/sr-web-sw.js", get(static_handler))
+            .route("/sr-web-shim.js", get(static_handler))
             .route("/agent/install", get(install_script_handler))
             .route("/agent/install.ps1", get(install_script_ps1_handler))
             .fallback(get(static_handler))
@@ -1852,7 +1879,11 @@ pub async fn start(
         .route("/files.js", get(static_handler))
         .route("/session.js", get(static_handler))
         // MYS-2383-C：网页视图脚本（会话页 <script src="/webview.js">）。
-        .route("/webview.js", get(static_handler));
+        .route("/webview.js", get(static_handler))
+        // MYS-2383-G：网页映射 v2 的 Service Worker（scope `/`）与注入脚本。
+        // 两个路径必须在 SW 的保留列表里——它们是映射之外的文件。
+        .route("/sr-web-sw.js", get(static_handler))
+        .route("/sr-web-shim.js", get(static_handler));
 
     // Admin panel routes — registered only when --admin-path is set. Paths
     // are built at startup from the configured secret prefix; axum parses them

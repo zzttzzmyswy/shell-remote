@@ -1236,6 +1236,32 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
     background: var(--bg-tertiary);
     color: var(--text-secondary);
 }
+/* 模式说明（MYS-2383-G）：v2 完整模式的高亮 + 降级原因提示。
+   降级原因用 warning 色，与状态区的 .warn 一致。 */
+.web-hint-warn {
+    display: inline-block;
+    margin-top: 2px;
+    color: var(--warning);
+}
+.webview-hint-v2 { color: var(--text-secondary); }
+.webview-hint-v2 code { color: var(--accent); }
+/* 模式徽标：状态区前面显示「完整 / 静态」，让用户一眼看出当前能力。 */
+.web-mode-badge {
+    display: inline-block;
+    margin-left: var(--space-2);
+    padding: 0 6px;
+    border-radius: 999px;
+    font-size: 0.68rem;
+    line-height: 1.5;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    vertical-align: middle;
+}
+.web-mode-badge.v2 {
+    color: var(--success);
+    border-color: var(--success);
+}
 /* 状态区：加载中 / 成功 / 失败三态，只用 token 里的颜色。 */
 .web-status {
     padding: 0 var(--space-3);

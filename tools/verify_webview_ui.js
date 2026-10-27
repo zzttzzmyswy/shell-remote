@@ -211,16 +211,29 @@ async function waitPort(port, timeout) {
       : { args: ['--disable-gpu', '--disable-software-rasterizer'] });
     console.log(`（chromium: ${exe || 'playwright 默认'}）`);
 
-    const makePage = async (base, token, perm) => {
+    // `staticMode`：本脚本断言的是**v1 静态模式**的渲染行为（单次 GET 代理 +
+    // HTML/CSS 重写）。MYS-2383-G 起，新 agent + rw + localhost 会自动选中 v2
+    // 完整模式（由 tools/verify_web_map_ui.js 覆盖）。这里用「浏览器不支持
+    // Service Worker」把会话钉在 v1——这是 v2 的一条真实降级路径
+    // （detectMode → reason 'no-service-worker'），不是为了绕过断言。
+    const makePage = async (base, token, perm, staticMode) => {
       const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 } });
-      await ctx.addInitScript(([t, a, p]) => {
+      await ctx.addInitScript(([t, a, p, noSw]) => {
         try {
           sessionStorage.setItem('shell-remote-token', t);
           sessionStorage.setItem('shell-remote-auth', a);
           sessionStorage.setItem('shell-remote-permission', p);
           localStorage.setItem('sr-theme', 'dark');
         } catch (e) {}
-      }, [token, AUTH, perm]);
+        if (noSw) {
+          try {
+            Object.defineProperty(navigator, 'serviceWorker', {
+              get: function () { return undefined; },
+              configurable: false
+            });
+          } catch (e) {}
+        }
+      }, [token, AUTH, perm, !!staticMode]);
       const page = await ctx.newPage();
       page.on('pageerror', (e) => console.log('  · pageerror: ' + e.message));
       await page.goto(`${base}/session`);
@@ -229,7 +242,7 @@ async function waitPort(port, timeout) {
 
     // ── 旧 agent：入口完全不出现 ────────────────────────────────────
     console.log('\n[1] 旧 agent（v0.57.0，无 web:proxy-v1）');
-    const oldPage = await makePage(OLD_BASE, AUTH, 'rw');
+    const oldPage = await makePage(OLD_BASE, AUTH, 'rw', true);
     await oldPage.waitForTimeout(4000);
     check('会话页已连上（终端初始化）',
       await oldPage.$('#terminal-container .xterm') !== null);
@@ -259,7 +272,7 @@ async function waitPort(port, timeout) {
 
     // ── 新 agent：入口出现 ─────────────────────────────────────────
     console.log('\n[2] 新 agent：能力协商与入口');
-    const page = await makePage(BASE, AUTH, 'rw');
+    const page = await makePage(BASE, AUTH, 'rw', true);
     await page.waitForSelector('#terminal-container .xterm', { timeout: 30000 });
     await page.waitForFunction(() => {
       const b = document.getElementById('toggle-web-btn');
@@ -459,7 +472,7 @@ async function waitPort(port, timeout) {
 
     // ── ro token 也能浏览 ────────────────────────────────────────
     console.log('\n[8] 只读 token 浏览');
-    const roPage = await makePage(BASE, AUTH, 'ro');
+    const roPage = await makePage(BASE, AUTH, 'ro', true);
     await roPage.waitForFunction(() => {
       const b = document.getElementById('toggle-web-btn');
       return b && !b.classList.contains('hidden') && !b.disabled;
