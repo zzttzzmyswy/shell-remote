@@ -606,6 +606,10 @@ pub fn build_upstream_headers(
         if lname == "x-sr-token" || lname == "x-auth" || lname.starts_with("x-sr-") {
             continue;
         }
+        // 前置反代（nginx）加的客户端信息头：不把访问者 IP 泄露给内网设备。
+        if lname.starts_with("x-forwarded-") || lname == "x-real-ip" || lname == "forwarded" {
+            continue;
+        }
         let Ok(n) = HeaderName::from_bytes(name.as_str().as_bytes()) else {
             continue;
         };
@@ -1795,6 +1799,10 @@ mod tests {
                 ("cookie", "a=b"),
                 ("authorization", "Bearer z"),
                 ("accept-encoding", "gzip, br"),
+                ("x-forwarded-for", "203.0.113.7"),
+                ("x-forwarded-proto", "https"),
+                ("x-real-ip", "203.0.113.7"),
+                ("forwarded", "for=203.0.113.7"),
             ]),
             false,
         );
@@ -1810,6 +1818,10 @@ mod tests {
             "x-sr-token",
             "x-auth",
             "x-sr-agent-token",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-real-ip",
+            "forwarded",
         ] {
             assert!(out.get(gone).is_none(), "{gone} 应被剥掉: {out:?}");
         }

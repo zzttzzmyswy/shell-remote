@@ -17,9 +17,11 @@
 //!    堵在后面。因此连接表用 `std::sync::Mutex`（临界区里全是哈希操作与
 //!    `try_send`），下行 ack/close 走 [`send_nonblocking`]。
 //! 2. **内存有界**：relay→agent 方向遵守 512 KiB「已发未确认」窗口（超了就
-//!    `Poll::Pending`，`tcp:ack` 唤醒）；agent→relay 方向每连接一个容量 32 的
-//!    队列，读者**整条消息消费完**才回 `tcp:ack` —— 读者不读，agent 的窗口就
-//!    满，背压一路传回目标站。队列溢出视为 agent 违约，中止连接。
+//!    `Poll::Pending`，`tcp:ack` 唤醒）；agent→relay 方向读者**整条消息消费完**
+//!    才回 `tcp:ack` —— 读者不读，agent 的窗口就满，背压一路传回目标站。
+//!    agent 的窗口按**字节**计，小消息可以很多条（WebSocket 小帧、SSE），所以
+//!    读队列按字节记账：排队字节超过窗口（或条数超过 [`MAX_QUEUED_MSGS`]）才
+//!    视为 agent 违约并中止连接。
 //!
 //! # 终态
 //!
@@ -52,8 +54,9 @@ pub const MAX_CHUNK_BYTES: usize = 48 * 1024;
 /// relay→agent 方向「已发未确认」字节上限。与 agent 侧 `WINDOW_BYTES` 一致。
 pub const WINDOW_BYTES: usize = 512 * 1024;
 
-/// 每连接 agent→relay 方向的有界队列容量（条）。
-pub const READ_QUEUE: usize = 32;
+/// 每连接 agent→relay 方向排队消息条数的硬上限（防御违约 agent 用海量空/小
+/// 消息撑爆内存；守约的 agent 受 [`WINDOW_BYTES`] 字节窗口约束）。
+pub const MAX_QUEUED_MSGS: usize = 8192;
 
 /// 每会话同时存在的管道上限。agent 上限 32，relay 留余量到 24：一个页面的
 /// HTTP 连接池（≤6）加若干 WebSocket 足够用，又不会把 agent 的名额顶满。
@@ -145,6 +148,9 @@ struct Shared {
     terminal: bool,
     /// 写路径被窗口/队列挡住时挂在这里；`tcp:ack` 或写任务腾出一格后唤醒。
     waker: Option<Waker>,
+    /// agent→relay 读队列里尚未被读者取走的字节数 / 条数（违约判定用）。
+    queued_bytes: usize,
+    queued_msgs: usize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -161,7 +167,7 @@ fn wake(sh: &mut Shared) {
 /// 浏览器侧，随时可能被 drop）。
 struct Entry {
     session_id: String,
-    read_tx: mpsc::Sender<ReadEvent>,
+    read_tx: mpsc::UnboundedSender<ReadEvent>,
     /// 下行通道：路由路径要发 `tcp:ack` / `tcp:close`，不能为它 await
     /// `agent_broadcast` 的异步锁。
     bulk: mpsc::Sender<String>,
@@ -344,7 +350,7 @@ pub async fn open(
     };
 
     let conn_id = random_conn_id();
-    let (read_tx, read_rx) = mpsc::channel::<ReadEvent>(READ_QUEUE);
+    let (read_tx, read_rx) = mpsc::unbounded_channel::<ReadEvent>();
     let (data_tx, data_rx) = mpsc::channel::<WriteCmd>(WRITE_QUEUE);
     let (opened_tx, opened_rx) = oneshot::channel::<Result<(), OpenError>>();
     let shared = Arc::new(Mutex::new(Shared::default()));
@@ -550,13 +556,20 @@ pub async fn route_agent_message(
                 None => Routed::Violation("malformed tcp:data"),
                 Some((seq, data)) => {
                     let want = entry.read_seq.load(Ordering::Relaxed);
+                    let len = data.len();
                     if seq != want {
                         Routed::Violation("tcp:data seq out of order")
-                    } else if entry.read_tx.try_send(ReadEvent::Data(data)).is_err() {
-                        // 读者消费不动。生产上不会发生：读者不读，agent 的发送
-                        // 窗口早就满了。
-                        Routed::Violation("read queue overflow")
+                    } else if sh.queued_bytes + len > WINDOW_BYTES
+                        || sh.queued_msgs >= MAX_QUEUED_MSGS
+                    {
+                        // 守约的 agent 已发未确认 ≤ 窗口，排队字节不可能超过它。
+                        Routed::Violation("read queue exceeds the agent window")
+                    } else if entry.read_tx.send(ReadEvent::Data(data)).is_err() {
+                        // 读者已不在（TunnelStream 正在 drop）：静默丢弃。
+                        Routed::Handled
                     } else {
+                        sh.queued_bytes += len;
+                        sh.queued_msgs += 1;
                         entry.read_seq.store(want + 1, Ordering::Relaxed);
                         Routed::Handled
                     }
@@ -573,7 +586,7 @@ pub async fn route_agent_message(
                 Routed::Handled
             }
             "tcp:eof" => {
-                let _ = entry.read_tx.try_send(ReadEvent::Eof);
+                let _ = entry.read_tx.send(ReadEvent::Eof);
                 Routed::Handled
             }
             "tcp:closed" => {
@@ -582,7 +595,7 @@ pub async fn route_agent_message(
                     io::ErrorKind::BrokenPipe,
                     "tunnel closed by agent",
                 ));
-                let _ = entry.read_tx.try_send(ReadEvent::Closed);
+                let _ = entry.read_tx.send(ReadEvent::Closed);
                 wake(&mut sh);
                 Routed::Handled
             }
@@ -608,7 +621,7 @@ pub async fn route_agent_message(
                     // open 还在等：直接以 agent 的错误结束，不再等超时。
                     let _ = tx.send(Err(OpenError::Agent { kind, message }));
                 }
-                let _ = entry.read_tx.try_send(ReadEvent::Error(err));
+                let _ = entry.read_tx.send(ReadEvent::Error(err));
                 wake(&mut sh);
                 Routed::Handled
             }
@@ -659,7 +672,7 @@ pub struct TunnelStream {
     bulk: mpsc::Sender<String>,
     shared: Arc<Mutex<Shared>>,
     data_tx: mpsc::Sender<WriteCmd>,
-    read_rx: mpsc::Receiver<ReadEvent>,
+    read_rx: mpsc::UnboundedReceiver<ReadEvent>,
     /// 一条 `tcp:data` 的全部字节。**整条消费完**才回 ack（流控）。
     pending: Vec<u8>,
     pending_pos: usize,
@@ -760,6 +773,11 @@ impl AsyncRead for TunnelStream {
             }
             match this.read_rx.poll_recv(cx) {
                 Poll::Ready(Some(ReadEvent::Data(data))) => {
+                    {
+                        let mut sh = lock(&this.shared);
+                        sh.queued_bytes = sh.queued_bytes.saturating_sub(data.len());
+                        sh.queued_msgs = sh.queued_msgs.saturating_sub(1);
+                    }
                     this.pending_ack = data.len();
                     this.pending = data;
                     this.pending_pos = 0;
@@ -1266,5 +1284,50 @@ mod tests {
         assert_eq!(kind_to_io_kind("invalid"), io::ErrorKind::InvalidInput);
         assert_eq!(kind_to_io_kind("busy"), io::ErrorKind::WouldBlock);
         assert_eq!(kind_to_io_kind("whatever"), io::ErrorKind::Other);
+    }
+
+    /// agent 的窗口按字节计：一批里大量小 `tcp:data`（WebSocket 小帧、SSE）
+    /// 只要总字节在窗口内就必须正常收下（回归：曾按条数 32 判违约）。
+    #[tokio::test]
+    async fn test_many_small_messages_within_byte_window() {
+        let state = make_state();
+        let (sid, mut rx) = setup(&state).await;
+        let (mut stream, conn_id) = open_ok(&state, &sid, &mut rx).await;
+        for seq in 0..64u64 {
+            let m = msg(
+                &sid,
+                "tcp:data",
+                json!({"conn_id": &conn_id, "seq": seq, "data": B64.encode(b"0123456789")}),
+            );
+            feed(&state, &sid, &m).await;
+        }
+        let mut got = vec![0u8; 640];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut got))
+            .await
+            .expect("读取超时")
+            .expect("64 条小消息（640 字节）不应中止管道");
+        assert_eq!(&got[..10], b"0123456789");
+        assert_eq!(state.tcp_tunnels.count_session(&sid), 1);
+    }
+
+    /// 排队字节超过窗口才算违约（agent 无视 ack 狂发）。
+    #[tokio::test]
+    async fn test_read_queue_beyond_window_is_violation() {
+        let state = make_state();
+        let (sid, mut rx) = setup(&state).await;
+        let (mut stream, conn_id) = open_ok(&state, &sid, &mut rx).await;
+        let chunk = B64.encode(vec![7u8; MAX_CHUNK_BYTES]);
+        let n = WINDOW_BYTES / MAX_CHUNK_BYTES + 1;
+        for seq in 0..=n as u64 {
+            let m = msg(
+                &sid,
+                "tcp:data",
+                json!({"conn_id": &conn_id, "seq": seq, "data": &chunk}),
+            );
+            feed(&state, &sid, &m).await;
+        }
+        assert_eq!(state.tcp_tunnels.count_session(&sid), 0, "超窗应中止连接");
+        let mut buf = [0u8; 16];
+        assert!(stream.read(&mut buf).await.is_err());
     }
 }
