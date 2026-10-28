@@ -244,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
 
     let version = env!("CARGO_PKG_VERSION");
     tracing::info!("shell-remote v{}", version);
+    eprintln!("agent pid={}", std::process::id());
 
     match cli.command {
         Command::Relay {

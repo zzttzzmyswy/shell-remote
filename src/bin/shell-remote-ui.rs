@@ -228,6 +228,7 @@ fn main() -> anyhow::Result<()> {
 
     let version = env!("CARGO_PKG_VERSION");
     tracing::info!("shell-remote-ui v{} (view={view:?})", version);
+    eprintln!("agent pid={}", std::process::id());
 
     match cli.command {
         Command::Agent {

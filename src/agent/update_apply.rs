@@ -1399,11 +1399,15 @@ pub fn restore_verdict(
 ///
 /// 退出码语义固定（便于运维脚本判定）：0 成功、2 未动磁盘即放弃、3 已回滚。
 pub fn run(handoff: &Path) -> i32 {
-    match helper_main_with(handoff, true, HelperTimeouts::default()) {
+    let code = match helper_main_with(handoff, true, HelperTimeouts::default()) {
         HelperOutcome::Registered { .. } | HelperOutcome::Delegated => EXIT_REGISTERED,
         HelperOutcome::RolledBack { .. } => EXIT_ROLLED_BACK,
         HelperOutcome::Aborted { .. } => EXIT_ABORTED,
-    }
+    };
+    // 新进程的 tracing 是 non-blocking writer：helper 退出会关闭它的 stderr，
+    // 给 writer 一个短暂收尾窗口，避免换机日志丢失/反复报 Broken pipe。
+    std::thread::sleep(Duration::from_millis(500));
+    code
 }
 
 /// 助手主体（生产超时）。`announce_ready` 为 true 时向 stdout 写就绪帧
