@@ -1258,9 +1258,10 @@ pub enum RollbackIdentity {
     Preserved,
     /// session_id 保住了，但 Token 与交接时不一致。
     ///
-    /// 固定 key 设备的 rw Token 就是 key 本身，只有 `--token-type both` 的
-    /// ro Token 会变；纯临时设备则整套 Token 都会轮换（下面 `tokens_rotated`
-    /// 记录具体原因），旧 Token 的浏览器/API 客户端会掉线，必须重登。
+    /// 正常回滚路径（助手重绑成功）会落到 `Preserved`，不会走到这里；出现
+    /// 这一档说明重绑没能恢复原 Token —— 典型是 relay 全量重启丢了 token
+    /// 映射，此后只能重新签发。面板看到的仍是同一台设备，但旧 Token 的
+    /// 浏览器/API 客户端会掉线，需要重新认证。
     SessionKept,
     /// 连 session_id 都没能保住：relay 不认这份身份（例如 relay 全量重启
     /// 丢了临时 Token）。必须明确报出来，不能算作"原身份回滚成功"。
@@ -1318,19 +1319,24 @@ pub fn identity_matches(
     norm(expected_tokens) == norm(actual_tokens)
 }
 
-/// 回滚后的身份判定（比 [`restore_verdict`] 宽松，但同样不撒谎）。
+/// 回滚后的身份判定。
 ///
-/// 为什么放宽：被拉起的旧版二进制**不认识交接文件**，它只能用原始 argv 做
-/// 一次 fresh 注册。relay 的 fresh 注册（`SessionRegistry::register`）对临时
-/// 设备**必然重新铸造 Token**——只有固定 key 设备的 rw Token 是 key 本身、
-/// 能原样重建。所以"临时设备回滚后 Token 不变"在物理上做不到，"旧版二进制
-/// 回滚后仍保持原 Token"这个要求只能在固定 key 场景成立。
+/// 判定对象是**助手重绑之后**relay 实际持有的身份，不是旧版二进制自己那次
+/// fresh 注册的结果——这一点很容易被误读，所以写清楚：
 ///
-/// 这里如实区分三档，绝不把"sid 回来了但 Token 换了"说成原身份无损：
+/// 旧版二进制不认识交接文件，它启动后只会用原始 argv 做一次 fresh 注册，而
+/// relay 的 fresh 注册对临时设备必然会铸造新 Token。**但这只是中间态**：
+/// 助手随后会用交接里缓存的 `(session_id, tokens)` 做一次 `register_existing`
+/// （见 [`bind_identity`] 与 [`rollback`] 里的顺序说明），把原身份原样绑回。
+/// 所以临时设备回滚后**同样能保住原 Token**，这正是本阶段要的效果；只有当
+/// relay 已经不认这份身份（全量重启丢了 token 表）时才会退化成下面第二/三档。
 ///
-/// - sid 一致 + Token 一致 → `Preserved`；
-/// - sid 一致 + Token 变了 → `SessionKept`（面板看到的还是同一台设备，但
-///   旧 Token 已失效）；
+/// 三档如实区分，绝不把"sid 回来了但 Token 换了"说成原身份无损：
+///
+/// - sid 一致 + Token 一致 → `Preserved`（临时与固定 key 设备在 relay 未失忆
+///   时都应落到这一档）；
+/// - sid 一致 + Token 变了 → `SessionKept`（重绑没能恢复 Token，例如 relay
+///   侧已丢掉旧的 token 映射；面板看到的还是同一台设备，但旧 Token 已失效）；
 /// - sid 都不一致 → `Lost`（relay 不认这份身份）。
 fn rollback_verdict(
     ctx: &RestartContext,

@@ -183,11 +183,18 @@ impl View {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // 换机助手子命令：无界面、无状态面板，直接做完退出。必须在任何视图/
-    // 日志目录初始化之前分流——助手的输出走交接文件同目录的日志。
+    // 换机助手必须在这里分流，**先于任何 tracing 初始化与版本打印**。
+    //
+    // 与 CLI（`src/main.rs`）同一条协议：旧 agent 从助手的 stdout 上只读
+    // 一行，必须是 `ready`。`init_logging()` 默认把 tracing 写到 stdout，
+    // 只要它先跑，第一行就变成 "shell-remote-ui v0.59.2 (view=…)"，旧 agent
+    // 会判定"助手没 ready 就报了别的东西"并放弃整次升级。
+    //
+    // 助手不需要 tracing：它自己的日志走交接文件同目录的 `update-apply.log`
+    // （0600，见 `HelperLog`）。UI 二进制也必须能当助手用，否则用 UI 制品
+    // 升级时助手入口不存在，整条换机链路在 UI 设备上直接缺失。
     if let Command::UpdateApply { handoff } = &cli.command {
         shell_remote::install_panic_hook();
-        let _log_guard = shell_remote::init_logging();
         let code = shell_remote::agent::update_apply::run(std::path::Path::new(handoff));
         std::process::exit(code);
     }

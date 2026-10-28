@@ -50,6 +50,19 @@ impl Drop for TmpDir {
     }
 }
 
+/// 进程级环境变量的测试锁。
+///
+/// `cargo test` 让每个 `#[test]` 跑在独立线程里，但**环境变量是进程全局**的：
+/// 一个用例刚 `set_var(RESTORE_ENV)`，并行跑的另一条就会读到它，于是
+/// "普通启动应返回 Ok(None)" 这类断言会随机失败（本地复现过）。
+/// 所有读写这些变量的用例都先拿这把锁。
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    // 某个用例 panic 会毒化互斥量：这里照常取锁，让后续用例继续跑。
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn sha256_of(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
@@ -313,6 +326,7 @@ fn test_restart_context_new_strips_restore_args() {
 
 #[test]
 fn test_restore_handoff_path_prefers_flag_then_env() {
+    let _env = env_guard();
     // 显式参数优先；没有参数时用环境变量（回滚路径唯一可用的通道）。
     assert_eq!(
         restore_handoff_path(Some("/run/flag.json")),
@@ -420,6 +434,7 @@ fn test_no_rollback_frame_for_a_normal_upgrade() {
 /// 把"我们也回滚了"继承下去，relay 上会出现一串假回滚。
 #[test]
 fn test_rollback_env_is_consumed_by_load() {
+    let _env = env_guard();
     let dir = TmpDir::new("rbenv-once");
     let ctx = sample_ctx(&dir, "up-rbenv-once");
     let path = ctx.write_handoff_into(dir.path()).unwrap();
@@ -1607,6 +1622,59 @@ fn test_rollback_verdict_reports_each_tier_honestly() {
     }
 }
 
+/// 回滚判定看的是**重绑之后** relay 持有的身份，所以**临时设备**也能落到
+/// `Preserved`。这条守着 review 里那个容易误读的点：旧版二进制自己那次 fresh
+/// 注册会轮换 Token，但那只是中间态，助手随后会把原 Token 绑回来。
+///
+/// 若判定改用"旧版自己 fresh 注册的结果"，临时设备会恒为 `SessionKept`，
+/// 实现方就会误以为"临时设备回滚保不住 Token 是必然的"——那正是上一版注释
+/// 的错误结论。
+#[test]
+fn test_temporary_device_reaches_preserved_after_rebind() {
+    let dir = TmpDir::new("rb-rebind");
+    let mut ctx = sample_ctx(&dir, "up-rebind");
+    // 临时设备：没有 --key，整套 Token 都是随机铸的。
+    ctx.fixed_key = None;
+    assert!(ctx.tokens.len() >= 2, "样例应覆盖多 Token（含权限）");
+
+    // 中间态：旧版 fresh 注册后 relay 铸了新 Token —— 此时判 SessionKept。
+    let minted_by_old_binary: Vec<(String, String)> = ctx
+        .tokens
+        .iter()
+        .map(|(_, p)| (format!("minted-{p}"), p.clone()))
+        .collect();
+    assert_eq!(
+        rollback_verdict(&ctx, &ctx.session_id, &minted_by_old_binary),
+        RollbackIdentity::SessionKept,
+        "旧版 fresh 注册后（尚未重绑）Token 必然变，这一档要能识别"
+    );
+
+    // 重绑之后：relay 持有的是交接里的原 Token —— 临时设备同样是 Preserved。
+    assert_eq!(
+        rollback_verdict(&ctx, &ctx.session_id, &ctx.tokens),
+        RollbackIdentity::Preserved,
+        "重绑成功后临时设备必须回到 Preserved，不能因为\"它没有 --key\"就降级"
+    );
+}
+
+/// relay 侧丢掉了旧的 token 映射（全量重启）时，重绑也无法恢复原 Token：
+/// 必须落到 SessionKept 而不是假装成功。
+#[test]
+fn test_rebind_that_cannot_restore_tokens_is_session_kept_not_preserved() {
+    let dir = TmpDir::new("rb-lost-tokens");
+    let ctx = sample_ctx(&dir, "up-losttok");
+    let reissued: Vec<(String, String)> = ctx
+        .tokens
+        .iter()
+        .map(|(_, p)| (format!("reissued-{p}"), p.clone()))
+        .collect();
+    assert_eq!(
+        rollback_verdict(&ctx, &ctx.session_id, &reissued),
+        RollbackIdentity::SessionKept,
+        "Token 没能恢复就不能算 Preserved"
+    );
+}
+
 #[test]
 fn test_merge_verdict_keeps_the_worse_outcome() {
     let lost = RollbackIdentity::Lost { detail: "x".into() };
@@ -1628,6 +1696,7 @@ fn test_merge_verdict_keeps_the_worse_outcome() {
 
 #[test]
 fn test_resolve_restore_is_fail_closed_for_an_explicit_but_broken_path() {
+    let _env = env_guard();
     // 换机助手把我拉起来了（显式 restore），但文件读不出来：必须报错，
     // 绝不能悄悄退化成全新注册（那会让临时设备换掉身份）。
     let dir = TmpDir::new("failclosed");
@@ -1652,6 +1721,7 @@ fn test_resolve_restore_is_fail_closed_for_an_explicit_but_broken_path() {
 
 #[test]
 fn test_resolve_restore_is_a_noop_for_a_normal_start() {
+    let _env = env_guard();
     // 普通启动（没有隐藏参数、也没有环境变量）：保持原行为，返回 Ok(None)。
     std::env::remove_var(RESTORE_ENV);
     assert!(
@@ -1662,6 +1732,7 @@ fn test_resolve_restore_is_a_noop_for_a_normal_start() {
 
 #[test]
 fn test_resolve_restore_loads_a_valid_handoff() {
+    let _env = env_guard();
     let dir = TmpDir::new("resolve-ok");
     let ctx = sample_ctx(&dir, "up-resolve");
     let path = ctx.write_handoff_into(dir.path()).unwrap();
@@ -1675,6 +1746,7 @@ fn test_resolve_restore_loads_a_valid_handoff() {
 
 #[test]
 fn test_failed_handoff_reason_never_leaks_a_token() {
+    let _env = env_guard();
     // 原因会写进 stderr → 助手转存 update-apply.log。不能带 Token。
     let dir = TmpDir::new("reason-nostoken");
     let missing = dir.join("nope.json");
@@ -1972,29 +2044,48 @@ mod real_old_binary {
 
 #[cfg(unix)]
 #[test]
-fn test_real_binary_announces_ready_on_the_first_stdout_line() {
-    let me = std::env::current_exe().unwrap();
-    let dir = std::env::current_dir().unwrap();
-    // 单测二进制在 target/<profile>/deps/ 下，真正的 bin 在上一级。
-    let bin = [
-        dir.join("shell-remote"),
-        dir.join("deps").join("shell-remote"),
-    ]
-    .into_iter()
-    .chain(std::env::current_exe().ok().and_then(|p| {
-        p.parent()
-            .and_then(|d| d.parent())
-            .map(|d| d.join("shell-remote"))
-    }))
-    .find(|p| p.is_file());
-    let Some(bin) = bin else {
-        eprintln!("跳过：找不到 shell-remote 二进制（{}）", me.display());
+fn test_real_binaries_announce_ready_on_the_first_stdout_line() {
+    // CLI 与 UI 用的是**同一条** helper stdout 协议：旧 agent 只读一行，
+    // 必须是 `ready`。两个二进制都必须满足——UI 制品升级时由 UI 二进制
+    // 当助手，只在 CLI 上验过等于没验 UI 那条路。
+    check_binary_ready_line("shell-remote", "CLI");
+    check_binary_ready_line("shell-remote-ui", "UI");
+}
+
+/// 找到同一次构建产出的某个二进制。单测二进制在 `target/<profile>/deps/`
+/// 下，真正的 bin 在上一级；也兼容从仓库根直接跑的情况。
+#[cfg(unix)]
+fn locate_binary(name: &str) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok();
+    let from_exe = std::env::current_exe().ok().and_then(|p| {
+        let deps = p.parent()?;
+        let profile = deps.parent()?;
+        let candidate = profile.join(name);
+        candidate.is_file().then_some(candidate)
+    });
+    from_exe
+        .or_else(|| cwd.as_ref().map(|d| d.join(name)).filter(|p| p.is_file()))
+        .or_else(|| {
+            cwd.as_ref()
+                .map(|d| d.join("deps").join(name))
+                .filter(|p| p.is_file())
+        })
+}
+
+/// 跑一次 `update-apply`，断言 stdout 首行就是 `ready`。
+///
+/// 缺二进制时**打印跳过原因**而不是静默通过：UI 二进制需要 `desktop` 等
+/// feature，lean 构建（`--no-default-features`）根本不会产出它，这时这条
+/// 用例应显式说明"UI 未验证"，不能让人误以为验过了。
+#[cfg(unix)]
+fn check_binary_ready_line(name: &str, label: &str) {
+    let Some(bin) = locate_binary(name) else {
+        eprintln!("跳过 {label} 首行 ready 检查：找不到二进制 {name}（lean 构建不产出 UI）");
         return;
     };
-
-    // 一份"还没有新文件"的交接：助手会在 ready 之后立刻失败，但我们只关心
-    // **第一行**是不是 ready。
-    let tmp = TmpDir::new("ready-line");
+    // 一份"新文件不存在"的交接：助手会在 ready 之后立刻失败，但我们只关心
+    // **第一行**。用不存在的 new_binary 可以让它快速退出，不必等满超时。
+    let tmp = TmpDir::new(&format!("ready-{name}"));
     let mut ctx = sample_ctx(&tmp, "up-ready");
     ctx.old_pid = 0;
     ctx.old_start = None;
@@ -2011,13 +2102,13 @@ fn test_real_binary_announces_ready_on_the_first_stdout_line() {
     assert_eq!(
         first.trim(),
         READY_LINE,
-        "助手的第一行 stdout 必须是 ready —— 否则旧 agent 会把它当成错误并放弃升级。\
-         实际 stdout 前几行: {:?}",
+        "{label}（{name}）的第一行 stdout 必须是 ready —— 否则旧 agent 会把它当成\
+         错误并放弃升级。实际 stdout 前几行: {:?}",
         stdout.lines().take(4).collect::<Vec<_>>()
     );
-    // 顺带确认没有任何日志行混进 stdout 的开头。
+    // 版本号/日志绝不能抢在 ready 前面。
     assert!(
-        !first.contains("shell-remote v"),
-        "日志不得出现在 ready 之前: {first}"
+        !first.contains("shell-remote"),
+        "{label}: 日志不得出现在 ready 之前: {first}"
     );
 }
