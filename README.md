@@ -424,15 +424,15 @@ v1（静态模式）：
 
 ```bash
 # 纯函数单测（node，无框架）：SW 的 URL 判定 / 前缀剥离 / <head> 字节注入 / WebSocket 改写
-node tools/test_sr_web.js
-node tools/test_webview.js
+node tools/verify/test_sr_web.js
+node tools/verify/test_webview.js
 
 # 用真 relay + 真 agent + 只监听 127.0.0.1 的测试 SPA 做端到端验证（无头 Chromium）：
 # SPA 渲染、history 路由、Cookie 登录、整页跳转、302、WebSocket echo 与推送、
 # 绝对地址 fetch、GBK 页面、页面尝试注销 SW、SW 安装后 shell-remote 自身回归、
 # ro / v0.58 / v0.57 三种降级、agent 断线。
 cargo build --bin shell-remote
-xvfb-run -a node tools/verify_web_map_ui.js
+xvfb-run -a node tools/verify/verify_web_map_ui.js
 ```
 
 ## Windows Agent

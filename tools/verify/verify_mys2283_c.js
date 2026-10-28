@@ -8,7 +8,7 @@
 //   4. Windows 路径纯函数断言（page.evaluate）。
 //
 // 用法:
-//   BIN=./target/debug/shell-remote node verify_mys2283_c.js
+//   BIN=./target/debug/shell-remote node tools/verify/verify_mys2283_c.js
 //   （relay/agent 由本脚本自行拉起，端口用 PORT 或默认 3189）
 
 const { chromium } = require('playwright');

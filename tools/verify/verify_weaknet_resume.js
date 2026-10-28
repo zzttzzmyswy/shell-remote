@@ -9,7 +9,7 @@
 //   2) shell PID 与故障前一致（PTY 跨重连存活，正在跑的命令不丢）
 // 并记录恢复耗时。
 //
-// 用法: BIN=./target/debug/shell-remote node tools/verify_weaknet_resume.js
+// 用法: BIN=./target/debug/shell-remote node tools/verify/verify_weaknet_resume.js
 // 依赖: playwright（chromium）、可访问 jsdelivr CDN（xterm）。
 const { chromium } = require('playwright');
 const { spawn } = require('child_process');

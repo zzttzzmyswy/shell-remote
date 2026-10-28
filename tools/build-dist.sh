@@ -104,7 +104,8 @@ done
 # 提权窗口/多数弹窗(360 等)。UAC 安全桌面本身仍需服务级组件(后续)。
 # 仅 UI 二进制需要（桌面键鼠注入）；CLI 二进制不嵌入。
 echo "== embedding windows manifest (UI only) =="
-x86_64-w64-mingw32-windres "$ROOT/build/embed-manifest.rc" -O coff -o "$ROOT/build/agent_manifest.o"
+x86_64-w64-mingw32-windres -I "$ROOT/windows" "$ROOT/windows/embed-manifest.rc" \
+  -O coff -o "$CACHE/agent_manifest.o"
 WIN_AOM_DIR="$CACHE/libaom-x86_64-pc-windows-gnu"
 WIN_LIBXAOM=()
 if [ -d "$WIN_AOM_DIR" ]; then
@@ -121,7 +122,7 @@ fi
 # 的动态导入库 libstdc++-6.dll.a → exe 运行时报"找不到 libstdc++-6.dll"
 # （用户实拍 MYS-886）。-static-libstdc++ + 打包的静态 libstdc++.a 双保险。
 WIN_STD="$CACHE/shell-remote-x86_64"
-RUSTFLAGS="-C link-args=$ROOT/build/agent_manifest.o -C target-feature=+crt-static \
+RUSTFLAGS="-C link-args=$CACHE/agent_manifest.o -C target-feature=+crt-static \
 -C link-arg=-L$WIN_STD -C link-arg=-static-libstdc++" \
   env "${WIN_LIBXAOM[@]}" \
   cargo build --release --bin shell-remote-ui \

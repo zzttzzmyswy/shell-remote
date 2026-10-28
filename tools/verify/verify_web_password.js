@@ -2,7 +2,7 @@
 // 服务器密码（relay --auth）守卫验证：真实 relay + agent + 无头 Chromium。
 // 校验：登录页必须填服务器密码；密码错 → 回登录页并提示；密码对 → 进入会话；
 // 管理后台密码 / 会话密钥不能当服务器密码用；MCP 仍需服务器密码。
-// 用法: BIN=./target/debug/shell-remote node tools/verify_web_password.js
+// 用法: BIN=./target/debug/shell-remote node tools/verify/verify_web_password.js
 const { chromium } = require('playwright');
 const { spawn } = require('child_process');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

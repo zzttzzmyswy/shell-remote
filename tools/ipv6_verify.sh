@@ -38,7 +38,7 @@ if ! python3 -c "import socket; s=socket.socket(socket.AF_INET6); s.bind(('::1',
 
 # 1) 动态画面（四象限字符块）
 BQ="$WORKDIR/bench_draw_quad"
-gcc -O2 -o "$BQ" tools/bench_draw_quad.c -lX11 2>"$WORKDIR/gcc.log" || {
+gcc -O2 -o "$BQ" tools/bench/bench_draw_quad.c -lX11 2>"$WORKDIR/gcc.log" || {
   echo "FAIL: 编译 bench_draw_quad.c 失败"; tail -3 "$WORKDIR/gcc.log"; exit 1; }
 DISPLAY="$DISPLAY_NUM" "$BQ" 18 >/dev/null 2>&1 & BQ_PID=$!
 sleep 1

@@ -37,7 +37,7 @@ agent  ──POST(/agent/send) + WS(/agent/ws/send，仅桌面视频)───�
 
 测试脚本见第 6 节。"旧版"= `origin/master`（v0.53.1，cd5c866），"新版"= 本分支。
 
-### 3.1 终端会话续接（`tools/verify_weaknet_resume.js`，真实 relay + agent + 无头 Chromium）
+### 3.1 终端会话续接（`tools/verify/verify_weaknet_resume.js`，真实 relay + agent + 无头 Chromium）
 
 | 故障 | 旧版 | 新版 |
 |---|---|---|
@@ -106,7 +106,7 @@ agent  ──POST(/agent/send) + WS(/agent/ws/send，仅桌面视频)───�
 | 会话密钥 | agent `--key` / 随机 token | 单个会话的终端/文件/桌面 | `Authorization: Bearer` |
 | 管理后台账号密码 | relay `--admin-user/--admin-pass` | 管理后台 | Cookie 登录 |
 
-v0.53.1 起登录页虽有"服务器密码"输入框，但前端从未发送、浏览器接口也不校验，Web 页面实际只靠会话密钥；v0.54.0 误删了该输入框，v0.54.1 补上真实校验：浏览器接口先验服务器密码（失败返回 `AUTH_INVALID_PASSWORD`），再验会话密钥。验证见 `tools/verify_web_password.js`。
+v0.53.1 起登录页虽有"服务器密码"输入框，但前端从未发送、浏览器接口也不校验，Web 页面实际只靠会话密钥；v0.54.0 误删了该输入框，v0.54.1 补上真实校验：浏览器接口先验服务器密码（失败返回 `AUTH_INVALID_PASSWORD`），再验会话密钥。验证见 `tools/verify/verify_web_password.js`。
 
 ## 6. 复现与回归
 
@@ -117,11 +117,11 @@ Xvfb :99 & cargo test
 
 # 终端续接端到端（relay kill -9 + 半开黑洞 70s），需 playwright + chromium
 cargo build --no-default-features
-BIN=./target/debug/shell-remote node tools/verify_weaknet_resume.js
+BIN=./target/debug/shell-remote node tools/verify/verify_weaknet_resume.js
 
 # 多 agent 高频并发注册冒烟（40 agent：冷启动 / relay 重启 / 5×10 抖动 / 20s 保持）
 BIN=./target/debug/shell-remote tools/concurrent_register_smoke.sh
 
 # 服务器密码守卫（登录流程 + MCP，需 playwright）
-BIN=./target/debug/shell-remote node tools/verify_web_password.js
+BIN=./target/debug/shell-remote node tools/verify/verify_web_password.js
 ```

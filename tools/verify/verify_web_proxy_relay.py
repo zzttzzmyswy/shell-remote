@@ -19,7 +19,7 @@ agent 用 `--key` 固定密钥启动，因此 rw token 就是该密钥、ro 侧�
   7. 并发上限：同会话 8 个在途 → 第 9 个 429。
   8. agent 断线：ticket 撤销（403）、代理返回 503、在途请求结束。
 
-用法（先构建）：cargo build --bin shell-remote && python3 tools/verify_web_proxy_relay.py
+用法（先构建）：cargo build --bin shell-remote && python3 tools/verify/verify_web_proxy_relay.py
 环境变量：BIN / RELAY_PORT / SITE_PORT / RELAY_PASSWORD。
 """
 
@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.environ.get("BIN", os.path.join(ROOT, "target", "debug", "shell-remote"))
 RELAY_PORT = int(os.environ.get("RELAY_PORT", "18820"))
 SITE_PORT = int(os.environ.get("SITE_PORT", "18821"))

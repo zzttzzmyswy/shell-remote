@@ -12,7 +12,7 @@
 //
 // 用法（先构建）：
 //   cargo build --bin shell-remote
-//   xvfb-run -a node tools/verify_web_map_ui.js
+//   xvfb-run -a node tools/verify/verify_web_map_ui.js
 //
 // 环境变量：BIN / V057_BIN / V058_BIN / RW_PORT / RO_PORT / OLD_PORT /
 // ANCIENT_PORT / SITE_PORT / OUT。
@@ -45,7 +45,7 @@ function hasCap(bin, cap) {
   }
 }
 
-const ROOT = path.dirname(path.dirname(fs.realpathSync(__filename)));
+const ROOT = path.dirname(path.dirname(path.dirname(fs.realpathSync(__filename))));
 const BIN = process.env.BIN || path.join(ROOT, 'target', 'debug', 'shell-remote');
 // 旧二进制按能力字符串分类（不是按文件名）：v0.58.0 只声明 web:proxy-v1，
 // v0.57.0 什么网页能力都不声明，本仓库新构建声明 net:tcp-v1。

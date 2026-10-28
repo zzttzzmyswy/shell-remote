@@ -9,7 +9,7 @@
 #   bitrate > 0 → PASS/FAIL 报告 → cleanup
 #
 # 用法:
-#   tools/bench_top4_verify.sh
+#   tools/bench/bench_top4_verify.sh
 # 环境: DISPLAY_NUM=:98（需已起 Xvfb）、BIN/PORT/ADMIN_*/KEY/SID 同其它验收脚本
 set -u
 BIN="${BIN:-./target/debug/shell-remote}"
@@ -44,8 +44,8 @@ if ! DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1; then echo "FAIL: Xvfb ${DI
 #    字体，xterm/top 起不来；bench_draw_quad.c 模拟 4 个 0.1s 刷新的动态
 #    终端，整体熵 ≈ 连续刷新终端）。
 BQ="$WORKDIR/bench_draw_quad"
-if ! gcc -O2 -o "$BQ" tools/bench_draw_quad.c -lX11 2>"$WORKDIR/gcc.log"; then
-  echo "FAIL: 编译 tools/bench_draw_quad.c 失败（看 $WORKDIR/gcc.log）"
+if ! gcc -O2 -o "$BQ" tools/bench/bench_draw_quad.c -lX11 2>"$WORKDIR/gcc.log"; then
+  echo "FAIL: 编译 tools/bench/bench_draw_quad.c 失败（看 $WORKDIR/gcc.log）"
   tail -3 "$WORKDIR/gcc.log"; exit 1
 fi
 DISPLAY="$DISPLAY_NUM" "$BQ" 18 >/dev/null 2>&1 &
