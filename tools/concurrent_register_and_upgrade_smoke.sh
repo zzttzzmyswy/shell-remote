@@ -175,7 +175,21 @@ fire_upgrades() { # $@ = session ids
 }
 
 # 进程数：同名二进制必须恰好是"每台设备一个"，不能因为换机留下双进程。
-proc_count() { pgrep -fc "shell-remote agent .*--session-id cusag" 2>/dev/null || echo 0; }
+proc_count() { python3 - "$WORKDIR" "$N" <<'PY'
+import os,re,sys
+work,n=sys.argv[1],int(sys.argv[2])
+pids=set()
+for i in range(1,n+1):
+    try:
+        text=open(os.path.join(work,f'agent{i}.log')).read()
+    except FileNotFoundError:
+        continue
+    found=re.findall(r'agent pid=(\d+)',text)
+    if found:
+        pids.add(found[-1])
+print(len(pids))
+PY
+}
 
 [ -x "$BIN" ] || { echo "FAIL: 无二进制 $BIN"; exit 1; }
 curl -s -o /dev/null "$BASE/" && { echo "FAIL: 端口 $PORT 被占用"; exit 1; }
@@ -348,7 +362,7 @@ for _ in $(seq 1 120); do
     old_alive_after="yes"
   else
     old_alive_after=""
-    p="$(pgrep -f "shell-remote agent .*--session-id $UPG_SID" | head -1)"
+    p="$(agent_pid_for "$UPG_IDX")"
     if [ -n "$p" ] && [ "$p" != "$OLD_PID" ]; then new_pid="$p"; break; fi
   fi
   sleep 1
@@ -411,7 +425,7 @@ api /api/agent/upgrade -X POST -H 'Content-Type: application/json' \
 new2=""
 for _ in $(seq 1 120); do
   if ! kill -0 "$OLD2_PID" 2>/dev/null; then
-    p="$(pgrep -f "shell-remote agent .*--session-id $UPG2_SID" | head -1)"
+    p="$(agent_pid_for "$UPG2_IDX")"
     if [ -n "$p" ] && [ "$p" != "$OLD2_PID" ]; then new2="$p"; break; fi
   fi
   sleep 1

@@ -243,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
     let _log_guard = shell_remote::init_logging();
 
     let version = env!("CARGO_PKG_VERSION");
-    tracing::info!("shell-remote v{}", version);
+    tracing::info!(pid = std::process::id(), "shell-remote v{} agent pid={}", version, std::process::id());
 
     match cli.command {
         Command::Relay {
