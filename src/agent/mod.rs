@@ -1321,17 +1321,54 @@ async fn run_session(
     // `registered` 标记。助手没收到标记就会回滚——所以这一步必须紧跟在注册
     // 成功之后，排在任何可能失败的后续初始化（PTY、桌面、代理）之前。
     if let Some(r) = restored {
-        // 恢复来的 id 与本进程注册到的 id 不一致说明 relay 没认这个身份
-        // （比如 relay 重启后临时 Token 全失效）。此时仍然算注册成功——设备
-        // 在线比身份一致更重要——但必须留痕，否则"升级后 ID 变了"无从解释。
-        if !r.restore.session_id.is_empty() && r.restore.session_id != client.session_id {
-            tracing::warn!(
-                expected = %r.restore.session_id,
-                actual = %client.session_id,
-                "the relay did not accept the handed-over identity; this device now has a new one"
-            );
+        // 只有**身份真的回到原样**才允许上报 `registered`。
+        //
+        // 之前这里是"id 不一致只 warn，然后照样 complete()"：relay 失忆或
+        // 拒绝这份身份时，临时设备已经拿到全新的 session_id/Token，助手却
+        // 收到成功回执、删掉备份——把"设备变成了另一台"记成升级成功。
+        //
+        // 现在按 [`restore_verdict`] 判定：
+        // - 完整一致 → 成功；
+        // - 固定 key 设备保住 sid、Token 被 relay 重签 → 允许成功但记 warn
+        //   （Token 由 key 派生，身份仍是同一台；旧 Token 的浏览器会掉线）；
+        // - 其余（尤其纯临时设备换了 sid 或 Token）→ 不消费交接文件、
+        //   不上报 registered，直接结束会话让助手按超时/提前退出回滚。
+        let mut accepted = false;
+        match crate::agent::update_apply::restore_verdict(
+            r.restore.fixed_key.as_deref(),
+            &r.restore.session_id,
+            &r.restore.tokens,
+            &client.session_id,
+            &client.tokens,
+        ) {
+            Ok(crate::agent::update_apply::RollbackIdentity::Preserved) => {
+                accepted = true;
+            }
+            Ok(verdict) => {
+                tracing::warn!(
+                    expected = %r.restore.session_id,
+                    actual = %client.session_id,
+                    verdict = ?verdict,
+                    "the original session id was preserved but the relay re-issued its tokens; \
+                     browsers holding the old tokens are logged out"
+                );
+                accepted = true;
+            }
+            Err(e) => {
+                tracing::error!(
+                    expected = %r.restore.session_id,
+                    actual = %client.session_id,
+                    error = %e,
+                    "the relay did not accept the handed-over identity; refusing to report a successful upgrade"
+                );
+                // 不消费交接文件、不写 registered 标记：助手要么等超时，
+                // 要么看到本进程退出，两条路都会走有界回滚。
+                anyhow::bail!("upgrade identity not restored: {e}");
+            }
         }
-        r.complete();
+        if accepted {
+            r.complete();
+        }
     }
 
     // 把实际 session id 与 token 写入共享状态（TUI 展示；token 刷新后在此更新）。
@@ -1348,7 +1385,11 @@ async fn run_session(
     // 回滚后的重启：把失败原因送回 relay。否则管理界面只会看到一个
     // "升级过、版本却没变"的状态，运维无从判断是没升成还是又退了回来。
     if let Some(r) = restored {
-        if let Some(frame) = r.progress_frame(&client.session_id) {
+        // 成功 → `registered` 终结帧；回滚重启 → `rolled_back` + 原因。
+        let frame = r
+            .registered_frame(&client.session_id)
+            .or_else(|| r.progress_frame(&client.session_id));
+        if let Some(frame) = frame {
             let _ = control_tx.send(frame).await;
         }
     }
@@ -2889,6 +2930,10 @@ async fn run_session(
                                             // 换机要交接**完整**身份：`--token-type ro/both`
                                             // 的设备升级后权限必须一模一样，只交 rw 会悄悄提权。
                                             ctx.tokens = client.tokens.clone();
+                                            // 回滚要用它把身份拉回原会话：旧版二进制
+                                            // 不认识交接文件，但它认识自己的 `--key`。
+                                            ctx.fixed_key = key.clone();
+                                            ctx.token_type = token_type.to_string();
                                             // 助手是本二进制的隐藏子命令，路径就是 target 自己。
                                             ctx.helper_exe = ctx.target.clone();
                                             tokio::spawn(async move {

@@ -133,6 +133,10 @@ pub struct UpgradeRestore {
     pub tokens: Vec<(String, String)>,
     /// 注册响应里的实际 session id。
     pub session_id: String,
+    /// 该设备的固定 `--key`（有则说明身份可由 key 重建）。用于区分
+    /// "固定 key 可以合法恢复 sid、只是 Token 被重签"与"纯临时设备身份
+    /// 不可恢复"这两种情况。
+    pub fixed_key: Option<String>,
     /// 本次换机的 upgrade_id（回执与管理界面对账用）。
     pub upgrade_id: String,
     /// 目标版本。

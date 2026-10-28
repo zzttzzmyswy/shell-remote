@@ -61,6 +61,10 @@ pub struct UpgradeContext {
     /// rw Token：**只**用于 relay 镜像与代解析，绝不出现在外部 CDN 请求里。
     pub token: String,
     pub session_id: String,
+    /// 原始 `--key`（固定 key 设备才有）。回滚时用它把身份拉回原会话。
+    pub fixed_key: Option<String>,
+    /// 原始 `--token-type`（rw / ro / both），回滚用 `--key` 重建权限用。
+    pub token_type: String,
     /// 注册响应里的完整 tokens（`(token, permission)`）。换机时交接给新进程，
     /// 让它以**原权限**恢复身份——只交接 rw 会把 `--token-type ro/both` 的
     /// 设备在升级后悄悄提权或降权。
@@ -128,6 +132,8 @@ impl UpgradeContext {
             },
             token,
             session_id,
+            fixed_key: None,
+            token_type: "rw".to_string(),
             ctrl_tx,
             // 默认助手就是自己：`update-apply` 是本二进制里的隐藏子命令。
             helper_exe: target.clone(),
@@ -279,6 +285,14 @@ fn hand_over_to_helper(
     let restart = update_apply::RestartContext::new(
         ctx.session_id.clone(),
         tokens,
+        // 固定 key 与 token-type 只用于**回滚**：旧版二进制不认识交接文件，
+        // 但它认识自己的 `--key`；`--token-type both` 的 ro Token 也必须按
+        // 原样重建，否则回滚后权限悄悄缩水。
+        ctx.fixed_key.clone(),
+        ctx.token_type.clone(),
+        // relay 端点：回滚时助手要替旧版把身份绑回 relay。
+        Some(ctx.relay_base.clone()),
+        ctx.relay_insecure,
         raw_argv,
         ctx.target.clone(),
         artifact.to_path_buf(),
@@ -1003,6 +1017,10 @@ mod tests {
         let restart = update_apply::RestartContext::new(
             ctx.session_id.clone(),
             ctx.handoff_tokens(),
+            None,
+            "rw".to_string(),
+            None,
+            false,
             vec![
                 std::ffi::OsString::from("agent"),
                 std::ffi::OsString::from("--upgrade-restore"),

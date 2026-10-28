@@ -87,6 +87,11 @@ fn sample_ctx(dir: &TmpDir, upgrade_id: &str) -> RestartContext {
             ("rw-token-abc".to_string(), "rw".to_string()),
             ("ro-token-def".to_string(), "ro".to_string()),
         ],
+        // 默认按"临时设备"造样例：没有 --key，这是身份最难保住的一档。
+        fixed_key: None,
+        token_type: "both".to_string(),
+        relay_base: None,
+        relay_insecure: false,
         argv: vec![
             OsString::from("agent"),
             OsString::from("--relay-url"),
@@ -292,6 +297,10 @@ fn test_restart_context_new_strips_restore_args() {
     let rebuilt = RestartContext::new(
         ctx.session_id.clone(),
         ctx.tokens.clone(),
+        None,
+        "both".to_string(),
+        None,
+        false,
         ctx.argv.clone(),
         ctx.target_path.clone(),
         ctx.new_binary.clone(),
@@ -307,22 +316,31 @@ fn test_restore_handoff_path_prefers_flag_then_env() {
     // 显式参数优先；没有参数时用环境变量（回滚路径唯一可用的通道）。
     assert_eq!(
         restore_handoff_path(Some("/run/flag.json")),
-        Some(PathBuf::from("/run/flag.json"))
+        Ok(Some(PathBuf::from("/run/flag.json")))
     );
     std::env::set_var(RESTORE_ENV, "/run/env.json");
     assert_eq!(
         restore_handoff_path(None),
-        Some(PathBuf::from("/run/env.json")),
+        Ok(Some(PathBuf::from("/run/env.json"))),
         "没有显式参数时必须能用环境变量恢复（回滚路径）"
     );
     assert_eq!(
         restore_handoff_path(Some("/run/flag.json")),
-        Some(PathBuf::from("/run/flag.json")),
+        Ok(Some(PathBuf::from("/run/flag.json"))),
         "显式参数优先于环境变量"
     );
     std::env::remove_var(RESTORE_ENV);
-    assert_eq!(restore_handoff_path(None), None, "普通启动没有任何恢复信息");
-    assert_eq!(restore_handoff_path(Some("")), None, "空参数等于没有");
+    assert_eq!(
+        restore_handoff_path(None),
+        Ok(None),
+        "普通启动没有任何恢复信息"
+    );
+    // 显式给了 `--upgrade-restore ""` = 调用方要求恢复但没给路径：必须报错，
+    // 不能当作"普通启动"（那会让临时设备静默换身份）。
+    assert!(
+        restore_handoff_path(Some("")).is_err(),
+        "空的显式恢复参数必须 fail-closed"
+    );
 }
 
 #[test]
@@ -350,8 +368,10 @@ fn test_restored_identity_rejects_unusable_handoff() {
     ctx.tokens.clear();
     let path = ctx.write_handoff_into(dir.path()).unwrap();
     // 写入时故意清空 tokens 会被 from_file 拒绝——这本身就是正确的防线。
-    let loaded = RestoredIdentity::load(&path);
-    assert!(loaded.is_none(), "无 tokens 的交接文件必须被拒绝");
+    assert!(
+        RestoredIdentity::load(&path).is_err(),
+        "无 tokens 的交接文件必须被拒绝（fail-closed，不能退化成全新注册）"
+    );
 }
 
 #[test]
@@ -745,7 +765,7 @@ fn test_helper_rolls_back_when_the_new_process_exits_without_registering() {
 
     let outcome = helper_main(&handoff, false);
     let reason = match &outcome {
-        HelperOutcome::RolledBack { reason } => reason.clone(),
+        HelperOutcome::RolledBack { reason, .. } => reason.clone(),
         other => panic!("注册失败必须回滚，实际: {other:?}"),
     };
     assert!(
@@ -788,7 +808,7 @@ fn test_helper_rolls_back_when_the_new_process_hangs() {
         started.elapsed()
     );
     match &outcome {
-        HelperOutcome::RolledBack { reason } => {
+        HelperOutcome::RolledBack { reason, .. } => {
             assert!(reason.contains("no registration"), "{reason}")
         }
         other => panic!("不注册就必须回滚，实际: {other:?}"),
@@ -1174,9 +1194,9 @@ esac
     /// stderr 必须有人一直读：relay 会持续写日志，管道写满（64KB）之后它会
     /// **阻塞在 write 上**，注册请求随之挂死——测试会从"几秒"变成"几分钟"，
     /// 而且失败原因完全看不出来。所以起一个排水线程读到 EOF。
-    struct TestRelay {
+    pub(super) struct TestRelay {
         child: std::process::Child,
-        base: String,
+        pub(super) base: String,
         _drain: std::thread::JoinHandle<()>,
     }
 
@@ -1184,7 +1204,7 @@ esac
         /// 二进制路径：`CARGO_BIN_EXE_*` 只在**集成测试**（tests/）里编译期
         /// 可用，lib 单测里必须运行时找。用 `current_exe` 的兄弟目录推：
         /// 单测二进制在 `target/<profile>/deps/`，发布二进制在上一级。
-        async fn start() -> Option<Self> {
+        pub(super) async fn start() -> Option<Self> {
             let me = std::env::current_exe().ok()?;
             let dir = me.parent()?;
             let candidates = [
@@ -1266,6 +1286,45 @@ esac
         }
     }
 
+    /// 读某个会话当前在 relay 上的 Token 集合。
+    ///
+    /// 用**管理面板**的 overview：agent 侧没有"查自己 Token"的接口，测试里
+    /// 也不该为此新增一个。这里直接用一份新的注册响应来读——注册响应本身就
+    /// 携带该 session 当前的 tokens（`register_existing` 原样返回）。
+    pub(super) async fn session_tokens(
+        client: &reqwest::Client,
+        relay: &TestRelay,
+        sid: &str,
+    ) -> Vec<(String, String)> {
+        let resp: serde_json::Value = client
+            .post(format!("{}/agent/send", relay.base))
+            .json(&serde_json::json!({
+                "type": "agent:register",
+                "session_id": sid,
+                "token_type": "rw",
+                "agent_version": "0.0.0-probe",
+            }))
+            .send()
+            .await
+            .expect("probe register must succeed")
+            .json()
+            .await
+            .expect("probe response must be JSON");
+        resp["payload"]["tokens"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|t| {
+                        (
+                            t["token"].as_str().unwrap_or("").to_string(),
+                            t["permission"].as_str().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// 从真 relay 的注册响应里读一个会话的 (tokens)。
     async fn register(client: &reqwest::Client, base: &str, sid: &str) -> Vec<String> {
         let resp: serde_json::Value = client
@@ -1334,6 +1393,10 @@ esac
                 .iter()
                 .map(|t| (t.clone(), "rw".to_string()))
                 .collect(),
+            fixed_key: None,
+            token_type: "rw".to_string(),
+            relay_base: Some(relay.base.clone()),
+            relay_insecure: false,
             // 原始参数里带空格和引号：验证参数交接不做 shell 插值。
             argv: vec![
                 OsString::from("agent"),
@@ -1431,4 +1494,530 @@ esac
             libc::kill(new_pid as i32, libc::SIGKILL);
         }
     }
+}
+
+// ── 11. 身份判定策略（review 第 2 条）──────────────────────────────
+//
+// 契约是"原身份重注册"，所以判定必须分清三档，不能把任何一档混成成功。
+
+#[test]
+fn test_identical_identity_is_preserved() {
+    let toks = vec![
+        ("rw-1".to_string(), "rw".to_string()),
+        ("ro-2".to_string(), "ro".to_string()),
+    ];
+    // 顺序不同也算一致（relay 不保证顺序）。
+    let reordered = vec![
+        ("ro-2".to_string(), "ro".to_string()),
+        ("rw-1".to_string(), "rw".to_string()),
+    ];
+    assert!(identity_matches("s1", &toks, "s1", &reordered));
+    assert_eq!(
+        restore_verdict(None, "s1", &toks, "s1", &reordered),
+        Ok(RollbackIdentity::Preserved)
+    );
+}
+
+#[test]
+fn test_permission_shrink_is_not_identity_preserved() {
+    // `--token-type both` 丢了 ro Token：Token 集合变了，不能算一致。
+    let expected = vec![
+        ("rw-1".to_string(), "rw".to_string()),
+        ("ro-2".to_string(), "ro".to_string()),
+    ];
+    let actual = vec![("rw-1".to_string(), "rw".to_string())];
+    assert!(!identity_matches("s1", &expected, "s1", &actual));
+    // 纯临时设备：sid 相同但 Token 少了 → 拒绝（没有 key 可重建身份）。
+    assert!(restore_verdict(None, "s1", &expected, "s1", &actual).is_err());
+}
+
+#[test]
+fn test_escalation_is_not_identity_preserved() {
+    // ro 设备多出 rw Token 属于提权，更不能放过。
+    let expected = vec![("ro-1".to_string(), "ro".to_string())];
+    let actual = vec![
+        ("ro-1".to_string(), "ro".to_string()),
+        ("rw-2".to_string(), "rw".to_string()),
+    ];
+    assert!(restore_verdict(None, "s1", &expected, "s1", &actual).is_err());
+}
+
+#[test]
+fn test_temporary_device_with_new_sid_is_rejected() {
+    // relay 失忆（临时 Token 全失效）→ 临时设备拿到新 sid：必须判失败，
+    // 否则设备已经变成另一台，而助手还会删备份、记成升级成功。
+    let expected = vec![("rw-1".to_string(), "rw".to_string())];
+    let actual = vec![("rw-new".to_string(), "rw".to_string())];
+    let err = restore_verdict(None, "old1", &expected, "brandnew2", &actual)
+        .expect_err("临时设备换 sid 必须拒绝");
+    assert!(err.contains("did not accept"), "{err}");
+    assert!(err.contains("old1") && err.contains("brandnew2"), "{err}");
+}
+
+#[test]
+fn test_fixed_key_device_may_keep_sid_with_rotated_tokens() {
+    // 固定 key 设备：sid 回到原值、Token 被 relay 重签。身份仍是同一台
+    // （Token 由 key 派生），允许成功但必须标注为 SessionKept。
+    let expected = vec![
+        ("mykey".to_string(), "rw".to_string()),
+        ("ro-old".to_string(), "ro".to_string()),
+    ];
+    let actual = vec![
+        ("mykey".to_string(), "rw".to_string()),
+        ("ro-new".to_string(), "ro".to_string()),
+    ];
+    assert_eq!(
+        restore_verdict(Some("mykey"), "dev1", &expected, "dev1", &actual),
+        Ok(RollbackIdentity::SessionKept),
+        "固定 key 的 sid 恢复了，只是 ro Token 被重签"
+    );
+    // 同一个 sid，但纯临时设备（无 key）同款情况必须拒绝。
+    assert!(restore_verdict(None, "dev1", &expected, "dev1", &actual).is_err());
+}
+
+#[test]
+fn test_fixed_key_device_that_lost_its_sid_is_still_rejected() {
+    // 有 key 也不能接受"sid 换了"：那已经不是原来那台设备的会话。
+    let expected = vec![("mykey".to_string(), "rw".to_string())];
+    let actual = vec![("mykey".to_string(), "rw".to_string())];
+    assert!(restore_verdict(Some("mykey"), "dev1", &expected, "other2", &actual).is_err());
+}
+
+#[test]
+fn test_rollback_verdict_reports_each_tier_honestly() {
+    let dir = TmpDir::new("rbverdict");
+    let ctx = sample_ctx(&dir, "up-rbv");
+    // 完全相同 → Preserved。
+    assert_eq!(
+        rollback_verdict(&ctx, &ctx.session_id, &ctx.tokens),
+        RollbackIdentity::Preserved
+    );
+    // sid 回来、Token 轮换 → SessionKept（**不**谎称原身份无损）。
+    let rotated = vec![("rw-brand-new".to_string(), "rw".to_string())];
+    assert_eq!(
+        rollback_verdict(&ctx, &ctx.session_id, &rotated),
+        RollbackIdentity::SessionKept
+    );
+    // sid 也没了 → Lost。relay 不认这份身份时不能宣称回滚成功。
+    match rollback_verdict(&ctx, "totally-new", &rotated) {
+        RollbackIdentity::Lost { detail } => {
+            assert!(detail.contains("sess42"), "{detail}");
+        }
+        other => panic!("必须判 Lost，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn test_merge_verdict_keeps_the_worse_outcome() {
+    let lost = RollbackIdentity::Lost { detail: "x".into() };
+    assert_eq!(
+        merge_verdict(RollbackIdentity::Preserved, lost.clone()),
+        lost
+    );
+    assert_eq!(
+        merge_verdict(RollbackIdentity::Preserved, RollbackIdentity::SessionKept),
+        RollbackIdentity::SessionKept
+    );
+    assert_eq!(
+        merge_verdict(RollbackIdentity::SessionKept, RollbackIdentity::Preserved),
+        RollbackIdentity::SessionKept
+    );
+}
+
+// ── 12. fail-closed 的恢复加载（review 第 3 条）────────────────────
+
+#[test]
+fn test_resolve_restore_is_fail_closed_for_an_explicit_but_broken_path() {
+    // 换机助手把我拉起来了（显式 restore），但文件读不出来：必须报错，
+    // 绝不能悄悄退化成全新注册（那会让临时设备换掉身份）。
+    let dir = TmpDir::new("failclosed");
+    let missing = dir.join("no-such-handoff.json");
+    let err = resolve_restore(Some(missing.to_str().unwrap()))
+        .expect_err("显式恢复但文件不存在必须 fail-closed");
+    assert!(err.contains("cannot read the upgrade handoff"), "{err}");
+
+    // 文件存在但内容坏了（权限/格式）：同样必须报错。
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, b"not json").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(
+        resolve_restore(Some(bad.to_str().unwrap())).is_err(),
+        "损坏的交接文件必须并失败，而不是静默全新注册"
+    );
+}
+
+#[test]
+fn test_resolve_restore_is_a_noop_for_a_normal_start() {
+    // 普通启动（没有隐藏参数、也没有环境变量）：保持原行为，返回 Ok(None)。
+    std::env::remove_var(RESTORE_ENV);
+    assert!(
+        matches!(resolve_restore(None), Ok(None)),
+        "普通启动必须返回 Ok(None)"
+    );
+}
+
+#[test]
+fn test_resolve_restore_loads_a_valid_handoff() {
+    let dir = TmpDir::new("resolve-ok");
+    let ctx = sample_ctx(&dir, "up-resolve");
+    let path = ctx.write_handoff_into(dir.path()).unwrap();
+    let id = resolve_restore(Some(path.to_str().unwrap()))
+        .expect("合法交接文件必须能加载")
+        .expect("必须返回恢复信息");
+    assert_eq!(id.restore.session_id, "sess42");
+    assert_eq!(id.restore.tokens, ctx.tokens);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_failed_handoff_reason_never_leaks_a_token() {
+    // 原因会写进 stderr → 助手转存 update-apply.log。不能带 Token。
+    let dir = TmpDir::new("reason-nostoken");
+    let missing = dir.join("nope.json");
+    let err = resolve_restore(Some(missing.to_str().unwrap())).unwrap_err();
+    assert!(!err.contains("rw-token-abc"), "{err}");
+    assert!(!err.contains("ro-token-def"), "{err}");
+}
+
+// ── 13. 真实旧版二进制回滚（review 第 1 条）────────────────────────
+//
+// 前面所有"回滚"用例用的都是认识交接协议的假 agent。review 指出这不够：
+// 真正被回滚的是**不认识 SR_UPGRADE_RESTORE 的旧二进制**，它只会用原始
+// argv 注册。这里用 `git archive <阶段2 基线>` 构建出来的真旧版二进制做回归
+// ——它没有 `--upgrade-restore`，也没有 `update-apply` 子命令。
+//
+// 旧版二进制路径由 `SR_OLD_AGENT_BIN` 给出（CI/本地跑前先 build 一次
+// 基线）；没有就跳过并**明确打印跳过原因**，避免"静默不测"。
+
+#[cfg(unix)]
+mod real_old_binary {
+    use super::*;
+
+    fn old_agent_bin() -> Option<PathBuf> {
+        let p = std::env::var_os("SR_OLD_AGENT_BIN")?;
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            Some(p)
+        } else {
+            eprintln!("跳过：SR_OLD_AGENT_BIN={} 不是文件", p.display());
+            None
+        }
+    }
+
+    /// 真旧版二进制**不认识**这两种新东西——这是本组用例的前提。
+    #[test]
+    fn test_old_binary_predates_the_handoff_protocol() {
+        let Some(bin) = old_agent_bin() else { return };
+        let run_help = |args: &[&str]| -> String {
+            let out = std::process::Command::new(&bin)
+                .args(args)
+                .output()
+                .expect("旧版二进制必须可执行");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+        let top = run_help(&["--help"]);
+        let agent = run_help(&["agent", "--help"]);
+
+        // 顶层子命令里**没有** update-apply（那是本阶段新增的隐藏命令）。
+        assert!(
+            !top.contains("update-apply") && !agent.contains("update-apply"),
+            "拿到的不是阶段2 基线之前的旧版（它认识 update-apply）:\n{top}"
+        );
+        // 也不认识隐藏恢复参数。
+        assert!(
+            !top.contains("upgrade-restore") && !agent.contains("upgrade-restore"),
+            "拿到的不是旧版（它认识 upgrade-restore）"
+        );
+        // 但它认识存量的 --session-id：回滚靠这个把会话拉回原 id。
+        assert!(
+            agent.contains("--session-id"),
+            "旧版应当认识存量的 --session-id:\n{agent}"
+        );
+    }
+
+    /// 回滚拉起旧版时**不得**注入它不认识的参数，且必须补上原 session id。
+    #[test]
+    fn test_rollback_argv_only_uses_flags_the_old_binary_knows() {
+        let dir = TmpDir::new("oldargv");
+        let mut ctx = sample_ctx(&dir, "up-oldargv");
+        // 临时设备：原始 argv 里没有 --session-id。
+        ctx.argv = vec![
+            OsString::from("agent"),
+            OsString::from("--relay-url"),
+            OsString::from("http://127.0.0.1:1"),
+        ];
+        let handoff = dir.join("h.json");
+        std::fs::write(&handoff, b"{}").unwrap();
+        let record = dir.join("argv.txt");
+        let recorder = dir.join("recorder");
+        write_executable(
+            &recorder,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'RESTORE=%s\\n' \"${{SR_UPGRADE_RESTORE:-}}\" >> '{}'\n",
+                record.display(),
+                record.display()
+            ),
+        );
+        ctx.target_path = recorder;
+        let mut child = spawn_agent_for_rollback(&ctx, &handoff, "test").unwrap();
+        let _ = child.wait();
+        let text = std::fs::read_to_string(&record).unwrap();
+        assert!(
+            !text.contains("upgrade-restore"),
+            "回滚不得把旧版不认识的隐藏参数传下去: {text}"
+        );
+        assert!(
+            text.contains("RESTORE=\n") || text.trim_end().ends_with("RESTORE="),
+            "回滚不该设 SR_UPGRADE_RESTORE（旧版不读，只会误导排查）: {text}"
+        );
+        assert!(
+            text.contains("--session-id") && text.contains("sess42"),
+            "回滚必须补上原 session id，否则临时设备会拿到新 ID: {text}"
+        );
+        // 原始 argv 保持不变。
+        assert!(text.contains("--relay-url"), "{text}");
+    }
+
+    /// 原始 argv 已带 `--session-id` 时不能重复注入。
+    #[test]
+    fn test_rollback_does_not_duplicate_session_id() {
+        let dir = TmpDir::new("olddup");
+        let mut ctx = sample_ctx(&dir, "up-olddup");
+        ctx.argv = vec![
+            OsString::from("agent"),
+            OsString::from("--session-id"),
+            OsString::from("sess42"),
+        ];
+        let handoff = dir.join("h.json");
+        std::fs::write(&handoff, b"{}").unwrap();
+        let record = dir.join("argv2.txt");
+        let recorder = dir.join("recorder2");
+        write_executable(
+            &recorder,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                record.display()
+            ),
+        );
+        ctx.target_path = recorder;
+        let mut child = spawn_agent_for_rollback(&ctx, &handoff, "test").unwrap();
+        let _ = child.wait();
+        let text = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(
+            text.matches("--session-id").count(),
+            1,
+            "不得重复注入 --session-id: {text}"
+        );
+    }
+
+    /// 端到端：真 relay + **真旧版二进制** + 无 key、无 --session-id 的临时
+    /// 设备 → 回滚后必须仍是原 sid。
+    ///
+    /// 这条覆盖 review 要求的"恢复进程不读 SR_UPGRADE_RESTORE、无 key、无
+    /// --session-id，回滚后仍保持原 sid"。
+    #[tokio::test]
+    async fn test_real_old_binary_rollback_keeps_the_temporary_identity() {
+        let Some(old_bin) = old_agent_bin() else {
+            return;
+        };
+        let Some(relay) = super::process_level::TestRelay::start().await else {
+            eprintln!("跳过：无法启动真 relay");
+            return;
+        };
+        let dir = TmpDir::new("oldbin-e2e");
+        let client = reqwest::Client::new();
+
+        // 1. 一台临时设备先注册（无 key、无 --session-id），拿到真实身份。
+        let resp: serde_json::Value = client
+            .post(format!("{}/agent/send", relay.base))
+            .json(&serde_json::json!({
+                "type": "agent:register",
+                "token_type": "rw",
+                "agent_version": "0.59.2"
+            }))
+            .send()
+            .await
+            .expect("注册必须成功")
+            .json()
+            .await
+            .expect("响应必须是 JSON");
+        let sid = resp["session_id"]
+            .as_str()
+            .expect("要有 session_id")
+            .to_string();
+        let tokens: Vec<(String, String)> = resp["payload"]["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["token"].as_str().unwrap().to_string(),
+                    t["permission"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(!tokens.is_empty());
+
+        // 2. 造交接文件：target 就是**真旧版二进制**（要它被"回滚"后运行）。
+        let target = dir.join("shell-remote");
+        std::fs::copy(&old_bin, &target).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let new_binary = dir.join("artifact.part");
+        std::fs::write(&new_binary, b"not a real binary").unwrap();
+        let ctx = RestartContext {
+            session_id: sid.clone(),
+            tokens: tokens.clone(),
+            // 关键：临时设备 —— 没有 --key。
+            fixed_key: None,
+            token_type: "rw".to_string(),
+            relay_base: Some(relay.base.clone()),
+            relay_insecure: false,
+            // 原始 argv：没有 --session-id。
+            argv: vec![
+                OsString::from("agent"),
+                OsString::from("--relay-url"),
+                OsString::from(relay.base.clone()),
+                OsString::from("--shell"),
+                OsString::from("/bin/sh"),
+                OsString::from("--root"),
+                OsString::from(dir.path().to_string_lossy().to_string()),
+            ],
+            old_pid: 0,
+            old_start: None,
+            upgrade_id: "oldbin-e2e".to_string(),
+            target_version: "9.9.9".to_string(),
+            target_path: target.clone(),
+            new_binary: new_binary.clone(),
+            new_sha256: sha256_of(b"not a real binary"),
+        };
+        let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+
+        // 3. 直接跑回滚（等价于"新进程没注册成功"之后的动作）。
+        let mut log = HelperLog::open(&handoff);
+        let outcome = {
+            // rollback 是私有函数，但同模块内的 tests 子模块可以调用。
+            rollback(
+                &ctx,
+                &handoff,
+                &target, // backup 指向 target 本身：这里不测文件恢复，只测身份
+                &mut log,
+                "test: new version did not register".to_string(),
+                None,
+                HelperTimeouts {
+                    old_exit: Duration::from_secs(1),
+                    register: Duration::from_secs(25),
+                },
+            )
+        };
+
+        // 4. 旧版必须自己注册成功（它会打印 session=… 与 token: …）。
+        let log_text = std::fs::read_to_string(dir.join("update-apply.log")).unwrap_or_default();
+        assert!(
+            log_text.contains("previous agent restarted"),
+            "旧版必须被拉起: {log_text}"
+        );
+        assert!(
+            log_text.contains("agent session established")
+                || log_text.contains("rolled-back agent registered on its own"),
+            "旧版必须真的注册上线（不是 spawn 完就算）: {log_text}"
+        );
+
+        // 5. 身份断言：回滚后 relay 上仍必须是原 sid + 原 Token。
+        match outcome {
+            HelperOutcome::RolledBack { identity, .. } => {
+                assert_eq!(
+                    identity,
+                    RollbackIdentity::Preserved,
+                    "临时设备回滚后必须保持原 sid 与 Token；日志:\n{log_text}"
+                );
+            }
+            other => panic!("必须走回滚路径，实际 {other:?}"),
+        }
+        let after = super::process_level::session_tokens(&client, &relay, &sid).await;
+        assert_eq!(
+            after, tokens,
+            "回滚后 relay 上的 Token 必须与升级前完全一致；日志:\n{log_text}"
+        );
+
+        // 收尾：旧版还在跑（它本来就是长驻进程）。
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &format!("--session-id {sid}")])
+            .status();
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &format!("--relay-url {}", relay.base)])
+            .status();
+    }
+}
+
+// ── 14. 助手 ready 通道不被日志污染（真实回归）────────────────────
+//
+// 一次真实事故：`main()` 先跑 `init_logging()` 再分发子命令，而 tracing 默认
+// 写 **stdout**。助手启动后先打印一行 "shell-remote v0.59.2"，旧 agent 读到
+// 这一行（它只读一行）就判定"助手没 ready 就报了别的东西"，直接放弃升级。
+// 表现为升级永远失败、而且错误信息里嵌着那行日志。
+//
+// 这里直接跑**真实二进制**的 `update-apply`，验证它的第一行输出就是 ready。
+
+#[cfg(unix)]
+#[test]
+fn test_real_binary_announces_ready_on_the_first_stdout_line() {
+    let me = std::env::current_exe().unwrap();
+    let dir = std::env::current_dir().unwrap();
+    // 单测二进制在 target/<profile>/deps/ 下，真正的 bin 在上一级。
+    let bin = [
+        dir.join("shell-remote"),
+        dir.join("deps").join("shell-remote"),
+    ]
+    .into_iter()
+    .chain(std::env::current_exe().ok().and_then(|p| {
+        p.parent()
+            .and_then(|d| d.parent())
+            .map(|d| d.join("shell-remote"))
+    }))
+    .find(|p| p.is_file());
+    let Some(bin) = bin else {
+        eprintln!("跳过：找不到 shell-remote 二进制（{}）", me.display());
+        return;
+    };
+
+    // 一份"还没有新文件"的交接：助手会在 ready 之后立刻失败，但我们只关心
+    // **第一行**是不是 ready。
+    let tmp = TmpDir::new("ready-line");
+    let mut ctx = sample_ctx(&tmp, "up-ready");
+    ctx.old_pid = 0;
+    ctx.old_start = None;
+    let handoff = ctx.write_handoff_into(tmp.path()).unwrap();
+
+    let out = std::process::Command::new(&bin)
+        .arg("update-apply")
+        .arg(&handoff)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("update-apply 必须能启动");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first = stdout.lines().next().unwrap_or("");
+    assert_eq!(
+        first.trim(),
+        READY_LINE,
+        "助手的第一行 stdout 必须是 ready —— 否则旧 agent 会把它当成错误并放弃升级。\
+         实际 stdout 前几行: {:?}",
+        stdout.lines().take(4).collect::<Vec<_>>()
+    );
+    // 顺带确认没有任何日志行混进 stdout 的开头。
+    assert!(
+        !first.contains("shell-remote v"),
+        "日志不得出现在 ready 之前: {first}"
+    );
 }

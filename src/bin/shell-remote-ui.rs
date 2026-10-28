@@ -256,8 +256,19 @@ fn main() -> anyhow::Result<()> {
             };
             // 换机后的一次性身份恢复：显式隐藏参数优先，其次环境变量（回滚
             // 路径）。都没有则是普通启动。
-            let restored = agent::update_apply::restore_handoff_path(upgrade_restore.as_deref())
-                .and_then(|p| agent::update_apply::RestoredIdentity::load(&p));
+            // fail-closed：换机助手把我拉起来、但交接文件读不出来时，直接让
+            // 进程启动失败（助手据此回滚），绝不能静默走全新注册——那会让
+            // 临时设备换掉 session_id/Token，而助手还以为升级成功了。
+            // 普通启动（没有恢复意图）不受影响，行为与旧版一致。
+            let restored = match agent::update_apply::resolve_restore(upgrade_restore.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot start with the handed-over identity");
+                    // 只写原因（不含 Token），助手会把它转存进 update-apply.log。
+                    eprintln!("shell-remote: upgrade restore failed: {e}");
+                    anyhow::bail!("upgrade restore failed: {e}");
+                }
+            };
             let root = root.unwrap_or_else(agent::home_dir);
             // 命令日志开关：默认开启，`--no-cmd-log` 关闭。
             agent::cmd_log::set_enabled(!no_cmd_log);

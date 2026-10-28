@@ -223,11 +223,24 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // 换机助手必须在**任何**日志初始化之前分流。
+    //
+    // 旧 agent 从助手的 stdout 上读一行 `ready`；`init_logging()` 默认把
+    // tracing 输出到 stdout，于是它先写一行 "shell-remote v0.59.2"，旧 agent
+    // 读到这一行就当成"助手没 ready 就报了别的东西"，直接判失败并放弃升级
+    // （`cannot start the update helper: 2026-... shell-remote v0.59.2`）。
+    // 助手自己的日志走交接文件同目录的 update-apply.log，不需要 tracing。
+    if let Command::UpdateApply { handoff } = &cli.command {
+        shell_remote::install_panic_hook();
+        let code = agent::update_apply::run(std::path::Path::new(handoff));
+        std::process::exit(code);
+    }
+
     shell_remote::install_panic_hook();
     // `_log_guard` 必须活到 main 末尾（drop 会关闭 non-blocking writer）。
     let _log_guard = shell_remote::init_logging();
-
-    let cli = Cli::parse();
 
     let version = env!("CARGO_PKG_VERSION");
     tracing::info!("shell-remote v{}", version);
@@ -306,8 +319,19 @@ async fn main() -> anyhow::Result<()> {
             };
             // 换机后的一次性身份恢复：显式隐藏参数优先，其次环境变量（回滚
             // 路径）。都没有则是普通启动，行为与旧版完全一致。
-            let restored = agent::update_apply::restore_handoff_path(upgrade_restore.as_deref())
-                .and_then(|p| agent::update_apply::RestoredIdentity::load(&p));
+            // fail-closed：换机助手把我拉起来、但交接文件读不出来时，直接让
+            // 进程启动失败（助手据此回滚），绝不能静默走全新注册——那会让
+            // 临时设备换掉 session_id/Token，而助手还以为升级成功了。
+            // 普通启动（没有恢复意图）不受影响，行为与旧版一致。
+            let restored = match agent::update_apply::resolve_restore(upgrade_restore.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot start with the handed-over identity");
+                    // 只写原因（不含 Token），助手会把它转存进 update-apply.log。
+                    eprintln!("shell-remote: upgrade restore failed: {e}");
+                    anyhow::bail!("upgrade restore failed: {e}");
+                }
+            };
             let root = root.unwrap_or_else(agent::home_dir);
             #[cfg(feature = "desktop")]
             {
@@ -348,12 +372,9 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             }
         }
-        Command::UpdateApply { handoff } => {
-            // 换机助手：短生命周期进程，做完就退出。日志走交接文件同目录的
-            // `update-apply.log`（助手可能在旧 agent 已退出、甚至没有日志
-            // 落盘的部署里运行）。
-            let code = agent::update_apply::run(std::path::Path::new(&handoff));
-            std::process::exit(code);
+        // 已在 main 开头分流（必须先于日志初始化），这里不可达。
+        Command::UpdateApply { .. } => {
+            unreachable!("update-apply is dispatched before logging is initialised")
         }
     }
 
