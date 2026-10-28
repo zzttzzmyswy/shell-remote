@@ -5,22 +5,24 @@
 //! - [`download`](crate::agent::download)：**取字节**——多 CDN 顺序 + relay 兜底、
 //!   Range 断点续传、代理/DoH 解析、有界预算。它不碰文件系统之外的东西，也不知道
 //!   relay 协议；
-//! - 本模块：**装字节**——校验制品身份 → 冒烟测试 → 原子替换 → 重启，以及把每个
+//! - 本模块：**装字节**——校验制品身份 → 冒烟测试 → 交给换机助手，以及把每个
 //!   阶段转成 `agent:upgrade_progress` 上报。
 //!
 //! 不变式：**下载与验证全部成功之前，旧 agent 不动**。任何失败路径都只上报
 //! `failed` 并返回，进程继续在线；只有确认新二进制能在这台机器上跑起来，才会
-//! 替换并退出。
+//! 进入换机流程。
 //!
-//! 安装细节（沿用既有实现，阶段 2 不改换机语义）：
+//! 换机本身由隐藏子命令 [`update_apply`](crate::agent::update_apply) 完成
+//! （MYS-2425 阶段3）。本模块在退出前只做三件事：
 //!
 //! 1. 校验 SHA-256 与制品身份（variant/arch/OS 必须就是本机这一份），
 //! 2. unix `--version` 冒烟测试，坏包/错架构在这里被拦住，
-//! 3. 原子 rename 覆盖（同目录同文件系统），
-//! 4. 用原 argv 拉起新进程并退出。
+//! 3. 把身份（实际 session_id + tokens）与原始 argv 写成交接文件，启动助手并
+//!    等到它 `ready`——**只有在 ready 之后**本进程才退出。
 //!
-//! Windows 无法覆盖运行中的 `.exe`，沿用既有 `.bat` 助手路径（阶段 3 会用
-//! `update-apply` 取代）。
+//! 助手负责等本进程退出、备份并替换二进制、拉起新进程、等它注册成功；失败则
+//! 回滚并用原身份拉起旧版。旧实现里的 `.bat` + `tasklist` 按进程名等待已在
+//! 阶段 3 移除（同名 agent 会互相阻塞/误杀）。
 
 use std::time::Duration;
 
@@ -31,6 +33,7 @@ use crate::agent::doh::{DohConfig, RelayResolver};
 use crate::agent::download::{
     self, DownloadBudget, Downloader, ProgressFn, ProxyConfig, RelaySource, UpgradeTask,
 };
+use crate::agent::update_apply;
 use crate::proto::Message;
 
 /// 下载总预算：制品是单个二进制（几十 MB），弱网下 10 分钟足够，再久就该
@@ -58,6 +61,14 @@ pub struct UpgradeContext {
     /// rw Token：**只**用于 relay 镜像与代解析，绝不出现在外部 CDN 请求里。
     pub token: String,
     pub session_id: String,
+    /// 原始 `--key`（固定 key 设备才有）。回滚时用它把身份拉回原会话。
+    pub fixed_key: Option<String>,
+    /// 原始 `--token-type`（rw / ro / both），回滚用 `--key` 重建权限用。
+    pub token_type: String,
+    /// 注册响应里的完整 tokens（`(token, permission)`）。换机时交接给新进程，
+    /// 让它以**原权限**恢复身份——只交接 rw 会把 `--token-type ro/both` 的
+    /// 设备在升级后悄悄提权或降权。
+    pub tokens: Vec<(String, String)>,
     pub ctrl_tx: Sender<String>,
     /// 正在运行的可执行文件的规范路径（启动时解析好）。
     pub target: std::path::PathBuf,
@@ -75,6 +86,9 @@ pub struct UpgradeContext {
     /// 配置，**下载客户端也必须按此配置**——否则「CDN 全部不可用 → 走 relay」
     /// 这条最需要兜底的路径会在握手阶段必然失败。
     pub relay_insecure: bool,
+    /// 换机助手的可执行文件（通常就是 `target` 自己：助手是同一个二进制里的
+    /// 隐藏子命令）。测试可指向一个假助手。
+    pub helper_exe: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for UpgradeContext {
@@ -84,8 +98,10 @@ impl std::fmt::Debug for UpgradeContext {
             .field("relay_base", &self.relay_base)
             .field("token", &"<redacted>")
             .field("session_id", &self.session_id)
+            .field("tokens", &format!("<{} redacted>", self.tokens.len()))
             .field("target", &self.target)
             .field("own_variant", &self.own_variant)
+            .field("helper_exe", &self.helper_exe)
             .finish()
     }
 }
@@ -95,6 +111,7 @@ impl UpgradeContext {
     ///
     /// `relay_insecure` 必须与 relay 上行客户端同源（`--relay-insecure`）：
     /// 下载侧的 relay 兜底走同一个 relay，TLS 策略不一致会让兜底必然失败。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         relay_http: reqwest::Client,
         relay_base: String,
@@ -107,9 +124,19 @@ impl UpgradeContext {
         Self {
             relay_http,
             relay_base,
+            // 只给了单个 token 时，它就是 rw 身份（老调用点/测试的语义）。
+            tokens: if token.is_empty() {
+                Vec::new()
+            } else {
+                vec![(token.clone(), "rw".to_string())]
+            },
             token,
             session_id,
+            fixed_key: None,
+            token_type: "rw".to_string(),
             ctrl_tx,
+            // 默认助手就是自己：`update-apply` 是本二进制里的隐藏子命令。
+            helper_exe: target.clone(),
             target,
             own_variant: download::AgentVariant::detect(),
             budget: DownloadBudget {
@@ -126,14 +153,23 @@ impl UpgradeContext {
             relay_insecure,
         }
     }
-}
 
-/// Result of installing the new binary.
-struct InstallOutcome {
-    /// True when the caller must spawn the new binary and exit. False only on
-    /// Windows where the swap was deferred to a helper `.bat` (already
-    /// spawned) — the caller should just exit so the bat can finish the swap.
-    restart_now: bool,
+    /// relay 侧用的那个 token（relay 镜像/代解析鉴权）。
+    pub fn rw_token(&self) -> &str {
+        &self.token
+    }
+
+    /// 换机要交接的完整身份。空集合时退回 `token`（保持老调用点的行为）。
+    pub fn handoff_tokens(&self) -> Vec<(String, String)> {
+        if !self.tokens.is_empty() {
+            return self.tokens.clone();
+        }
+        if self.token.is_empty() {
+            Vec::new()
+        } else {
+            vec![(self.token.clone(), "rw".to_string())]
+        }
+    }
 }
 
 /// 进度上报：把下载器的 [`DownloadProgress`] 转成 `agent:upgrade_progress` 帧。
@@ -223,87 +259,70 @@ async fn smoke_test(_path: &std::path::Path) -> bool {
     true
 }
 
-/// Atomically replace `target` with `tmp` (same directory).
-#[cfg(not(windows))]
-fn install_binary(
-    tmp: &std::path::Path,
-    target: &std::path::Path,
-) -> std::io::Result<InstallOutcome> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o755))?;
+/// 「已校验的制品」到「正在运行的二进制」之间的那一步。
+///
+/// 阶段 3 起这一步**不由本进程执行**：Windows 无法替换运行中的 `.exe`，
+/// Unix 也无法在自己退出之后再拉起自己。这里只负责准备交接文件、启动换机
+/// 助手、等它 `ready`；拿到 ready 之后调用方才退出。失败返回 `Err`，调用方
+/// 上报 `failed` 并继续在线——磁盘此时**一点都没动**。
+fn hand_over_to_helper(
+    ctx: &UpgradeContext,
+    task: &UpgradeTask,
+    artifact: &std::path::Path,
+) -> Result<std::process::Child, String> {
+    // 原始 argv（去掉 argv[0]）。隐藏恢复参数由 `RestartContext::new` 剥掉，
+    // 避免上一轮的交接信息被当成这一轮的。
+    let raw_argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let tokens = ctx.handoff_tokens();
+    if tokens.is_empty() {
+        // 没有可交接的身份：新进程会以全新身份注册，升级本身仍可完成，但
+        // 必须让运维知道身份不会保持。
+        tracing::warn!(
+            session = %ctx.session_id,
+            "self-upgrade without any token to hand over — the new process will register as a new device"
+        );
     }
-    std::fs::rename(tmp, target)?;
-    Ok(InstallOutcome { restart_now: true })
-}
-
-/// Windows: try a direct replace; if the running `.exe` blocks it (access
-/// denied), defer the swap to a helper `.bat` that waits for this process to
-/// exit, then moves the file into place and starts the new binary.
-#[cfg(windows)]
-fn install_binary(
-    tmp: &std::path::Path,
-    target: &std::path::Path,
-) -> std::io::Result<InstallOutcome> {
-    match std::fs::rename(tmp, target) {
-        Ok(()) => Ok(InstallOutcome { restart_now: true }),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::PermissionDenied
-                || e.kind() == std::io::ErrorKind::Other =>
-        {
-            let exe_name = target
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("shell-remote.exe");
-            let bat = target.with_extension("update.bat");
-            let args = std::env::args()
-                .skip(1)
-                .map(|a| format!("\"{}\"", a))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let script = format!(
-                "@echo off\r\n\
-                 :wait\r\n\
-                 tasklist /FI \"IMAGENAME eq {exe}\" | findstr /I \"{exe}\" >nul 2>nul\r\n\
-                 if not errorlevel 1 (\r\n\
-                 timeout /t 1 /nobreak >nul\r\n\
-                 goto wait\r\n\
-                 )\r\n\
-                 move /y \"{tmp}\" \"{target}\" >nul\r\n\
-                 del \"%~f0\"\r\n\
-                 start \"\" \"{target}\" {args}\r\n",
-                exe = exe_name,
-                tmp = tmp.display(),
-                target = target.display(),
-                args = args,
-            );
-            std::fs::write(&bat, script)?;
-            let _ = std::process::Command::new("cmd")
-                .arg("/c")
-                .arg(&bat)
-                .spawn();
-            Ok(InstallOutcome { restart_now: false })
+    let restart = update_apply::RestartContext::new(
+        ctx.session_id.clone(),
+        tokens,
+        // 固定 key 与 token-type 只用于**回滚**：旧版二进制不认识交接文件，
+        // 但它认识自己的 `--key`；`--token-type both` 的 ro Token 也必须按
+        // 原样重建，否则回滚后权限悄悄缩水。
+        ctx.fixed_key.clone(),
+        ctx.token_type.clone(),
+        // relay 端点：回滚时助手要替旧版把身份绑回 relay。
+        Some(ctx.relay_base.clone()),
+        ctx.relay_insecure,
+        raw_argv,
+        ctx.target.clone(),
+        artifact.to_path_buf(),
+        task.sha256.clone(),
+        task.upgrade_id.clone(),
+        task.target_version.clone(),
+    );
+    // Token 只进 0600/当前用户 ACL 的交接文件：argv 会出现在 `ps` 里，
+    // 日志会被收集走，两者都不能碰。
+    let handoff = restart
+        .write_handoff()
+        .map_err(|e| format!("cannot write the upgrade handoff file: {e}"))?;
+    tracing::info!(
+        handoff = %handoff.display(),
+        upgrade_id = %task.upgrade_id,
+        "handing the upgrade over to the update-apply helper"
+    );
+    match update_apply::launch_helper_and_wait_ready(
+        &ctx.helper_exe,
+        &handoff,
+        update_apply::HELPER_READY_TIMEOUT,
+    ) {
+        Ok(child) => Ok(child),
+        Err(e) => {
+            // 助手没 ready ⇒ 磁盘没动、旧进程继续跑。交接文件里是凭据，
+            // 立刻删掉。
+            let _ = std::fs::remove_file(&handoff);
+            Err(e)
         }
-        Err(e) => Err(e),
     }
-}
-
-/// Spawn the (already-replaced) binary with the original argv, detached. On
-/// unix the child gets its own process group so the parent's terminal logout
-/// (SIGHUP to the old foreground group) cannot kill the upgraded agent.
-fn restart_process(target: &std::path::Path) -> std::io::Result<()> {
-    let mut cmd = std::process::Command::new(target);
-    cmd.args(std::env::args().skip(1))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    cmd.spawn().map(|_| ())
 }
 
 /// 建 relay 兜底下载用的客户端：**禁止重定向**，TLS 策略与 relay 上行一致。
@@ -520,44 +539,43 @@ pub async fn perform_upgrade(ctx: UpgradeContext, task: UpgradeTask) {
         return;
     }
 
-    // 4. 原子替换。
-    let outcome = match install_binary(&part, &ctx.target) {
-        Ok(o) => o,
+    // 4. 换机：交接身份 → 启动助手 → 等它 ready。
+    //
+    // 这一步**不替换任何文件**（助手才替换）。助手 ready 之前失败 ⇒ 磁盘
+    // 原封不动，`.part` 也保留（下次重试能接着续传）。
+    send_progress(
+        &ctx.ctrl_tx,
+        &ctx.session_id,
+        "swapping",
+        None,
+        Some(format!(
+            "verified {} from {}; handing over to update-apply",
+            version, downloaded.source
+        )),
+        &version,
+    )
+    .await;
+    let helper = match hand_over_to_helper(&ctx, &task, &part) {
+        Ok(child) => child,
         Err(e) => {
-            report_failed_cleanup(
+            report_failed(
                 &ctx,
                 &version,
-                &part,
-                format!("cannot replace the running binary: {e}"),
+                format!("cannot start the update helper: {e}"),
             )
             .await;
             return;
         }
     };
-    let _ = std::fs::remove_file(&part);
+    tracing::info!(
+        helper_pid = helper.id(),
+        upgrade_id = %task.upgrade_id,
+        "update helper is ready; exiting so it can swap the binary"
+    );
 
-    // 5. 重启。给终结帧一点时间到 relay，再让这个进程（和它的发送循环）消失。
-    send_progress(
-        &ctx.ctrl_tx,
-        &ctx.session_id,
-        "installing",
-        None,
-        Some(format!("installed {} from {}", version, downloaded.source)),
-        &version,
-    )
-    .await;
+    // 5. 退出。给终结帧一点时间到 relay，再让这个进程（和它的发送循环）
+    //    消失——助手正在按本进程的 PID 等我们退出。
     tokio::time::sleep(EXIT_FLUSH_GRACE).await;
-    if outcome.restart_now {
-        if let Err(e) = restart_process(&ctx.target) {
-            report_failed(
-                &ctx,
-                &version,
-                format!("binary replaced but restart failed: {e}"),
-            )
-            .await;
-            return;
-        }
-    }
     std::process::exit(0);
 }
 
@@ -900,36 +918,137 @@ mod tests {
         assert!(rendered.contains("https://relay.test"));
     }
 
-    #[cfg(unix)]
+    // 阶段 3 起「替换二进制 + 重启」不在本进程里做：那两件事由
+    // `update_apply` 助手完成（本进程退出之后）。原地替换/失败恢复的测试
+    // 因此一并搬到 `agent::update_apply::tests`，这里保留的只有**交接点**
+    // ——即本模块与助手之间的契约。
+
+    /// 交接必须带上**完整** token 集合：`--token-type ro/both` 的设备升级后
+    /// 权限必须一模一样，只交 rw 会悄悄提权。
     #[test]
-    fn test_install_binary_atomic_replace() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("sr-upg-install-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let tmp = dir.join("new");
-        let target = dir.join("running");
-        std::fs::write(&tmp, b"new-content").unwrap();
-        std::fs::write(&target, b"old-content").unwrap();
-        let outcome = install_binary(&tmp, &target).unwrap();
-        assert!(outcome.restart_now);
-        assert_eq!(std::fs::read(&target).unwrap(), b"new-content");
-        assert!(!tmp.exists());
-        // executable bit preserved for the swapped file
-        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
-        assert_ne!(mode & 0o111, 0, "installed binary must stay executable");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn test_handoff_tokens_keeps_every_permission() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        let mut ctx = UpgradeContext::new(
+            reqwest::Client::new(),
+            "https://relay.test".into(),
+            "rw-1".into(),
+            "sess".into(),
+            tx,
+            std::path::PathBuf::from("/usr/local/bin/shell-remote"),
+            false,
+        );
+        ctx.tokens = vec![("rw-1".into(), "rw".into()), ("ro-2".into(), "ro".into())];
+        assert_eq!(ctx.handoff_tokens(), ctx.tokens);
+        assert_eq!(ctx.rw_token(), "rw-1");
+        // 老调用点只给单 token：退化成那一个（仍是 rw），不交空集合。
+        ctx.tokens.clear();
+        assert_eq!(
+            ctx.handoff_tokens(),
+            vec![("rw-1".to_string(), "rw".to_string())]
+        );
+        // 一个 token 都没有时交空集合（调用方会 warn 并如实降级）。
+        ctx.token.clear();
+        assert!(ctx.handoff_tokens().is_empty());
     }
 
+    /// 助手默认就是本二进制：`update-apply` 是它里面的隐藏子命令。用错路径
+    /// 会让换机在"启动助手"这一步就失败（旧进程因此不敢退出，反而安全，但
+    /// 升级永远做不成）。
+    #[test]
+    fn test_helper_exe_defaults_to_the_running_binary() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        let target = std::path::PathBuf::from("/opt/sr/shell-remote");
+        let ctx = UpgradeContext::new(
+            reqwest::Client::new(),
+            "https://relay.test".into(),
+            "rw-1".into(),
+            "sess".into(),
+            tx,
+            target.clone(),
+            false,
+        );
+        assert_eq!(ctx.helper_exe, target);
+    }
+
+    /// 交接点必须把「完整 tokens」「实际 session_id」「原始 argv」交给助手，
+    /// 且 Token 不出现在 argv 里。这里直接检查落盘的交接文件，因为那才是
+    /// 助手唯一的输入。
     #[cfg(unix)]
     #[test]
-    fn test_install_binary_missing_tmp_fails() {
-        let dir = std::env::temp_dir().join(format!("sr-upg-fail-{}", std::process::id()));
+    fn test_handoff_file_carries_identity_but_not_tokens_in_argv() {
+        let dir = std::env::temp_dir().join(format!("sr-upg-handoff-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let tmp = dir.join("missing");
-        let target = dir.join("running");
-        std::fs::write(&target, b"old").unwrap();
-        assert!(install_binary(&tmp, &target).is_err());
-        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        let mut ctx = UpgradeContext::new(
+            reqwest::Client::new(),
+            "https://relay.test".into(),
+            "rw-tok".into(),
+            "sess-actual".into(),
+            tx,
+            dir.join("shell-remote"),
+            false,
+        );
+        ctx.tokens = vec![
+            ("rw-tok".into(), "rw".into()),
+            ("ro-tok".into(), "ro".into()),
+        ];
+        let artifact = dir.join("artifact.part");
+        std::fs::write(&artifact, b"new").unwrap();
+        let task = UpgradeTask {
+            upgrade_id: "up-handoff".into(),
+            target_version: "1.2.3".into(),
+            filename: local_artifact_name(),
+            size: 3,
+            sha256: {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha256::digest(b"new"))
+            },
+            official_path: None,
+            cdn_base_urls: Vec::new(),
+            relay_url: None,
+            relay_fallback: false,
+            source: "official".into(),
+        };
+        let restart = update_apply::RestartContext::new(
+            ctx.session_id.clone(),
+            ctx.handoff_tokens(),
+            None,
+            "rw".to_string(),
+            None,
+            false,
+            vec![
+                std::ffi::OsString::from("agent"),
+                std::ffi::OsString::from("--upgrade-restore"),
+                std::ffi::OsString::from("/old/handoff.json"),
+                std::ffi::OsString::from("--key"),
+                std::ffi::OsString::from("k"),
+            ],
+            ctx.target.clone(),
+            artifact.clone(),
+            task.sha256.clone(),
+            task.upgrade_id.clone(),
+            task.target_version.clone(),
+        );
+        // 上一轮的恢复参数必须被剥掉，否则新一轮会去读上一轮的身份。
+        assert_eq!(
+            restart.argv,
+            vec![
+                std::ffi::OsString::from("agent"),
+                std::ffi::OsString::from("--key"),
+                std::ffi::OsString::from("k")
+            ]
+        );
+        assert_eq!(restart.session_id, "sess-actual");
+        assert_eq!(restart.tokens.len(), 2, "两个权限都必须交接");
+        let path = restart.write_handoff_into(&dir).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("sess-actual"));
+        let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

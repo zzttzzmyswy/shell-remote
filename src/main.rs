@@ -198,16 +198,49 @@ enum Command {
         /// 关闭命令日志（默认会把 MCP 执行的命令与 Web 终端输入的命令行打印到日志）
         #[arg(long)]
         no_cmd_log: bool,
+
+        /// INTERNAL — 换机后的一次性身份恢复（MYS-2425 阶段3）：私有交接文件
+        /// 的路径。隐藏参数，只由 `update-apply` 拉起新进程时传入；普通启动
+        /// 不落任何长期身份文件。
+        ///
+        /// 回滚路径不走这里：那时被拉起的可能是还不认识本参数的旧版二进制，
+        /// 所以助手改用环境变量 `SR_UPGRADE_RESTORE` 传递。
+        #[arg(long = "upgrade-restore", hide = true)]
+        upgrade_restore: Option<String>,
+    },
+
+    /// INTERNAL — 换机助手（MYS-2425 阶段3）：等旧 agent 退出、原子替换二进制、
+    /// 拉起新进程并等它注册成功；失败则回滚并原身份重启旧版。
+    ///
+    /// 隐藏子命令：`hide = true` 让它不出现在 `--help`，避免前台用户误调用。
+    /// 正常运行时由 agent 自己在升级流程里启动，参数是私有交接文件的路径。
+    #[command(hide = true)]
+    UpdateApply {
+        /// 私有交接文件（0600 / 当前用户 ACL）的路径。
+        handoff: String,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // 换机助手必须在**任何**日志初始化之前分流。
+    //
+    // 旧 agent 从助手的 stdout 上读一行 `ready`；`init_logging()` 默认把
+    // tracing 输出到 stdout，于是它先写一行 "shell-remote v0.59.2"，旧 agent
+    // 读到这一行就当成"助手没 ready 就报了别的东西"，直接判失败并放弃升级
+    // （`cannot start the update helper: 2026-... shell-remote v0.59.2`）。
+    // 助手自己的日志走交接文件同目录的 update-apply.log，不需要 tracing。
+    if let Command::UpdateApply { handoff } = &cli.command {
+        shell_remote::install_panic_hook();
+        let code = agent::update_apply::run(std::path::Path::new(handoff));
+        std::process::exit(code);
+    }
+
     shell_remote::install_panic_hook();
     // `_log_guard` 必须活到 main 末尾（drop 会关闭 non-blocking writer）。
     let _log_guard = shell_remote::init_logging();
-
-    let cli = Cli::parse();
 
     let version = env!("CARGO_PKG_VERSION");
     tracing::info!("shell-remote v{}", version);
@@ -270,6 +303,7 @@ async fn main() -> anyhow::Result<()> {
             shell,
             session_id,
             no_cmd_log,
+            upgrade_restore,
         } => {
             // 命令日志开关：默认开启，`--no-cmd-log` 关闭。
             agent::cmd_log::set_enabled(!no_cmd_log);
@@ -283,6 +317,21 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => None,
             };
+            // 换机后的一次性身份恢复：显式隐藏参数优先，其次环境变量（回滚
+            // 路径）。都没有则是普通启动，行为与旧版完全一致。
+            // fail-closed：换机助手把我拉起来、但交接文件读不出来时，直接让
+            // 进程启动失败（助手据此回滚），绝不能静默走全新注册——那会让
+            // 临时设备换掉 session_id/Token，而助手还以为升级成功了。
+            // 普通启动（没有恢复意图）不受影响，行为与旧版一致。
+            let restored = match agent::update_apply::resolve_restore(upgrade_restore.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot start with the handed-over identity");
+                    // 只写原因（不含 Token），助手会把它转存进 update-apply.log。
+                    eprintln!("shell-remote: upgrade restore failed: {e}");
+                    anyhow::bail!("upgrade restore failed: {e}");
+                }
+            };
             let root = root.unwrap_or_else(agent::home_dir);
             #[cfg(feature = "desktop")]
             {
@@ -291,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
                     capture: "none".to_string(),
                     ..Default::default()
                 };
-                agent::start(
+                agent::start_with_restore(
                     relay_url,
                     key,
                     root,
@@ -302,12 +351,13 @@ async fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "tui")]
                     None,
                     relay_insecure,
+                    restored,
                 )
                 .await?;
             }
             #[cfg(not(feature = "desktop"))]
             {
-                agent::start(
+                agent::start_with_restore(
                     relay_url,
                     key,
                     root,
@@ -317,9 +367,14 @@ async fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "tui")]
                     None,
                     relay_insecure,
+                    restored,
                 )
                 .await?;
             }
+        }
+        // 已在 main 开头分流（必须先于日志初始化），这里不可达。
+        Command::UpdateApply { .. } => {
+            unreachable!("update-apply is dispatched before logging is initialised")
         }
     }
 

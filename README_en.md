@@ -298,14 +298,18 @@ Every online device in the admin **Devices** tab has an **Upgrade** button. Clic
 2. The agent downloads the artifact from the relay (authenticated with its own read-write token), reporting progress percentages.
 3. The SHA-256 is verified — a mismatch aborts and keeps the old binary.
 4. On Unix the new binary is smoke-tested with `--version` to confirm it actually runs on this platform (guards against wrong-arch or truncated artifacts); Windows skips this (SHA-256 is the integrity gate).
-5. The binary is atomically replaced in its own directory (atomic `rename` on Unix; on Windows, when the running `.exe` blocks replacement, a helper `.bat` defers the swap), then the agent re-launches itself with its original arguments and the old process exits.
+5. A short-lived helper process (`shell-remote update-apply <handoff>`, a hidden subcommand; also present in `shell-remote-ui`) is started. It reports `ready` on stdout, and **only then** does the old agent exit. The helper waits for that exact PID (Unix `kill(0)` + `/proc/<pid>/stat` start time; Windows `OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject` + process creation time — never by process name), renames the current binary to a backup, atomically installs the new one, starts it, and waits on an anonymous pipe for a `registered` receipt before deleting the backup. No systemd/SCM unit and no long-lived supervisor is installed.
 
 Progress is shown live in the device row's version cell (started / downloading n% / verifying / installing / failure reason); once upgraded it shows a green "upgraded v<version>" and the version column reflects the new agent version.
 
 Notes:
 
 - The agent's binary directory must be writable (`rename` needs write permission on it); failures surface clearly in the panel.
-- The restarted process re-registers with its fixed `--key`, keeping its identity; agents started with a temporary token (no `--key`) get freshly minted tokens after the restart, invalidating old ones.
+- **Identity survives the swap, including for temporary agents.** Before exiting, the old agent writes a one-off handoff file holding its **actual** `session_id`, every `(token, permission)` pair and its original argv. The new process uses those as its initial `cached_tokens` through the existing `register_existing` path, so `session_id`, tokens and permissions are unchanged — no new relay API is involved. A temporary agent (no `--key`) keeps its `session_id` **and** its tokens, so browsers and MCP clients already holding them keep working.
+- The handoff file lives in a private directory (`0700`) as a `0600` file (Unix) / a DACL limited to the current user (Windows), with a random name created via `create_new`. Tokens never appear in argv, in logs or in the stdout/stderr handshake. The file is deleted as soon as the new process has registered; it never persists as long-term credential storage.
+- **Rollback is bounded.** If the new process does not report `registered` within 75 s, exits early, or the helper cannot get ready within 20 s, the helper restores the backup and restarts the previous version. Before restarting it re-binds the handed-over identity with a `register_existing` call (equivalent to the old version's normal reconnect), so a rolled-back temporary device keeps its `session_id` and tokens too. If the relay no longer recognises that identity (e.g. it lost its in-memory token map in a full restart), the helper reports `Lost` with the reason and keeps the backup and log rather than claiming a clean rollback.
+- **Relay amnesia is a known boundary.** After a full relay restart, temporary tokens live only in that relay's memory; a temporary agent can then only be issued a new identity. Fixed keys recover. Temporary tokens are never silently converted into permanent keys.
+- Windows is covered by cross-compilation only in this change; the `OpenProcess`/DACL paths have not been exercised on real hardware.
 
 ## Session Recording
 

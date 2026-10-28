@@ -646,7 +646,11 @@ TTL 上限 300s，解析失败有 15s 负缓存（仍带 `expires_at`，让 agen
 
 - 制品目录必须可读（relay 需要现场算 hash）；agent 所在目录必须可写（替换需要该目录写权限），失败会在后台明确提示。
 - **旧 agent（≤ v0.59.2）只认 relay 的 `url`**：收到仅含外部 CDN 的任务时它会解析失败、只回一个错误帧，旧进程根本不会升级。因此没有本地镜像时 relay 会对这类 agent 返回 `409 legacy_agent_needs_relay_mirror`（明确提示先把制品放入 `--download-dir`），而不是白发送。它们同样不会上报 `variant:*`，未配 `--upgrade-variant` 时返回 `409 variant_unknown`。
-- 重新拉起的新进程会按 `--key` 固定密钥重新注册，身份保持；若原 agent 使用临时令牌启动（未指定 `--key`），重启后会签发新令牌，旧令牌失效。
+- **身份在换机后保持不变，临时 agent 也一样。** 旧进程退出前会把**实际** `session_id`、全部 `(token, permission)` 与原始 argv 写进一次性交接文件；新进程用它作为首次注册的 `cached_tokens`，走既有 `register_existing` 路径，`session_id`、Token 与权限都不变，不新增任何 relay API。未指定 `--key` 的临时 agent 同样保住 `session_id` **和** Token，浏览器上已打开的页面与已下发的 MCP 凭据继续可用。
+- 交接文件放在 `0700` 私有目录下的 `0600` 文件（Unix）/ 限当前用户的 DACL（Windows），随机文件名 + `create_new`，Token 不进 argv、不进日志、不进握手管道。新进程注册成功后立即删除，**不作为长期凭据存储**。
+- **回滚有界。** 新进程 75 秒内未上报 `registered`、提前退出，或助手 20 秒内没能 `ready`，助手都会恢复备份并重启旧版；重启前先用交接的缓存身份做一次 `register_existing`（等价旧版的普通重连），所以回滚后的临时设备同样保持原 `session_id` 与 Token。若 relay 已不认这份身份（例如全量重启丢了内存中的 token 表），助手会明确报 `Lost` 并保留备份与日志，不宣称回滚成功。
+- **relay 失忆是已知边界**：全量重启后临时 Token 只存在于该 relay 内存中，临时 agent 只能重新签发身份；固定 key 可恢复。不会把临时 Token 静默转成永久 key。
+- 本次改动 Windows 部分**仅交叉编译验证**，`OpenProcess`/DACL 等路径尚未在实机跑过。
 - **信任边界**：hash 来自官方 release 的 asset digest，能证明字节与 GitHub 上已上传的资产一致；它**不能**抵御官方仓库或 release 资产被恶意替换。需要这个保证要另加发布签名（不在当前范围）。CDN、DoH、代解析只解决可达性，不参与版本与字节决策。
 
 ## 会话录制

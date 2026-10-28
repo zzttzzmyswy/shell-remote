@@ -737,7 +737,11 @@
       upg_stage_started: "已触发",
       upg_stage_downloading: "下载中",
       upg_stage_verifying: "校验中",
+      upg_stage_swapping: "换机中（等待新进程注册）",
       upg_stage_installing: "安装重启中",
+      upg_stage_registered: "已注册成功",
+      upg_stage_rolled_back: "已回滚",
+      upg_stage_checking: "检查中",
       upg_failed: "升级失败",
       upg_done_suffix: "已升级 ",
       // 带宽限制（MYS-2287）
@@ -912,7 +916,11 @@
       upg_stage_started: "started",
       upg_stage_downloading: "downloading",
       upg_stage_verifying: "verifying",
+      upg_stage_swapping: "swapping (waiting for the new process)",
       upg_stage_installing: "installing",
+      upg_stage_registered: "registered",
+      upg_stage_rolled_back: "rolled back",
+      upg_stage_checking: "checking",
       upg_failed: "upgrade failed",
       upg_done_suffix: "upgraded ",
       // Bandwidth limit (MYS-2287)
@@ -1565,9 +1573,16 @@
     const wrap = document.createElement('span');
     wrap.className = 'upg-status';
     if (!u) { wrap.textContent = cur; return wrap; }
-    if (u.stage === 'failed') {
+    // 回滚与失败都是"没升成"，必须显眼——否则面板会把一台退回旧版的设备
+    // 显示成"升级过、版本没变"，运维看不出这里出过事。
+    if (u.stage === 'failed' || u.stage === 'rolled_back') {
       wrap.className += ' upg-fail';
-      wrap.appendChild(textNode('✗ ' + (u.error || t('upg_failed'))));
+      wrap.appendChild(textNode('✗ ' + (u.error || t('upg_stage_' + u.stage))));
+      return wrap;
+    }
+    if (u.stage === 'registered') {
+      wrap.className += ' upg-done';
+      wrap.appendChild(textNode('✓ ' + t('upg_done_suffix') + (u.version ? 'v' + u.version : cur)));
       return wrap;
     }
     if (s.agent_version && u.version && s.agent_version === u.version) {

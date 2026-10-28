@@ -116,6 +116,23 @@ enum Command {
         /// relay 中转，浏览器同网段探测在后续阶段接入）。
         #[arg(long, default_value_t = 0)]
         desktop_lan_port: u16,
+
+        /// INTERNAL — 换机后的一次性身份恢复（MYS-2425 阶段3）：私有交接文件
+        /// 的路径。隐藏参数，只由 `update-apply` 拉起新进程时传入。
+        #[arg(long = "upgrade-restore", hide = true)]
+        upgrade_restore: Option<String>,
+    },
+
+    /// INTERNAL — 换机助手（MYS-2425 阶段3）：等旧 agent 退出、原子替换二进制、
+    /// 拉起新进程并等它注册成功；失败则回滚并原身份重启旧版。
+    ///
+    /// 隐藏子命令，正常运行时由 agent 自己在升级流程里启动。UI 二进制也必须
+    /// 有它：否则用 UI 制品升级时助手入口不存在，整条换机链路在 UI 设备上
+    /// 直接缺失。
+    #[command(hide = true)]
+    UpdateApply {
+        /// 私有交接文件（0600 / 当前用户 ACL）的路径。
+        handoff: String,
     },
 }
 
@@ -166,8 +183,27 @@ impl View {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // 换机助手必须在这里分流，**先于任何 tracing 初始化与版本打印**。
+    //
+    // 与 CLI（`src/main.rs`）同一条协议：旧 agent 从助手的 stdout 上只读
+    // 一行，必须是 `ready`。`init_logging()` 默认把 tracing 写到 stdout，
+    // 只要它先跑，第一行就变成 "shell-remote-ui v0.59.2 (view=…)"，旧 agent
+    // 会判定"助手没 ready 就报了别的东西"并放弃整次升级。
+    //
+    // 助手不需要 tracing：它自己的日志走交接文件同目录的 `update-apply.log`
+    // （0600，见 `HelperLog`）。UI 二进制也必须能当助手用，否则用 UI 制品
+    // 升级时助手入口不存在，整条换机链路在 UI 设备上直接缺失。
+    if let Command::UpdateApply { handoff } = &cli.command {
+        shell_remote::install_panic_hook();
+        let code = shell_remote::agent::update_apply::run(std::path::Path::new(handoff));
+        std::process::exit(code);
+    }
+
     let view = View::resolve(match &cli.command {
         Command::Agent { view, .. } => view,
+        Command::UpdateApply { .. } => {
+            unreachable!("update-apply is dispatched before the view is resolved")
+        }
     });
     let view = view.effective();
 
@@ -213,6 +249,7 @@ fn main() -> anyhow::Result<()> {
             desktop_min_bitrate,
             desktop_display,
             desktop_lan_port,
+            upgrade_restore,
         } => {
             let desired = match session_id.as_deref() {
                 Some(s) => {
@@ -223,6 +260,21 @@ fn main() -> anyhow::Result<()> {
                     Some(s.to_string())
                 }
                 None => None,
+            };
+            // 换机后的一次性身份恢复：显式隐藏参数优先，其次环境变量（回滚
+            // 路径）。都没有则是普通启动。
+            // fail-closed：换机助手把我拉起来、但交接文件读不出来时，直接让
+            // 进程启动失败（助手据此回滚），绝不能静默走全新注册——那会让
+            // 临时设备换掉 session_id/Token，而助手还以为升级成功了。
+            // 普通启动（没有恢复意图）不受影响，行为与旧版一致。
+            let restored = match agent::update_apply::resolve_restore(upgrade_restore.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot start with the handed-over identity");
+                    // 只写原因（不含 Token），助手会把它转存进 update-apply.log。
+                    eprintln!("shell-remote: upgrade restore failed: {e}");
+                    anyhow::bail!("upgrade restore failed: {e}");
+                }
             };
             let root = root.unwrap_or_else(agent::home_dir);
             // 命令日志开关：默认开启，`--no-cmd-log` 关闭。
@@ -287,7 +339,7 @@ fn main() -> anyhow::Result<()> {
                     let rt = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
                         .build()?;
-                    rt.block_on(agent::start(
+                    rt.block_on(agent::start_with_restore(
                         relay_url,
                         key,
                         root,
@@ -297,6 +349,7 @@ fn main() -> anyhow::Result<()> {
                         desktop_cfg,
                         Some(status_for_agent),
                         relay_insecure,
+                        restored,
                     ))
                 })
                 .expect("spawn agent thread");
@@ -317,6 +370,11 @@ fn main() -> anyhow::Result<()> {
                     let _ = agent_thread.join();
                 }
             }
+        }
+        // 已在 main 开头分流（换机助手无界面、无状态面板），这里不可达；
+        // 显式列出而不是 `_ =>`，让新增子命令时编译器继续提醒。
+        Command::UpdateApply { .. } => {
+            unreachable!("update-apply is dispatched before the view is resolved")
         }
     }
 

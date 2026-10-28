@@ -21,6 +21,9 @@ pub mod tcp_tunnel;
 #[cfg(test)]
 mod test_tls;
 pub mod upgrade;
+// MYS-2425 阶段3：隐藏换机助手（`update-apply`）、一次性身份交接与有界回滚。
+// 与桌面无关，lean 构建同样编译。
+pub mod update_apply;
 pub mod web_proxy;
 
 /// Unix 登录环境策略（网页终端与 MCP exec 共用，MYS-2421）。
@@ -1034,6 +1037,44 @@ pub async fn start(
     status: Option<AgentStatus>,
     insecure_tls: bool,
 ) -> anyhow::Result<()> {
+    start_with_restore(
+        relay_url,
+        key,
+        root,
+        token_type,
+        shell_path,
+        session_id,
+        #[cfg(feature = "desktop")]
+        desktop_cfg,
+        #[cfg(feature = "tui")]
+        status,
+        insecure_tls,
+        None,
+    )
+    .await
+}
+
+/// 带「一次性身份恢复」的启动入口（MYS-2425 阶段3）。普通启动传 `None`
+/// 即完全走原路径——正常启动不落任何长期身份文件。
+///
+/// 恢复只在**进程内**生效：把交接来的 tokens + 实际 session_id 作为首次注册
+/// 的初始 `cached_tokens`，之后的重连逻辑与平时完全一致。身份一旦进了内存，
+/// 交接文件立即删除。
+#[allow(clippy::too_many_arguments)]
+pub async fn start_with_restore(
+    relay_url: String,
+    key: Option<String>,
+    root: String,
+    token_type: String,
+    shell_path: String,
+    session_id: Option<String>,
+    #[cfg(feature = "desktop")]
+    desktop_cfg: crate::agent::desktop::DesktopConfig,
+    #[cfg(feature = "tui")]
+    status: Option<AgentStatus>,
+    insecure_tls: bool,
+    restored: Option<crate::agent::update_apply::RestoredIdentity>,
+) -> anyhow::Result<()> {
     let mut delay = Duration::from_secs(1);
     // Same 60s cap as registration retries (client.rs, R5#9): a 300s cap made
     // recovery after a flapping network take up to 5 minutes.
@@ -1044,13 +1085,48 @@ pub async fn start(
     let mut terminals = Terminals::new();
     // Tokens obtained on the first successful registration; replayed on every
     // reconnect so the relay reuses them instead of minting new random ones.
-    let mut cached_tokens: Option<Vec<(String, String)>> = None;
-    // 会话 id：优先用 CLI 指定的；刷新 token 时保留最近一次注册拿到的实际 id
-    //（未指定 --session-id 时首个随机 id 也保持不变，满足"不动会话 id"）。
+    //
+    // 换机恢复：交接来的 (token, permission) 就是**第一次**注册的 cached
+    // tokens。转成 `(String, String)` 与既有类型一致，后续重连/失效清理逻辑
+    // 一行都不用改（401/409 仍会清缓存回退到 `--key` 全新注册）。
+    let mut cached_tokens: Option<Vec<(String, String)>> = restored
+        .as_ref()
+        .filter(|r| r.restore.is_usable())
+        .map(|r| r.restore.tokens.clone());
+    // 会话 id：优先用交接来的**实际** id（临时 agent 没有 --session-id，
+    // 只有这个能保住原会话）；其次才是 CLI 指定的。
     #[cfg(feature = "tui")]
-    let mut effective_session_id = session_id;
+    let mut effective_session_id = restored
+        .as_ref()
+        .filter(|r| r.restore.is_usable())
+        .map(|r| r.restore.session_id.clone())
+        .or(session_id);
     #[cfg(not(feature = "tui"))]
-    let effective_session_id = session_id;
+    let effective_session_id = restored
+        .as_ref()
+        .filter(|r| r.restore.is_usable())
+        .map(|r| r.restore.session_id.clone())
+        .or(session_id);
+    // 恢复状态只在**首次**会话生效：注册成功即消费，之后的正常重连不再
+    // 依赖它。
+    let mut restore_pending = restored;
+    if let Some(r) = restore_pending.as_ref() {
+        if r.restore.is_usable() {
+            tracing::info!(
+                session = %r.restore.session_id,
+                upgrade_id = %r.restore.upgrade_id,
+                tokens = r.restore.tokens.len(),
+                rollback = r.restore.rollback.is_some(),
+                "recovering the previous identity after a self-upgrade"
+            );
+        } else {
+            tracing::warn!(
+                upgrade_id = %r.restore.upgrade_id,
+                "the upgrade handoff carried no usable identity; registering as a new device"
+            );
+            restore_pending = None;
+        }
+    }
     // R5#11 会话级桌面状态：relay 重启/断线后自动恢复桌面流（跨 run_session
     // 重连传递"上次桌面是否在跑"）。
     #[cfg(feature = "desktop")]
@@ -1078,6 +1154,10 @@ pub async fn start(
             #[cfg(feature = "desktop")]
             &mut desktop_want_running,
             &mut terminals,
+            // 交接文件的生命周期只到"首次注册成功"为止：注册后由
+            // `RestoredIdentity::complete` 删除并回执助手。传引用是因为
+            // 注册失败要继续在线重试（文件必须还在），成功后才消费。
+            restore_pending.as_ref(),
         )
         .await
         {
@@ -1086,6 +1166,12 @@ pub async fn start(
             }
             Err(e) => {
                 tracing::warn!("Agent session error: {}, reconnecting in {:?}...", e, delay);
+            }
+        }
+        // 首次注册已回报（成功或已判定不可用）→ 后续重连不再带恢复语义。
+        if let Some(r) = restore_pending.as_ref() {
+            if r.consumed() {
+                restore_pending = None;
             }
         }
 
@@ -1150,6 +1236,8 @@ async fn run_session(
     #[cfg(feature = "desktop")]
     desktop_want_running: &mut bool,
     terminals: &mut Terminals,
+    // 换机后的一次性身份恢复（`None` = 普通启动）。注册成功即消费。
+    restored: Option<&crate::agent::update_apply::RestoredIdentity>,
 ) -> anyhow::Result<()> {
     // Validate the root directory BEFORE registering with the relay. A bad
     // root must fail fast without minting a session — otherwise the relay
@@ -1227,6 +1315,62 @@ async fn run_session(
         tracing::info!(session = %client.session_id, permission = %perm, "token: {}", token);
     }
 
+    // 换机恢复的回执：**注册成功之后**才做（"进程起来了"不算数）。
+    //
+    // 两件事：删交接文件（身份已进内存，文件留着只是风险）+ 向助手写
+    // `registered` 标记。助手没收到标记就会回滚——所以这一步必须紧跟在注册
+    // 成功之后，排在任何可能失败的后续初始化（PTY、桌面、代理）之前。
+    if let Some(r) = restored {
+        // 只有**身份真的回到原样**才允许上报 `registered`。
+        //
+        // 之前这里是"id 不一致只 warn，然后照样 complete()"：relay 失忆或
+        // 拒绝这份身份时，临时设备已经拿到全新的 session_id/Token，助手却
+        // 收到成功回执、删掉备份——把"设备变成了另一台"记成升级成功。
+        //
+        // 现在按 [`restore_verdict`] 判定：
+        // - 完整一致 → 成功；
+        // - 固定 key 设备保住 sid、Token 被 relay 重签 → 允许成功但记 warn
+        //   （Token 由 key 派生，身份仍是同一台；旧 Token 的浏览器会掉线）；
+        // - 其余（尤其纯临时设备换了 sid 或 Token）→ 不消费交接文件、
+        //   不上报 registered，直接结束会话让助手按超时/提前退出回滚。
+        let mut accepted = false;
+        match crate::agent::update_apply::restore_verdict(
+            r.restore.fixed_key.as_deref(),
+            &r.restore.session_id,
+            &r.restore.tokens,
+            &client.session_id,
+            &client.tokens,
+        ) {
+            Ok(crate::agent::update_apply::RollbackIdentity::Preserved) => {
+                accepted = true;
+            }
+            Ok(verdict) => {
+                tracing::warn!(
+                    expected = %r.restore.session_id,
+                    actual = %client.session_id,
+                    verdict = ?verdict,
+                    "the original session id was preserved but the relay re-issued its tokens; \
+                     browsers holding the old tokens are logged out"
+                );
+                accepted = true;
+            }
+            Err(e) => {
+                tracing::error!(
+                    expected = %r.restore.session_id,
+                    actual = %client.session_id,
+                    error = %e,
+                    "the relay did not accept the handed-over identity; refusing to report a successful upgrade"
+                );
+                // 不消费交接文件、不写 registered 标记：助手要么等超时，
+                // 要么看到本进程退出，两条路都会走有界回滚。
+                anyhow::bail!("upgrade identity not restored: {e}");
+            }
+        }
+        if accepted {
+            r.complete();
+        }
+    }
+
     // 把实际 session id 与 token 写入共享状态（TUI 展示；token 刷新后在此更新）。
     #[cfg(feature = "tui")]
     if let Some(st) = &status {
@@ -1238,6 +1382,17 @@ async fn run_session(
     // processing (and MCP round-trips time out as "i/o error").
     let (control_tx, control_rx) = tokio::sync::mpsc::channel::<String>(64);
     let (output_tx, output_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(64);
+    // 回滚后的重启：把失败原因送回 relay。否则管理界面只会看到一个
+    // "升级过、版本却没变"的状态，运维无从判断是没升成还是又退了回来。
+    if let Some(r) = restored {
+        // 成功 → `registered` 终结帧；回滚重启 → `rolled_back` + 原因。
+        let frame = r
+            .registered_frame(&client.session_id)
+            .or_else(|| r.progress_frame(&client.session_id));
+        if let Some(frame) = frame {
+            let _ = control_tx.send(frame).await;
+        }
+    }
     let out = Out {
         control_tx: control_tx.clone(),
         output_tx,
@@ -2763,7 +2918,7 @@ async fn run_session(
                                             // 升级上下文显式装配：relay 客户端与 Token
                                             // 只交给 UpgradeContext，外部 CDN 请求由下载器
                                             // 用另一个（无凭据的）客户端发出。
-                                            let ctx = crate::agent::upgrade::UpgradeContext::new(
+                                            let mut ctx = crate::agent::upgrade::UpgradeContext::new(
                                                 http,
                                                 relay_base,
                                                 token,
@@ -2772,6 +2927,15 @@ async fn run_session(
                                                 exe,
                                                 relay_insecure,
                                             );
+                                            // 换机要交接**完整**身份：`--token-type ro/both`
+                                            // 的设备升级后权限必须一模一样，只交 rw 会悄悄提权。
+                                            ctx.tokens = client.tokens.clone();
+                                            // 回滚要用它把身份拉回原会话：旧版二进制
+                                            // 不认识交接文件，但它认识自己的 `--key`。
+                                            ctx.fixed_key = key.clone();
+                                            ctx.token_type = token_type.to_string();
+                                            // 助手是本二进制的隐藏子命令，路径就是 target 自己。
+                                            ctx.helper_exe = ctx.target.clone();
                                             tokio::spawn(async move {
                                                 crate::agent::upgrade::perform_upgrade(ctx, req)
                                                     .await;
