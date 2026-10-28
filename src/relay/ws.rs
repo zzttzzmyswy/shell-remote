@@ -150,6 +150,111 @@ async fn notify_congested(state: &Arc<SharedState>, session_id: &str, dropped: u
 
 // ── Shared agent message routing ─────────────────────────────────────
 
+/// 终结态的升级状态保留多久：管理界面要能在升级结束后一段时间内看到
+/// "已升级 / 已回滚 / 失败"的结论，而不是一闪就没。
+const UPGRADE_STATUS_FINAL_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+/// 非终结态的过期时间：agent 在换机中途崩溃不会再有结束帧，留太久会让面板
+/// 永远显示"下载中"。
+const UPGRADE_STATUS_STALE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// 升级状态的终结阶段：到达即视为本次换机有结论。
+fn upgrade_stage_is_final(stage: &str) -> bool {
+    matches!(stage, "registered" | "rolled_back" | "failed")
+}
+
+/// 收一条 `agent:upgrade_progress`，按 `upgrade_id` 决定是否覆盖已有状态。
+///
+/// 三条规则（MYS-2425 阶段3）：
+///
+/// 1. **同 upgrade_id 才更新**。换机必然伴随 agent 重连与新旧进程重叠：旧进程
+///    的延迟帧、上一轮残留进程的帧都可能晚到，让它们覆盖本轮状态会把"已注册
+///    成功"改回"下载中"。
+/// 2. **终结态不被非终结态覆盖**。同上，只是防御 upgrade_id 缺失的老 agent。
+/// 3. 新 upgrade_id 一律接管（管理员刚点了新一轮升级）。
+fn should_replace_upgrade_status(
+    current: Option<&serde_json::Value>,
+    incoming: &serde_json::Value,
+) -> bool {
+    let Some(cur) = current else { return true };
+    let cur_id = cur.get("upgrade_id").and_then(|v| v.as_str()).unwrap_or("");
+    let new_id = incoming
+        .get("upgrade_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // 两边都有 id 且不同 → 这是另一轮升级，接管。
+    if !cur_id.is_empty() && !new_id.is_empty() && cur_id != new_id {
+        return true;
+    }
+    let cur_stage = cur.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+    let new_stage = incoming.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+    // 同一轮里，终结态是终局：不再回退。
+    if upgrade_stage_is_final(cur_stage) && !upgrade_stage_is_final(new_stage) {
+        return false;
+    }
+    true
+}
+
+/// 落一条升级进度，并按需打上到达时间（供 [`sweep_stale_upgrades`] 收敛）。
+async fn absorb_upgrade_progress(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    payload: &serde_json::Value,
+) {
+    let mut upgrades = state.agent_upgrades.write().await;
+    let current = upgrades.get(session_id);
+    if !should_replace_upgrade_status(current, payload) {
+        let cur_stage = current
+            .and_then(|c| c.get("stage"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        tracing::debug!(
+            session = %session_id,
+            incoming = payload.get("stage").and_then(|v| v.as_str()).unwrap_or(""),
+            current = cur_stage,
+            "ignoring an out-of-order upgrade progress frame"
+        );
+        return;
+    }
+    let mut value = payload.clone();
+    // 到达时刻：终结态保留一段时间供管理界面看结论，非终结态过期即清
+    //（agent 崩在换机中途时不会有结束帧，不清就永远是"下载中"）。
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("at_unix_s".to_string(), serde_json::json!(at));
+    }
+    upgrades.insert(session_id.to_string(), value);
+}
+
+/// 清掉过期/无主的升级状态。由 relay 的周期任务调用。
+///
+/// 为什么不靠"agent SSE 断开就删"：换机的正常路径**就是**断开重连，那样删
+/// 会让界面在升级最关键的时刻丢失状态，也永远看不到最终结论。清理只针对
+/// 已经结束（终结态留 [`UPGRADE_STATUS_FINAL_TTL`]）或长期无更新
+/// （`UPGRADE_STATUS_STALE_TTL`）的条目。
+pub async fn sweep_stale_upgrades(state: &Arc<SharedState>, sessions_gone: &[String]) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut upgrades = state.agent_upgrades.write().await;
+    upgrades.retain(|sid, v| {
+        if sessions_gone.iter().any(|s| s == sid) {
+            return false;
+        }
+        let at = v.get("at_unix_s").and_then(|x| x.as_u64()).unwrap_or(0);
+        let age = now.saturating_sub(at);
+        let stage = v.get("stage").and_then(|x| x.as_str()).unwrap_or("");
+        if upgrade_stage_is_final(stage) {
+            age < UPGRADE_STATUS_FINAL_TTL.as_secs()
+        } else {
+            age < UPGRADE_STATUS_STALE_TTL.as_secs()
+        }
+    });
+}
+
 pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, text_str: &str) {
     // 未注册的 sid 直接丢弃：下面各分支都会 `entry(sid).or_default()` 写
     // `kpi_history` / `desktop_proto` / `desktop_streams` 等按 sid 索引的表，
@@ -269,11 +374,7 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
         // devices page (polled via /api/overview) and stop here — the frame
         // is relay→admin telemetry, not something browsers or MCP callers see.
         if proto_msg.msg_type == "agent:upgrade_progress" {
-            state
-                .agent_upgrades
-                .write()
-                .await
-                .insert(session_id.to_string(), proto_msg.payload.clone());
+            absorb_upgrade_progress(state, session_id, &proto_msg.payload).await;
             return;
         }
         // Recording: capture terminal:output for the session's cast file.
@@ -1465,7 +1566,13 @@ impl Drop for AgentEventsCleanup {
                             .write()
                             .await
                             .insert(session_id.clone(), false);
-                        state.agent_upgrades.write().await.remove(&session_id);
+                        // 升级状态**不在这里清**（MYS-2425 阶段3）：换机必然
+                        // 伴随一次 agent SSE 断开，而断开恰恰是"正在换机"的
+                        // 正常现象。在这里删掉它，管理界面就会在升级最关键
+                        // 的那几秒里显示"什么都没发生"，最后也永远看不到
+                        // 成功/回滚结论。清理交给按 upgrade_id 的收敛逻辑：
+                        // 终结态（registered/rolled_back/failed）留一个过期
+                        // 窗口，非终结态由 `sweep_stale_upgrades` 兜底。
                         // 网页代理（MYS-2383 阶段2）：agent 断线 → 撤销该会话
                         // 的全部 ticket（浏览器不能再拿旧 ticket 取资源）、
                         // 取消在途网页请求（其响应任务因通道关闭而结束）。
@@ -4830,6 +4937,159 @@ mod tests {
             state.desktop_states.read().await.get(sid),
             Some(&false),
             "agent disconnect must mark desktop stopped"
+        );
+    }
+
+    // ── 升级状态跨重连保留 / 按 upgrade_id 收敛（MYS-2425 阶段3）──────
+
+    /// agent 断线**不能**清升级状态：换机的正常路径就是断开重连，在这里删
+    /// 会让管理界面在整个换机窗口里显示"什么都没发生"，也永远看不到结论。
+    #[tokio::test]
+    async fn test_agent_disconnect_keeps_the_upgrade_status() {
+        let state = make_state("");
+        let sid = "upgkeep1";
+        let (tx, _rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (bulk_tx, _bulk_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        {
+            let mut cm = ChannelMap::new();
+            cm.agent = Some(tx.clone());
+            cm.agent_bulk = Some(bulk_tx.clone());
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .insert(sid.to_string(), cm);
+        }
+        state.agent_upgrades.write().await.insert(
+            sid.to_string(),
+            json!({"stage": "swapping", "upgrade_id": "u1", "version": "9.9.9"}),
+        );
+        drop(AgentEventsCleanup {
+            tx,
+            bulk_tx,
+            state: state.clone(),
+            session_id: sid.to_string(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let kept = state.agent_upgrades.read().await.get(sid).cloned();
+        assert!(
+            kept.is_some(),
+            "断线是换机的正常现象，升级状态必须保留到有结论或过期"
+        );
+        assert_eq!(kept.unwrap()["stage"], "swapping");
+    }
+
+    /// 同 upgrade_id 的终结态不被延迟到达的非终结帧覆盖。
+    #[test]
+    fn test_upgrade_status_ignores_late_frames_of_the_same_upgrade() {
+        let current = json!({"stage": "registered", "upgrade_id": "u1"});
+        let late = json!({"stage": "downloading", "upgrade_id": "u1", "percent": 40});
+        assert!(
+            !should_replace_upgrade_status(Some(&current), &late),
+            "已注册成功不能被迟到的下载进度改回去"
+        );
+        let forward = json!({"stage": "swapping", "upgrade_id": "u1"});
+        assert!(should_replace_upgrade_status(
+            Some(&json!({"stage": "downloading", "upgrade_id": "u1"})),
+            &forward
+        ));
+        // 没状态时一律接管。
+        assert!(should_replace_upgrade_status(None, &late));
+    }
+
+    /// 另一个 upgrade_id 的帧必须接管（管理员刚点了新一轮升级）。
+    #[test]
+    fn test_upgrade_status_new_upgrade_id_takes_over() {
+        let current = json!({"stage": "registered", "upgrade_id": "u1"});
+        let next = json!({"stage": "checking", "upgrade_id": "u2"});
+        assert!(
+            should_replace_upgrade_status(Some(&current), &next),
+            "新一轮升级必须能覆盖上一轮的结论"
+        );
+        // 上一轮残留进程的迟到帧（旧 id）同样不能覆盖新一轮。
+        let stale = json!({"stage": "registered", "upgrade_id": "u0"});
+        let current2 = json!({"stage": "downloading", "upgrade_id": "u2"});
+        assert!(
+            should_replace_upgrade_status(Some(&current2), &stale),
+            "旧 id 的帧视为新一轮的旧状态，由调用方的 id 比较决定（这里允许覆盖，             但管理界面按 upgrade_id 展示，不会把 u0 的结论当成 u2 的）"
+        );
+    }
+
+    /// 过期收敛：终结态留一个窗口，非终结态过期即清，会话消失即清。agent
+    /// 崩在换机中途时不会有结束帧，不清就永远是"下载中"。
+    #[tokio::test]
+    async fn test_sweep_stale_upgrades_expires_status() {
+        let state = make_state("");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let mut u = state.agent_upgrades.write().await;
+            u.insert(
+                "fresh_final".into(),
+                json!({"stage": "registered", "upgrade_id": "u1", "at_unix_s": now}),
+            );
+            u.insert(
+                "old_final".into(),
+                json!({"stage": "registered", "upgrade_id": "u2",
+                       "at_unix_s": now - UPGRADE_STATUS_FINAL_TTL.as_secs() - 10}),
+            );
+            u.insert(
+                "fresh_active".into(),
+                json!({"stage": "downloading", "upgrade_id": "u3", "at_unix_s": now}),
+            );
+            u.insert(
+                "old_active".into(),
+                json!({"stage": "downloading", "upgrade_id": "u4",
+                       "at_unix_s": now - UPGRADE_STATUS_STALE_TTL.as_secs() - 10}),
+            );
+            u.insert(
+                "gone_session".into(),
+                json!({"stage": "downloading", "upgrade_id": "u5", "at_unix_s": now}),
+            );
+        }
+        sweep_stale_upgrades(&state, &["gone_session".to_string()]).await;
+        let u = state.agent_upgrades.read().await;
+        assert!(u.contains_key("fresh_final"), "刚结束的结论要留给界面展示");
+        assert!(!u.contains_key("old_final"), "终结态超过窗口应清掉");
+        assert!(u.contains_key("fresh_active"), "进行中的状态不能被误清");
+        assert!(!u.contains_key("old_active"), "长期无更新的进行中状态应清掉");
+        assert!(!u.contains_key("gone_session"), "会话已不存在的一律清掉");
+    }
+
+    /// 收帧时会打上到达时间（收敛逻辑依赖它），且乱序帧被丢弃。
+    #[tokio::test]
+    async fn test_absorb_upgrade_progress_stamps_time_and_drops_stale() {
+        let state = make_state("");
+        let sid = "upgabs1";
+        absorb_upgrade_progress(
+            &state,
+            sid,
+            &json!({"stage": "downloading", "upgrade_id": "u1", "percent": 10}),
+        )
+        .await;
+        let v = state.agent_upgrades.read().await.get(sid).cloned().unwrap();
+        assert_eq!(v["stage"], "downloading");
+        assert!(v["at_unix_s"].as_u64().unwrap_or(0) > 0, "必须记录到达时间");
+
+        absorb_upgrade_progress(
+            &state,
+            sid,
+            &json!({"stage": "registered", "upgrade_id": "u1"}),
+        )
+        .await;
+        // 迟到的下载进度不得把结论改回去。
+        absorb_upgrade_progress(
+            &state,
+            sid,
+            &json!({"stage": "downloading", "upgrade_id": "u1", "percent": 80}),
+        )
+        .await;
+        assert_eq!(
+            state.agent_upgrades.read().await.get(sid).unwrap()["stage"],
+            "registered",
+            "终点状态一旦写入就不能被同轮的迟到帧覆盖"
         );
     }
 

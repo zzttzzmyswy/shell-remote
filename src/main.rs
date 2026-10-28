@@ -198,6 +198,26 @@ enum Command {
         /// 关闭命令日志（默认会把 MCP 执行的命令与 Web 终端输入的命令行打印到日志）
         #[arg(long)]
         no_cmd_log: bool,
+
+        /// INTERNAL — 换机后的一次性身份恢复（MYS-2425 阶段3）：私有交接文件
+        /// 的路径。隐藏参数，只由 `update-apply` 拉起新进程时传入；普通启动
+        /// 不落任何长期身份文件。
+        ///
+        /// 回滚路径不走这里：那时被拉起的可能是还不认识本参数的旧版二进制，
+        /// 所以助手改用环境变量 `SR_UPGRADE_RESTORE` 传递。
+        #[arg(long = "upgrade-restore", hide = true)]
+        upgrade_restore: Option<String>,
+    },
+
+    /// INTERNAL — 换机助手（MYS-2425 阶段3）：等旧 agent 退出、原子替换二进制、
+    /// 拉起新进程并等它注册成功；失败则回滚并原身份重启旧版。
+    ///
+    /// 隐藏子命令：`hide = true` 让它不出现在 `--help`，避免前台用户误调用。
+    /// 正常运行时由 agent 自己在升级流程里启动，参数是私有交接文件的路径。
+    #[command(hide = true)]
+    UpdateApply {
+        /// 私有交接文件（0600 / 当前用户 ACL）的路径。
+        handoff: String,
     },
 }
 
@@ -270,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
             shell,
             session_id,
             no_cmd_log,
+            upgrade_restore,
         } => {
             // 命令日志开关：默认开启，`--no-cmd-log` 关闭。
             agent::cmd_log::set_enabled(!no_cmd_log);
@@ -283,6 +304,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => None,
             };
+            // 换机后的一次性身份恢复：显式隐藏参数优先，其次环境变量（回滚
+            // 路径）。都没有则是普通启动，行为与旧版完全一致。
+            let restored = agent::update_apply::restore_handoff_path(upgrade_restore.as_deref())
+                .and_then(|p| agent::update_apply::RestoredIdentity::load(&p));
             let root = root.unwrap_or_else(agent::home_dir);
             #[cfg(feature = "desktop")]
             {
@@ -291,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
                     capture: "none".to_string(),
                     ..Default::default()
                 };
-                agent::start(
+                agent::start_with_restore(
                     relay_url,
                     key,
                     root,
@@ -302,12 +327,13 @@ async fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "tui")]
                     None,
                     relay_insecure,
+                    restored,
                 )
                 .await?;
             }
             #[cfg(not(feature = "desktop"))]
             {
-                agent::start(
+                agent::start_with_restore(
                     relay_url,
                     key,
                     root,
@@ -317,9 +343,17 @@ async fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "tui")]
                     None,
                     relay_insecure,
+                    restored,
                 )
                 .await?;
             }
+        }
+        Command::UpdateApply { handoff } => {
+            // 换机助手：短生命周期进程，做完就退出。日志走交接文件同目录的
+            // `update-apply.log`（助手可能在旧 agent 已退出、甚至没有日志
+            // 落盘的部署里运行）。
+            let code = agent::update_apply::run(std::path::Path::new(&handoff));
+            std::process::exit(code);
         }
     }
 

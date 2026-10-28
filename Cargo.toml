@@ -110,7 +110,12 @@ strip = true
 panic = "unwind"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_SystemServices", "Win32_System_Ole"], optional = true }
+# Windows 平台基础 API。**非 optional**：换机助手（MYS-2425 阶段3）在 lean 构建
+# （--no-default-features，发布用的 CLI 产物）里就必须能按确切 PID 等待旧进程
+# （OpenProcess/WaitForSingleObject）并给交接文件设当前用户 DACL
+# （Win32_Security）。这些能力与桌面 feature 无关，挂在 desktop 下面会让发布版
+# Windows agent 的换机整条不可用。
+windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_SystemServices", "Win32_System_Ole", "Win32_System_Threading", "Win32_Security"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"
@@ -124,7 +129,7 @@ windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics
 default = ["desktop", "av1", "tui", "gui"]
 # 桌面转发（UI 二进制）：X11/DXGI/GDI/wayland 捕获 + AV1/H264 软编 +
 # WebRTC P2P + LAN 直连。关闭时整个 src/agent/desktop、lan、p2p 不编译。
-desktop = ["dep:openh264-sys2", "dep:x11rb", "dep:enigo", "dep:str0m", "dep:windows-sys", "dep:windows"]
+desktop = ["dep:openh264-sys2", "dep:x11rb", "dep:enigo", "dep:str0m", "dep:windows"]
 # AV1 软编（libaom），默认编进桌面构建（build.rs 链接系统/静态 libaom）。
 av1 = []
 # 终端状态界面（ratatui）：UI 二进制带 TTY 时渲染状态面板。

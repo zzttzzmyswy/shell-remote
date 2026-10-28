@@ -2713,6 +2713,23 @@ pub async fn start(
                     }
                 }
 
+                // 升级状态周期收敛（MYS-2425 阶段3）：终结态留一个窗口供
+                // 界面展示结论，非终结态过期即清（agent 崩在换机中途时不会
+                // 再有结束帧）。agent 断线本身**不**清状态——换机的正常路径
+                // 就是断开重连。
+                let gone: Vec<String> = {
+                    let sessions = state_clone.sessions.list_sessions().await;
+                    let live: std::collections::HashSet<String> =
+                        sessions.into_iter().map(|(sid, _)| sid).collect();
+                    let upgrades = state_clone.agent_upgrades.read().await;
+                    upgrades
+                        .keys()
+                        .filter(|sid| !live.contains(*sid))
+                        .cloned()
+                        .collect()
+                };
+                crate::relay::ws::sweep_stale_upgrades(&state_clone, &gone).await;
+
                 // 网页代理周期清理（MYS-2383 阶段2）：过期 ticket + 已无消费者的
                 // 在途网页请求。正常路径由请求守卫清理，这里是兜底（进程被
                 // 拖慢 / 任务被 abort 时不会留下永久条目）。

@@ -117,6 +117,39 @@ struct Transport {
 /// （仅在会话无在线 agent 时放行）。
 pub(crate) const AGENT_TOKEN_HEADER: &str = "X-SR-Agent-Token";
 
+/// 换机后的一次性身份恢复。
+///
+/// 临时 agent 的 `session_id` 与 Token **只存在于内存**：进程一换，未显式
+/// `--session-id` 的实例会拿到全新 ID、无 `--key` 的实例会拿到全新 Token，
+/// 浏览器上已打开的页面与已下发的 MCP 凭据全部失效。换机助手因此把旧进程
+/// 的身份交接给新进程，新进程用它作为**首次注册的 cached_tokens**——沿用
+/// 既有的 `register_existing` 路径，不新增任何 relay API。
+///
+/// `session_id` 必须是注册响应里的**实际** ID（不是用户传的 `--session-id`：
+/// 临时 agent 没有那个值），relay 侧据此认定这是同一个会话的新化身。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpgradeRestore {
+    /// `(token, permission)`，顺序与 relay 下发一致。
+    pub tokens: Vec<(String, String)>,
+    /// 注册响应里的实际 session id。
+    pub session_id: String,
+    /// 本次换机的 upgrade_id（回执与管理界面对账用）。
+    pub upgrade_id: String,
+    /// 目标版本。
+    pub target_version: String,
+    /// 非空表示这是**回滚**后的重启：新版本没注册成功，设备退回了旧版本。
+    /// 注册后要把它上报成 `agent:upgrade_progress{stage:"rolled_back"}`，
+    /// 否则管理界面只会看到一个"升级了但版本没变"的谜。
+    pub rollback: Option<String>,
+}
+
+impl UpgradeRestore {
+    /// 是否可以真的拿来恢复身份（空 token 集合没有意义）。
+    pub fn is_usable(&self) -> bool {
+        !self.tokens.is_empty() && !self.session_id.is_empty()
+    }
+}
+
 impl Drop for Transport {
     // The SSE reader is a detached task; abort it with the session so a
     // session that ends for a non-SSE reason does not leak the GET connection.
