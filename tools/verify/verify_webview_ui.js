@@ -35,7 +35,10 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 
-const ROOT = path.dirname(path.dirname(__dirname));
+// 本文件在 tools/verify/，向上三级到仓库根。统一按 __filename 起算（与
+// test_sr_web.js / verify_web_map_*.js 一致）：__filename 是文件路径、__dirname
+// 是它所在目录，两者差一级，混用极易误判层级。三级 = 去掉文件名、verify/、tools/。
+const ROOT = path.dirname(path.dirname(path.dirname(fs.realpathSync(__filename))));
 const BIN = process.env.BIN || path.join(ROOT, 'target', 'debug', 'shell-remote');
 // 旧 agent：publish 的 v0.57.0 二进制（基线，未含 web:proxy-v1）。
 const OLD_BIN = process.env.OLD_BIN || path.join(ROOT, 'dist', 'shell-remote-x86_64');
