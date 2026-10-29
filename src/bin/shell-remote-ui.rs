@@ -209,16 +209,26 @@ fn main() -> anyhow::Result<()> {
 
     // 交互视图（窗口/TUI）下业务日志默认落 ~/.shell-remote/，避免刷屏污染界面；
     // headless（systemd/nohup）保持原 stderr 行为。
-    if view.is_interactive() && std::env::var("SR_LOG_DIR").map(|d| d.trim().is_empty()).unwrap_or(true) {
-        let dir = std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join(".shell-remote"))
-            .unwrap_or_else(|_| std::path::PathBuf::from(".shell-remote"));
+    //
+    // 目录取 `default_log_dir()`：`HOME` → `%USERPROFILE%` → cwd，与 `--root`
+    // 默认值和 PTY 子进程 cwd 同一条 home 语义。Windows 桌面通常没有 `HOME`，
+    // 只看 `HOME` 会让目录退化成相对路径 `.shell-remote`（随启动 cwd 漂移）。
+    // 创建失败不设 SR_LOG_DIR：日志降级到 stderr，agent 照常启动（MYS-2461）。
+    if view.is_interactive()
+        && std::env::var("SR_LOG_DIR")
+            .map(|d| d.trim().is_empty())
+            .unwrap_or(true)
+    {
+        let dir = shell_remote::default_log_dir();
         match std::fs::create_dir_all(&dir) {
             Ok(()) => {
                 std::env::set_var("SR_LOG_DIR", &dir);
             }
             Err(e) => {
-                eprintln!("WARN: 创建默认日志目录失败 {:?}: {e}", dir.display());
+                eprintln!(
+                    "WARN: 创建默认日志目录失败 {:?}: {e} —— 日志改用 stderr",
+                    dir.display()
+                );
             }
         }
     }
@@ -360,7 +370,12 @@ fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "gui")]
                     {
                         if let Err(e) = shell_remote::gui::run(agent_status.clone()) {
+                            // 交互视图下 tracing 只落日志文件；GUI 初始化失败
+                            // （RDP/无 GPU 驱动时 glutin 找不到 GL config）必须
+                            // 也出现在 stderr，否则窗口没出现就没了、没有任何
+                            // 可读线索（MYS-2461 排查现场）。
                             tracing::warn!("GUI exited with error: {e:?}");
+                            eprintln!("ERROR: 窗口初始化失败: {e:?}");
                         }
                         // 窗口关闭/退出 → 请求 agent 停机并等它收尾（返回后进程退出）。
                         agent_status.request_shutdown();
