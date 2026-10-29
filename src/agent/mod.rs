@@ -53,7 +53,7 @@ pub fn home_dir() -> String {
     )
 }
 
-fn home_dir_from(home: Option<String>, userprofile: Option<String>) -> String {
+pub(crate) fn home_dir_from(home: Option<String>, userprofile: Option<String>) -> String {
     home.or(userprofile).unwrap_or_else(|| ".".to_string())
 }
 
