@@ -17,7 +17,7 @@
 # Usage:  tools/build-dist.sh
 # Env:    CACHE_DIR overrides $HOME/.cache/shell-remote-dist
 #
-# Requires: rustup targets + toolchains, see BUILD.md.
+# Requires: rustup targets + toolchains, see docs/build.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

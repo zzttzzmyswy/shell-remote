@@ -1,4 +1,4 @@
-// glibc-only symbol stubs for musl static links (see BUILD.md).
+// glibc-only symbol stubs for musl static links (see docs/build.md).
 //
 // OpenH264 is C++; the static musl binaries must drag in a C++ stdlib, and the
 // distro sysroots only ship a glibc-built libstdc++.a. That archive references
