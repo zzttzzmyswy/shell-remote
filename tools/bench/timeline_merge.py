@@ -9,7 +9,7 @@
   - KPI 样本：admin `/api/session/kpi/:sid` 导出的 JSON（samples[].at_unix_ms）
 
 用法:
-  python3 tools/timeline_merge.py --agent agent.log [--relay relay.log] [--kpi kpi.json] [--tail 200]
+  python3 tools/bench/timeline_merge.py --agent agent.log [--relay relay.log] [--kpi kpi.json] [--tail 200]
 
 输出: t_ms | source | 事件行（按时间升序）；`--tail` 限制行数（默认全量）。
 """

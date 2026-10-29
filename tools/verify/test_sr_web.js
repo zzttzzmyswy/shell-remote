@@ -12,12 +12,12 @@
 //   - fetch/XHR/EventSource 的绝对地址改写；
 //   - shim 的 Service Worker 防护（register 拒绝、枚举为空）。
 //
-// 用法：node tools/test_sr_web.js
+// 用法：node tools/verify/test_sr_web.js
 
 const assert = require('node:assert');
 const path = require('node:path');
 
-const ROOT = path.dirname(path.dirname(require('node:fs').realpathSync(__filename)));
+const ROOT = path.dirname(path.dirname(path.dirname(require('node:fs').realpathSync(__filename))));
 const sw = require(path.join(ROOT, 'web', 'sr-web-sw.js'));
 const shim = require(path.join(ROOT, 'web', 'sr-web-shim.js'));
 

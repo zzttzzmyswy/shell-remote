@@ -10,7 +10,7 @@
 //
 // 用法:
 //   npm i                                  # 只装 playwright
-//   BIN=./target/debug/shell-remote node verify_mys2283_e.js
+//   BIN=./target/debug/shell-remote node tools/verify/verify_mys2283_e.js
 //
 // 环境变量：
 //   BIN     shell-remote 二进制路径（默认 ./target/debug/shell-remote）

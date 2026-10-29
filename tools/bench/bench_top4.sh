@@ -1,6 +1,6 @@
 #!/bin/bash
 # 用户指定的标准动态基准画面：桌面放置 4 个 0.1s 刷新的 top 终端。
-# 用法: DISPLAY=:98 bash bench_top4.sh
+# 用法: DISPLAY=:98 bash tools/bench/bench_top4.sh
 set -u
 DISPLAY="${DISPLAY:-:98}"
 export DISPLAY

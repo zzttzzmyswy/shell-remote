@@ -18,8 +18,8 @@ QoS 决策做延迟归因：
 单次尖峰误报。
 
 用法:
-  python3 tools/qos_attribution.py <agent.log> [--window N]
-  # 示例: python3 tools/qos_attribution.py /tmp/sr22_agent.log
+  python3 tools/bench/qos_attribution.py <agent.log> [--window N]
+  # 示例: python3 tools/bench/qos_attribution.py /tmp/sr22_agent.log
 
 依赖: 无（仅标准库）。
 """

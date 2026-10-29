@@ -19,7 +19,7 @@
 //
 // 用法：
 //   cargo build --bin shell-remote
-//   BIN=./target/debug/shell-remote OLD_BIN=./dist/shell-remote-x86_64 node tools/verify_webview_ui.js
+//   BIN=./target/debug/shell-remote OLD_BIN=./dist/shell-remote-x86_64 node tools/verify/verify_webview_ui.js
 //
 // 环境变量：BIN / OLD_BIN / PORT / OLD_PORT / SITE_PORT / OUT
 
@@ -35,7 +35,10 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 
-const ROOT = path.dirname(__dirname);
+// 本文件在 tools/verify/，向上三级到仓库根。统一按 __filename 起算（与
+// test_sr_web.js / verify_web_map_*.js 一致）：__filename 是文件路径、__dirname
+// 是它所在目录，两者差一级，混用极易误判层级。三级 = 去掉文件名、verify/、tools/。
+const ROOT = path.dirname(path.dirname(path.dirname(fs.realpathSync(__filename))));
 const BIN = process.env.BIN || path.join(ROOT, 'target', 'debug', 'shell-remote');
 // 旧 agent：publish 的 v0.57.0 二进制（基线，未含 web:proxy-v1）。
 const OLD_BIN = process.env.OLD_BIN || path.join(ROOT, 'dist', 'shell-remote-x86_64');
@@ -213,7 +216,7 @@ async function waitPort(port, timeout) {
 
     // `staticMode`：本脚本断言的是**v1 静态模式**的渲染行为（单次 GET 代理 +
     // HTML/CSS 重写）。MYS-2383-G 起，新 agent + rw + localhost 会自动选中 v2
-    // 完整模式（由 tools/verify_web_map_ui.js 覆盖）。这里用「浏览器不支持
+    // 完整模式（由 tools/verify/verify_web_map_ui.js 覆盖）。这里用「浏览器不支持
     // Service Worker」把会话钉在 v1——这是 v2 的一条真实降级路径
     // （detectMode → reason 'no-service-worker'），不是为了绕过断言。
     const makePage = async (base, token, perm, staticMode) => {

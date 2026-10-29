@@ -21,7 +21,7 @@
 //  10. 原 /agent/web/proxy（v1）路径仍可用（回归一条）；
 //  11. 映射复用：同目标两次创建返回同一 map_id。
 //
-// 用法（先构建）：cargo build --bin shell-remote && node tools/verify_web_map_relay.js
+// 用法（先构建）：cargo build --bin shell-remote && node tools/verify/verify_web_map_relay.js
 // 环境变量：BIN / RELAY_PORT / SITE_PORT / TLS_PORT / RELAY_PASSWORD。
 
 'use strict';
@@ -35,7 +35,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 
-const ROOT = path.dirname(path.dirname(fs.realpathSync(__filename)));
+const ROOT = path.dirname(path.dirname(path.dirname(fs.realpathSync(__filename))));
 const BIN = process.env.BIN || path.join(ROOT, 'target', 'debug', 'shell-remote');
 const RELAY_PORT = Number(process.env.RELAY_PORT || 18920);
 const SITE_PORT = Number(process.env.SITE_PORT || 18921);

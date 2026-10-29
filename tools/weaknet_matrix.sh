@@ -3,7 +3,7 @@
 #
 # 在 agent↔relay 之间的网卡上施加 netem 延迟/丢包，逐一跑 6 组弱网矩阵
 # （RTT 100/300/800ms × 丢包 {0, 2%}），每组跑一轮 4-top 等效动态基准
-# （tools/bench_draw_quad + 浏览器采样），并记录评分卡
+# （tools/bench/bench_draw_quad + 浏览器采样），并记录评分卡
 # （渲染 fps / e2e 中位 / 丢帧率 / CPU）。无 netem 权限时降级为"仅提示"。
 #
 # 用法:

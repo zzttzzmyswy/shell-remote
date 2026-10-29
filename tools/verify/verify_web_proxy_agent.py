@@ -17,7 +17,7 @@
 
 用法（先构建 lean agent）：
     cargo build --no-default-features --bin shell-remote
-    python3 tools/verify_web_proxy_agent.py
+    python3 tools/verify/verify_web_proxy_agent.py
 
 可用环境变量覆盖：AGENT_BIN / RELAY_PORT / SITE_PORT。
 """
@@ -37,8 +37,8 @@ RELAY_PORT = int(os.environ.get("RELAY_PORT", "18800"))
 SITE_PORT = int(os.environ.get("SITE_PORT", "18801"))
 AGENT_BIN = os.environ.get(
     "AGENT_BIN",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "target-lean", "debug", "shell-remote"),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "target-lean", "debug", "shell-remote"),
 )
 
 FAILS = []

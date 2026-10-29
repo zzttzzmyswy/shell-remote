@@ -35,7 +35,7 @@ f0aea0f75f48559013ae6643c2479dd737d26da42d5524e6d2b70915ae6523c7  xterm/xterm.js
 
 `src/web.rs` 的 `rust_embed` 以整个 `web/` 目录为根（`#[folder = "web/"]`），
 所以 `web/vendor/**` 会被内嵌进二进制，并由 `static_handler`（含 `fallback`）
-按路径原样提供；`verify_mys2283_c.js` 断言这四个 URL 均返回 HTTP 200。
+按路径原样提供；`tools/verify/verify_mys2283_c.js` 断言这四个 URL 均返回 HTTP 200。
 
 ## 升级
 

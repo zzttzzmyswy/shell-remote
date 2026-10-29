@@ -5,12 +5,12 @@
 // 无框架、无浏览器：`web/webview.js` 在非浏览器环境里把同一套实现挂到
 // `module.exports`，这里直接 require 它跑真实代码（不是复制一份逻辑）。
 //
-// 用法：node tools/test_webview.js
+// 用法：node tools/verify/test_webview.js
 
 const path = require('path');
 const assert = require('assert');
 
-const WV = require(path.join(__dirname, '..', 'web', 'webview.js'));
+const WV = require(path.join(__dirname, '..', '..', 'web', 'webview.js'));
 const R = WV.Rewrite;
 const ORIGIN = 'https://relay.example:8443';
 const TICKET = 'a'.repeat(64);

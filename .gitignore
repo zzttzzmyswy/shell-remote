@@ -1,7 +1,11 @@
 target/
+# 构建产物：发布二进制（tools/build-dist.sh 输出）与 Windows manifest 中间
+# 产物（windres 输出），均由脚本生成，不进版本库。
+dist/
+build/
 .superpowers/
 releases/
 docs/superpowers/
-# Playwright 截图产物（verify_mys2283_e.js 输出，不随仓库分发）
+# Playwright 截图产物（tools/verify/verify_mys2283_e.js 输出，不随仓库分发）
 artifacts/
 node_modules/
