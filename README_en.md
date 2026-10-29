@@ -2,458 +2,124 @@
 
 [简体中文](README.md) | English
 
-Self-hosted, lightweight remote server collaboration tool. Deploy a single Rust binary to share terminal sessions via browser, manage remote files, and expose MCP protocol endpoints for AI agents.
+Self-hosted, lightweight remote collaboration tool: a single Rust binary that shares terminal sessions through a browser, manages remote files, shares the desktop, and exposes an MCP interface for AI agents. All web assets are embedded into the binary via `rust-embed`, so deployment needs no external files.
 
 ## Features
 
-- **Collaborative Terminal** — Multiple users view and interact with the same shell session simultaneously (xterm.js + WebGL)
-- **Multi-Tab Shells** — Each user independently switches between multiple PTY shells; tab changes never affect others
-- **File Manager** — Side panel with breadcrumb navigation, upload, download, delete, rename, mkdir, refresh
-- **MCP Server** — AI agents (Claude, etc.) execute commands on remote machines via standard MCP SSE Transport
-- **Tabbed Admin Panel** — The admin page is organized into six tabs: Overview / Sessions / Devices / Recordings / Access log / Settings; the active tab is remembered
-- **Device Management** — The Devices tab lists every agent with its probed host info (CPU model, architecture, OS, kernel, hostname, agent version) and supports keyword / architecture / status filtering with one-click connect
-- **Atomic Agent Self-Upgrade** — One-click per-device upgrade from the Devices tab: the agent downloads the new binary from the relay, verifies its SHA-256, smoke-tests executability, atomically replaces itself and restarts with its original arguments; progress is shown live in the device row and any failure keeps the old binary with a clear error
-- **Connection Self-Healing** — A registered-but-unreachable device no longer leaves the browser on a blank terminal: the session page shows "agent disconnected, reconnecting" and auto-reconnects; the terminal resumes once the agent link is back. If a join cannot be delivered because the agent channel is stale (reconnect/eviction window), the relay tells the browser to re-join, and the browser-side join-ack watchdog reconnects after 8s without an agent reply — no silent failure can leave a permanently empty terminal
-- **Weak-Network Resume** — Terminal shells (PTYs) survive relay reconnects: after a network drop, relay restart or half-open link, running commands keep going and the browser re-join replays each tab's last 64KB of output. The agent detects dead links in both directions (downlink: 60s SSE idle; uplink: 3 consecutive failed heartbeats), and reconnect backoff is jittered and resets after a healthy session. See [docs/weak-network-robustness.md](docs/weak-network-robustness.md)
-- **Desktop Sharing** — Agent captures the real X11/Windows desktop, encodes H.264 (openh264 software encoder) with adaptive bitrate 800–200 kbps, and streams fragmented MP4 to browsers over MSE; the session page switches freely between terminal and desktop views (desktop is off by default; click a button to open it)
-- **SSE+POST Transport** — Full-stack HTTP SSE push + POST send; no WebSocket dependency, works behind any proxy
-- **Single Binary** — All web assets embedded via `rust-embed`; zero external file dependencies
-- **Token Authentication** — Random temporary tokens or fixed keys; read-write and read-only permission levels
-- **Server Password** — Relay-level access password (`--auth`), required
+- **Collaborative terminal** — Several people view and drive the same PTY session in the browser (xterm.js + WebGL); each switches their own tabs independently
+- **Weak-network resume** — PTYs survive relay reconnects: after a network drop, a relay restart or a half-open link, running commands continue and a re-join replays each tab's last 64KB of output. Both directions have idle timeouts and heartbeat-based dead-link detection. See [docs/performance.md](docs/performance.md)
+- **Desktop sharing** — Captures the X11/Windows desktop and encodes it in pure software with AV1 (libaom) or H.264 (openh264) at an adaptive bitrate; the downlink picks LAN → WebRTC P2P → relay automatically. See [docs/desktop.md](docs/desktop.md)
+- **Web mapping** — The "Web" button in the session page browses pages on the remote device's network (including services bound to the device's own `127.0.0.1`) through a relay/agent tunnel. v2 full mode runs scripts with SPA routing, cookie login, POST and WebSocket; v1 static mode renders static pages only. See [docs/web-map.md](docs/web-map.md)
+- **MCP server** — AI agents run commands on the remote machine over standard MCP SSE Transport, with dedicated streaming endpoints for large files that keep bytes out of the LLM context. See [docs/mcp.md](docs/mcp.md)
+- **File manager and recording** — Breadcrumb navigation, upload/download/rename/delete; asciinema cast v2 recording plus an MCP command audit trail. See [docs/sessions.md](docs/sessions.md)
+- **Admin panel** — Six tabs (Overview / Sessions / Devices / Recordings / Access log / Settings) with device probing, one-click connect and one-click atomic self-upgrade. See [docs/admin.md](docs/admin.md)
+- **SSE + POST transport** — HTTP push plus POST sends end to end; no WebSocket dependency, works behind any reverse proxy
+- **Two binaries** — `shell-remote` (lean: terminal and MCP only) and `shell-remote-ui` (terminal + desktop) share the same relay and protocol and can join the same relay
 
 ## Architecture
 
 ```
-Browser (xterm.js + File UI)
+Browser (xterm.js + file manager UI)
          │ SSE + POST /agent/session/sse + /agent/session/send
          ▼
 ┌───────────────┐   HTTP SSE+POST (/agent/events + /agent/send)   ┌──────────────┐
 │   Relay       │ ◄─────────────────────────────────────────────► │   Agent      │
-│   Route + Auth │                                                  │   Shell + FS │
-│   Static + MCP│                                                  │   (target)   │
+│  route + auth │                                                  │  shell + FS  │
+│  static + MCP │                                                  │  (target)    │
 └───────────────┘                                                  └──────────────┘
          ▲
          │ MCP (/agent/mcp/sse + /agent/mcp/messages)
          │
-   AI Agent (Claude, etc.)
+   AI agent (Claude, etc.)
 ```
+
+- **Relay** — Routing hub; enforces authentication and permissions and embeds the web frontend and the MCP server
+- **Agent** — Runs on the target machine and owns the PTYs and filesystem; desktop sharing additionally needs `shell-remote-ui`
+
+| Binary | Subcommands | Capabilities | Typical use |
+|--------|-------------|--------------|-------------|
+| `shell-remote` | `relay` / `agent` | Terminal forwarding (PTY + file manager + MCP exec); the build contains no desktop code | Self-hosted relay; agents on NAS / cloud hosts / headless boxes; MCP integration |
+| `shell-remote-ui` | `agent` | Terminal + desktop forwarding (all `--desktop-*` flags plus the status panel) | Devices whose real desktop must be shared |
 
 ## Quick Start
 
 ### Download
 
+[GitHub Releases](https://github.com/zzttzzmyswy/shell-remote/releases) publishes two musl-static binaries per architecture. Downloading the x86_64 CLI as an example:
+
 ```bash
-# x86_64 (Intel/AMD)
-curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-x86_64 && chmod +x shell-remote-x86_64
-
-# aarch64 (ARM 64-bit, Raspberry Pi 4/5, cloud)
-curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-aarch64 && chmod +x shell-remote-aarch64
-
-# armv7 (ARM 32-bit, Raspberry Pi 2/3)
-curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-armv7 && chmod +x shell-remote-armv7
+curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-x86_64
+chmod +x shell-remote-x86_64
 ```
+
+Other architectures (`aarch64`, `armv7`) and the desktop build (`shell-remote-ui-<arch>`) are covered in [docs/install.md](docs/install.md).
 
 ### Build
 
 ```bash
-git clone https://github.com/zzttzzmyswy/shell-remote.git && cd shell-remote
-cargo build --release
+git clone https://github.com/zzttzzmyswy/shell-remote.git
+cd shell-remote
+cargo build --release --no-default-features
 ```
 
-### Start Relay
+`--no-default-features` produces the lean CLI (`target/release/shell-remote`, no desktop dependency compiled). For desktop sharing use `cargo build --release`, which emits both `shell-remote` and `shell-remote-ui`. Cross-compilation and the static musl link are covered in [docs/build.md](docs/build.md).
+
+### Start the relay
 
 ```bash
-# --auth required; TLS is terminated by a fronting reverse proxy (nginx/caddy)
 ./shell-remote relay --auth YourStrongPassword --bind 0.0.0.0:3000
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--bind` | `0.0.0.0:3000` | Listen address |
-| `--auth` | none | Server password (required) |
-| `--record-dir` | none | Directory to record terminal sessions (asciinema cast v2); unset disables |
-| `--download-dir` | none | Offline binary distribution directory: place per-platform agent binaries by file name (e.g. `shell-remote-x86_64`, `shell-remote-aarch64`, `shell-remote-armv7`, `shell-remote-x86_64.exe`), served at `/download/<name>`. The install scripts download from this relay **first**, falling back to GitHub mirrors — for intranet / restricted networks |
-| `--download-dir` | none | Unified artifact store (public install downloads + authenticated agent self-upgrade). `--agent-upgrade-dir` is a compatibility alias; setting both to different paths refuses to start |
-| `--upgrade-cdn` | built-in list | External CDN origins for upgrade tasks (repeatable / comma-separated, bare origins like `https://gh-proxy.com`). These hosts also form the `/agent/resolve` allowlist |
-| `--allow-custom-upgrade` | off | Allow tasks for local mirrors with no official digest source (`source: custom`, no external CDN) |
-| `--upgrade-variant` | none | Artifact variant (`cli`/`ui`) for agents that do not report `variant:*`. **Unset means such agents are refused** (`variant_unknown`) rather than guessed |
-| `--manifest-api-base` | `https://api.github.com` | Official release API root (mirrors/testing) |
-| `--bandwidth-down-mbps` | `0` (unlimited) | Relay-wide **downlink** (relay egress) cap in Mbit/s. Priority: same field in the settings file > this flag > unlimited. Changes made in the admin panel's Settings → Bandwidth limit section take effect immediately and are written back to the settings file |
-| `--bandwidth-up-mbps` | `0` (unlimited) | Relay-wide **uplink** (relay ingress) cap in Mbit/s, same priority rules |
-| `--settings-file` | `~/.shell-remote/relay-settings.json` | Persistence file for the bandwidth settings (JSON). Every admin save writes a temp file and renames it over the target (atomic); a missing or corrupt file is treated as "not configured" and the CLI values apply |
+`--auth` is required. The relay serves HTTPS directly on the listen port, generating and persisting a self-signed certificate on first start; add `--no-tls` for plain HTTP. Every flag is documented in [docs/install.md](docs/install.md).
 
-**How the limiter behaves**: file transfers, upgrade blobs and binary downloads are throttled by waiting (slower, never lossy); desktop video drops frames when tokens run out and reports `desktop:congested` (limiter drops never count toward evicting a viewer, and the agent lowers its bitrate); interactive traffic (terminal, control) is only accounted, never waited on, so responsiveness is unaffected.
-
-### Start Agent
+### Start an agent
 
 ```bash
-# HTTP SSE+POST mode (works behind any reverse proxy)
-./shell-remote agent --relay-url https://<relay-ip>
+./shell-remote agent --relay-url https://relay.example.com --relay-insecure
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--relay-url` | `https://localhost:3000` | Relay URL (SSE+POST protocol) |
-| `--key` | — | Fixed auth key (random if omitted) |
-| `--root` | `$HOME` | File manager default directory |
-| `--token-type` | `rw` | Token type: `rw`, `ro`, or `both` |
-| `--shell` | `/bin/bash` | Shell binary path |
-| `--session-id` | — | Custom session id (5-20 alphanumeric) shown in admin to distinguish devices; **reusable** — a new agent registering with the same id takes over the old session (old tokens invalidated), no more conflict error |
-| `--desktop-capture` | `auto` | Desktop capture backend: `auto` / `dxgi` / `gdi` / `x11` / `wayland` / `none` (Windows defaults to DXGI Desktop Duplication with GDI fallback; `wayland` needs a build with `--features wayland` plus xdg-desktop-portal + PipeWire at runtime) |
-| `--desktop-codec` | `av1` | Desktop video codec: `av1` (libaom) / `vp9` (libvpx) / `vp8` / `h264` (openh264); init failure falls back automatically av1→vp9→vp8→h264 |
-| `--desktop-fps` | `30` | Desktop encode fps cap (content-driven QoS: 1 fps static, full fps on activity) |
-| `--desktop-max-bitrate` | `0` | Hard encode bitrate cap (kbps); 0 = auto (rustdesk base_bitrate × quality model, 1080p balanced ≈1388 kbps) |
-| `--desktop-min-bitrate` | `80` | Minimum encode bitrate (kbps) |
-| `--desktop-display` | platform default | Linux: X11 display (e.g. `:1`, defaults to `$DISPLAY`); Windows: monitor enumeration index (`"0"` = primary, `"1"` = second, MYS-954 multi-monitor, switchable live from the session page) |
-| `--no-cmd-log` | — | Disable the command log (on by default — see "Command Log" below) |
-
-Output:
-
-```
-session: a1b2c3d4
-  rw: 5fe42fc877b0a721157508c67fd19633c9c03cc97aaa2d5af0ced67cd3980d90
-```
-
-### Command Log
-
-Both agent binaries (`shell-remote agent` and `shell-remote-ui agent`) log every command they
-run **by default**, in one aligned single-line format (fields separated by two spaces), so you can
-audit later what actually ran on the machine:
-
-```
-[MCP] exec        sess=ABCDE  shell=auto  cwd=/root  timeout=30s  $ ls -la
-[MCP] exec_start  sess=ABCDE  $ tail -f /var/log/syslog
-[MCP] stdin       sess=ABCDE  id=1a2b3c4d  bytes=4  "yes\n"
-[WEB] cmd         sess=ABCDE  tab=tab-1  $ git status
-[WEB] cmd~        sess=ABCDE  tab=tab-2  $ systemctl restart nginx
-```
-
-| Field | Meaning |
-|-------|---------|
-| Action | `exec` / `exec_start` / `stdin` come from MCP; `cmd` / `cmd~` from the web terminal |
-| `sess=` | Device session id (the one shown in the admin panel) |
-| `shell=` / `cwd=` / `timeout=` | Values explicitly set on the MCP request; `-` when absent. Timeouts print as `30s` for whole seconds, `1500ms` otherwise |
-| `id=` / `bytes=` | First 8 chars of the stdin target session id, and the raw byte count |
-| `tab=` | Web terminal tab id |
-| After `$ ` | The command text, always the last field; newlines/tabs/control chars are escaped to `\n` `\t` `\x1b`, and text over 1000 chars is truncated |
-
-`cmd~` means the line was edited with arrow keys, Tab completion or history search — the agent
-only reconstructs it from keystrokes, so the text may differ from what actually ran. Trust the
-`exec` lines (MCP) for exact commands.
-
-**Disable** with `--no-cmd-log`:
+`--relay-insecure` trusts the relay's self-signed certificate. To join a session with a fixed key:
 
 ```bash
-./shell-remote agent --relay-url https://<relay-ip> --no-cmd-log
+./shell-remote agent --relay-url https://relay.example.com --relay-insecure --key YourFixedKey
 ```
 
-**Where the output goes**: the existing tracing setup — stderr by default; a rolling hourly file
-under `SR_LOG_DIR` when that is set; `shell-remote-ui` in window/TUI mode writes to
-`~/.shell-remote/` so the panel stays clean.
-
-**Limitations**
-
-- Only input typed at a shell prompt is recorded for the web terminal. Password prompts
-  (`sudo`/`ssh`/`read -s` — echo off plus canonical mode) and keystrokes inside foreground
-  programs such as `vim`/`python`/`ssh` are skipped: the former to avoid leaking secrets, the
-  latter to avoid noise.
-- That check uses termios and the foreground process group on Unix. **Windows ConPTY exposes
-  neither, so a Windows agent records all terminal input**, password prompts included. Use
-  `--no-cmd-log` there when handling sensitive input.
-
-### Browser Access
-
-Open `http://<relay-ip>:3000`, enter server password and token. Main area: xterm.js terminal. Right drawer: file manager.
-
-## Desktop Sharing
-
-Share the agent's real desktop in agent mode: click the "Desktop" button in the browser session page to open the stream; the picture is encoded in real time and forwarded over the relay (`/agent/desktop/stream`).
-
-- Start: click the "Desktop" toolbar button in the session page (off by default, click to open) → on `desktop:started`, the browser auto-connects the video stream; click "Terminal" to switch back.
-- Permission: starting/stopping the stream needs an rw token (`requires_write`); watching the stream works with rw or ro.
-- Bitrate: adaptive (`--desktop-max-bitrate` / `--desktop-min-bitrate`, kbps; 0 = auto via the rustdesk model base_bitrate × quality, 1080p balanced ≈1388 kbps).
-- Encoding: **pure software** — AV1 (libaom) by default, switchable to VP9 (libvpx) / VP8 / H.264 (openh264) via `--desktop-codec`; init failure falls back av1→vp9→vp8→h264. **No GPU encoding is used** (on Windows DXGI is used for capture only — encoding runs entirely on the CPU; the D3D11 device falls back to WARP rasterization when no GPU driver is usable, so GPU-equipped and GPU-less Windows behave identically). Hardware encoding (VAAPI / Media Foundation) is a planned extension.
-- Grayscale mode: "灰度" toggle in the session desktop control bar saves bandwidth on weak links. On AV1 it switches to a **native libaom monochrome bitstream** (no chroma planes in the stream, ~30% bitrate saving in tests, stream rebuild applies it); on VP9/H.264 chroma is neutralized before encoding (takes effect on the next frame).
-- Multi-monitor: `desktop:started` reports the remote display topology (X11 RANDR outputs / Windows DXGI outputs / GDI monitors), visible in the metrics panel "remote displays" row; with multiple displays a "display" dropdown appears in the session page — selecting one rebuilds the stream on that display (Windows: `"0"` = primary, `"1"` = second, and so on).
-- Capture: Windows DXGI Desktop Duplication (default, multi-monitor selectable) → GDI BitBlt fallback (multi-monitor selectable); Linux X11 (incl. XWayland) and native Wayland (portal + PipeWire, build with `--features wayland`).
-- Transport: fragmented MP4 streamed to browser MSE / WebCodecs; late joiners start at the most recent key frame (IDR).
-
-```bash
-./shell-remote agent --relay-url https://relay.example.com \
-  --desktop-capture auto --desktop-fps 30
-```
-
-## Windows Agent
-
-Requirements: Windows 10 1809+ (ConPTY minimum).
-
-One-line install & run (relay URL auto-injected):
-
-```powershell
-# default cmd
-irm http://your-relay:3000/agent/install.ps1 | iex
-
-# or manually download shell-remote-x86_64.exe from releases and rename to shell-remote.exe
-```
-
-Download to the current directory without running:
-
-```powershell
-& ([scriptblock]::Create((irm http://your-relay:3000/agent/install.ps1))) --download-only
-```
-
-> Linux/macOS equivalent: `curl -fsSL http://your-relay:3000/agent/install | sh` (run) or `... | sh -s -- --download-only` (download only). If curl is missing, use `wget -qO- http://your-relay:3000/agent/install | sh` (or `... | sh -s -- --download-only`). The script supports both curl and wget internally and tries multiple GitHub mirrors, so it works in most network environments.
-
-Manual start:
-
-```powershell
-# default cmd
-shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx
-
-# using PowerShell
-shell-remote.exe agent --relay-url http://your-relay:3000 --key xxx --shell powershell.exe
-```
-
-Notes: run as administrator for full filesystem access; interactive programs (ssh/vim) are not supported in the MCP exec path; file download (read) works. Terminal output and MCP command results are automatically normalized from non-UTF-8 console encodings (e.g. GBK/cp936) to UTF-8, so browsers and AI agents never need to know the target machine's encoding.
-
-### Cross-compile from Linux
-
-```bash
-rustup target add x86_64-pc-windows-gnu
-# requires x86_64-w64-mingw32-gcc (mingw-w64)
-cargo build --release --target x86_64-pc-windows-gnu
-```
-
-### Feature comparison
-
-| Feature | Linux/macOS | Windows |
-|---------|-------------|---------|
-| PTY interactive shell | ✅ | ✅ (ConPTY) |
-| Command execution | ✅ | ✅ (cmd / pwsh) |
-| File browse/read/write/rename/delete | ✅ | ✅ |
-| File download (read) | ✅ | ✅ |
-| File upload (upload) | ✅ | ✅ |
-| Interactive programs (ssh/vim) | ✅ | ⚠️ not supported in exec path |
-| File permission bits (mode) | ✅ | placeholder (no POSIX perms) |
-
-## API Endpoints
-
-| Path | Method | Description |
-|------|--------|-------------|
-| `/agent/session/sse` | GET → SSE | Browser receive stream |
-| `/agent/session/send` | POST | Browser send messages |
-| `/agent/events` | GET → SSE | Agent receive stream |
-| `/agent/send` | POST | Agent send messages |
-| `/agent/upload` | POST | File upload |
-| `/agent/mcp/sse` | GET → SSE | MCP SSE Transport endpoint |
-| `/agent/mcp/messages` | POST | MCP JSON-RPC messages |
-
-## Admin Panel
-
-The relay can optionally enable a web admin panel: view sessions/tokens, kick sessions, manage token permissions, view/rotate the server password, and see runtime status. Disabled by default; must be enabled via CLI. **The homepage has no link to it — you must type the secret sub-path manually.**
-
-### Enable
-
-```bash
-shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 \
-  --admin-path /your-secret-path --admin-pass ADMIN_PASSWORD
-# --admin-user defaults to "admin"; omit --admin-path to leave the panel fully disabled
-```
-
-### Access
-
-Open `http://<relay-ip>:3000/your-secret-path` (the value of `--admin-path`) in a browser and sign in with `--admin-user` / `--admin-pass`. The secret path is the first barrier; a successful login issues an HttpOnly + SameSite=Strict session cookie (12h TTL).
-
-### Features
-
-- **Overview**: version, uptime, agent total/online, browser total, per-session token list with permissions, connected browser count.
-- **Session monitoring**: per-session online status and last-active time (refreshes every few seconds).
-- **Access log (lightweight bastion audit)**: records browser/MCP connect & disconnect events (session, first 8 chars of token, permission, time), bounded to the latest 500 entries, visible in the panel.
-- **Token management**: revoke a single token, regenerate a session's tokens (old ones invalidated), toggle token permission (rw↔ro).
-- **Jump to terminal**: per-session "Connect" button opens that session's browser terminal in a new tab (token pre-filled; server password still typed manually).
-- **Session recording**: with `--record-dir`, interactive terminal I/O (output + input) is written as asciinema cast v2; the panel shows recording status; files replay with `asciinema play`.
-- **Recording management**: the "Recordings" panel lists all recorded files (terminal casts + MCP command audits) with their time and size; terminal casts replay in an in-panel player (xterm.js, with play/pause, 0.25x–4x speed, and seek bar), MCP command records are shown as structured cards, and any recording can be deleted.
-- **Kick session**: disconnect that agent and all its browsers and invalidate its tokens.
-- **Server password**: view the current `--auth`, rotate it live (takes effect immediately).
-- **Chinese / English toggle**: switch the panel UI between zh and en (auto-detects browser language, remembered in localStorage).
-
-### Security notes
-
-- The admin page is not in the public static asset folder — it cannot be fetched via `/admin.html` or similar.
-- Two layers: secret path (hidden entry) + user/password login.
-- Admin sessions live in memory only; relay restart requires re-login.
-- Known limitation: after revoking/regenerating a token, an agent that reconnects via `register_existing` (replaying its cached tokens) may re-introduce that token; does not affect the live session.
-
-## Atomic Agent Self-Upgrade
-
-Upgrades prefer external CDNs and use the relay mirror only as a conditional fallback. Enable the store with `--download-dir <dir>` (`--agent-upgrade-dir` is a compatibility alias; setting both to different paths refuses to start). Stage artifacts with the release naming (see `tools/build-dist.sh`): CLI is `shell-remote-<arch>[.exe]`, desktop is `shell-remote-ui-<arch>[.exe]`; an optional same-named `.version` file labels the target version. `releases/v<version>/` keeps multiple versions side by side.
-
-Two read entry points share this one store but keep separate auth boundaries: `/download/<filename>` (public, for install scripts) and `/agent/upgrade/blob/<filename>` (rw token, for agents). Both support `Range`.
-
-> **Compatibility note:** agents released before the CDN protocol (≤ v0.59.2) only understand a relay `url`. For those agents an upgrade requires a local mirror; without one the relay returns `409 legacy_agent_needs_relay_mirror` instead of sending a task they cannot consume. They also cannot report `variant:cli`/`variant:ui`, so the relay refuses with `409 variant_unknown` unless you set `--upgrade-variant`.
-
-Every online device in the admin **Devices** tab has an **Upgrade** button. Clicking it:
-
-1. The relay picks the artifact matching the device's reported architecture, hashes it (SHA-256), and sends `agent:upgrade` to that agent.
-2. The agent downloads the artifact from the relay (authenticated with its own read-write token), reporting progress percentages.
-3. The SHA-256 is verified — a mismatch aborts and keeps the old binary.
-4. On Unix the new binary is smoke-tested with `--version` to confirm it actually runs on this platform (guards against wrong-arch or truncated artifacts); Windows skips this (SHA-256 is the integrity gate).
-5. A short-lived helper process (`shell-remote update-apply <handoff>`, a hidden subcommand; also present in `shell-remote-ui`) is started. It reports `ready` on stdout, and **only then** does the old agent exit. The helper waits for that exact PID (Unix `kill(0)` + `/proc/<pid>/stat` start time; Windows `OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject` + process creation time — never by process name), renames the current binary to a backup, atomically installs the new one, starts it, and waits on an anonymous pipe for a `registered` receipt before deleting the backup. No systemd/SCM unit and no long-lived supervisor is installed.
-
-Progress is shown live in the device row's version cell (started / downloading n% / verifying / installing / failure reason); once upgraded it shows a green "upgraded v<version>" and the version column reflects the new agent version.
-
-Notes:
-
-- The agent's binary directory must be writable (`rename` needs write permission on it); failures surface clearly in the panel.
-- **Identity survives the swap, including for temporary agents.** Before exiting, the old agent writes a one-off handoff file holding its **actual** `session_id`, every `(token, permission)` pair and its original argv. The new process uses those as its initial `cached_tokens` through the existing `register_existing` path, so `session_id`, tokens and permissions are unchanged — no new relay API is involved. A temporary agent (no `--key`) keeps its `session_id` **and** its tokens, so browsers and MCP clients already holding them keep working.
-- The handoff file lives in a private directory (`0700`) as a `0600` file (Unix) / a DACL limited to the current user (Windows), with a random name created via `create_new`. Tokens never appear in argv, in logs or in the stdout/stderr handshake. The file is deleted as soon as the new process has registered; it never persists as long-term credential storage.
-- **Rollback is bounded.** If the new process does not report `registered` within 75 s, exits early, or the helper cannot get ready within 20 s, the helper restores the backup and restarts the previous version. Before restarting it re-binds the handed-over identity with a `register_existing` call (equivalent to the old version's normal reconnect), so a rolled-back temporary device keeps its `session_id` and tokens too. If the relay no longer recognises that identity (e.g. it lost its in-memory token map in a full restart), the helper reports `Lost` with the reason and keeps the backup and log rather than claiming a clean rollback.
-- **Relay amnesia is a known boundary.** After a full relay restart, temporary tokens live only in that relay's memory; a temporary agent can then only be issued a new identity. Fixed keys recover. Temporary tokens are never silently converted into permanent keys.
-- Windows is covered by cross-compilation only in this change; the `OpenProcess`/DACL paths have not been exercised on real hardware.
-
-## Session Recording
-
-Add `--record-dir <dir>` to record interactive terminal sessions (MCP exec is not recorded):
-
-```bash
-shell-remote relay --auth YOUR_PASSWORD --bind 0.0.0.0:3000 --record-dir /var/log/shell-remote
-```
-
-- Format: asciinema cast v2 (JSONL); replay with `asciinema play xxx.cast` or xterm.js.
-- Records output + input streams; **the input stream includes sensitive keystrokes typed in the terminal (e.g. sudo passwords) — protect the record directory's filesystem permissions**.
-- One file per session: `{session_id}_{unix_timestamp}.cast`; with agent `--session-id`, the filename is that id.
-- Captured at the relay; no agent change. Kicked/idle-reaped sessions flush and close their files.
-
-### MCP command audit
-
-With `--record-dir` enabled, every MCP `shell_remote` tool call is also audited (same opt-in and directory as terminal recording), written to a per-session file `{session_id}_{unix_timestamp}.audit.jsonl`, one JSON object per line:
-
-```json
-{"ts":"2026-07-06T12:34:56Z","unix_ms":1783339200000,"session_id":"seSupportBot","token_prefix":"b4e2ec42","permission":"rw","cmd":"ls -la","timeout_ms":30000,"duration_ms":12,"status":"ok","exit_code":0,"stdout_len":1234,"stderr_len":0,"stdout":"...","stderr":"..."}
-```
-
-- `status`: `ok` / `timeout` / `disconnected` / `no_agent` / `rejected_readonly`.
-- `token_prefix` stores only the first 8 chars of the token (enough to correlate with the admin token list without leaking the full secret).
-- `stdout` / `stderr` are truncated to 4KB (`stdout_len` / `stderr_len` hold the full lengths).
-- The admin overview shows a `●AUDIT` marker per session; kicked/idle-reaped sessions flush and close their audit file.
-- The "Recordings" panel lists each audit file as an "MCP cmd" entry; clicking it shows a structured card (command, status, exit code, duration, permission, token prefix, stdout/stderr), and it can be deleted.
-- **Audit files may also contain sensitive data in commands and output — protect the record directory's filesystem permissions.**
-
-## AI Agent Integration (MCP)
-
-### Configuration
-
-```json
-{
-  "transport": "sse",
-  "url": "https://<relay-host>/agent/mcp/sse",
-  "headers": { "X-Auth": "your-server-password" },
-  "timeout": 60,
-  "sse_read_timeout": 300
-}
-```
-
-Protocol flow: `GET /sse` → `endpoint` event → `POST /messages` → `202 Accepted` → SSE `message` response.
-
-### Tool: shell_remote
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `token` | string | Yes | shell_remote token (agent session token) |
-| `cmd` | string | Yes | Shell command to execute |
-| `timeout_ms` | number | No | Timeout in milliseconds (default 30000, max 300000) |
-
-Example call:
-
-```json
-{
-  "method": "tools/call",
-  "params": {
-    "name": "shell_remote",
-    "arguments": {
-      "token": "5fe42fc877b0a721...",
-      "cmd": "cat /etc/hostname && uname -a"
-    }
-  }
-}
-```
-
-Token is passed in arguments, not in URL or headers. Commands execute via `sh -c`.
-
-### Login environment (`/etc/profile`)
-
-The agent is started directly by systemd/a service — **no PAM, no SSH** — so child
-processes only inherit the agent's own environment. On many devices the PATH entries
-for vendor tools are added by `/etc/profile` (e.g. Sophon's `bm-smi` in
-`/opt/sophon/libsophon-current/bin`), which only login shells read. Both the web
-terminal and MCP therefore start as a **login shell**, so no manual
-`source /etc/profile` is needed:
-
-| Path | What is actually spawned |
-|---|---|
-| Web terminal | `<shell from --shell> -l` (e.g. `/bin/bash -l`) |
-| MCP `exec` / `exec_start` | `sh -l -c <your command>` |
-
-- **Your command is never rewritten**: it is passed verbatim as a single argv to `sh`.
-- **Not `ENV`/`BASH_ENV`**: POSIX `ENV` is only read by *interactive* shells —
-  `ENV=/etc/profile sh -c '...'` sets nothing (verified on dash/bash/busybox ash) —
-  so `-l`, the standard login-shell semantic, is used instead.
-- **A missing `/etc/profile` breaks nothing**: the shell simply skips it and the
-  command runs as usual.
-- **Unix only**: Windows behaviour is unchanged (no `/etc/profile` concept).
-- **No locale injection**: the agent still sets no LANG/LC_* variables.
-
-> ⚠️ Inherent to login environments: if `/etc/profile` (or anything in `profile.d`)
-> prints output or runs commands meant for interactive logins, MCP results may show
-> that output too. That is standard login-shell behaviour, not a bug — adjust the
-> profile if it gets in the way.
-
-- If the shell given to `--shell` rejects `-l` (e.g. `tcsh`, `elvish`, `nu`), the agent
-  detects this at startup and falls back to the previous non-login startup: the
-  terminal still works, it just does not load `/etc/profile`. The probe result is
-  cached per shell path, so it runs once per process.
-- **Two `script` implementations**: when MCP runs a command and `script` exists, it is
-  used to allocate a PTY. util-linux's `script` needs `-e` to pass the command's exit
-  code through, whereas **busybox's `script` rejects `-e`** (unknown option → usage +
-  exit 1), which is common on Alpine and minimal containers. The agent probes the
-  target `script` at startup and omits `-e` when unsupported — commands still run, only
-  the exit code is always 0 (the same behaviour as before login environments existed).
-
-## Token Permissions
-
-| Token Type | Terminal Input | File Ops | MCP Exec |
-|-----------|---------------|----------|----------|
-| ReadWrite | ✅ | ✅ | ✅ |
-| ReadOnly | ❌ | list/read | ❌ |
-
-## Performance & congestion isolation
-
-To prevent a large file transfer or a flood of terminal logs from making other sessions unresponsive, the relay isolates traffic at several layers:
-
-- **Chunked file transfer**: uploads and downloads are streamed as ≤256KB base64 chunks. No single message is ever large enough to hold a worker thread with one giant synchronous encode or blow up memory.
-- **Bounded channels**: the relay→agent and relay→browser SSE channels are bounded (256 entries). On overflow they drop loss-tolerant terminal-output frames first and keep control/result messages, so a stuck consumer can't grow memory without limit and starve the whole relay.
-- **EventBuffer byte cap**: the per-session replay buffer is capped at 1000 entries *and* 8MB total, so large messages or a sustained log flood can't blow it up.
-- **Backpressure**: upload chunks are sent with backpressure (await, not drop) when the agent falls behind; downloads stream from a dedicated task so they don't block the agent's terminal-input forwarding.
-
-Trade-off: when a session's consumer is badly stuck, that session's transfer may fail or drop frames — but other sessions stay responsive.
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Runtime | Rust + Tokio async |
-| HTTP | Axum |
-| Terminal | portable-pty + xterm.js |
-| Embedding | rust-embed |
-| Frontend | Vanilla HTML/CSS/JS |
-| MCP | SSE Transport + JSON-RPC |
+Swap the command for `./shell-remote-ui agent` and add `--desktop-capture` and friends to share a desktop (see [docs/desktop.md](docs/desktop.md)). For a systemd-managed agent at boot see [deploy/systemd-agent/](deploy/systemd-agent/).
+
+### Browser access
+
+Open `https://<relay-ip>:3000` (accept the self-signed certificate once) and enter the server password and token. The main area is the xterm.js terminal, the right drawer is the file manager, and the toolbar also offers the "Desktop" and "Web" views.
+
+## Documentation
+
+| Document | Contents |
+|----------|----------|
+| [docs/install.md](docs/install.md) | Per-architecture downloads, every relay / agent flag, systemd deployment |
+| [docs/build.md](docs/build.md) | Building, the static musl link, four-platform cross-compilation and packaging scripts |
+| [docs/desktop.md](docs/desktop.md) | Desktop sharing, capture and codec backends, LAN / P2P direct links, status panels |
+| [docs/web-map.md](docs/web-map.md) | Web mapping v2 / v1, capability negotiation, deployment requirements, security and limits |
+| [docs/windows.md](docs/windows.md) | Windows agent install, shell selection, feature differences |
+| [docs/admin.md](docs/admin.md) | Admin panel, HTTP endpoint reference, bandwidth limiting |
+| [docs/upgrade.md](docs/upgrade.md) | Artifact store, upgrade task decisions, payload fields, the atomic swap |
+| [docs/mcp.md](docs/mcp.md) | MCP configuration, protocol flow, tool parameters, login environment, file transfer, command audit |
+| [docs/sessions.md](docs/sessions.md) | Session recording, token permission model, file manager |
+| [docs/performance.md](docs/performance.md) | Performance isolation, weak-network robustness |
+| [docs/weak-network-robustness.md](docs/weak-network-robustness.md) | Weak-network failure matrix and per-item fix log (v0.54.0 baseline) |
+| [docs/history/alignment-ledger.md](docs/history/alignment-ledger.md) | rustdesk alignment ledger (historical archive) |
 
 ## Tests
 
 ```bash
-cargo test
-# 173 passed; 0 failed (including integration test)
+cargo test --no-default-features
 ```
+
+Full-feature build (includes desktop encoder / capture unit tests; the X11 capture tests need `Xvfb :99`):
+
+```bash
+cargo test
+```
+
+Browser end-to-end and load scripts live in `tools/verify/` (playwright) and `tools/bench/`; usage is documented in each script's header.
 
 ## License
 
