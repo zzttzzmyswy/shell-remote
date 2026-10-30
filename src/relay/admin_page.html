@@ -438,6 +438,7 @@
         <option value="online" data-i18n="online">Online</option>
         <option value="offline" data-i18n="offline">Offline</option>
       </select>
+      <button class="btn btn-sm" type="button" id="devUpgradeAll" data-i18n="upg_all">Upgrade all</button>
     </div>
     <div class="table-scroll">
       <table>
@@ -729,6 +730,10 @@
       upg_legacy_needs_mirror: "该 agent 版本不支持外部 CDN 升级，且 relay 没有本地镜像——请先把制品放入 --download-dir",
       upg_confirm: "确定升级设备 {id}？将下载并校验、原子替换 agent 二进制，随后 agent 自动重启（版本 {v}）。",
       upg_confirm_cdn: "确定升级设备 {id} 到版本 {v}？relay 无本地镜像，agent 将从外部 CDN 下载 {f} 并校验 SHA-256（由 relay 依据官方 release digest 下发），随后自动重启。",
+      upg_all: "全部升级",
+      upg_all_confirm: "将命令 {n} 台落后设备升级到本 relay 的版本，每台会重启一次 agent。继续？",
+      upg_all_none: "没有可升级的设备。",
+      upg_all_done: "已触发 {t} 台，跳过 {s} 台，失败 {f} 台。",
       upg_err: "升级失败：",
       upg_artifacts: "Agent 升级",
       upg_hint: "升级默认优先走外部 CDN，relay 本地镜像只是条件兜底：把制品放到 relay 的 --download-dir（公开安装下载与鉴权升级共享同一目录）即可提供兜底。文件名按发布制品命名：CLI 为 shell-remote-<arch>，桌面版为 shell-remote-ui-<arch>（Windows 加 .exe），可选同名 .version 标注版本；也可放在 releases/v<版本>/ 下多版本并存。未镜像时，不支持 CDN 升级的旧 agent 无法升级。",
@@ -908,6 +913,10 @@
       upg_legacy_needs_mirror: "this agent predates CDN upgrades and the relay has no local mirror — stage the artifact into --download-dir first",
       upg_confirm: "Upgrade device {id}? The agent will download, verify and atomically replace its binary, then restart (version {v}).",
       upg_confirm_cdn: "Upgrade device {id} to version {v}? The relay has no local mirror, so the agent will fetch {f} from an external CDN and verify the SHA-256 supplied by the relay from the official release digest, then restart.",
+      upg_all: "Upgrade all",
+      upg_all_confirm: "This will command {n} outdated device(s) to upgrade to this relay's version; each restarts its agent once. Continue?",
+      upg_all_none: "No devices need an upgrade.",
+      upg_all_done: "Triggered {t}, skipped {s}, failed {f}.",
       upg_err: "Upgrade failed: ",
       upg_artifacts: "Agent updates",
       upg_hint: "Upgrades prefer external CDNs; the relay mirror is only a conditional fallback. Drop artifacts into the relay's --download-dir (shared by public install downloads and authenticated upgrades): CLI is shell-remote-<arch>, desktop is shell-remote-ui-<arch> (.exe on Windows), with an optional same-named .version. releases/v<version>/ keeps multiple versions side by side. Without a mirror, agents too old for CDN upgrades cannot be upgraded.",
@@ -1621,6 +1630,28 @@
     } catch (e) { failDialog(t('upg_err') + e.message); }
   }
 
+  async function onUpgradeAll() {
+    // 全量入口：一次命令所有落后设备升级。确认框必须说清"会影响多少台"——
+    // 这个按钮会重启一批设备，不能点完才发现范围不对。
+    const sessions = (lastOverview && lastOverview.sessions) || [];
+    const eligible = sessions.filter(s => upgradeEligible(s).ok);
+    if (!eligible.length) { failDialog(t('upg_all_none')); return; }
+    const ok = await UI.confirm(t('upg_all_confirm', { n: eligible.length }), {
+      title: t('dlg_title_upgrade'),
+      okLabel: t('dlg_confirm'), cancelLabel: t('dlg_cancel')
+    });
+    if (!ok) return;
+    try {
+      const r = await api('/api/agent/upgrade/fleet', { method: 'POST', body: {} });
+      if (!r.ok) throw new Error(r.error || 'failed');
+      const c = r.counts || {};
+      UI.alert(t('upg_all_done', {
+        t: c.triggered || 0, s: c.skipped || 0, f: c.failed || 0
+      }), { title: t('dlg_title_upgrade') });
+      refresh();
+    } catch (e) { failDialog(t('upg_err') + e.message); }
+  }
+
   async function refreshUpgradeArtifacts() {
     try {
       const r = await api('/api/agent/upgrade/artifacts');
@@ -1666,6 +1697,7 @@
   $('devFilter').addEventListener('focus', function () { this.removeAttribute('readonly'); });
   $('devArchFilter').addEventListener('change', (e) => { devArch = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
   $('devStatusFilter').addEventListener('change', (e) => { devStatus = e.target.value; if (lastOverview) renderDevices(lastOverview.sessions || []); });
+  $('devUpgradeAll').addEventListener('click', onUpgradeAll);
 
   // --- Access log table ---
   function renderConnLog(entries) {

@@ -927,8 +927,6 @@ pub async fn agent_upgrade_handler(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    use crate::relay::artifact_store as a;
-
     if !check_admin(&state, &headers).await {
         return unauthorized();
     }
@@ -940,46 +938,70 @@ pub async fn agent_upgrade_handler(
         )
             .into_response();
     }
+    let force = body["force"].as_bool().unwrap_or(false);
+    match trigger_upgrade(&state, &sid, force).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (*e).into_response(),
+    }
+}
+
+/// 单台设备的升级决策与下发（HTTP 无关，单台入口与全量入口共用）。
+///
+/// 失败时返回**完整的 HTTP 响应**（状态码 + JSON），因为单台入口要把每个失败
+/// 原因的不同状态码原样透给调用方（400 参数/未配置、404 无制品、409 版本或
+/// 能力不满足）。全量入口只取状态码与 JSON 体，用于汇总。
+///
+/// `Err` 装箱：`Response` 本身就上百字节，直接塞进 `Result` 会让每个调用点的
+/// 栈帧都背上它（clippy `result_large_err`）。失败路径是冷路径，一次分配不心疼。
+async fn trigger_upgrade(
+    state: &Arc<SharedState>,
+    sid: &str,
+    force: bool,
+) -> Result<Value, Box<Response>> {
+    use crate::relay::artifact_store as a;
+
+    // 变量名沿用单台入口的写法（`state` 已是引用，这里只是别名）。
+    let state = state.clone();
+    let sid = sid.to_string();
     let Some(info) = state.sessions.get(&sid).await else {
-        return (
+        return Err(Box::new((
             StatusCode::NOT_FOUND,
             Json(json!({"ok": false, "error": "session not found"})),
         )
-            .into_response();
+            .into_response()));
     };
     let (arch, platform) = match info.device.as_ref() {
         Some(d) => (d.arch.clone().unwrap_or_default(), d.platform.clone()),
         None => (String::new(), None),
     };
     if arch.is_empty() {
-        return (
+        return Err(Box::new((
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": "device arch unknown — cannot pick an artifact"})),
         )
-            .into_response();
+            .into_response()));
     }
     // 先确认 agent 在线：离线时没有必要做后续任何判断（也不该去抓官方清单），
     // 并保持"agent offline → 409"的既有语义。
     {
         let broadcast = state.agent_broadcast.read().await;
         if broadcast.get(&sid).and_then(|cm| cm.agent.as_ref()).is_none() {
-            return (
+            return Err(Box::new((
                 StatusCode::CONFLICT,
                 Json(json!({"ok": false, "error": "agent offline"})),
             )
-                .into_response();
+                .into_response()));
         }
     }
 
     // ── 版本决策 ────────────────────────────────────────────────────
     let relay_version = env!("CARGO_PKG_VERSION");
-    let force = body["force"].as_bool().unwrap_or(false);
     let decision = a::version_decision(relay_version, info.agent_version.as_deref());
     // `force` 允许重装同一版本，但绝不降级、也不在版本未知时瞎猜。
     let allowed = decision.needs_upgrade()
         || (force && matches!(decision, a::VersionDecision::UpToDate));
     if !allowed {
-        return (
+        return Err(Box::new((
             StatusCode::CONFLICT,
             Json(json!({
                 "ok": false,
@@ -989,15 +1011,15 @@ pub async fn agent_upgrade_handler(
                 "decision": format!("{decision:?}"),
             })),
         )
-            .into_response();
+            .into_response()));
     }
 
     let Some(store) = state.artifact_store.clone() else {
-        return (
+        return Err(Box::new((
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": "agent upgrades disabled (no artifact dir configured)"})),
         )
-            .into_response();
+            .into_response()));
     };
 
     // 制品形态由 agent 自报能力决定：不要把桌面 agent 换成 CLI，也不猜。
@@ -1005,7 +1027,7 @@ pub async fn agent_upgrade_handler(
     let Some(variant) = variant_res.variant() else {
         // 未知形态 → 拒绝。原地替换猜错就是能力丢失（UI→CLI），不能"按保守值"
         // 处理。管理员显式配 --upgrade-variant 或等 agent 上报 variant:* 后再试。
-        return (
+        return Err(Box::new((
             StatusCode::CONFLICT,
             Json(json!({
                 "ok": false,
@@ -1018,16 +1040,16 @@ pub async fn agent_upgrade_handler(
                 "agent_capabilities": info.capabilities,
             })),
         )
-            .into_response();
+            .into_response()));
     };
     let variant_source = variant_res.source();
     let windows = platform.as_deref() == Some("windows");
     let Some(artifact) = ArtifactRef::new(variant, &arch, windows) else {
-        return (
+        return Err(Box::new((
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": format!("unusable device arch {arch:?}")})),
         )
-            .into_response();
+            .into_response()));
     };
 
     // ── 取清单 + 本地镜像 hash ──────────────────────────────────────
@@ -1047,11 +1069,11 @@ pub async fn agent_upgrade_handler(
     let local = match local {
         Ok(l) => l,
         Err(e) => {
-            return (
+            return Err(Box::new((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"ok": false, "error": format!("cannot hash local artifact: {e}")})),
             )
-                .into_response();
+                .into_response()));
         }
     };
 
@@ -1068,7 +1090,7 @@ pub async fn agent_upgrade_handler(
         Ok(t) => t,
         Err(refusal) => {
             // 明确拒绝的原因，而不是给一个"猜出来的" hash。
-            return (
+            return Err(Box::new((
                 StatusCode::NOT_FOUND,
                 Json(json!({
                     "ok": false,
@@ -1077,7 +1099,7 @@ pub async fn agent_upgrade_handler(
                     "manifest": state.manifest_status.read().await.get(relay_version),
                 })),
             )
-                .into_response();
+                .into_response()));
         }
     };
 
@@ -1087,7 +1109,7 @@ pub async fn agent_upgrade_handler(
     // 实际什么都没发生。所以没有 relay 副本时必须确认对端是新协议 agent，
     // 否则明确 409 并告诉管理员去镜像制品。
     if !task.legacy_compatible() && !supports_upgrade_v2(&info.capabilities) {
-        return (
+        return Err(Box::new((
             StatusCode::CONFLICT,
             Json(json!({
                 "ok": false,
@@ -1103,7 +1125,7 @@ pub async fn agent_upgrade_handler(
                 "agent_capabilities": info.capabilities,
             })),
         )
-            .into_response();
+            .into_response()));
     }
 
     let text = serde_json::to_string(&json!({
@@ -1117,11 +1139,11 @@ pub async fn agent_upgrade_handler(
         match broadcast.get(&sid).and_then(|cm| cm.agent.as_ref()) {
             Some(tx) => crate::relay::ws::deliver(tx, "agent:upgrade", text),
             None => {
-                return (
+                return Err(Box::new((
                     StatusCode::CONFLICT,
                     Json(json!({"ok": false, "error": "agent offline"})),
                 )
-                    .into_response();
+                    .into_response()));
             }
         }
     }
@@ -1137,7 +1159,7 @@ pub async fn agent_upgrade_handler(
             "detail": "upgrade triggered",
         }),
     );
-    Json(json!({
+    Ok(json!({
         "ok": true,
         "upgrade_id": task.upgrade_id,
         "version": task.target_version,
@@ -1151,7 +1173,125 @@ pub async fn agent_upgrade_handler(
         // 老 agent 只会从 relay 下载；没有 relay 副本时它无法完成升级。
         "legacy_compatible": task.legacy_compatible(),
     }))
+}
+
+/// `POST <admin>/api/agent/upgrade/fleet`：**命令全部（或指定）在线设备升级到
+/// relay 的版本**。
+///
+/// 单台入口 `POST /api/agent/upgrade` 每次只能点一台，几十台设备时运维只能
+/// 逐台点、逐台看结果，容易漏。本入口把同一套决策规则（版本 → 形态 → 制品 →
+/// 能力校验）复用到整个会话集合上，并为每台设备返回独立结果：
+///
+/// - 每台设备**独立决策**：已达目标版本的跳过（`up_to_date`），形态/制品/
+///   能力不满足的各自失败，一台失败不影响其他设备。
+/// - 默认**只升级确实需要升级的**（`semver(relay) > semver(agent)`），与单台
+///   入口一致；`force: true` 才对同版本设备重装。
+/// - 幂等：同一 `session_id` 已有在途升级（`agent_upgrades` 处于非终态）时跳过，
+///   避免一次误触把整片设备重复重启。
+/// - `session_ids` 可选：给了就只处理这些会话，便于灰度；不给就是全部在线设备。
+///
+/// 返回按设备分组的汇总，调用方据此判断哪些成功、哪些为什么没升。
+pub async fn agent_upgrade_fleet_handler(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !check_admin(&state, &headers).await {
+        return unauthorized();
+    }
+    let force = body["force"].as_bool().unwrap_or(false);
+    // 可选的显式名单（灰度用）。空/缺省 = 全部在线设备。
+    let only: Option<Vec<String>> = body["session_ids"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    });
+
+    // 枚举候选设备：注册表里的全部会话，按 session_id 排序保证结果稳定可对账。
+    let mut candidates: Vec<String> = state
+        .sessions
+        .list_sessions()
+        .await
+        .into_iter()
+        .map(|(sid, _)| sid)
+        .filter(|sid| only.as_ref().is_none_or(|list| list.contains(sid)))
+        .collect();
+    candidates.sort();
+
+    let mut triggered: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+
+    for sid in candidates {
+        // 幂等闸门必须先于触发：`trigger_upgrade` 里没有"已在升级中"的判断，
+        // 连续两次点击会把设备重启两次。终态（done/error/rolled_back）放行。
+        if let Some(cur) = state.agent_upgrades.read().await.get(&sid) {
+            let stage = cur["stage"].as_str().unwrap_or("");
+            if !matches!(stage, "" | "done" | "error" | "failed" | "rolled_back") {
+                skipped.push(json!({
+                    "session_id": sid,
+                    "reason": "upgrade_in_progress",
+                    "stage": stage,
+                }));
+                continue;
+            }
+        }
+        match trigger_upgrade(&state, &sid, force).await {
+            Ok(v) => triggered.push(json!({
+                "session_id": sid,
+                "upgrade_id": v["upgrade_id"],
+                "version": v["version"],
+                "source": v["source"],
+            })),
+            Err(resp) => {
+                // 单台入口的状态码在这里只用于归类：409 = 不需要/不满足前置条件
+                // （属于正常跳过），其余才是真正的失败。
+                let status = resp.status();
+                let code = status.as_u16();
+                let body = response_json_body(*resp).await;
+                let error = body["error"].as_str().unwrap_or("unknown error").to_string();
+                let detail = body.get("code").and_then(|c| c.as_str()).map(str::to_string);
+                if code == StatusCode::CONFLICT.as_u16() {
+                    skipped.push(json!({
+                        "session_id": sid,
+                        "reason": "conflict",
+                        "code": detail,
+                        "error": error,
+                    }));
+                } else {
+                    failed.push(json!({
+                        "session_id": sid,
+                        "status": code,
+                        "code": detail,
+                        "error": error,
+                    }));
+                }
+            }
+        }
+    }
+
+    Json(json!({
+        "ok": true,
+        "relay_version": env!("CARGO_PKG_VERSION"),
+        "force": force,
+        "counts": {
+            "triggered": triggered.len(),
+            "skipped": skipped.len(),
+            "failed": failed.len(),
+        },
+        "triggered": triggered,
+        "skipped": skipped,
+        "failed": failed,
+    }))
     .into_response()
+}
+
+/// 把 `Response` 的 JSON body 读回来（全量入口要拿单台的错误原因做汇总）。
+async fn response_json_body(resp: Response) -> Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+        .await
+        .unwrap_or_default();
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
 }
 
 /// `GET <admin>/api/agent/upgrade/plan?session_id=…`：只做版本决策与制品定位，
@@ -2258,6 +2398,153 @@ mod tests {
         assert_eq!(r.status(), 200);
         assert!(rx.try_recv().is_ok(), "force 应当下发任务");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_fleet_commands_every_eligible_device() {
+        // 全量入口的核心契约：一次调用命令**所有**落后设备升级，每台各自决策，
+        // 一台失败不影响其他设备。
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_manifest_mock(&dir, b"new-binary-x86").await;
+        let h = login(&state).await;
+
+        // 3 台落后（应下发）、1 台已最新（应跳过）。
+        let mut outdated = Vec::new();
+        let mut rxes = Vec::new();
+        for name in ["fleeta", "fleetb", "fleetc"] {
+            let sid = register_device(
+                &state,
+                name,
+                "x86_64",
+                "linux",
+                NEW_AGENT_CAPS,
+                Some("0.59.1"),
+            )
+            .await;
+            rxes.push(attach_agent_channel(&state, &sid).await);
+            outdated.push(sid);
+        }
+        let up_to_date = register_device(
+            &state,
+            "fleetcurrent",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some(env!("CARGO_PKG_VERSION")),
+        )
+        .await;
+        let mut rx_current = attach_agent_channel(&state, &up_to_date).await;
+
+        let r = agent_upgrade_fleet_handler(State(state.clone()), h, Json(json!({}))).await;
+        assert_eq!(r.status(), 200);
+        let body = body_json(r).await;
+        assert_eq!(body["counts"]["triggered"], 3, "{body}");
+        assert_eq!(body["counts"]["skipped"], 1, "{body}");
+        assert_eq!(body["counts"]["failed"], 0, "{body}");
+
+        // 每台落后设备都必须真的收到 agent:upgrade（不是只报了数）。
+        for (i, rx) in rxes.iter_mut().enumerate() {
+            let got = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("第 {i} 台落后设备没有收到升级指令"));
+            let v: Value = serde_json::from_str(&got).unwrap();
+            assert_eq!(v["type"], "agent:upgrade");
+            assert_eq!(v["session_id"], outdated[i]);
+            assert_eq!(v["payload"]["target_version"], env!("CARGO_PKG_VERSION"));
+        }
+        // 已最新的设备一条指令都不该收到。
+        assert!(
+            rx_current.try_recv().is_err(),
+            "已是最新版本的设备不得收到升级指令"
+        );
+        // 跳过原因必须可解释，而不是静默少一台。
+        let skipped = body["skipped"].as_array().unwrap();
+        assert_eq!(skipped[0]["session_id"], up_to_date);
+        assert_eq!(skipped[0]["reason"], "conflict");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_fleet_skips_device_already_upgrading() {
+        // 幂等：同一设备已有在途升级时必须跳过，否则一次误触会把它重复重启。
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_manifest_mock(&dir, b"new-binary-x86").await;
+        let h = login(&state).await;
+
+        let sid = register_device(
+            &state,
+            "busydev",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+        state
+            .agent_upgrades
+            .write()
+            .await
+            .insert(sid.clone(), json!({"stage": "downloading"}));
+
+        let r = agent_upgrade_fleet_handler(State(state.clone()), h.clone(), Json(json!({}))).await;
+        let body = body_json(r).await;
+        assert_eq!(body["counts"]["triggered"], 0, "{body}");
+        assert_eq!(body["counts"]["skipped"], 1, "{body}");
+        assert_eq!(body["skipped"][0]["reason"], "upgrade_in_progress");
+        assert_eq!(body["skipped"][0]["stage"], "downloading");
+        assert!(rx.try_recv().is_err(), "在途设备不得被再次触发");
+
+        // 终态（done）必须放行，否则设备升级完就再也升不了了。
+        state
+            .agent_upgrades
+            .write()
+            .await
+            .insert(sid.clone(), json!({"stage": "done"}));
+        let r = agent_upgrade_fleet_handler(State(state.clone()), h, Json(json!({}))).await;
+        let body = body_json(r).await;
+        assert_eq!(body["counts"]["triggered"], 1, "终态设备必须可以再次升级: {body}");
+        assert!(rx.try_recv().is_ok(), "终态设备应收到新指令");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_fleet_honours_explicit_session_list() {
+        // 灰度：给了 session_ids 就只碰这些设备，其余一台都不许动。
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_manifest_mock(&dir, b"new-binary-x86").await;
+        let h = login(&state).await;
+
+        let a = register_device(&state, "graya", "x86_64", "linux", NEW_AGENT_CAPS, Some("0.59.1")).await;
+        let b = register_device(&state, "grayb", "x86_64", "linux", NEW_AGENT_CAPS, Some("0.59.1")).await;
+        let mut rx_a = attach_agent_channel(&state, &a).await;
+        let mut rx_b = attach_agent_channel(&state, &b).await;
+
+        let r = agent_upgrade_fleet_handler(
+            State(state.clone()),
+            h,
+            Json(json!({"session_ids": [a.clone()]})),
+        )
+        .await;
+        let body = body_json(r).await;
+        assert_eq!(body["counts"]["triggered"], 1, "{body}");
+        assert!(rx_a.try_recv().is_ok(), "名单内的设备必须被触发");
+        assert!(rx_b.try_recv().is_err(), "名单外的设备一台都不许动");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_fleet_requires_admin() {
+        // 全量入口能一次重启整个设备群，未登录绝不能碰。
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_manifest_mock(&dir, b"new-binary-x86").await;
+        register_device(&state, "secdev", "x86_64", "linux", NEW_AGENT_CAPS, Some("0.59.1")).await;
+        let r = agent_upgrade_fleet_handler(State(state), HeaderMap::new(), Json(json!({}))).await;
+        assert_eq!(r.status(), 401);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
