@@ -2623,6 +2623,7 @@ pub async fn start(
             .route(&format!("{}/api/recordings/content", ap), get(admin::recording_content_handler))
             .route(&format!("{}/api/recordings/delete", ap), axum::routing::delete(admin::recording_delete_handler))
             .route(&format!("{}/api/agent/upgrade", ap), axum::routing::post(admin::agent_upgrade_handler))
+            .route(&format!("{}/api/agent/upgrade/fleet", ap), axum::routing::post(admin::agent_upgrade_fleet_handler))
             .route(&format!("{}/api/agent/upgrade/plan", ap), get(admin::agent_upgrade_plan_handler))
             .route(&format!("{}/api/agent/upgrade/artifacts", ap), get(admin::upgrade_artifacts_handler))
     } else {
