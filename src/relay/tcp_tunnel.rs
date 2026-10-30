@@ -27,6 +27,12 @@
 //!
 //! 每条连接只结束一次：正常 `closed`、agent `error`、本侧违约、或会话清理。
 //! 之后 [`Drop`] **不再**发 `tcp:close` —— 只是把记录摘掉、写任务 abort。
+//!
+//! **但 `tcp:eof` 不是终态**：它只表示 agent 的读方向结束（目标不再发数据），
+//! agent 的写方向仍在等 relay 指令。因此 `tcp:eof` 不置 `terminal`，`Drop`
+//! 照常下发 `tcp:close` —— 否则那条连接记录与目标 socket 会留在 agent 上，
+//! 攒满 [`MAX_TUNNELS_PER_SESSION`] 对应的 agent 配额（32）后所有新管道都被
+//! 拒成 `busy`（MYS-2495 现场的 503）。
 
 use std::collections::HashMap;
 use std::io;
@@ -377,6 +383,16 @@ pub async fn open(
     };
     if let Err(e) = store.insert(entry, &conn_id, session_id) {
         writer.abort();
+        // relay 侧配额（[`MAX_TUNNELS_PER_SESSION`]）。与 agent 侧 `busy` 的
+        // 503 文案相同，这里是唯一能把两者分开的地方（MYS-2495）。
+        if e == OpenError::Busy {
+            tracing::warn!(
+                session = %session_id,
+                current = store.count_session(session_id),
+                max = store.max_per_session(),
+                "tcp tunnel: relay-side per-session tunnel limit reached — rejecting open (503 Busy)"
+            );
+        }
         return Err(e);
     }
 
@@ -420,8 +436,26 @@ pub async fn open(
     // 等 `tcp:opened` / `tcp:error`。
     match tokio::time::timeout(store.open_timeout(), opened_rx).await {
         Ok(Ok(Ok(()))) => Ok(stream),
-        // agent 明确拒绝：记录已由路由侧摘除并置终态。
-        Ok(Ok(Err(e))) => Err(e),
+        // agent 明确拒绝：路由侧只置了 `terminal` 并把错误塞进 `opened_rx`，
+        // **没有**摘记录。配额归还靠的是下面 return 时局部 `stream` 被 drop
+        // → `Drop::drop` 里的 `store.remove()`（agent 已自行放弃该连接，
+        // `terminal` 为真，所以不会补发 `tcp:close`）。
+        Ok(Ok(Err(e))) => {
+            // agent 侧的 `busy` 与 relay 侧的 `Busy` 文案相同（都是
+            // "too many tunnels open on this agent"），必须留一行日志把两侧分开，
+            // 否则现场又要在「重启 agent 就好」和「relay 配额满了」之间猜。
+            if let OpenError::Agent { kind, .. } = &e {
+                if kind == "busy" {
+                    tracing::warn!(
+                        session = %session_id,
+                        relay_tunnels = store.count_session(session_id),
+                        max = store.max_per_session(),
+                        "tcp tunnel: agent-side concurrency limit reached — rejecting open (503 busy)"
+                    );
+                }
+            }
+            Err(e)
+        }
         // oneshot 被 drop：记录被清理（agent 断线 / 会话清理）。
         Ok(Err(_)) => Err(OpenError::Offline),
         Err(_) => {
@@ -782,7 +816,17 @@ impl AsyncRead for TunnelStream {
                     this.pending = data;
                     this.pending_pos = 0;
                 }
-                Poll::Ready(Some(ReadEvent::Eof)) | Poll::Ready(Some(ReadEvent::Closed)) => {
+                Poll::Ready(Some(ReadEvent::Eof)) => {
+                    // **不是终态**：`tcp:eof` 只关了 agent 的读方向（目标不再发
+                    // 数据），agent 的写方向仍持着记录与目标 socket。因此这里
+                    // 不能置 `finished` —— 否则浏览器侧丢弃管道时 `Drop` 不下发
+                    // `tcp:close`，agent 侧那条连接永久留在 CLOSE-WAIT，攒满 32
+                    // 条后所有新管道被拒成 `busy`（MYS-2495 的 503）。
+                    this.read_eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(ReadEvent::Closed)) => {
+                    // `tcp:closed` 是真正的终态：agent 已自行摘记录、归还名额。
                     this.read_eof = true;
                     this.finished = true;
                     return Poll::Ready(Ok(()));
@@ -1308,6 +1352,169 @@ mod tests {
             .expect("64 条小消息（640 字节）不应中止管道");
         assert_eq!(&got[..10], b"0123456789");
         assert_eq!(state.tcp_tunnels.count_session(&sid), 1);
+    }
+
+    /// 回归（MYS-2495）：目标关掉写方向（agent 发 `tcp:eof`）之后，relay 侧丢
+    /// 弃管道时**必须**仍然下发 `tcp:close`。
+    ///
+    /// `tcp:eof` 只表示 agent 的**读**方向结束（目标不再发数据），agent 的写
+    /// 方向还在等 relay 的指令：没有 `tcp:close` / `tcp:eof`，那条连接记录与
+    /// 目标 socket 会永久留在 agent 上（现场表现为一堆 CLOSE-WAIT），攒到 agent
+    /// 的 32 条上限后所有新的网页映射请求都被拒成 503。
+    #[tokio::test]
+    async fn test_drop_after_agent_eof_still_closes_agent_connection() {
+        let state = make_state();
+        let (sid, mut rx) = setup(&state).await;
+        let (mut stream, conn_id) = open_ok(&state, &sid, &mut rx).await;
+
+        // 目标写完响应就关掉写方向 → agent 回 `tcp:eof`（写方向仍然开着）。
+        feed(
+            &state,
+            &sid,
+            &msg(&sid, "tcp:eof", json!({ "conn_id": &conn_id })),
+        )
+        .await;
+        let mut buf = [0u8; 16];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0, "eof 后读必须返回 0");
+
+        // 浏览器侧收完响应，hyper 丢掉管道。
+        drop(stream);
+
+        let v = next_bulk(&mut rx).await;
+        assert_eq!(
+            v["type"], "tcp:close",
+            "agent 半关闭之后 drop 仍必须发 tcp:close（否则 agent 侧连接永久泄漏）: {v}"
+        );
+        assert_eq!(v["payload"]["conn_id"], conn_id.as_str());
+        assert_eq!(state.tcp_tunnels.count_session(&sid), 0);
+    }
+
+    /// 回归（MYS-2495）：端到端复现现场 503 —— 目标每次都在写完响应后关连接，
+    /// 浏览器每个请求都新建并丢弃一条管道。
+    ///
+    /// 假 agent 严格按协议行事：`tcp:open` → `tcp:opened` → 目标数据 →
+    /// `tcp:eof`；只在收到 `tcp:close`（或 relay 的 `tcp:eof`）时才释放连接，
+    /// 并发上限 32（= `src/agent/tcp_tunnel.rs::MAX_CONNS`）。基线在目标半关闭
+    /// 之后不再下发 `tcp:close`，连接一条条攒着，第 33 个请求起被拒成 `busy`。
+    #[tokio::test]
+    async fn test_repeated_target_close_does_not_leak_agent_quota() {
+        use std::collections::HashSet;
+
+        /// 与 `src/agent/tcp_tunnel.rs::MAX_CONNS` 一致：agent 侧并发上限。
+        const AGENT_MAX_CONNS: usize = 32;
+        const REQUESTS: usize = AGENT_MAX_CONNS + 8;
+
+        let state = make_state();
+        let (sid, rx) = setup(&state).await;
+        let live: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        // 假 agent：消费 relay 的下行指令，按上面那套协议回包。
+        let agent = {
+            let state = state.clone();
+            let sid = sid.clone();
+            let live = live.clone();
+            let mut rx = rx;
+            tokio::spawn(async move {
+                while let Some(text) = rx.recv().await {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    let conn_id = v["payload"]["conn_id"].as_str().unwrap_or("").to_string();
+                    let reply = |ty: &'static str, payload: Value| {
+                        let state = state.clone();
+                        let sid = sid.clone();
+                        async move {
+                            feed(&state, &sid, &msg(&sid, ty, payload)).await;
+                        }
+                    };
+                    match v["type"].as_str().unwrap_or("") {
+                        "tcp:open" => {
+                            // 配额判定与插入之间不能有 await（与真实 agent 一致）。
+                            let admitted = {
+                                let mut l = live.lock().unwrap();
+                                if l.len() >= AGENT_MAX_CONNS {
+                                    false
+                                } else {
+                                    l.insert(conn_id.clone());
+                                    true
+                                }
+                            };
+                            if !admitted {
+                                reply(
+                                    "tcp:error",
+                                    json!({
+                                        "conn_id": conn_id,
+                                        "kind": "busy",
+                                        "message": format!(
+                                            "more than {AGENT_MAX_CONNS} concurrent connections"
+                                        ),
+                                    }),
+                                )
+                                .await;
+                                continue;
+                            }
+                            reply("tcp:opened", json!({ "conn_id": conn_id })).await;
+                            // 目标写出响应体就关掉写方向（CLOSE-WAIT 的现场形态）。
+                            reply(
+                                "tcp:data",
+                                json!({
+                                    "conn_id": conn_id,
+                                    "seq": 0,
+                                    "data": B64.encode(b"HTTP/1.1 200 OK\r\n\r\nhi"),
+                                }),
+                            )
+                            .await;
+                            reply("tcp:eof", json!({ "conn_id": conn_id })).await;
+                        }
+                        // relay 不再需要这条管道 → 释放。
+                        "tcp:close" => {
+                            live.lock().unwrap().remove(&conn_id);
+                        }
+                        // relay 写半关闭：读方向早已结束，agent 两侧都收摊。
+                        "tcp:eof" => {
+                            if live.lock().unwrap().remove(&conn_id) {
+                                reply("tcp:closed", json!({ "conn_id": conn_id })).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            })
+        };
+
+        for i in 0..REQUESTS {
+            let stream = tokio::time::timeout(
+                Duration::from_secs(10),
+                open(&state, &sid, "127.0.0.1", 80),
+            )
+            .await
+            .expect("open 不应挂住")
+            .unwrap_or_else(|e| panic!("第 {} 个请求被拒: {e:?}（agent 侧配额泄漏）", i + 1));
+            // 浏览器读完响应体（读到 eof）后丢弃管道。
+            let mut stream = stream;
+            let mut buf = [0u8; 64];
+            loop {
+                let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                    .await
+                    .expect("读不应挂住")
+                    .expect("读失败");
+                if n == 0 {
+                    break;
+                }
+            }
+            drop(stream);
+            // 给假 agent 一点时间处理 drop 产生的 tcp:close。
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                state.tcp_tunnels.count_session(&sid),
+                0,
+                "第 {} 个请求结束后 relay 侧配额必须已归还",
+                i + 1
+            );
+        }
+
+        // 每个请求的管道都必须被 agent 释放，否则配额已经泄漏。
+        let leaked = live.lock().unwrap().len();
+        assert_eq!(leaked, 0, "{REQUESTS} 个请求后 agent 侧仍残留 {leaked} 条连接");
+        agent.abort();
     }
 
     /// 排队字节超过窗口才算违约（agent 无视 ack 狂发）。
