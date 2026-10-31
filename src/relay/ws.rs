@@ -297,31 +297,110 @@ async fn absorb_upgrade_progress(
     upgrades.insert(session_id.to_string(), value);
 }
 
-/// 清掉过期/无主的升级状态。由 relay 的周期任务调用。
+/// 清掉过期/无主的升级状态，并让**悬挂任务变成可见的失败**。由 relay 的周期
+/// 任务调用。
 ///
 /// 为什么不靠"agent SSE 断开就删"：换机的正常路径**就是**断开重连，那样删
-/// 会让界面在升级最关键的时刻丢失状态，也永远看不到最终结论。清理只针对
-/// 已经结束（终结态留 [`UPGRADE_STATUS_FINAL_TTL`]）或长期无更新
-/// （`UPGRADE_STATUS_STALE_TTL`）的条目。
+/// 会让界面在升级最关键的时刻丢失状态，也永远看不到最终结论。
+///
+/// 两条不同的过期语义：
+///
+/// - **终结态**（`registered`/`rolled_back`/`failed`）留
+///   [`UPGRADE_STATUS_FINAL_TTL`] 供界面展示结论，然后删除——已经结束的东西
+///   过期就该消失。
+/// - **非终结态**超过 [`UPGRADE_STATUS_STALE_TTL`]：**不能直接删**。删掉之后
+///   管理页在无 `upgrade` 时只显示当前版本，运维看到的是"什么都没发生过"，
+///   而实际上有一次升级没走完、磁盘可能已被动过。所以这里把它**改写**成带
+///   `error`/`detail` 的 `failed`，再按终结态 TTL 继续保留一个窗口。这正是
+///   任务卡要求的"无重连的悬挂任务按合理有界 TTL 转为 failed，在 TTL 内 Web
+///   显示失败，不能仅删除后假装无任务"。
+///
+/// 会话已消失（`sessions_gone`）的条目仍然直接删：连设备都不在了，面板上没有
+/// 那一行可以承载失败原因。
 pub async fn sweep_stale_upgrades(state: &Arc<SharedState>, sessions_gone: &[String]) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut upgrades = state.agent_upgrades.write().await;
-    upgrades.retain(|sid, v| {
+    let mut expired: Vec<String> = Vec::new();
+    for (sid, v) in upgrades.iter_mut() {
         if sessions_gone.iter().any(|s| s == sid) {
-            return false;
+            expired.push(sid.clone());
+            continue;
         }
         let at = v.get("at_unix_s").and_then(|x| x.as_u64()).unwrap_or(0);
         let age = now.saturating_sub(at);
-        let stage = v.get("stage").and_then(|x| x.as_str()).unwrap_or("");
-        if upgrade_stage_is_final(stage) {
-            age < UPGRADE_STATUS_FINAL_TTL.as_secs()
-        } else {
-            age < UPGRADE_STATUS_STALE_TTL.as_secs()
+        // 先拷成 owned：下面要拿 `as_object_mut` 改写，不能留着对 `v` 的借用。
+        let stage = v
+            .get("stage")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if upgrade_stage_is_final(&stage) {
+            if age >= UPGRADE_STATUS_FINAL_TTL.as_secs() {
+                expired.push(sid.clone());
+            }
+            continue;
         }
-    });
+        if age < UPGRADE_STATUS_STALE_TTL.as_secs() {
+            continue; // 还在合理窗口内，交给 agent 自己报结论
+        }
+        // 悬挂：改写为可见的失败，并把到达时间刷新到"现在"，让它再按终结态
+        // TTL 保留一个窗口。不删 upgrade_id / 目标版本 —— 界面要能看出这是
+        // 哪一轮升级、本来要升到哪个版本。
+        let target = v
+            .get("target_version")
+            .or_else(|| v.get("version"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(obj) = v.as_object_mut() {
+            // 管理页失败分支读 `u.version`（经过 `target_version`）来显示"本来要
+            // 升到哪个版本"。`started` 条目只有 `target_version`、没有 `version`，
+            // 不补这一步界面会显示成 `v` 加空串。
+            if !target.is_empty() {
+                obj.insert("version".to_string(), json!(target));
+            }
+            obj.insert("stage".to_string(), json!("failed"));
+            obj.insert(
+                "error".to_string(),
+                json!(stale_upgrade_reason(&target, &stage)),
+            );
+            obj.insert(
+                "detail".to_string(),
+                json!("no conclusion from the agent within the TTL"),
+            );
+            obj.insert("at_unix_s".to_string(), json!(now));
+            obj.insert("expired".to_string(), json!(true));
+            obj.remove("percent");
+        }
+        tracing::warn!(
+            session = %sid,
+            stage = %stage,
+            target = %target,
+            "upgrade task went stale without a terminal frame — marking it failed so the admin \
+             panel shows a reason instead of silently forgetting it"
+        );
+    }
+    for sid in expired {
+        upgrades.remove(&sid);
+    }
+}
+
+/// 悬挂任务转为 `failed` 时的可读原因（中英混排，与其它升级文案同一风格：
+/// 结论 + 磁盘状态 + 下一步）。
+fn stale_upgrade_reason(target: &str, stage: &str) -> String {
+    let target = if target.is_empty() {
+        String::new()
+    } else {
+        format!(" v{target}")
+    };
+    format!(
+        "the upgrade to{target} never reported a result (last stage: {stage}). The update helper \
+         stopped responding, so this device is still on its previous version. Check \
+         `update-apply.log` on the device, then retry the upgrade."
+    )
 }
 
 pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, text_str: &str) {
@@ -5177,7 +5256,7 @@ mod tests {
             );
             u.insert(
                 "old_active".into(),
-                json!({"stage": "downloading", "upgrade_id": "u4",
+                json!({"stage": "downloading", "upgrade_id": "u4", "target_version": "0.59.6",
                        "at_unix_s": now - UPGRADE_STATUS_STALE_TTL.as_secs() - 10}),
             );
             u.insert(
@@ -5190,8 +5269,146 @@ mod tests {
         assert!(u.contains_key("fresh_final"), "刚结束的结论要留给界面展示");
         assert!(!u.contains_key("old_final"), "终结态超过窗口应清掉");
         assert!(u.contains_key("fresh_active"), "进行中的状态不能被误清");
-        assert!(!u.contains_key("old_active"), "长期无更新的进行中状态应清掉");
-        assert!(!u.contains_key("gone_session"), "会话已不存在的一律清掉");
+        assert!(
+            !u.contains_key("gone_session"),
+            "会话已不存在的一律清掉（面板上没有那一行可以承载原因）"
+        );
+
+        // 悬挂任务**不能**被直接删掉——必须变成一条带原因的 failed，并在
+        // 终结态 TTL 窗口内继续可见。删掉就等于让界面假装"什么都没发生过"。
+        let stale = u
+            .get("old_active")
+            .expect("悬挂任务必须转成 failed 保留，而不是被静默删除");
+        assert_eq!(stale["stage"], "failed", "{stale}");
+        assert_eq!(
+            stale["upgrade_id"], "u4",
+            "upgrade_id 必须保留，界面才看得出是哪一轮"
+        );
+        assert_eq!(
+            stale["version"], "0.59.6",
+            "目标版本要挪到 version 上供界面展示"
+        );
+        let err = stale["error"].as_str().unwrap_or("");
+        assert!(err.contains("never reported a result"), "{err}");
+        assert!(err.contains("0.59.6"), "原因里要带目标版本: {err}");
+        assert!(err.contains("downloading"), "原因里要带最后阶段: {err}");
+        assert!(err.contains("update-apply.log"), "要给排查入口: {err}");
+        assert_eq!(stale["expired"], true, "标记为 TTL 收敛，便于运维区分");
+        assert!(
+            stale.get("percent").is_none(),
+            "失败状态不该再显示下载百分比"
+        );
+    }
+
+    /// 悬挂任务转 failed 之后，要按**终结态** TTL 继续保留一个窗口——
+    /// 否则"转 failed"只是把删除推迟了一点，运维还是看不到。
+    #[tokio::test]
+    async fn test_stale_upgrade_stays_visible_for_the_final_ttl_window() {
+        let state = make_state("");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        state.agent_upgrades.write().await.insert(
+            "stale1".into(),
+            json!({"stage": "swapping", "upgrade_id": "u1", "target_version": "0.59.6",
+                   "at_unix_s": now - UPGRADE_STATUS_STALE_TTL.as_secs() - 1}),
+        );
+        // 第一次 sweep：转 failed，并把到达时间刷新到"现在"。
+        sweep_stale_upgrades(&state, &[]).await;
+        let v = state.agent_upgrades.read().await.get("stale1").cloned();
+        let v = v.expect("转 failed 后必须还在");
+        assert_eq!(v["stage"], "failed");
+
+        // 立刻再 sweep：还在终结态窗口内，必须仍然可见。
+        sweep_stale_upgrades(&state, &[]).await;
+        assert!(
+            state.agent_upgrades.read().await.contains_key("stale1"),
+            "刚转 failed 的条目不能被同一轮统计口径立刻清掉"
+        );
+
+        // 把时间推到终结态窗口之外，才允许消失。
+        {
+            let mut u = state.agent_upgrades.write().await;
+            if let Some(obj) = u.get_mut("stale1").and_then(|v| v.as_object_mut()) {
+                obj.insert(
+                    "at_unix_s".to_string(),
+                    json!(now - UPGRADE_STATUS_FINAL_TTL.as_secs() - 10),
+                );
+            }
+        }
+        sweep_stale_upgrades(&state, &[]).await;
+        assert!(
+            !state.agent_upgrades.read().await.contains_key("stale1"),
+            "终结态窗口过后才允许清理"
+        );
+    }
+
+    /// 每个非终结态都会被收敛成 failed（不只是 `swapping`）：任何"失去回执"
+    /// 的路径都要有可理解的失败展示。
+    #[tokio::test]
+    async fn test_every_non_terminal_stage_converges_to_a_visible_failure() {
+        let state = make_state("");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stages = [
+            "started",
+            "checking",
+            "downloading",
+            "verifying",
+            "swapping",
+            "installing",
+        ];
+        {
+            let mut u = state.agent_upgrades.write().await;
+            for (i, st) in stages.iter().enumerate() {
+                u.insert(
+                    format!("s{i}"),
+                    json!({"stage": st, "upgrade_id": format!("u{i}"),
+                           "target_version": "9.9.9",
+                           "at_unix_s": now - UPGRADE_STATUS_STALE_TTL.as_secs() - 5}),
+                );
+            }
+        }
+        sweep_stale_upgrades(&state, &[]).await;
+        let u = state.agent_upgrades.read().await;
+        for (i, st) in stages.iter().enumerate() {
+            let v = u
+                .get(&format!("s{i}"))
+                .unwrap_or_else(|| panic!("{st} 阶段悬挂后必须转为 failed 保留"));
+            assert_eq!(v["stage"], "failed", "{st}: {v}");
+            let err = v["error"].as_str().unwrap_or("");
+            assert!(
+                err.contains(st),
+                "{st} 的失败原因要指出最后停在哪个阶段: {err}"
+            );
+            assert!(!err.is_empty(), "{st} 必须有非空原因");
+        }
+    }
+
+    /// 无 `upgrade` 时管理页只显示版本号——这正是"删掉悬挂任务"会让运维
+    /// 误判的原因。这里把两条渲染输入放在一起对照，钉住"必须有 failed 条目"。
+    #[tokio::test]
+    async fn test_stale_upgrade_leaves_something_for_the_panel_to_render() {
+        let state = make_state("");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        state.agent_upgrades.write().await.insert(
+            "s1".into(),
+            json!({"stage": "swapping", "upgrade_id": "u1", "target_version": "0.59.6",
+                   "at_unix_s": now - UPGRADE_STATUS_STALE_TTL.as_secs() - 5}),
+        );
+        sweep_stale_upgrades(&state, &[]).await;
+        let v = state.agent_upgrades.read().await.get("s1").cloned();
+        let v = v.expect("面板需要这条记录才能显示失败原因");
+        // 管理页的失败分支读 error / detail / version，三者都要在。
+        assert!(v.get("error").and_then(|x| x.as_str()).is_some());
+        assert!(v.get("detail").and_then(|x| x.as_str()).is_some());
+        assert!(v.get("version").and_then(|x| x.as_str()).is_some());
     }
 
     /// 收帧时会打上到达时间（收敛逻辑依赖它），且乱序帧被丢弃。

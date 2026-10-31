@@ -372,6 +372,184 @@ pub fn stop_unit(unit: &str) {
     let _ = unit;
 }
 
+// ── unit 的 Restart= 策略：决定"谁负责拉起新 agent" ────────────────
+
+/// 读某个 unit 的 `Restart=` 策略（`always` / `on-failure` / `no` / …）。
+///
+/// 非 root 也能读（`systemctl show` 的属性读权限不受 polkit 限制，实测
+/// `systemctl show -p Restart --value <unit>` 可直接拿到 `always`）。
+///
+/// 读不到时返回 `None`——调用方必须把它当作"**不知道**"，而不是"不会重启"：
+/// 知道不清楚时宁可自己拉起新 agent（设备不失联优先），也不要赌 systemd 会补。
+pub fn service_restart_policy(unit: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["show", "-p", "Restart", "--value", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        apply_user_manager_env(&mut cmd);
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = unit;
+        None
+    }
+}
+
+/// `Restart=` 是否会让 systemd 在**正常退出**后补起一个实例。
+///
+/// 只有 `always` 会。`on-failure` / `on-abnormal` / `no` 都不会——它们只对
+/// 异常退出生效，而换机交接是 `exit 0`。
+pub fn restart_policy_respawns_on_success(policy: &str) -> bool {
+    policy.trim().eq_ignore_ascii_case("always")
+}
+
+/// 换机成功后，"谁负责让新版 agent 跑起来"。
+///
+/// 这个判定是 MYS-2425-D review #2 的核心：`Restart=always` 下如果助手再自己
+/// 起一个新进程，设备就会有两个无人协调的 agent 互相驱逐；反之在
+/// `on-failure` 下如果助手不起，设备直接失联。两种都必须处理对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewAgentOwner {
+    /// 由 systemd 补起（`Restart=always`）：助手**不**起新进程，只等它上线。
+    ///
+    /// 旧主进程退出 ⇒ systemd 按 `RestartSec` 用**已替换的新二进制**再起一个，
+    /// 成为原 service 的唯一 MainPID；它带原始 argv（交接文件里的 `--key` /
+    /// `--session-id` 等），因此身份自然延续。实测（临时 unit）：换机后
+    /// `NRestarts` 恰好 +1、`MainPID` 指向新进程、同 sid 活进程数为 1。
+    Systemd,
+    /// 由助手拉起（非 `always`，或策略未知）：保持既有行为。
+    Helper,
+}
+
+/// 依据 `Restart=` 策略与"本 cgroup 里是否只有一个 agent"决定新 agent 归谁拉起。
+///
+/// `alone_in_cgroup` 是**必须**的第二个条件，理由是语义而不是口味：
+/// `Restart=always` 补起的是 **unit 的主进程**（一个 unit 只有一个 MainPID），
+/// 它与"某一个 agent"一一对应**仅在 cgroup 里只有一个 agent 时**成立。
+///
+/// 同机把多个 agent 放进同一个 service（或用 `systemd-run` 一次性跑一批，
+/// 例如测试 harness）时，该 unit 的"补起"补的是那唯一的主进程，与正在升级的
+/// 这台设备没有对应关系：补起的进程可能带的是**别的**设备的 argv，认领到的
+/// 也可能是别人的交接。这种情况下交给 systemd 会得到错误结果，必须由助手
+/// 自己拉起。
+///
+/// 未知策略同样选 [`NewAgentOwner::Helper`]：宁可多起一个能立刻注册的 agent
+/// （设备可用优先），也不要赌一个读不到的配置替我们补进程。
+pub fn new_agent_owner(
+    restart_policy: Option<&str>,
+    alone_in_cgroup: bool,
+    is_main_pid: bool,
+) -> NewAgentOwner {
+    match restart_policy {
+        Some(p) if restart_policy_respawns_on_success(p) && alone_in_cgroup && is_main_pid => {
+            NewAgentOwner::Systemd
+        }
+        _ => NewAgentOwner::Helper,
+    }
+}
+
+/// 本进程是否就是所在 unit 的 **MainPID**。
+///
+/// 这是"交给 systemd 补起"能否成立的**决定性**条件：`Restart=always` 补起的
+/// 是 unit 的 MainPID，只有当**正在升级的这个进程就是 MainPID** 时，补起来的
+/// 才真的是它。非 root 可读该属性（`systemctl show -p MainPID`），实测可行。
+///
+/// 反例（真实冒烟复现）：8 个 agent 跑在 `multica-daemon.service` 里，该 unit
+/// 的 MainPID 是 daemon 自己；逐个换机到最后只剩一个 agent 时，"同 cgroup 只有
+/// 一个 agent" 成立，但 MainPID 仍不是它——systemd 补起的是 daemon，新 agent
+/// 永远起不来，只能超时回滚。
+pub fn is_unit_main_pid(unit: &str) -> bool {
+    is_unit_main_pid_of(unit, std::process::id())
+}
+
+/// [`is_unit_main_pid`] 的显式 pid 版本。
+///
+/// **必须传"旧 agent 的 pid"而不是调用者自己的 pid**：这个判定是在换机助手
+/// 里执行的，助手跑在独立的 transient unit 里，`process::id()` 是助手自己。
+/// 只有 `unit.MainPID == 旧 agent pid` 才说明"systemd 补起的会是这台设备"。
+pub fn is_unit_main_pid_of(unit: &str, expected_pid: u32) -> bool {
+    match unit_main_pid(unit) {
+        Some(pid) => pid == expected_pid,
+        None => false,
+    }
+}
+
+/// 读 unit 当前的 MainPID（读不到/已停止返回 `None`）。
+///
+/// 单独暴露出来是为了让调用方能把它写进日志：判定失败时运维需要看到
+/// "unit 说 MainPID 是谁"与"我们在等谁"这两个值。
+pub fn unit_main_pid(unit: &str) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["show", "-p", "MainPID", "--value", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        apply_user_manager_env(&mut cmd);
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&out.stdout);
+        match v.trim().parse::<u32>() {
+            Ok(pid) if pid > 0 => Some(pid),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = unit;
+        None
+    }
+}
+
+/// 本进程所在 service cgroup 里，除了自己还有没有别的 agent。
+///
+/// 判据与 [`is_service_side_duplicate`] 同源（同 `exe`、同 cgroup），但不要求
+/// "无恢复意图"：这里只问"是不是还有同伴"。读不到 `/proc` 时返回 `false`
+/// （当作"只有自己"）——读不到的情况下，systemd 的补起语义通常是成立的
+/// （真实部署每设备一个 unit）。
+pub fn alone_in_service_cgroup(service_cgroup: &str) -> bool {
+    find_any_agent_in_cgroup(service_cgroup).is_none()
+}
+
+/// 在给定 cgroup 里找"除自己之外的另一个 agent"（不看恢复意图）。
+fn find_any_agent_in_cgroup(service_cgroup: &str) -> Option<u32> {
+    let me = std::process::id();
+    let Ok(my_exe) = std::fs::read_link("/proc/self/exe") else {
+        return None;
+    };
+    let entries = std::fs::read_dir("/proc").ok()?;
+    entries.flatten().find_map(|entry| {
+        let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+        if pid == me {
+            return None;
+        }
+        if std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .as_deref()
+            != Some(my_exe.as_path())
+        {
+            return None;
+        }
+        (cgroup_path_of_pid(pid).as_deref() == Some(service_cgroup)).then_some(pid)
+    })
+}
+
 // ── 重复进程识别（MYS-2425-D）──────────────────────────────────────
 
 /// 判定**另一个**进程是否是 systemd 按 `Restart=always` 补起的重复实例。

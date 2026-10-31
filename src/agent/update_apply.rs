@@ -78,6 +78,43 @@ const BACKUP_INFIX: &str = ".sr-old-";
 /// Windows 自我搬运出来的助手副本前缀（用完即删，启动时顺手清理残留）。
 const HELPER_COPY_PREFIX: &str = ".shell-remote-update-apply-";
 
+/// `Restart=always` 场景的"待认领交接"指针文件名（在 `0700` 私有目录里）。
+///
+/// 为什么需要它：systemd 补起的进程**不带** `SR_UPGRADE_RESTORE`——那是我方
+/// 拉起时才设的环境变量，systemd 只重放 unit 里声明的环境。临时 agent（没有
+/// `--key`/`--session-id`）因此会拿到一个全新身份，违反"换机后身份不变"。
+///
+/// 所以 `always` 路径改成：助手把交接文件**留在私有目录**并写这个指针，
+/// 由补起的进程启动时主动认领（见 [`take_pending_handoff`]）。
+///
+/// 指针只含一个**路径**，不含 Token：真正的凭据仍在 `0600` 的交接文件里。
+///
+/// **必须按 unit 区分**（后缀是 unit 名）：同机并发升级两台设备时，两份交接
+/// 都落在同一个 `~/.shell-remote/upgrade/` 私有目录里，若共用一个固定文件名，
+/// 后写的会覆盖先写的，先起的那台就会"没有交接可认领"而白白超时回滚。
+/// 真实双 unit 测试（`KillMode=control-group` + `mixed` 同时换机）当场复现了
+/// 这个竞争，因此这里带上 unit 名做键。
+const PENDING_HANDOFF_PREFIX: &str = ".pending-handoff-";
+
+/// 一次换机的待认领指针文件名。
+///
+/// 键取 **unit 名**（`Restart=always` 场景必然有），而不是 `upgrade_id`：
+/// 认领方是 systemd 补起的进程，它只能知道自己属于哪个 unit（读
+/// `/proc/self/cgroup`），拿不到 `upgrade_id`。
+fn pending_handoff_name(unit: &str) -> String {
+    let safe: String = unit
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{PENDING_HANDOFF_PREFIX}{safe}")
+}
+
 /// 助手的三段等待上限。
 ///
 /// 抽成值而不是写死常量，是为了让测试能用毫秒级的上限跑**同一条**代码路径
@@ -148,6 +185,18 @@ pub struct RestartContext {
     ///
     /// 它是路径，不是凭据：不含 Token、不含 argv。
     pub service_cgroup: Option<String>,
+    /// 旧 agent 所在 unit 的 `Restart=` 策略（`always` / `on-failure` / …）。
+    ///
+    /// 换机成功后在 `Restart=always` 下的行为与其它策略**根本不同**：
+    ///
+    /// - `always`：旧主进程一退出，systemd 就用**已替换的新二进制**再起一个，
+    ///   得到一个受原 service 托管的唯一 MainPID。此时助手**不能**再自己起
+    ///   新进程，否则就是两个无人协调的 agent 互相驱逐。
+    /// - 其它（`on-failure` / `no` / 空）：systemd 不会因"正常退出"补起，
+    ///   助手必须自己拉起新 agent，否则设备直接失联。
+    ///
+    /// 由旧 agent 在交接时读一次写进来（非 systemd 环境恒为 `None`）。
+    pub service_restart_policy: Option<String>,
 }
 
 impl std::fmt::Debug for RestartContext {
@@ -170,6 +219,7 @@ impl std::fmt::Debug for RestartContext {
             .field("new_binary", &self.new_binary)
             .field("new_sha256", &self.new_sha256)
             .field("service_cgroup", &self.service_cgroup)
+            .field("service_restart_policy", &self.service_restart_policy)
             .finish()
     }
 }
@@ -203,6 +253,9 @@ struct HandoffFile {
     /// 旧 agent 的 service cgroup（systemd 托管时才有）。见 [`RestartContext`]。
     #[serde(default)]
     service_cgroup: Option<String>,
+    /// 旧 agent 所在 unit 的 `Restart=` 策略（systemd 托管时才有）。
+    #[serde(default)]
+    service_restart_policy: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -308,6 +361,7 @@ impl RestartContext {
         upgrade_id: String,
         target_version: String,
         service_cgroup: Option<String>,
+        service_restart_policy: Option<String>,
     ) -> Self {
         Self {
             session_id,
@@ -325,6 +379,7 @@ impl RestartContext {
             new_binary,
             new_sha256,
             service_cgroup,
+            service_restart_policy,
         }
     }
 
@@ -354,6 +409,7 @@ impl RestartContext {
             new_binary: encode_path(&self.new_binary),
             new_sha256: self.new_sha256.clone(),
             service_cgroup: self.service_cgroup.clone(),
+            service_restart_policy: self.service_restart_policy.clone(),
         }
     }
 
@@ -409,6 +465,7 @@ impl RestartContext {
             new_binary,
             new_sha256: f.new_sha256.to_ascii_lowercase(),
             service_cgroup: f.service_cgroup,
+            service_restart_policy: f.service_restart_policy,
         })
     }
 
@@ -791,7 +848,93 @@ pub fn restore_handoff_path(flag: Option<&str>) -> Result<Option<PathBuf>, Strin
     }
 }
 
-/// 解析并加载一次性恢复信息（CLI/UI 共用的入口）。
+/// 把交接文件登记为"待认领"，供 systemd 补起的进程启动时取用。
+///
+/// 只写一个路径指针（`0600`），不动交接文件本身。返回指针路径。
+pub fn mark_pending_handoff(handoff: &Path, unit: &str) -> std::io::Result<PathBuf> {
+    let dir = handoff
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir"))?;
+    let ptr = dir.join(pending_handoff_name(unit));
+    // 先删再写：上一次换机残留的指针绝不能被当成这一轮的。
+    let _ = std::fs::remove_file(&ptr);
+    write_private_new(&ptr, handoff.as_os_str().as_encoded_bytes())?;
+    Ok(ptr)
+}
+
+/// 撤销"待认领"登记（成功、回滚、失败都要撤，避免被下一轮误认领）。
+pub fn clear_pending_handoff(dir: &Path, unit: &str) {
+    let _ = std::fs::remove_file(dir.join(pending_handoff_name(unit)));
+}
+
+/// 清掉**所有**待认领指针（只给测试收尾用；生产路径按 unit 精确清）。
+pub fn clear_all_pending_handoffs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(PENDING_HANDOFF_PREFIX))
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// 认领"待处理交接"：**只给 systemd 补起的那个进程用**。
+///
+/// 几个必须成立的约束：
+///
+/// - 只认 `0700` 私有目录里、`0600`、属主为自己的指针（复用
+///   [`verify_private_file`]），别的用户写不进来；
+/// - 指针必须指向同目录下真实存在的交接文件；
+/// - **认领即消费**：拿到路径后立刻删除指针，保证同一轮交接只被认领一次
+///   （否则 systemd 反复补起会反复恢复身份）；
+/// - 交接文件本身**不删**：`RestoredIdentity::complete()` 在注册成功后删它，
+///   失败时留着供排查——与既有语义一致。
+///
+/// 返回 `None` = 没有待认领的交接（普通启动）。
+pub fn take_pending_handoff() -> Option<PathBuf> {
+    let dir = RestartContext::private_dir().ok()?;
+    // 认领方是 systemd 补起的进程：它是哪个 unit 的，就只认领哪个 unit 的指针。
+    // 用 cgroup 推断而不是环境变量——环境里没有可靠的 unit 标识，而 cgroup
+    // 由 systemd 决定、进程自己改不了。
+    #[cfg(not(target_os = "linux"))]
+    {
+        // 非 Linux 没有 systemd，"待认领"机制不适用（那条路径也不会写指针）。
+        let _ = &dir;
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cg = super::systemd_helper::current_cgroup_path()?;
+        let unit = super::systemd_helper::service_unit_name(&cg);
+        take_pending_handoff_for_unit(&dir, &unit)
+    }
+}
+
+/// [`take_pending_handoff`] 的显式目录 + unit 版本（测试与内部复用）。
+pub fn take_pending_handoff_for_unit(dir: &Path, unit: &str) -> Option<PathBuf> {
+    let ptr = dir.join(pending_handoff_name(unit));
+    if !ptr.exists() {
+        return None;
+    }
+    verify_private_file(&ptr).ok()?;
+    let raw = std::fs::read(&ptr).ok()?;
+    // SAFETY: 字节来自我们自己用 `as_encoded_bytes()` 写出的指针文件，
+    // 且文件权限已校验（`0600`、属主为本用户），不存在外部注入。
+    let target = PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(raw) });
+    // 指针必须指向私有目录里的交接文件（不给"指向任意路径"留口子）。
+    if target.parent() != Some(dir) || !target.is_file() {
+        let _ = std::fs::remove_file(&ptr);
+        return None;
+    }
+    let _ = std::fs::remove_file(&ptr);
+    Some(target)
+}
+
+/// 解析并加载一次性恢复信息（CLI/UI 共用的入口）。/// 解析并加载一次性恢复信息（CLI/UI 共用的入口）。
 ///
 /// fail-closed：**明确要求了恢复**（隐藏参数或环境变量）但读不出来时返回
 /// `Err`，调用方必须让进程启动失败。这样助手会看到新进程提前退出并回滚，
@@ -799,7 +942,15 @@ pub fn restore_handoff_path(flag: Option<&str>) -> Result<Option<PathBuf>, Strin
 pub fn resolve_restore(flag: Option<&str>) -> Result<Option<RestoredIdentity>, String> {
     match restore_handoff_path(flag)? {
         Some(path) => RestoredIdentity::load(&path).map(Some),
-        None => Ok(None),
+        // 没有显式恢复通道 → 看看是否有一份"待认领"的交接等着我们。
+        //
+        // 这条只会在 `Restart=always` 换机后由 systemd 补起的进程上命中：
+        // 它拿不到 `SR_UPGRADE_RESTORE`，靠这个私有目录里的指针认领原身份。
+        // 普通启动没有指针，行为与本改动之前完全一致（`Ok(None)`）。
+        None => match take_pending_handoff() {
+            Some(path) => RestoredIdentity::load(&path).map(Some),
+            None => Ok(None),
+        },
     }
 }
 
@@ -1594,6 +1745,61 @@ pub fn helper_main_with(
     fsync_dir(&target_dir);
     log.line("new binary installed");
 
+    // ── 新 agent 归谁拉起？──────────────────────────────────────────
+    //
+    // `Restart=always` 下由 **systemd** 补起（MYS-2425-D review #2）：
+    // 旧主进程已经退出，systemd 会用刚替换好的新二进制再起一个，它成为原
+    // service 的唯一 MainPID，并带着同一份原始 argv（`--key` / `--session-id`），
+    // 因此身份自然延续。助手此时**必须不**再自己起一个——那正是"两个 agent
+    // 互相驱逐"的来源。
+    //
+    // 其它策略（`on-failure` / `no` / 读不到）下 systemd 不会因正常退出补起，
+    // 助手照旧自己拉起，否则设备直接失联。
+    //
+    // 第二个条件「cgroup 里只有自己」同样必需：`Restart=always` 补起的是 unit
+    // 的**主进程**，它与"这台设备"一一对应只在单 agent unit 下成立。同机把多个
+    // agent 塞进同一个 service（或 harness 用 systemd-run 跑一批）时，补起的
+    // 进程可能带别的设备的 argv，交给 systemd 会换错身份。
+    let alone = ctx
+        .service_cgroup
+        .as_deref()
+        .map(super::systemd_helper::alone_in_service_cgroup)
+        .unwrap_or(false);
+    // 必须**自己就是 MainPID**：`Restart=always` 补起的是 unit 的 MainPID，
+    // 只有当本进程就是它时，补起来的才真的是这台设备。
+    let unit_name = ctx
+        .service_cgroup
+        .as_deref()
+        .map(super::systemd_helper::service_unit_name);
+    let unit_main = unit_name
+        .as_deref()
+        .and_then(super::systemd_helper::unit_main_pid);
+    let is_main = unit_main == Some(ctx.old_pid);
+    log.line(&format!(
+        "restart-policy check: policy={:?} alone_in_cgroup={alone} unit_main_pid={unit_main:?} \
+         expected(old_pid)={} => is_main_pid={is_main}",
+        ctx.service_restart_policy.as_deref(),
+        ctx.old_pid
+    ));
+    let owner = super::systemd_helper::new_agent_owner(
+        ctx.service_restart_policy.as_deref(),
+        alone,
+        is_main,
+    );
+    if owner != super::systemd_helper::NewAgentOwner::Systemd
+        && ctx.service_restart_policy.is_some()
+    {
+        log.line(&format!(
+            "not handing the new agent to systemd (alone_in_cgroup={alone}, is_main_pid={is_main}): \
+             `Restart=always` only respawns the unit's MainPID, so it can only stand in for this \
+             device when this very process is that MainPID — starting the new agent directly \
+             instead"
+        ));
+    }
+    if owner == super::systemd_helper::NewAgentOwner::Systemd {
+        return finish_with_systemd_takeover(&ctx, handoff, &backup, &mut log, timeouts);
+    }
+
     // ── 拉起新进程并等它注册 ──────────────────────────────────────
     let mut child = match spawn_agent(&ctx, handoff, None) {
         Ok(c) => c,
@@ -1632,6 +1838,113 @@ pub fn helper_main_with(
                 timeouts,
             )
         }
+    }
+}
+
+/// `Restart=always` 下换机成功的收尾：**不自己起进程**，让 systemd 补起的那个接管。
+///
+/// 前置条件此时已全部满足：新二进制原子就位、备份已保留、交接文件仍在。
+///
+/// ## 为什么这样能得到"一个受管 agent"
+///
+/// systemd 是**唯一**的拉起者：旧主进程退出后它按 `RestartSec` 用刚替换的
+/// 新二进制再起一个，成为原 service 的唯一 MainPID。助手不再起第二个进程，
+/// 因此不存在"两个 agent 互相驱逐"。实测（临时 unit，`KillMode=control-group`
+/// 与 `mixed`）：`NRestarts` 恰好 +1、`MainPID` 指向新进程、同 sid 活进程数为 1。
+///
+/// ## 身份怎么保住
+///
+/// systemd 补起的进程**拿不到** `SR_UPGRADE_RESTORE`（那是助手拉起时才设的
+/// 环境变量），临时 agent 会因此拿到全新身份。所以这里先把交接文件登记为
+/// "待认领"（[`mark_pending_handoff`]），补起的进程启动时自己认领
+/// （[`take_pending_handoff`]）——凭据始终只在 `0600` 交接文件里，指针只含路径。
+///
+/// ## 怎么判定成功
+///
+/// 只认**注册回执**：交接文件被消费（`RestoredIdentity::complete()` 在注册
+/// 成功后删除它）。等不到就回滚，与直接 spawn 的路径同一标准。
+fn finish_with_systemd_takeover(
+    ctx: &RestartContext,
+    handoff: &Path,
+    backup: &Path,
+    log: &mut HelperLog,
+    timeouts: HelperTimeouts,
+) -> HelperOutcome {
+    log.line(
+        "Restart=always is configured: leaving the new agent to systemd so the service keeps a \
+         single managed MainPID (the helper will not spawn one)",
+    );
+    let dir = match handoff.parent() {
+        Some(d) => d.to_path_buf(),
+        None => {
+            let msg = "the handoff file has no parent directory".to_string();
+            log.line(&msg);
+            return HelperOutcome::aborted(msg);
+        }
+    };
+    // 指针按 unit 区分（同机并发升级两台设备时互不覆盖）。
+    let unit = ctx
+        .service_cgroup
+        .as_deref()
+        .map(super::systemd_helper::service_unit_name)
+        .unwrap_or_default();
+    // 登记待认领：补起的进程靠它拿回原身份。
+    if let Err(e) = mark_pending_handoff(handoff, &unit) {
+        let msg = format!("cannot register the pending handoff for the systemd restart: {e}");
+        log.line(&msg);
+        return rollback(ctx, handoff, backup, log, msg, None, timeouts);
+    }
+    log.line("pending handoff registered; waiting for the systemd-restarted agent to claim it");
+
+    match await_systemd_registration(handoff, timeouts.register) {
+        Ok(()) => {
+            log.line(
+                "the systemd-restarted agent claimed the handoff and registered; upgrade complete",
+            );
+            let _ = std::fs::remove_file(backup);
+            clear_pending_handoff(&dir, &unit);
+            HelperOutcome::Registered {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }
+        }
+        Err(reason) => {
+            log.line(&format!(
+                "the systemd-restarted agent did not register: {reason}; rolling back"
+            ));
+            clear_pending_handoff(&dir, &unit);
+            rollback(ctx, handoff, backup, log, reason, None, timeouts)
+        }
+    }
+}
+
+/// 等"systemd 补起的那个进程"完成注册。
+///
+/// 信号是**交接文件被消费**（`RestoredIdentity::complete()` 在注册成功后才
+/// 删除它）。用它而不是读子进程 stderr：拉起者是 systemd，助手没有它的管道。
+///
+/// 这个信号是可靠的：交接文件只有"注册成功后被消费"这一条路径会删；失败与
+/// 回滚都保留它供排查。
+fn await_systemd_registration(handoff: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last_report = Instant::now();
+    loop {
+        if !handoff.exists() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no registration from the systemd-restarted agent within {timeout:?}"
+            ));
+        }
+        // 每隔一小段留一行心跳：systemd 是隔 `RestartSec` 才补起的，日志里
+        // 什么都没有会让运维误以为助手卡死。
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            last_report = Instant::now();
+            // 调用方持有 `log`，这里只输出到 stderr（HelperLog 会转存）。
+            let _ = std::io::stderr()
+                .write_all(b"[helper] still waiting for the systemd-restarted agent\n");
+        }
+        std::thread::sleep(POLL);
     }
 }
 

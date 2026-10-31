@@ -278,6 +278,27 @@ fn managed_service_cgroup() -> Option<String> {
     }
 }
 
+/// 本进程所在 unit 的 `Restart=` 策略（仅 systemd 托管场景返回）。
+///
+/// 换机成功后由助手据此决定"新 agent 归谁拉起"：`always` 交给 systemd（得到
+/// 一个受管的唯一 MainPID），其它策略由助手自己拉起。读不到时返回 `None`，
+/// 助手按"自己拉起"处理（设备可用优先）。
+fn managed_service_restart_policy() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if !crate::agent::update_apply::managed_detection() {
+            return None;
+        }
+        let cg = crate::agent::systemd_helper::current_cgroup_path()?;
+        let unit = crate::agent::systemd_helper::service_unit_name(&cg);
+        crate::agent::systemd_helper::service_restart_policy(&unit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// 「已校验的制品」到「正在运行的二进制」之间的那一步。
 ///
 /// 阶段 3 起这一步**不由本进程执行**：Windows 无法替换运行中的 `.exe`，
@@ -322,6 +343,7 @@ fn hand_over_to_helper(
         // systemd 按 `Restart=always` 补起的重复实例并报告（MYS-2425-D）。
         // 非 systemd 环境为 `None`，那条路径行为不变。
         managed_service_cgroup(),
+        managed_service_restart_policy(),
     );
     // Token 只进 0600/当前用户 ACL 的交接文件：argv 会出现在 `ps` 里，
     // 日志会被收集走，两者都不能碰。
@@ -1058,6 +1080,7 @@ mod tests {
             task.sha256.clone(),
             task.upgrade_id.clone(),
             task.target_version.clone(),
+            None,
             None,
         );
         // 上一轮的恢复参数必须被剥掉，否则新一轮会去读上一轮的身份。

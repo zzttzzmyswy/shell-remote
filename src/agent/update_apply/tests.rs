@@ -121,6 +121,7 @@ fn sample_ctx(dir: &TmpDir, upgrade_id: &str) -> RestartContext {
         new_binary,
         new_sha256: sha256_of(new_bytes),
         service_cgroup: None,
+        service_restart_policy: None,
     }
 }
 
@@ -321,6 +322,7 @@ fn test_restart_context_new_strips_restore_args() {
         ctx.new_sha256.clone(),
         ctx.upgrade_id.clone(),
         ctx.target_version.clone(),
+        None,
         None,
     );
     assert_eq!(rebuilt.argv, vec![OsString::from("agent")]);
@@ -1450,6 +1452,7 @@ esac
             new_binary: new_bin.clone(),
             new_sha256: new_sha,
             service_cgroup: None,
+            service_restart_policy: None,
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
 
@@ -1999,6 +2002,7 @@ mod real_old_binary {
             new_binary: new_binary.clone(),
             new_sha256: sha256_of(b"not a real binary"),
             service_cgroup: None,
+            service_restart_policy: None,
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
 
@@ -2154,4 +2158,107 @@ fn test_non_linux_platform_never_takes_the_transient_route() {
     // 托管判定与路由的映射本身与平台无关，这里一并钉住：
     assert_eq!(managed_route(false), ManagedRoute::Direct);
     assert_eq!(managed_route(true), ManagedRoute::Transient);
+}
+
+// ── 10. `Restart=always` 的身份交接：待认领指针（MYS-2425-D review #2）──
+
+const UNIT_A: &str = "sr-test-a.service";
+const UNIT_B: &str = "sr-test-b.service";
+
+/// 指针登记后能被认领，且**认领即消费**（同一轮只认一次）。
+#[test]
+fn test_pending_handoff_is_claimed_exactly_once() {
+    let dir = TmpDir::new("pending1");
+    let ctx = sample_ctx(&dir, "up-pending");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+
+    mark_pending_handoff(&handoff, UNIT_A).unwrap();
+    let claimed = take_pending_handoff_for_unit(dir.path(), UNIT_A).expect("应能认领");
+    assert_eq!(claimed, handoff);
+    // 指针已被消费，第二次认领拿不到。
+    assert!(
+        take_pending_handoff_for_unit(dir.path(), UNIT_A).is_none(),
+        "同一份交接不能被认领两次（否则 systemd 反复补起会反复恢复身份）"
+    );
+    // 交接文件本身仍在：由注册成功的 complete() 删除。
+    assert!(handoff.exists(), "认领不删交接文件");
+}
+
+/// **并发回归**（真实双 unit 测试当场复现）：两台设备同时换机时，各自的指针
+/// 必须互不覆盖，只能认领自己 unit 那一份。
+#[test]
+fn test_concurrent_upgrades_do_not_steal_each_others_handoff() {
+    let dir = TmpDir::new("pending-concurrent");
+    let ctx_a = sample_ctx(&dir, "up-a");
+    let ctx_b = sample_ctx(&dir, "up-b");
+    let handoff_a = ctx_a.write_handoff_into(dir.path()).unwrap();
+    let handoff_b = ctx_b.write_handoff_into(dir.path()).unwrap();
+    assert_ne!(handoff_a, handoff_b, "两个交接文件必须不同");
+
+    mark_pending_handoff(&handoff_a, UNIT_A).unwrap();
+    mark_pending_handoff(&handoff_b, UNIT_B).unwrap();
+
+    // B 先认领，只能拿到自己的；A 的必须还在。
+    assert_eq!(
+        take_pending_handoff_for_unit(dir.path(), UNIT_B).unwrap(),
+        handoff_b,
+        "B 只能认领自己的交接"
+    );
+    let claimed_a =
+        take_pending_handoff_for_unit(dir.path(), UNIT_A).expect("A 的交接不能被 B 的登记覆盖掉");
+    assert_eq!(claimed_a, handoff_a);
+}
+
+/// 没有登记时认领返回 `None`——普通启动不受影响。
+#[test]
+fn test_pending_handoff_absent_means_plain_start() {
+    let dir = TmpDir::new("pending-none");
+    assert!(take_pending_handoff_for_unit(dir.path(), UNIT_A).is_none());
+}
+
+/// 指针指向目录外的路径时必须拒绝并清掉（不给"指向任意文件"留口子）。
+#[test]
+fn test_pending_handoff_rejects_a_path_outside_the_private_dir() {
+    let dir = TmpDir::new("pending-escape");
+    let ptr = dir.join(&pending_handoff_name(UNIT_A));
+    write_private_new(&ptr, b"/etc/passwd").unwrap();
+    assert!(
+        take_pending_handoff_for_unit(dir.path(), UNIT_A).is_none(),
+        "指向私有目录之外的指针必须被拒绝"
+    );
+    assert!(!ptr.exists(), "非法指针要被清掉，不能留着反复尝试");
+}
+
+/// `clear_pending_handoff` 幂等，只清自己 unit 的，且不影响交接文件。
+#[test]
+fn test_clear_pending_handoff_is_scoped_and_idempotent() {
+    let dir = TmpDir::new("pending-clear");
+    let ctx_a = sample_ctx(&dir, "up-clear-a");
+    let ctx_b = sample_ctx(&dir, "up-clear-b");
+    let handoff_a = ctx_a.write_handoff_into(dir.path()).unwrap();
+    let handoff_b = ctx_b.write_handoff_into(dir.path()).unwrap();
+    mark_pending_handoff(&handoff_a, UNIT_A).unwrap();
+    mark_pending_handoff(&handoff_b, UNIT_B).unwrap();
+
+    clear_pending_handoff(dir.path(), UNIT_A);
+    assert!(
+        take_pending_handoff_for_unit(dir.path(), UNIT_A).is_none(),
+        "A 的指针已清"
+    );
+    assert_eq!(
+        take_pending_handoff_for_unit(dir.path(), UNIT_B).unwrap(),
+        handoff_b,
+        "清 A 不能影响 B"
+    );
+    clear_pending_handoff(dir.path(), UNIT_A); // 再调一次不 panic
+    assert!(handoff_a.exists(), "撤销登记不动交接文件");
+}
+
+/// unit 名里的非常规字符不能让指针文件名跑出私有目录。
+#[test]
+fn test_pending_pointer_name_is_sanitized() {
+    let name = pending_handoff_name("../../etc/passwd.service");
+    assert!(name.starts_with(PENDING_HANDOFF_PREFIX));
+    assert!(!name.contains('/'), "{name}");
+    assert!(!name.contains(".."), "{name}");
 }

@@ -495,3 +495,108 @@ fn test_settle_is_bounded_and_returns_a_known_verdict() {
         "意外结论: {verdict:?}"
     );
 }
+
+// ── 5. Restart= 策略决定"谁拉起新 agent"（MYS-2425-D review #2）────
+
+/// `always` 下必须交给 systemd：助手再起一个就是两个 agent 互相驱逐。
+#[test]
+fn test_restart_always_hands_the_new_agent_to_systemd() {
+    assert!(restart_policy_respawns_on_success("always"));
+    assert_eq!(
+        new_agent_owner(Some("always"), true, true),
+        NewAgentOwner::Systemd
+    );
+}
+
+/// 大小写与空白都要容忍：`systemctl show --value` 可能带换行。
+#[test]
+fn test_restart_policy_parsing_is_lenient() {
+    for v in ["always", "Always", " always\n", "ALWAYS\r\n"] {
+        assert!(
+            restart_policy_respawns_on_success(v),
+            "{v:?} 应被认成 always"
+        );
+        assert_eq!(
+            new_agent_owner(Some(v), true, true),
+            NewAgentOwner::Systemd,
+            "{v:?}"
+        );
+    }
+}
+
+/// 其它策略下 systemd **不会**因正常退出补起，助手必须自己拉起——
+/// 否则设备直接失联。
+#[test]
+fn test_other_policies_keep_the_helper_as_owner() {
+    for v in [
+        "on-failure",
+        "on-abnormal",
+        "on-abort",
+        "on-watchdog",
+        "on-success",
+        "no",
+    ] {
+        assert!(
+            !restart_policy_respawns_on_success(v),
+            "{v} 不应被视为会补起"
+        );
+        assert_eq!(
+            new_agent_owner(Some(v), true, true),
+            NewAgentOwner::Helper,
+            "{v} 下必须由助手拉起"
+        );
+    }
+}
+
+/// 策略读不到（无 systemd / 权限收紧 / unit 已消失）⇒ 按"助手拉起"处理。
+///
+/// 宁可多起一个能立刻注册的 agent（设备可用优先），也不要赌一个读不到的配置
+/// 会替我们补进程。
+#[test]
+fn test_unknown_policy_falls_back_to_the_helper() {
+    assert_eq!(new_agent_owner(None, true, true), NewAgentOwner::Helper);
+    assert_eq!(new_agent_owner(Some(""), true, true), NewAgentOwner::Helper);
+}
+
+/// **共享 cgroup 回归**（真实冒烟当场复现）：`Restart=always` 但同一个 service
+/// 里跑着多个 agent 时，必须由助手自己拉起。
+///
+/// systemd 补起的是 unit 的**主进程**，一个 unit 只有一个 MainPID；多 agent
+/// 共用 cgroup 时，补起的进程与该设备没有对应关系（可能带着别的设备的 argv），
+/// 交给 systemd 会换错身份、并让本次换机超时回滚。
+#[test]
+fn test_shared_cgroup_disables_the_systemd_takeover() {
+    assert_eq!(
+        new_agent_owner(Some("always"), false, true),
+        NewAgentOwner::Helper,
+        "同一 cgroup 里有多个 agent 时，systemd 的补起与这台设备无对应关系"
+    );
+}
+
+/// **MainPID 回归**（真实冒烟当场复现）：`Restart=always` 且 cgroup 里只剩自己，
+/// 但自己**不是** unit 的 MainPID 时，仍不能交给 systemd。
+///
+/// 复现：8 个 agent 共处 `multica-daemon.service`，逐个换机到最后只剩一个时，
+/// "cgroup 里只有一个 agent"成立，但该 unit 的 MainPID 是 daemon 本身；systemd
+/// 补起的是 daemon，新 agent 永远起不来，只能超时回滚。
+#[test]
+fn test_systemd_takeover_requires_being_the_main_pid() {
+    assert_eq!(
+        new_agent_owner(Some("always"), true, false),
+        NewAgentOwner::Helper,
+        "不是 unit MainPID 时，systemd 补起的不是这台设备"
+    );
+    // 三个条件同时成立才交给 systemd。
+    assert_eq!(
+        new_agent_owner(Some("always"), true, true),
+        NewAgentOwner::Systemd
+    );
+    assert_eq!(
+        new_agent_owner(Some("on-failure"), true, true),
+        NewAgentOwner::Helper
+    );
+    assert_eq!(
+        new_agent_owner(Some("always"), false, true),
+        NewAgentOwner::Helper
+    );
+}

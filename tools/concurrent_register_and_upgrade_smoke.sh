@@ -183,20 +183,72 @@ fire_upgrades() { # $@ = session ids
     -H 'Content-Type: application/json' -d '{"session_id":"{}"}' 2>/dev/null
 }
 
-# 进程数：同名二进制必须恰好是"每台设备一个"，不能因为换机留下双进程。
-proc_count() { python3 - "$WORKDIR" "$N" <<'PY'
-import os,re,sys
-work,n=sys.argv[1],int(sys.argv[2])
-pids=set()
-for i in range(1,n+1):
+# 每个 session 的**活进程**数（MYS-2425-D review #3）。
+#
+# 旧实现数的是"日志里出现过的最后一个 pid"，有两个致命漏洞：
+#   1. 换机后由助手拉起的新进程 stderr 被助手接管，它的 `agent pid=` 根本
+#      不会写进日志文件——数出来的是**旧** pid，永远证明不了实际有几个进程；
+#   2. 断言是 `<= N`，少一个也算"通过"，无法证明"每个 sid 恰好 1 个"。
+#
+# 现在直接按**精确二进制路径 + 精确 `--session-id`** 枚举 /proc：
+#   - argv 必须含 `--session-id <sid>`（按独立词匹配，避免 cusag1 命中 cusag10）；
+#   - exe 必须就是本次被测的 `$BIN`（排除同机其它 shell-remote）；
+#   - stat 状态不能是 Z（僵尸不算活进程）。
+# 每行输出 `<sid> <count>`，由调用方逐个断言 == 1。
+live_proc_per_session() { python3 - "$BIN" "$N" <<'PY'
+import os,sys
+binarg,n=sys.argv[1],int(sys.argv[2])
+target=os.path.realpath(binarg)
+target_base=os.path.basename(target)
+def same_binary(argv0):
+    """argv[0] 是否指向被测二进制。
+
+    换机后磁盘上的二进制被原子替换：旧进程的 `/proc/<pid>/exe` 会变成
+    `... (deleted)`，新进程的 argv[0] 也可能被规范化成 `/proc/self/exe`
+    的解析路径。所以三重比较：realpath 相等 / basename 相等 / exe 的
+    realpath 相等（去掉 deleted 后缀）。任何一条成立即认为是同一份二进制。
+    """
     try:
-        text=open(os.path.join(work,f'agent{i}.log')).read()
-    except FileNotFoundError:
-        continue
-    found=re.findall(r'agent pid=(\d+)',text)
-    if found:
-        pids.add(found[-1])
-print(len(pids))
+        if os.path.realpath(argv0)==target:
+            return True
+    except OSError:
+        pass
+    if os.path.basename(argv0)==target_base:
+        return True
+    return False
+
+for i in range(1,n+1):
+    sid='cusag%d'%i
+    cnt=0
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        try:
+            with open('/proc/'+pid+'/cmdline','rb') as f:
+                argv=[a.decode('utf-8','replace') for a in f.read().split(b'\x00') if a]
+        except OSError:
+            continue
+        if len(argv)<2:
+            continue
+        if not same_binary(argv[0]):
+            continue
+        hit=False
+        for j,a in enumerate(argv):
+            if a=='--session-id' and j+1<len(argv) and argv[j+1]==sid:
+                hit=True; break
+            if a=='--session-id='+sid:
+                hit=True; break
+        if not hit:
+            continue
+        try:
+            with open('/proc/'+pid+'/stat') as f:
+                state=f.read().rsplit(')',1)[1].split()[0]
+            if state=='Z':
+                continue
+        except OSError:
+            continue
+        cnt+=1
+    print(sid,cnt)
 PY
 }
 
@@ -448,10 +500,17 @@ after2="$(sess_tokens "$UPG2_SID" 2>/dev/null)"
   && ok "5.2 第二次换机后身份不变" \
   || bad "5.2 第二次换机后身份变了"
 
-# ── 6. 无重复进程 / 无 panic ───────────────────────────────────────
-procs="$(proc_count)"
-[ "$procs" -le "$N" ] && ok "无重复 agent 进程（$procs ≤ $N）" \
-  || bad "出现重复 agent 进程（$procs > $N）——换机残留旧进程"
+# ── 6. 每个 session 恰好 1 个活进程 / 无 panic ────────────────────
+#
+# 「恰好 1」而不是「≤ N」：少一个说明有设备失联，多一个说明换机留下了重复
+# 进程。两种都必须报出来。
+bad_sids=""
+while read -r sid cnt; do
+  [ -z "$sid" ] && continue
+  [ "$cnt" = "1" ] || bad_sids="$bad_sids $sid=$cnt"
+done <<< "$(live_proc_per_session)"
+[ -z "$bad_sids" ] && ok "每个 session 恰好 1 个活 agent 进程（共 $N 个）" \
+  || bad "活进程数不等于 1:$bad_sids"
 panics=$(grep -l 'panicked' "$WORKDIR"/*.log 2>/dev/null | wc -l)
 [ "$panics" -eq 0 ] && ok "无 panic" || bad "$panics 个日志含 panic"
 kill -0 "$RELAY_PID" 2>/dev/null && ok "relay 存活" || bad "relay 已退出"

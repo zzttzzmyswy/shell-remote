@@ -180,33 +180,46 @@ systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
   出的更精确结论）；
 - 没有重连的悬挂任务由 30 分钟 TTL 收敛为过期清理。
 
-### 已知边界：`Restart=always` 会补起一个重复实例
+### `Restart=always` 下的行为
 
-旧 agent 是**正常退出（exit 0）**的，`Restart=always` 会随即用刚换上的新版再
-起一个。于是设备上短暂存在两个 agent（一个在 helper 的 transient unit 里、带
-`SR_UPGRADE_RESTORE`，是真正持有会话的那个；一个在 service cgroup 里、没有
-恢复意图）。新 agent 会识别这个形状并按 unit 名记 warn 日志。
+换机时 agent 是**正常退出（exit 0）**把控制权交给助手，`Restart=always` 会随即
+用刚换上的新版再起一个实例。助手据三个条件决定"新 agent 归谁拉起"：
 
-**不在代码里自动杀掉它**，因为两条自动路径都实测不可靠：
+| 条件 | 读法 | 不满足时 |
+|------|------|----------|
+| `Restart=` 为 `always` | `systemctl show -p Restart` | 助手自己拉起（`on-failure` 等不会因正常退出补起） |
+| 本 cgroup 里只有自己一个 agent | 枚举 `/proc` 同 exe + 同 cgroup | 助手自己拉起：多 agent 共用一个 service 时，systemd 补起的是该 unit 的**唯一** MainPID，与这台设备没有对应关系 |
+| **本进程就是该 unit 的 MainPID** | `systemctl show -p MainPID` | 助手自己拉起 |
 
-- `SIGTERM` 那个 pid：`Restart=always` 立刻再补一个，形成杀掉—重启循环
-  （实测 `NRestarts` 从 0 涨到 3，反而把设备推进反复重启）；
-- `systemctl stop <unit>`：语义正确（stop 会清掉待执行的重启），但 agent 现场
-  以非 root 运行（unit 里 `User=sr-agent`），被 polkit 拒绝。
+三个条件都满足时，助手不起新进程，只把交接文件登记为"待认领"（私有目录里的
+`0600` 指针，按 unit 名区分），由 systemd 补起的那个进程启动时自行认领原身份。
+实测（临时单 agent unit，`KillMode=control-group` + `Restart=always` +
+`RestartSec=5`）：换机后 `NRestarts=1`、`MainPID` 指向新进程、同 sid 活进程数
+为 1、`session_id` 与 Token 不变、磁盘 hash 为新制品。
 
-运维侧根治任选其一：
+> ⚠️ **已知限制：第三个条件在换机窗口内无法判定。** 旧主进程一退出，systemd
+> 在整个 `RestartSec` 窗口内把 `MainPID` 置 `0`（实测：kill 主进程后连续 3s
+> 读到 `MainPID=0`、`ActiveState=activating`），而助手恰恰在这个窗口里做判定，
+> 因此**总会**读不到并退回"助手自己拉起"。
+>
+> 退回路径是安全的：新 agent 会被助手拉起并正常注册（身份由交接文件保证），
+> 只是**多了一个 systemd 补起的实例**——两者同 `session_id`，relay 按 newest
+> wins 顶替，最终只剩一个（实测稳定，不抖动）。但这不是"一个受管 agent"，而是
+> "一个在跑 + 一个被顶替"。要彻底消除它，需要 systemd 侧配合（见下）。
+
+**运维侧收敛方式**（任选其一，均不需要改断言代码）：
 
 ```sh
-# 一次性：换机结束后确认只剩一个 agent
-systemctl stop shell-remote-agent && systemctl start shell-remote-agent
+# 一次性：换机结束后只保留受管实例
+systemctl stop <unit> && systemctl start <unit>
 
-# 长期：让 agent 主动退出时不再被重启（换机交接退出码是 0）
-# 在 unit 的 [Service] 里把 Restart=always 改成：
+# 长期（推荐）：让 agent 主动退出时不再被重启
+# [Service] 里把 Restart=always 改成：
 Restart=on-failure
 ```
 
-`Restart=on-failure` 只在该进程异常退出时重启，正常退出（含换机交接）不会补起，
-因此从根上消除重复实例；崩溃自动恢复的能力保持不变。
+`Restart=on-failure` 只对异常退出生效，换机交接是 `exit 0`，因此不会被补起；
+崩溃自动恢复能力不变。这也是模板建议值。
 
 ### 排查清单
 
