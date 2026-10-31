@@ -294,19 +294,23 @@ fn hand_over_to_helper(
     ctx: &UpgradeContext,
     task: &UpgradeTask,
     artifact: &std::path::Path,
-) -> Result<std::process::Child, String> {
+) -> Result<Handover, String> {
     // ── 先判定"能不能把服务生命周期协调好"再动手 ────────────────────
     //
-    // fail-closed（MYS-2425-D 设计决定）：只有归属明确的单 agent service 且当前
-    // 身份**已**被授权管理它时，才允许继续换机；否则**在这里、旧进程仍在线、
-    // 磁盘未动**的情况下上报失败，并给出可操作的原因。
+    // fail-closed（MYS-2425-D 设计决定）：归属不明确的托管形态一律在**旧进程仍
+    // 在线、磁盘未动**时上报失败。绝不降级成"助手 spawn 一个无人托管的进程"
+    // （会留下第二个实例），也绝不偷偷提权/改 sudoers/改 unit。
     //
-    // 绝不降级成"助手 spawn 一个无人托管的进程"（会留下第二个实例），也绝不
-    // 偷偷提权/改 sudoers/改 unit。
+    // MYS-2425-E 起，"非 root + `Restart=always`"不再属于拒绝之列：它走
+    // `SystemdRestart`——旧 agent 自己换盘后 `exit 0`，由 systemd 拉起新版。
     let managed_plan = managed_plan_for_upgrade();
     if let Some(crate::agent::systemd_helper::ManagedPlan::Refuse { unit, reason }) = &managed_plan
     {
-        let hint = "Nothing on disk was changed and this agent keeps running. To upgrade this device, either set `Restart=on-failure` in the service (the agent exits 0 when it hands over, so it will not be restarted), or have an administrator grant this account permission to manage the service lifecycle (polkit `org.freedesktop.systemd1.manage-units`).";
+        let hint = "Nothing on disk was changed and this agent keeps running. This device needs \
+                    `Restart=always` in its service (the default template uses it) so systemd \
+                    restarts the new version after the handover, or an administrator must grant \
+                    this account permission to manage the service lifecycle (polkit \
+                    `org.freedesktop.systemd1.manage-units`).";
         return Err(match unit {
             Some(u) => format!("{reason} {hint} Affected unit: {u}."),
             None => format!("{reason} {hint}"),
@@ -358,6 +362,37 @@ fn hand_over_to_helper(
     let handoff = restart
         .write_handoff()
         .map_err(|e| format!("cannot write the upgrade handoff file: {e}"))?;
+
+    // ── `SystemdRestart`：不启动助手，本进程自己换盘 ─────────────────
+    //
+    // 这条路径的全部意义是"零权限"：非 root 账户既起不了值得信赖的 transient
+    // unit，也 stop 不了自己的 service。所以换盘在这里做完，随后本进程 `exit 0`，
+    // 由 systemd 按 `Restart=always` 拉起新版本——它仍是原 service 的 MainPID。
+    if matches!(
+        restart.managed_plan,
+        Some(crate::agent::systemd_helper::ManagedPlan::SystemdRestart { .. })
+    ) {
+        let restore_dir = handoff
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| "the handoff file has no parent directory".to_string())?;
+        tracing::info!(
+            handoff = %handoff.display(),
+            upgrade_id = %task.upgrade_id,
+            "swapping the binary in-process; systemd will restart this service with the new \
+             version (Restart=always)"
+        );
+        return match update_apply::systemd_restart_swap(&restart, &handoff, &restore_dir) {
+            Ok(()) => Ok(Handover::SystemdRestart),
+            Err(e) => {
+                // 换盘失败：磁盘已由 `systemd_restart_swap` 恢复，身份没交出去。
+                // 交接文件里是凭据，立刻删掉，本进程继续在线。
+                let _ = std::fs::remove_file(&handoff);
+                Err(e)
+            }
+        };
+    }
+
     tracing::info!(
         handoff = %handoff.display(),
         upgrade_id = %task.upgrade_id,
@@ -370,7 +405,7 @@ fn hand_over_to_helper(
         &task.upgrade_id,
         update_apply::HELPER_READY_TIMEOUT,
     ) {
-        Ok(child) => Ok(child),
+        Ok(child) => Ok(Handover::Helper(child)),
         Err(e) => {
             // 助手没 ready ⇒ 磁盘没动、旧进程继续跑。交接文件里是凭据，
             // 立刻删掉。
@@ -378,6 +413,18 @@ fn hand_over_to_helper(
             Err(e)
         }
     }
+}
+
+/// 换机交接的两种形态。
+///
+/// 调用方对两者的收尾动作**不同**，必须分开：助手路径要等它接住（旧进程退出
+/// 是必需的），`SystemdRestart` 则相反——磁盘已经换好、指针已就位，本进程退出
+/// 正是 systemd 拉起新版的触发条件。
+pub enum Handover {
+    /// 助手已 `ready`，本进程必须退出让它接手。
+    Helper(std::process::Child),
+    /// 本进程已换盘完毕，退出后由 systemd 拉起新版。
+    SystemdRestart,
 }
 
 /// 建 relay 兜底下载用的客户端：**禁止重定向**，TLS 策略与 relay 上行一致。
@@ -604,32 +651,55 @@ pub async fn perform_upgrade(ctx: UpgradeContext, task: UpgradeTask) {
         "swapping",
         None,
         Some(format!(
-            "verified {} from {}; handing over to update-apply",
+            "verified {} from {}; installing it",
             version, downloaded.source
         )),
         &version,
     )
     .await;
     let helper = match hand_over_to_helper(&ctx, &task, &part) {
-        Ok(child) => child,
+        Ok(h) => h,
         Err(e) => {
-            report_failed(
-                &ctx,
-                &version,
-                format!("cannot start the update helper: {e}"),
-            )
-            .await;
+            report_failed(&ctx, &version, format!("cannot swap the binary: {e}")).await;
             return;
         }
     };
-    tracing::info!(
-        helper_pid = helper.id(),
-        upgrade_id = %task.upgrade_id,
-        "update helper is ready; exiting so it can swap the binary"
-    );
+    match helper {
+        Handover::Helper(helper) => {
+            tracing::info!(
+                helper_pid = helper.id(),
+                upgrade_id = %task.upgrade_id,
+                "update helper is ready; exiting so it can swap the binary"
+            );
+        }
+        Handover::SystemdRestart => {
+            // 磁盘已经是新版、指针已就位。下面这条 `swapping` 帧要赶在退出前
+            // 发出去：面板靠它显示"systemd 即将拉起新版本"，新进程随后会自己
+            // 补一条 `registered`。
+            send_progress(
+                &ctx.ctrl_tx,
+                &ctx.session_id,
+                "swapping",
+                None,
+                Some(
+                    "the new binary is in place; systemd will start it according to \
+                     Restart=always and it will report registered itself"
+                        .to_string(),
+                ),
+                &version,
+            )
+            .await;
+            tracing::info!(
+                upgrade_id = %task.upgrade_id,
+                "binary swapped in-process; exiting so systemd restarts the service with the new \
+                 version"
+            );
+        }
+    }
 
     // 5. 退出。给终结帧一点时间到 relay，再让这个进程（和它的发送循环）
-    //    消失——助手正在按本进程的 PID 等我们退出。
+    //    消失——助手正在按本进程的 PID 等我们退出；`SystemdRestart` 下则是
+    //    systemd 在等主进程消失以触发 `Restart=always`。
     tokio::time::sleep(EXIT_FLUSH_GRACE).await;
     std::process::exit(0);
 }

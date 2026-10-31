@@ -87,16 +87,20 @@ unit 的关键点：
   agent 自身有指数退避重连（实测 2→4→8→16→32→60s 封顶），relay 挂掉期间进程不退出，
   `NRestarts` 保持 0，relay 恢复后自动重新注册。因此也不需要关掉 systemd 的启动频率限制。
 
-  > ⚠️ **自升级场景建议改成 `Restart=on-failure`。** 换机时 agent 是**正常退出
-  > （exit 0）**把控制权交给换机助手的，`Restart=always` 会立刻用刚换上的新版再起
-  > 一个，于是短暂出现两个 agent 抢同一个会话。`Restart=on-failure` 只在异常退出时
-  > 重启，正常退出（含换机交接）不补起，崩溃恢复能力不变。模板保持 `always` 是为了
-  > 不改变既有部署的行为；细节与排查见 [docs/upgrade.md](../../docs/upgrade.md) 的
-  > 「systemd 托管下的换机」。
+  > ✅ **`Restart=always` 是自升级的前提，请保持它。** v0.59.7 起，非 root 账户在
+  > `Restart=always` 下**不需要任何权限**就能自升级：agent 在自己进程内把新二进制
+  > 原子换上磁盘、写下身份指针后 `exit 0`，systemd 随即用新字节拉起新版本，新进程
+  > 恢复原 `session_id`/Token 并自己上报 `registered`。升级后服务仍是 `active`、
+  > MainPID 就是新 agent（`NRestarts` 恰好 +1），崩溃恢复能力不变。
   >
-  > 另外 v0.59.6 起换机助手会自动放到独立的 transient unit 里跑，因此**不需要**给
-  > unit 加 `KillMode=` 之类的特殊配置——**升级本身在 `Restart=always` 下也能正常完成**，
-  > 上面的建议只是为了避免换机后短暂的双进程。
+  > **不要改成 `Restart=on-failure`。** 换机是**正常退出**（exit 0），`on-failure`
+  > 不会补起新版本，只能由换机助手在独立的 transient unit 里 `spawn` 新进程——那个
+  > 进程不在原 service 的 cgroup 里，升级完成后 service 变 `inactive`，agent 失去
+  > 托管、崩溃不会被拉起，此时手动 `systemctl start` 还会再起一个重复实例。所以
+  > v0.59.7 在"`on-failure` 且未授权"时**直接拒绝**升级并说明原因，磁盘一点不动。
+  >
+  > 完整时序、指针格式、自回滚机制与剩余风险见
+  > [docs/upgrade.md](../../docs/upgrade.md) 的「systemd 托管 service」。
 
 ### 3. 开机自启动
 

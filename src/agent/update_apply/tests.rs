@@ -2181,7 +2181,8 @@ fn test_restore_pending_is_taken_exactly_once() {
     pending_restore_marker("up-rp", &handoff, dir.path());
 
     let got = take_restore_pending_in(dir.path()).expect("应能取到待恢复交接");
-    assert_eq!(got, handoff);
+    assert_eq!(got.handoff, handoff);
+    assert_eq!(got.backup, None, "两行指针没有自回滚备份");
     assert!(
         take_restore_pending_in(dir.path()).is_none(),
         "取到即消费，不能反复恢复"
@@ -2228,7 +2229,7 @@ fn test_restore_pending_must_live_next_to_the_handoff() {
     // 写对地方就能取到。
     pending_restore_marker("up-rp2", &handoff, handoff_dir.path());
     assert_eq!(
-        take_restore_pending_in(handoff_dir.path()).unwrap(),
+        take_restore_pending_in(handoff_dir.path()).unwrap().handoff,
         handoff
     );
 }
@@ -2243,7 +2244,530 @@ fn test_restore_pending_overwrites_previous_leftover() {
     let h2 = ctx2.write_handoff_into(dir.path()).unwrap();
     pending_restore_marker("up-a", &h1, dir.path());
     pending_restore_marker("up-b", &h2, dir.path()); // 不应 panic/失败
-    assert_eq!(take_restore_pending_in(dir.path()).unwrap(), h2);
+    assert_eq!(take_restore_pending_in(dir.path()).unwrap().handoff, h2);
+}
+
+// ── 11b. 三行指针与自回滚备份校验（MYS-2425-E）───────────────────────
+
+/// 三行指针：第 3 行的 backup 能被读回来，并解析成 `self_rollback`。
+#[test]
+fn test_three_line_pointer_carries_the_backup() {
+    let dir = TmpDir::new("rp3-ok");
+    let ctx = sample_ctx(&dir, "up-rp3");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+    std::fs::rename(&ctx.target_path, &backup).unwrap();
+    std::fs::rename(&ctx.new_binary, &ctx.target_path).unwrap();
+
+    pending_restore_marker_with("up-rp3", &handoff, Some(&backup), dir.path());
+    let got = take_restore_pending_in(dir.path()).expect("三行指针应能读到");
+    assert_eq!(got.handoff, handoff);
+    assert_eq!(got.backup.as_deref(), Some(backup.as_path()));
+}
+
+/// **兼容两行格式**：`Coordinated` 换机写的指针没有 backup，必须照旧解析成功，
+/// 且 `backup` 为 `None`（那条路径的回滚由助手负责，新进程不该自己动手）。
+#[test]
+fn test_two_line_pointer_still_parses_without_backup() {
+    let dir = TmpDir::new("rp2-compat");
+    let ctx = sample_ctx(&dir, "up-rp2c");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    pending_restore_marker("up-rp2c", &handoff, dir.path());
+    let got = take_restore_pending_in(dir.path()).expect("两行指针必须继续可用");
+    assert_eq!(got.handoff, handoff);
+    assert_eq!(got.backup, None);
+}
+
+/// backup 与 target **不同目录** ⇒ 忽略 backup（但身份恢复照做）。
+#[test]
+fn test_pointer_backup_in_another_directory_is_ignored() {
+    let dir = TmpDir::new("rp3-otherdir");
+    let elsewhere = TmpDir::new("rp3-elsewhere");
+    let ctx = sample_ctx(&dir, "up-rp3o");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    // 造一个"名字对但目录不对"的备份：`<target 名>.sr-old-<tag>`，但放在别处。
+    let mut name = ctx.target_path.file_name().unwrap().to_os_string();
+    name.push(format!("{BACKUP_INFIX}up-rp3o"));
+    let bad = elsewhere.path().join(name);
+    std::fs::write(&bad, b"old").unwrap();
+
+    pending_restore_marker_with("up-rp3o", &handoff, Some(&bad), dir.path());
+    let got = take_restore_pending_in(dir.path()).unwrap();
+    assert_eq!(got.backup, None, "跨目录的 backup 必须被忽略");
+}
+
+/// backup 前缀不符（不是 `<target>.sr-old-`）⇒ 忽略。
+#[test]
+fn test_pointer_backup_with_wrong_prefix_is_ignored() {
+    let dir = TmpDir::new("rp3-prefix");
+    let ctx = sample_ctx(&dir, "up-rp3p");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    // 同目录、真实存在，但名字不是备份命名。
+    let bad = dir.join("some-other-file");
+    std::fs::write(&bad, b"not a backup").unwrap();
+
+    pending_restore_marker_with("up-rp3p", &handoff, Some(&bad), dir.path());
+    let got = take_restore_pending_in(dir.path()).unwrap();
+    assert_eq!(got.backup, None, "前缀不符的路径必须被忽略");
+}
+
+/// 纯判定：backup 必须与 target 同目录且带备份前缀。
+#[test]
+fn test_self_rollback_backup_belongs_to_target() {
+    let target = Path::new("/usr/local/bin/shell-remote");
+    let good = PathBuf::from("/usr/local/bin/shell-remote.sr-old-up123456");
+    assert!(self_rollback_backup_belongs_to(&good, target));
+
+    // 相对路径
+    assert!(!self_rollback_backup_belongs_to(
+        Path::new("shell-remote.sr-old-x"),
+        target
+    ));
+    // 不同目录
+    assert!(!self_rollback_backup_belongs_to(
+        Path::new("/opt/bin/shell-remote.sr-old-x"),
+        target
+    ));
+    // 前缀不符（另一个二进制）
+    assert!(!self_rollback_backup_belongs_to(
+        Path::new("/usr/local/bin/other.sr-old-x"),
+        target
+    ));
+    // 有前缀但没 tag（不是 backup_path_for 的产物）
+    assert!(!self_rollback_backup_belongs_to(
+        Path::new("/usr/local/bin/shell-remote.sr-old-"),
+        target
+    ));
+}
+
+/// 备份名 → target 的反推。
+#[test]
+fn test_self_rollback_target_is_derived_from_the_backup_name() {
+    assert_eq!(
+        self_rollback_target(Path::new("/usr/local/bin/shell-remote.sr-old-abcd1234")),
+        Some(PathBuf::from("/usr/local/bin/shell-remote"))
+    );
+    // 不合规的名字一律拒绝，绝不猜路径。
+    assert_eq!(self_rollback_target(Path::new("/usr/local/bin/plain")), None);
+    assert_eq!(
+        self_rollback_target(Path::new("/usr/local/bin/.sr-old-abcd")),
+        None,
+        "中缀前必须有名字"
+    );
+    assert_eq!(
+        self_rollback_target(Path::new("/usr/local/bin/shell-remote.sr-old-")),
+        None,
+        "中缀后必须有 tag"
+    );
+}
+
+/// **自回滚主路径**：到期仍未被消费 ⇒ 旧二进制恢复回 target、调用退出回调，
+/// 且按真实退出码 1。
+#[test]
+fn test_self_rollback_restores_the_previous_binary_when_not_registered() {
+    let dir = TmpDir::new("sr-rollback");
+    let target = fake_target(&dir, "shell-remote");
+    let old_bytes = std::fs::read(&target).unwrap();
+    let backup = backup_path_for(&target, "up-sr1");
+    // 模拟换盘完成后的状态：旧版在 backup，新版在 target。
+    std::fs::rename(&target, &backup).unwrap();
+    std::fs::write(&target, b"brand new version").unwrap();
+
+    let exited = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+    let record = exited.clone();
+    let outcome = run_self_rollback_watchdog(
+        Instant::now(), // 立即到期
+        &backup,
+        &target,
+        &dir.join("handoff.json"),
+        || false, // 从未注册成功
+        move |code| record.lock().unwrap().push(code),
+    );
+    assert_eq!(outcome, SelfRollbackOutcome::RolledBack);
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        old_bytes,
+        "target 必须恢复成旧版字节"
+    );
+    assert!(!backup.exists(), "备份已被 rename 走");
+    assert_eq!(*exited.lock().unwrap(), vec![1], "必须以 1 退出让 systemd 拉起旧版");
+}
+
+/// **已注册 ⇒ 不回滚**，且退出回调不被调用（进程继续服务）。
+#[test]
+fn test_self_rollback_does_nothing_when_registered() {
+    let dir = TmpDir::new("sr-ok");
+    let target = fake_target(&dir, "shell-remote");
+    let backup = backup_path_for(&target, "up-sr2");
+    std::fs::copy(&target, &backup).unwrap();
+    let new_bytes = b"new version".to_vec();
+    std::fs::write(&target, &new_bytes).unwrap();
+
+    let outcome = run_self_rollback_watchdog(
+        Instant::now() + Duration::from_secs(30),
+        &backup,
+        &target,
+        &dir.join("handoff.json"),
+        || true, // 立刻判定为已注册
+        |_| panic!("已注册时绝不能退出"),
+    );
+    assert_eq!(outcome, SelfRollbackOutcome::Registered);
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        new_bytes,
+        "已注册时不得回滚磁盘"
+    );
+    assert!(backup.exists(), "备份交给 complete() 删，不做重复动作");
+}
+
+/// 恢复失败（备份不存在）⇒ 仍然退出（用码 2），让 systemd 别反复拉起坏版本。
+#[test]
+fn test_self_rollback_exits_even_when_restore_fails() {
+    let dir = TmpDir::new("sr-fail");
+    let target = fake_target(&dir, "shell-remote");
+    let backup = backup_path_for(&target, "up-sr3"); // 故意不创建
+    let exited = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+    let record = exited.clone();
+    let outcome = run_self_rollback_watchdog(
+        Instant::now(),
+        &backup,
+        &target,
+        &dir.join("handoff.json"),
+        || false,
+        move |code| record.lock().unwrap().push(code),
+    );
+    assert_eq!(outcome, SelfRollbackOutcome::RollbackFailed);
+    assert_eq!(*exited.lock().unwrap(), vec![2], "恢复失败也必须退出");
+}
+
+/// **竞态回归**：窗口到期那一刻恰好注册成功（备份已被 `complete()` 删掉）⇒
+/// 不得退出，必须保留新版。
+///
+/// 没有这道复核的话，一台**已经升级成功**的设备会在计时器到期时被打回旧版并
+/// 退出——比不升级严重得多。`consumed()` 在 rename 失败后会被再读一次，这里
+/// 用"第一次读 false、之后读 true"模拟那个时序。
+#[test]
+fn test_self_rollback_does_not_kill_a_process_that_just_registered() {
+    let dir = TmpDir::new("sr-race");
+    let target = fake_target(&dir, "shell-remote");
+    let new_bytes = b"new version".to_vec();
+    std::fs::write(&target, &new_bytes).unwrap();
+    let backup = backup_path_for(&target, "up-sr5"); // 已被 complete() 删掉
+
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = reads.clone();
+    let outcome = run_self_rollback_watchdog(
+        Instant::now(),
+        &backup,
+        &target,
+        &dir.join("handoff.json"),
+        move || {
+            // 循环里读到 false（还没注册），rename 失败后再读就是 true。
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+        },
+        |_| panic!("刚注册成功的进程绝不能被自回滚杀掉"),
+    );
+    assert_eq!(outcome, SelfRollbackOutcome::Registered);
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        new_bytes,
+        "新版必须留在磁盘上"
+    );
+}
+
+/// `complete()` 成功后删掉 backup（升级确认，旧版字节再无用）。
+#[test]
+fn test_complete_removes_the_backup_after_a_successful_upgrade() {
+    let dir = TmpDir::new("sr-complete");
+    let ctx = sample_ctx(&dir, "up-sr4");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+    std::fs::copy(&ctx.target_path, &backup).unwrap();
+
+    let mut id = RestoredIdentity::load(&handoff).unwrap();
+    id.self_rollback = Some(SelfRollback {
+        backup: backup.clone(),
+        deadline: Duration::from_secs(60),
+    });
+    assert!(backup.exists());
+    id.complete();
+    assert!(!backup.exists(), "注册成功后备份必须删除");
+}
+
+/// 环境变量越界/非法 ⇒ 回落到默认窗口（不报错，不让设备起不来）。
+#[test]
+fn test_self_rollback_window_falls_back_to_default() {
+    let _g = env_guard();
+    for bad in ["0", "29", "901", "abc", "", "-5"] {
+        std::env::set_var(SELF_ROLLBACK_ENV, bad);
+        assert_eq!(
+            self_rollback_window(),
+            Duration::from_secs(SELF_ROLLBACK_SECS),
+            "{bad:?} 越界时应回落默认值"
+        );
+    }
+    // 合法范围两端都接受。
+    for good in [SELF_ROLLBACK_MIN_SECS, SELF_ROLLBACK_MAX_SECS] {
+        std::env::set_var(SELF_ROLLBACK_ENV, good.to_string());
+        assert_eq!(self_rollback_window(), Duration::from_secs(good));
+    }
+    std::env::remove_var(SELF_ROLLBACK_ENV);
+    assert_eq!(
+        self_rollback_window(),
+        Duration::from_secs(SELF_ROLLBACK_SECS)
+    );
+}
+
+
+// ── 11c. 旧 agent 侧换盘：SystemdRestart（MYS-2425-E）──────────────────
+//
+// 这条路径上**没有任何外部监督者**：不启助手、不调 systemd。所以每个失败分支
+// 都必须自己把磁盘恢复原状、返回 `Err`，由调用方上报 `failed` 并**继续在线**
+// ——旧进程活着是这台设备唯一的保障。
+//
+// 失败靠注入的文件系统制造：真实的"第二次 rename 失败"要跨文件系统或恰好撞上
+// 权限变化，不稳定复现，而它恰恰是"磁盘必须恢复"的关键分支。
+
+/// 可编排的换盘文件系统：每一格都能单独失败。
+struct FakeSwapFs {
+    /// 第几次 `rename` 调用开始失败（1 起算；`None` = 从不失败）。
+    fail_rename_at: Option<usize>,
+    /// 让**恢复**用的 rename 也失败（模拟"回滚也救不回来"）。
+    fail_restore: bool,
+    make_executable_err: Option<String>,
+    verify_err: Option<String>,
+    write_pointer_ok: bool,
+    calls: std::cell::RefCell<Vec<String>>,
+}
+
+impl FakeSwapFs {
+    fn ok() -> Self {
+        Self {
+            fail_rename_at: None,
+            fail_restore: false,
+            make_executable_err: None,
+            verify_err: None,
+            write_pointer_ok: true,
+            calls: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.calls.borrow().iter().filter(|c| c.starts_with("rename")).count()
+    }
+}
+
+impl SwapFs for FakeSwapFs {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.calls
+            .borrow_mut()
+            .push(format!("rename {} -> {}", from.display(), to.display()));
+        // 奇数次失败 = 装新版那一步；`fail_restore` 让恢复那一步也失败。
+        let n = self.count();
+        let is_restore = self.fail_restore && n >= 3;
+        if Some(n) == self.fail_rename_at || is_restore {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected rename failure",
+            ));
+        }
+        // 真实语义：真的移动文件，否则"恢复"断言无从验证。
+        std::fs::rename(from, to)
+    }
+
+    fn make_executable(&self, path: &Path) -> std::io::Result<()> {
+        self.calls.borrow_mut().push(format!("make_executable {}", path.display()));
+        match &self.make_executable_err {
+            Some(e) => Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.clone())),
+            None => make_executable(path),
+        }
+    }
+
+    fn verify(&self, target: &Path, expected_sha: &str) -> Result<(), String> {
+        self.calls.borrow_mut().push(format!("verify {}", target.display()));
+        match &self.verify_err {
+            Some(e) => Err(e.clone()),
+            None => verify_installed_binary(target, expected_sha),
+        }
+    }
+
+    fn write_pointer(&self, upgrade_id: &str, handoff: &Path, backup: &Path, dir: &Path) -> bool {
+        self.calls.borrow_mut().push(format!("write_pointer {upgrade_id}"));
+        if !self.write_pointer_ok {
+            return false;
+        }
+        super::pending_restore_marker_with(upgrade_id, handoff, Some(backup), dir);
+        dir.join(RESTORE_PENDING_FILE).is_file()
+    }
+}
+
+/// 换盘成功：磁盘是新字节、旧版在 backup、三行指针就位。
+#[cfg(unix)]
+#[test]
+fn test_systemd_restart_swap_succeeds_and_writes_three_line_pointer() {
+    let dir = TmpDir::new("srs-ok");
+    let ctx = sample_ctx(&dir, "up-srsok");
+    let old_bytes = std::fs::read(&ctx.target_path).unwrap();
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+
+    systemd_restart_swap(&ctx, &handoff, dir.path()).expect("换盘应成功");
+
+    // target = 新字节
+    assert_eq!(file_sha(&ctx.target_path), ctx.new_sha256);
+    // 旧版保留在 backup
+    let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+    assert_eq!(std::fs::read(&backup).unwrap(), old_bytes);
+    // 三行指针：新 agent 靠它恢复身份并自回滚。
+    let body = std::fs::read_to_string(dir.join(RESTORE_PENDING_FILE)).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 3, "必须是三行: {body:?}");
+    assert_eq!(lines[0], "up-srsok");
+    assert_eq!(PathBuf::from(lines[1]), handoff);
+    assert_eq!(PathBuf::from(lines[2]), backup);
+    // 交接文件还在（等新 agent 注册成功后删）
+    assert!(handoff.exists());
+}
+
+/// **第二次 rename 失败** ⇒ 备份被立刻恢复回 target，返回 `Err`。
+///
+/// 这是"换了半个"的唯一入口：备份已改名、新文件没就位。此时磁盘上 target
+/// 不存在，如果不恢复，设备重启后 service 直接起不来。
+#[cfg(unix)]
+#[test]
+fn test_systemd_restart_swap_restores_the_backup_when_install_fails() {
+    let dir = TmpDir::new("srs-installfail");
+    let ctx = sample_ctx(&dir, "up-srsif");
+    let old_bytes = std::fs::read(&ctx.target_path).unwrap();
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    let fs = FakeSwapFs {
+        fail_rename_at: Some(2), // 第 1 次备份成功，第 2 次装新版失败
+        ..FakeSwapFs::ok()
+    };
+
+    let err = systemd_restart_swap_with(&fs, &ctx, &handoff, dir.path()).expect_err("必须失败");
+    assert!(err.contains("cannot install the new binary"), "{err}");
+    assert!(err.contains("back in place"), "必须说明旧版已归位: {err}");
+    // 磁盘恢复为旧 hash
+    assert_eq!(file_sha(&ctx.target_path), sha256_of(&old_bytes));
+    assert!(
+        !backup_path_for(&ctx.target_path, &ctx.upgrade_id).exists(),
+        "恢复时备份被 rename 回 target，不该再留着"
+    );
+    assert!(!dir.join(RESTORE_PENDING_FILE).exists(), "失败不得留指针");
+    assert!(handoff.exists(), "凭据文件的清理由调用方负责");
+}
+
+/// 装新版失败**且恢复也失败** ⇒ 如实报出备份路径（人工处理），仍返回 `Err`。
+#[cfg(unix)]
+#[test]
+fn test_systemd_restart_swap_reports_the_backup_when_restore_also_fails() {
+    let dir = TmpDir::new("srs-bothfail");
+    let ctx = sample_ctx(&dir, "up-srsbf");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    let fs = FakeSwapFs {
+        fail_rename_at: Some(2),
+        fail_restore: true,
+        ..FakeSwapFs::ok()
+    };
+
+    let err = systemd_restart_swap_with(&fs, &ctx, &handoff, dir.path()).expect_err("必须失败");
+    let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+    assert!(
+        err.contains(&backup.display().to_string()),
+        "原因必须指出备份在哪: {err}"
+    );
+}
+
+/// `.part` 被篡改（hash 不符）⇒ 换盘前就失败，磁盘**一点没动**。
+#[cfg(unix)]
+#[test]
+fn test_systemd_restart_swap_rejects_a_tampered_artifact_before_touching_the_disk() {
+    let dir = TmpDir::new("srs-hash");
+    let ctx = sample_ctx(&dir, "up-srsh");
+    let old_sha = file_sha(&ctx.target_path);
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    // 篡改下载好的字节，但保留交接文件里的原 sha256。
+    std::fs::write(&ctx.new_binary, b"#!/bin/sh\nexit 1 # tampered\n").unwrap();
+
+    let err = systemd_restart_swap(&ctx, &handoff, dir.path()).expect_err("必须拒绝");
+    assert!(err.contains("no longer matches its digest"), "{err}");
+    assert_eq!(file_sha(&ctx.target_path), old_sha, "校验失败不得动 target");
+    let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+    assert!(!backup.exists(), "校验失败不得产生备份");
+    assert!(!dir.join(RESTORE_PENDING_FILE).exists(), "校验失败不得留指针");
+}
+
+/// 换盘后一致性复核失败 ⇒ 恢复旧二进制。
+#[cfg(unix)]
+#[test]
+fn test_systemd_restart_swap_restores_when_the_installed_binary_does_not_match() {
+    let dir = TmpDir::new("srs-postverify");
+    let ctx = sample_ctx(&dir, "up-srspv");
+    let old_bytes = std::fs::read(&ctx.target_path).unwrap();
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    let fs = FakeSwapFs {
+        verify_err: Some("injected digest mismatch".to_string()),
+        ..FakeSwapFs::ok()
+    };
+
+    let err = systemd_restart_swap_with(&fs, &ctx, &handoff, dir.path()).expect_err("必须失败");
+    assert!(err.contains("previous binary was restored"), "{err}");
+    assert_eq!(file_sha(&ctx.target_path), sha256_of(&old_bytes));
+}
+
+/// 补可执行位失败 ⇒ 在动磁盘前失败，什么都不用恢复。
+#[cfg(unix)]
+#[test]
+fn test_systemd_restart_swap_aborts_before_the_disk_when_chmod_fails() {
+    let dir = TmpDir::new("srs-chmod");
+    let ctx = sample_ctx(&dir, "up-srscm");
+    let old_sha = file_sha(&ctx.target_path);
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    let fs = FakeSwapFs {
+        make_executable_err: Some("injected chmod failure".to_string()),
+        ..FakeSwapFs::ok()
+    };
+
+    let err = systemd_restart_swap_with(&fs, &ctx, &handoff, dir.path()).expect_err("必须失败");
+    assert!(err.contains("nothing on disk was changed"), "{err}");
+    assert_eq!(file_sha(&ctx.target_path), old_sha);
+    assert!(
+        fs.calls.borrow().iter().all(|c| !c.starts_with("rename")),
+        "chmod 失败时不该 attempt 任何 rename: {:?}",
+        fs.calls.borrow()
+    );
+}
+
+/// 指针写不进去 ⇒ 恢复旧二进制并失败。
+///
+/// 指针是三步握手的唯一凭据：写不进去，新 agent 会以全新身份注册、而且没有
+/// 自回滚能力——比不升级更糟，所以必须回滚。
+#[cfg(unix)]
+#[test]
+fn test_systemd_restart_swap_rolls_back_when_the_pointer_cannot_be_written() {
+    let dir = TmpDir::new("srs-ptrfail");
+    let ctx = sample_ctx(&dir, "up-srsptr");
+    let old_bytes = std::fs::read(&ctx.target_path).unwrap();
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    let fs = FakeSwapFs {
+        write_pointer_ok: false,
+        ..FakeSwapFs::ok()
+    };
+
+    let err = systemd_restart_swap_with(&fs, &ctx, &handoff, dir.path()).expect_err("必须失败");
+    assert!(
+        err.contains("restore pointer"),
+        "原因要说明是指针写不进去: {err}"
+    );
+    assert!(
+        err.contains("previous binary was restored"),
+        "必须说明已回滚: {err}"
+    );
+    assert_eq!(
+        file_sha(&ctx.target_path),
+        sha256_of(&old_bytes),
+        "指针失败必须回滚磁盘"
+    );
 }
 
 // ── 12. 协调换机的失败分支必须恢复磁盘并如实报告（评审第 2 项）──────

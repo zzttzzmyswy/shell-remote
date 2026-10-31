@@ -180,10 +180,14 @@ systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
   出的更精确结论）；
 - 没有重连的悬挂任务由 30 分钟 TTL 收敛为过期清理。
 
-### systemd 托管 service：先确认可协调，再换机
+### systemd 托管 service：先判定，再选换机方式
 
-换机时 agent 是**正常退出（exit 0）**把控制权交给助手。systemd 托管下，助手
-**在磁盘改动之前**先做一次能力检查，只有确认"能协调"才继续：
+agent 是**正常退出（exit 0）**完成换机的。systemd 托管下，判定分两层：先问
+"这个 service 是不是**明确属于我**"，再按"有没有管理权限"和"`Restart=` 策略"
+选换机方式。全部读操作（`systemctl show` / `/proc` / `pkcheck`）都在**磁盘改动
+之前、旧 agent 仍在线时**完成。
+
+#### 第一层：归属是否明确
 
 | 检查项 | 要求 | 不满足时 |
 |--------|------|----------|
@@ -191,45 +195,37 @@ systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
 | 归属是否明确 | `systemctl show -p MainPID` **等于**当前 agent PID | 拒绝（多 agent 共享一个 service 时必然不相等） |
 | 是否单 agent | 同 cgroup 里没有同 exe 的其它 agent | 拒绝（stop 会连带停掉它们） |
 | 形态是否相符 | `ExecStart` **直接** exec 运行中的这份二进制 | 拒绝（wrapper 脚本下换文件不等于换服务启动的东西） |
-| 重启策略 | `Restart=always` | **`Restart=on-failure` / `no` 等 ⇒ 直接走既有路径**（不会补起，天然单实例） |
-| 是否已授权 | `pkcheck org.freedesktop.systemd1.manage-units` 返回 `yes` | 拒绝（**不探测、不提权、不改 sudoers/unit**） |
+| 重启策略可读 | `systemctl show -p Restart` 有值 | 拒绝（不猜） |
 
-**全部满足** ⇒ 助手执行受控的 `systemctl stop <unit>`（取消 `Restart=always` 的
-待执行重启）、等旧 cgroup 排空、替换磁盘、再用同一 unit `start`：新 agent 回到
-唯一受管 MainPID，不存在第二个实例。
+非 systemd 托管（`!managed`）直接走原有的直接助手路径，行为不变。
 
-**任何一项不满足** ⇒ fail-closed：**在旧 agent 退出前**上报 `failed`，磁盘一点
-不动，旧 agent 继续服务，管理页显示可操作的原因（改 `Restart=on-failure`，或由
-管理员授权服务生命周期操作）。
+#### 第二层：选一种换机方式
 
-实测（本任务新建的临时 unit）：
+| `Restart=` | 已授权（polkit `manage-units` = yes） | 未授权 |
+|---|---|---|
+| `always` | `Coordinated`：stop → 换盘 → start | **`SystemdRestart`：旧 agent 自己换盘后退出，systemd 拉起新版** |
+| 其它（`on-failure` / `no` / …） | `Coordinated` | **拒绝**（原因写明需要 `Restart=always` 或服务管理授权） |
+| 读不到 | 拒绝 | 拒绝 |
 
-| 场景 | 结果 |
-|------|------|
-| `Restart=on-failure`，单 agent | 换机成功：新 PID、Token 不变、磁盘 hash 为新制品、单进程、`NRestarts=0` |
-| `Restart=always`，未授权（普通账户） | **换机前** `failed` + 可读原因；磁盘 hash 未变、MainPID 未变、`NRestarts=0`、单进程 |
-| `Restart=always`，已授权（root 的测试 unit） | 协调成功：`NRestarts=0`、单进程、Token 不变、磁盘为新制品、`registered` |
+"已授权"指 `pkcheck --action-id org.freedesktop.systemd1.manage-units` 返回
+`polkit.result=yes`。`auth_admin*` 表示需要交互认证，非交互的 agent 做不到，按
+**未授权**处理。**不探测性提权、不改 sudoers、不改 unit。**
 
-> 为什么不在换机后判定：`Restart=always` 的 `MainPID` 在 `RestartSec` 窗口内是
-> `0`（实测连续 3s），事后无法确认"这台设备是不是该 unit 的主进程"。把检查
-> 放在动手之前，既拿得到答案，也天然满足"不能升级就别动磁盘"。
+#### `Coordinated`（已授权，v0.59.6 起未变）
 
-### 时序：先 stop 再换盘
+助手执行受控的 `systemctl stop <unit>`（取消 `Restart=always` 的待执行重启）、
+等旧 cgroup 排空、替换磁盘、再用同一 unit `start`：新 agent 回到唯一受管
+MainPID，不存在第二个实例。
 
-协调模式的顺序是 **旧 agent 退出 → stop → 备份/替换 → start**，不是"先换盘再 stop"。
+顺序是 **旧 agent 退出 → stop → 备份/替换 → start**，不是"先换盘再 stop"。
 
-旧 agent 收到 ready 后为换机 `exit 0`，`Restart=always` 会在 `RestartSec`（systemd
-默认 100ms，模板 5s）后补起一个实例；helper 检测到旧进程退出后才执行 stop，因此
-`RestartSec` 很短时，stop 之前仍可能先补起一个实例。由于此时**磁盘还没动**，补起的
-是旧版本，只会短暂注册一次，随后被 stop 终止；之后才换盘、start 并通过交接指针
-恢复身份。最终仍只有一个受管 agent，磁盘状态一致。若之前"先换盘再 stop"，补起的
-就会是**没有交接指针的新版本**，临时 agent 会因此丢失身份。
+旧 agent 收到 ready 后为换机 `exit 0`，`Restart=always` 会在 `RestartSec`
+（systemd 默认 100ms，模板 5s）后补起一个实例；helper 检测到旧进程退出后才执行
+stop，因此 `RestartSec` 很短时，stop 之前仍可能先补起一个实例。由于此时**磁盘
+还没动**，补起的是旧版本，只会短暂注册一次，随后被 stop 终止；之后才换盘、start
+并通过交接指针恢复身份。最终仍只有一个受管 agent，磁盘状态一致。
 
-### 失败一律先恢复旧二进制
-
-进入协调换机时旧 agent **已经退出**，所以任何一步失败都必须把磁盘恢复到旧版
-并用同一 unit 把旧版拉回来，否则设备会停在"新版本在盘上但没人正确接管"的状态。
-失败分两档、消息如实反映：
+失败一律先恢复旧二进制：
 
 | 失败位置 | 磁盘状态 | outcome 与消息 |
 |---|---|---|
@@ -237,20 +233,90 @@ systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
 | 备份后任一失败（替换、校验、start、等注册超时） | **已改成新版** → 恢复旧版 | `rolled_back` + "the previous binary was restored … temporary identities may have been lost" |
 | 恢复也失败 | 新版留在盘上、旧版在备份路径 | `rolled_back` + 指出备份路径，需要人工处理 |
 
-> 不能用 `aborted`（"未改动即放弃"）——那时旧进程已经退出、磁盘可能已被改。
+> 用户级 `systemd-run` 用于让助手活过旧 service 的 cgroup 清理
+> （`KillMode=process` 保证它拉起的进程不被一并收掉）。没有用户级 manager 的
+> 账户（例如 root 常无 `/run/user/0`）自动回退到系统级 transient unit。
 
-> 用户级 `systemd-run` 仍用于让助手活过旧 service 的 cgroup 清理（`KillMode=process`
-> 保证它拉起的进程不被一并收掉）。没有用户级 manager 的账户（例如 root 常无
-> `/run/user/0`）自动回退到系统级 transient unit。
+#### `SystemdRestart`（未授权 + `Restart=always`，v0.59.7 新增）
+
+**不需要任何权限**。旧 agent 在自己进程内完成换盘，然后 `exit 0`，由 systemd
+按 `Restart=always` 用磁盘上的新字节拉起新版本。全程只有 service 里这一个受管
+进程，崩溃恢复能力不受影响。
+
+时序（编号即执行顺序，全部在旧 agent 进程内）：
+
+```text
+1. 校验 .part 的 SHA-256（旧 agent 自己再看一遍，最后一个可信检查点）
+2. rename(target → backup)          backup = <target>.sr-old-<upgrade_id 前 8 位>
+3. rename(.part  → target)          失败则立刻 rename(backup → target) 并上报 failed
+4. fsync(目录)
+5. 复核 target 的 SHA-256            不符则恢复 backup 并上报 failed
+6. 写三行指针 .restore-pending       upgrade_id / handoff / backup
+7. 发 swapping 进度帧，EXIT_FLUSH_GRACE 后 exit(0)
+8. systemd 按 Restart=always 用新二进制拉起 → 它就是本 service 的新 MainPID
+9. 新 agent 读指针、按交接文件恢复原 session_id/Token，注册成功后：
+   - 删除交接文件
+   - 由新 agent 自己上报 registered（没有助手参与）
+   - 删除 backup（升级已确认）
+```
+
+步骤 1–6 任一步失败：磁盘恢复原状、上报 `failed`、**旧进程继续运行**。Linux
+允许 `rename` 一个正在运行的可执行文件，旧进程用已映射的旧 inode 跑完退出流程。
+
+**指针格式**（`$HOME/.shell-remote/upgrade/.restore-pending`，`0600`，目录 `0700`）：
+
+```text
+<upgrade_id>
+<交接文件绝对路径>
+<backup 绝对路径>          ← 仅 SystemdRestart 有；Coordinated 是两行
+```
+
+两行格式继续被 `Coordinated` 使用，读取端同时兼容两种。第三行的 backup 必须
+**绝对路径、与 target 同目录、且文件名以 `<target 名>.sr-old-` 开头**，否则整行
+被忽略（此时不做自回滚，但身份恢复照常）。指针读到即删除，只恢复一次。
+
+**自回滚**：这条路径上没有外部监督者——旧 agent 已退出、没有助手在等
+`registered`。所以由新 agent 自己看着窗口：
+
+- 默认 **180 秒**（从进程启动算起），`SR_UPGRADE_SELF_ROLLBACK_SECS` 可覆盖，
+  取值限制在 **30..=900**，越界/非数字按默认值处理；
+- 超时仍未注册成功 ⇒ `rename(backup → target)` 恢复旧二进制 → `exit(1)`，
+  systemd 随即拉起旧版；旧版重连后 relay 按"重连版本低于目标"判为 `failed`；
+- 恢复本身失败 ⇒ 记 error 日志并 `exit(2)`，设备需要人工处理；
+- 交接文件**不删**：旧版二进制不认识指针协议（指针已在读取时删除），留着它不
+  影响旧版启动，反而留下现场；
+- 窗口到期那一刻恰好注册成功时**不会**误杀：`consumed()` 在 rename 之前与失败
+  之后各复核一次。
+
+**剩余风险**：新二进制在读取指针**之前**就崩溃时无法自回滚——systemd 会按
+`Restart=always` 反复拉起它。换机前的 `--version` 冒烟测试（`smoke_test`）只能
+部分缓解（它能拦住错架构/被截断的制品，拦不住"能跑但初始化即崩"）。现场表现为
+`NRestarts` 持续增长而 relay 上没有 `registered`；此时人工把 `*.sr-old-*` 改名回
+target 即可。
+
+#### 实测（本任务新建的临时 unit，非 root 账户，未配置 polkit 授权）
+
+| 场景 | 结果 |
+|------|------|
+| `Restart=always` + 未授权，`KillMode=control-group` | `SystemdRestart` 成功：`active`、MainPID 为新进程、`NRestarts` 恰好 +1、`/proc/<pid>/exe` 指向 target、Token 不变、单进程、backup 已删 |
+| `Restart=always` + 未授权，`KillMode=mixed` | 同上 |
+| 自回滚（`SR_UPGRADE_SELF_ROLLBACK_SECS=30`，relay 停机） | 磁盘恢复为旧 hash、service 仍 `active` 且 MainPID 为旧版进程、relay 最终 `failed` |
+| `Restart=on-failure` + 未授权 | **换机前** `failed`、磁盘未动、旧 agent 在线，原因含 `Restart=always` |
+| `Restart=always` + 已授权（root 的测试 unit） | `Coordinated` 成功：`NRestarts=0`、单进程、Token 不变、磁盘为新制品、`registered` |
+
+> 为什么不在换机后判定：`Restart=always` 的 `MainPID` 在 `RestartSec` 窗口内是
+> `0`（实测连续 3s），事后无法确认"这台设备是不是该 unit 的主进程"。把检查
+> 放在动手之前，既拿得到答案，也天然满足"不能升级就别动磁盘"。
 
 ### 排查清单
 
 | 现象 | 查看 | 结论 |
 |------|------|------|
-| 管理页停在"换机中" | 设备上 `~/.shell-remote/upgrade/update-apply.log` | 末行是 `ready announced` 却无后续 ⇒ 助手被 cgroup 清掉（旧版本）；有 `cannot ...` ⇒ 按原因处理 |
+| 管理页停在"换机中" | 设备上 `~/.shell-remote/upgrade/update-apply.log`（`Coordinated`）或 `journalctl -u <unit>`（`SystemdRestart`） | 末行是 `ready announced` 却无后续 ⇒ 助手被 cgroup 清掉（旧版本）；有 `cannot ...` ⇒ 按原因处理 |
 | 管理页显示"升级失败 / 助手未完成" | 同上 + `systemctl status <unit>` | relay 在重连时判定助手没完成；磁盘未变，可直接重试 |
-| 声明"无法作为 transient unit 启动" | `systemd-run --user --unit=probe --collect true` | 失败 ⇒ 该账户没有可用的用户级 manager（无 `XDG_RUNTIME_DIR` / 无 dbus session），升级会被明确拒绝而不是卡住 |
-| 两个 agent | `pgrep -af 'shell-remote agent'`；`systemctl show -p NRestarts <unit>` | `Restart=always` 补起的重复实例，见上一节 |
+| 声明"无法作为 transient unit 启动" | `systemd-run --user --unit=probe --collect true` | 失败 ⇒ 该账户没有可用的用户级 manager（无 `XDG_RUNTIME_DIR` / 无 dbus session）；`on-failure` + 未授权会被明确拒绝而不是卡住 |
+| `NRestarts` 持续增长、relay 上没有 `registered` | `systemctl show -p NRestarts,MainPID <unit>`；`ls <agent 目录>/*.sr-old-*` | 新版起来就崩，自回滚也没赶上：手工把 `*.sr-old-*` 改名回 target |
+| 两个 agent | `pgrep -af 'shell-remote agent'`；`systemctl show -p NRestarts <unit>` | 不该再出现；若出现，检查是否有 systemd 之外的启动方式（cron/手工/nohup） |
 
 
 ## 身份保持与回滚
@@ -259,7 +325,7 @@ systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
 - **旧 agent（≤ v0.59.2）只认 relay 的 `url`**：收到仅含外部 CDN 的任务时会解析失败、只回一个错误帧，旧进程根本不会升级。因此没有本地镜像时 relay 会对这类 agent 返回 `409 legacy_agent_needs_relay_mirror`，而不是白发送。它们同样不会上报 `variant:*`，未配 `--upgrade-variant` 时返回 `409 variant_unknown`
 - **身份在换机后保持不变，临时 agent 也一样。** 旧进程退出前会把**实际** `session_id`、全部 `(token, permission)` 与原始 argv 写进一次性交接文件；新进程用它作为首次注册的 `cached_tokens`，走既有 `register_existing` 路径，`session_id`、Token 与权限都不变，不新增任何 relay API。未指定 `--key` 的临时 agent 同样保住 `session_id` **和** Token，浏览器上已打开的页面与已下发的 MCP 凭据继续可用
 - **交接文件安全**：放在 `0700` 私有目录下的 `0600` 文件（Unix）/ 限当前用户的 DACL（Windows），随机文件名 + `create_new`。Token 不进 argv、不进日志、不进握手管道。新进程注册成功后立即删除，**不作为长期凭据存储**
-- **回滚有界。** 新进程 75s 内未上报 `registered`、提前退出，或助手 20s 内没能 `ready`，助手都会恢复备份并重启旧版；重启前先用交接的缓存身份做一次 `register_existing`（等价旧版的普通重连），所以回滚后的临时设备同样保持原 `session_id` 与 Token。若 relay 已不认这份身份（例如全量重启丢了内存中的 token 表），助手会明确报 `Lost` 并保留备份与日志，不宣称回滚成功
+- **回滚有界。** 新进程 75s 内未上报 `registered`、提前退出，或助手 20s 内没能 `ready`，助手都会恢复备份并重启旧版；重启前先用交接的缓存身份做一次 `register_existing`（等价旧版的普通重连），所以回滚后的临时设备同样保持原 `session_id` 与 Token。若 relay 已不认这份身份（例如全量重启丢了内存中的 token 表），助手会明确报 `Lost` 并保留备份与日志，不宣称回滚成功。`SystemdRestart` 路径没有助手，改由**新进程自己**在 180s（`SR_UPGRADE_SELF_ROLLBACK_SECS`）窗口到期后恢复旧二进制并 `exit(1)`，见上文「systemd 托管 service」
 - **relay 失忆是已知边界**：全量重启后临时 Token 只存在于该 relay 内存中，临时 agent 只能重新签发身份；固定 key 可恢复。不会把临时 Token 静默转成永久 key
 - Windows 部分仅交叉编译验证，`OpenProcess` / DACL 等路径尚未在实机跑过
 - **信任边界**：hash 来自官方 release 的 asset digest，能证明字节与 GitHub 上已上传的资产一致；它**不能**抵御官方仓库或 release 资产被恶意替换。需要这个保证要另加发布签名（不在当前范围）。CDN、DoH、代解析只解决可达性，不参与版本与字节决策
