@@ -259,6 +259,25 @@ async fn smoke_test(_path: &std::path::Path) -> bool {
     true
 }
 
+/// 本进程的 systemd service cgroup（仅托管场景返回）。
+///
+/// 换机交接时带上它，新进程据此**认出并报告** systemd 按 `Restart=always`
+/// 补起的重复实例（MYS-2425-D）。非 systemd 环境返回 `None`——那条路径不做
+/// 任何额外的进程处置，行为与本改动之前完全一致。
+fn managed_service_cgroup() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if crate::agent::update_apply::managed_detection() {
+            return crate::agent::systemd_helper::current_cgroup_path();
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// 「已校验的制品」到「正在运行的二进制」之间的那一步。
 ///
 /// 阶段 3 起这一步**不由本进程执行**：Windows 无法替换运行中的 `.exe`，
@@ -299,6 +318,10 @@ fn hand_over_to_helper(
         task.sha256.clone(),
         task.upgrade_id.clone(),
         task.target_version.clone(),
+        // systemd 托管时把本轮 service 的 cgroup 一并交接：新进程靠它认出
+        // systemd 按 `Restart=always` 补起的重复实例并报告（MYS-2425-D）。
+        // 非 systemd 环境为 `None`，那条路径行为不变。
+        managed_service_cgroup(),
     );
     // Token 只进 0600/当前用户 ACL 的交接文件：argv 会出现在 `ps` 里，
     // 日志会被收集走，两者都不能碰。
@@ -313,6 +336,8 @@ fn hand_over_to_helper(
     match update_apply::launch_helper_and_wait_ready(
         &ctx.helper_exe,
         &handoff,
+        // transient unit 名要按 upgrade_id 唯一，避免并发换机撞名。
+        &task.upgrade_id,
         update_apply::HELPER_READY_TIMEOUT,
     ) {
         Ok(child) => Ok(child),
@@ -1033,6 +1058,7 @@ mod tests {
             task.sha256.clone(),
             task.upgrade_id.clone(),
             task.target_version.clone(),
+            None,
         );
         // 上一轮的恢复参数必须被剥掉，否则新一轮会去读上一轮的身份。
         assert_eq!(

@@ -45,9 +45,14 @@ fn token_prefix(token: &str) -> &str {
 /// silently and everything else is dropped with a warning — the alternative
 /// (unbounded buffering) would let one stuck session OOM the whole relay and
 /// stall every other session.
-pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) {
+/// 投递一条 relay→agent 的消息。
+///
+/// 返回 `false` 表示**没送到**（通道满或已关闭）。换机指令必须看这个返回值：
+/// 静默丢一条 `agent:upgrade` 而不报错，会让管理界面显示"已触发"、实际什么都没
+/// 发生，随后一路停在 `started`（MYS-2425-D 冒烟实测）。
+pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) -> bool {
     match tx.try_send(msg) {
-        Ok(()) => {}
+        Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
             if !is_lossy_msg_type(msg_type) {
                 tracing::warn!(
@@ -55,8 +60,9 @@ pub fn deliver(tx: &mpsc::Sender<String>, msg_type: &str, msg: String) {
                     msg_type
                 );
             }
+            false
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
 
@@ -160,6 +166,69 @@ const UPGRADE_STATUS_STALE_TTL: std::time::Duration = std::time::Duration::from_
 /// 升级状态的终结阶段：到达即视为本次换机有结论。
 fn upgrade_stage_is_final(stage: &str) -> bool {
     matches!(stage, "registered" | "rolled_back" | "failed")
+}
+
+/// 换机的"最后一公里"阶段：磁盘已经被动过（或正准备动），结论只能来自
+/// 接手的新进程/助手。
+///
+/// 这些阶段里 agent 断开是**正常现象**，所以断线时不能清状态（见
+/// `AgentEventsCleanup`）。但也正因为如此：如果助手被连带杀掉（MYS-2425-D
+/// 的现场），就再也不会有人发终结帧，界面会永远停在 `swapping`。所以重连时
+/// 必须能把这几个阶段收敛掉。
+fn upgrade_stage_awaits_handover(stage: &str) -> bool {
+    matches!(stage, "swapping" | "installing" | "verifying")
+}
+
+/// 重连收敛：agent 带着旧版本回来了，说明这次换机没成。
+///
+/// 判据与"为什么需要它"：
+///
+/// - **同 upgrade_id 仍在非终态** + **重连版本低于目标版本** ⇒ 新进程从未上线，
+///   磁盘仍是旧版。现场（NAS 上 `KillMode=control-group` 清掉助手）正是这个
+///   形状：relay 停在 `swapping`，重连的是旧版。此时必须给出可读的 `failed`，
+///   而不是靠 30 分钟的 `UPGRADE_STATUS_STALE_TTL` 悄悄抹掉。
+/// - **版本等于目标版本不算成功**。同版本重装（`force`）、以及"新进程起来了但
+///   没走到注册回执"都可能落到这里；成功只认 `registered` 回执，绝不由版本号
+///   推断。这一条是设计里的硬约束。
+/// - **已是终态的不覆盖**。`rolled_back` 是助手给出的更准确结论（它知道身份
+///   恢复到了哪一步），不能被 relay 的推断盖成一句泛泛的 `failed`；
+///   `registered` 同理。
+///
+/// 返回 `Some(原因)` 表示本次重连把状态判成了失败；`None` 表示不该动它。
+fn converge_upgrade_on_reconnect(
+    current: Option<&serde_json::Value>,
+    reconnect_version: Option<&str>,
+) -> Option<String> {
+    let cur = current?;
+    let stage = cur.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+    if upgrade_stage_is_final(stage) || !upgrade_stage_awaits_handover(stage) {
+        return None;
+    }
+    let target = cur.get("target_version").or_else(|| cur.get("version"));
+    let target = target.and_then(|v| v.as_str()).unwrap_or("");
+    // 目标版本缺失/非法时无法比较，不猜——留给 TTL 收敛。
+    let Ok(target_v) = semver::Version::parse(target.trim().trim_start_matches('v')) else {
+        return None;
+    };
+    let actual = reconnect_version?
+        .trim()
+        .trim_start_matches('v')
+        .to_string();
+    let Ok(actual_v) = semver::Version::parse(&actual) else {
+        return None;
+    };
+    // 版本已达/超目标：可能是**旧的**同版本实例回连（同版本 force 重装），
+    // 也可能是新进程注册回执丢了。两种情况都不能判"成功"，也不该判"失败"
+    // ——没有回执就没有结论，交给 TTL。
+    if actual_v >= target_v {
+        return None;
+    }
+    Some(format!(
+        "the update helper did not finish: this device reconnected as v{actual} while the \
+         upgrade targeted v{target_v}. The binary on disk is unchanged; the helper was most \
+         likely killed together with the old service's cgroup. Check `update-apply.log` on \
+         the device and retry the upgrade."
+    ))
 }
 
 /// 收一条 `agent:upgrade_progress`，按 `upgrade_id` 决定是否覆盖已有状态。
@@ -1360,8 +1429,49 @@ pub async fn agent_send_handler(
             .map(|s| s.to_string());
         state
             .sessions
-            .set_agent_version(&session_id, agent_version)
+            .set_agent_version(&session_id, agent_version.clone())
             .await;
+
+        // 升级任务的终态收敛（MYS-2425-D）：agent 重新注册了，但它带的版本
+        // 低于本轮目标版本，而 relay 手上这条任务还停在换机中途——说明接手
+        // 的新进程从没上线过，磁盘仍是旧版。现场（助手被旧 service 的 cgroup
+        // 连带清掉）就停在这个形状上，页面会永远显示"换机中"。
+        //
+        // 放在注册路径里而不是等 TTL：TTL 是 30 分钟后"悄悄消失"，运维看到的
+        // 是"什么都没发生过"；而重连是一个明确的证据点，必须当场给出结论。
+        {
+            let note = {
+                let upgrades = state.agent_upgrades.read().await;
+                converge_upgrade_on_reconnect(
+                    upgrades.get(&session_id),
+                    agent_version.as_deref(),
+                )
+            };
+            if let Some(reason) = note {
+                let mut upgrades = state.agent_upgrades.write().await;
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // 在旧条目上改：保留 upgrade_id / 目标版本 / 来源，只把结论
+                // 与到达时间换掉，管理界面还能看出这是哪一轮升级。
+                if let Some(obj) = upgrades.get_mut(&session_id).and_then(|v| v.as_object_mut()) {
+                    if let Some(target) = obj.get("target_version").cloned() {
+                        obj.insert("version".to_string(), target);
+                    }
+                    obj.insert("stage".to_string(), json!("failed"));
+                    obj.insert("error".to_string(), json!(reason));
+                    obj.insert("detail".to_string(), json!("helper did not finish"));
+                    obj.insert("at_unix_s".to_string(), json!(at));
+                    obj.remove("percent");
+                    tracing::warn!(
+                        session = %session_id,
+                        version = agent_version.as_deref().unwrap_or(""),
+                        "upgrade converged to failed on reconnect — the helper never completed"
+                    );
+                }
+            }
+        }
 
         return Json(json!({
             "type": "agent:registered",
@@ -3236,6 +3346,32 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// **换机指令不能静默丢失**（MYS-2425-D）。
+    ///
+    /// `deliver` 的返回值是"真的投递了吗"的唯一信号。换机指令被静默丢掉时，
+    /// 管理界面会显示"已触发"、设备上却什么都没发生，页面随后一路停在
+    /// `started`（冒烟实测过一次）。所以这条必须能被调用方看到。
+    #[tokio::test]
+    async fn test_deliver_reports_whether_the_upgrade_command_was_queued() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        assert!(
+            deliver(&tx, "agent:upgrade", "first".into()),
+            "通道有空位时投递必须报成功"
+        );
+        assert!(
+            !deliver(&tx, "agent:upgrade", "second".into()),
+            "通道满时必须报失败——换机指令不能静默丢弃"
+        );
+        assert_eq!(rx.recv().await.unwrap(), "first");
+
+        // 通道关闭（agent 断开）同样要报失败。
+        drop(rx);
+        assert!(
+            !deliver(&tx, "agent:upgrade", "third".into()),
+            "通道已关闭时必须报失败"
+        );
+    }
+
     #[tokio::test]
     async fn test_route_agent_message_broadcasts_to_all_browsers() {
         let state = make_state("");
@@ -5091,6 +5227,164 @@ mod tests {
             "registered",
             "终点状态一旦写入就不能被同轮的迟到帧覆盖"
         );
+    }
+
+    // ── 重连收敛：换机中途被打断必须给出可读结论（MYS-2425-D）─────────
+
+    /// 现场复现的那个形状：relay 停在 `swapping`，重连回来的是**旧版本**。
+    /// 必须当场判失败并说明原因，不能靠 30 分钟的 TTL 悄悄抹掉。
+    #[test]
+    fn test_reconnect_on_old_version_fails_a_stuck_swap() {
+        let cur = json!({
+            "stage": "swapping",
+            "upgrade_id": "u1",
+            "version": "0.59.5",
+            "target_version": "0.59.5",
+        });
+        let reason = converge_upgrade_on_reconnect(Some(&cur), Some("0.59.3"))
+            .expect("旧版本回连必须判失败");
+        assert!(reason.contains("did not finish"), "{reason}");
+        assert!(
+            reason.contains("0.59.3"),
+            "原因里要带上实际重连版本: {reason}"
+        );
+        assert!(reason.contains("0.59.5"), "原因里要带上目标版本: {reason}");
+        // 运维能照着做的下一步：指出磁盘没变 + 让看日志/重试。
+        assert!(reason.contains("unchanged"), "{reason}");
+        assert!(reason.contains("update-apply.log"), "{reason}");
+    }
+
+    /// `verifying` / `installing` 同属"结论只能来自交接"的阶段，一样要收敛。
+    #[test]
+    fn test_all_handover_stages_converge() {
+        for stage in ["verifying", "swapping", "installing"] {
+            let cur = json!({"stage": stage, "upgrade_id": "u1", "target_version": "9.9.9"});
+            assert!(
+                converge_upgrade_on_reconnect(Some(&cur), Some("1.0.0")).is_some(),
+                "{stage} 阶段被打断也必须收敛"
+            );
+        }
+    }
+
+    /// **不能伪报成功**：版本已经等于目标版本但没收到 `registered` 回执时，
+    /// 既不能判成功也不能判失败——没有回执就没有结论，交给 TTL。
+    #[test]
+    fn test_reconnect_on_target_version_does_not_claim_success_or_failure() {
+        let cur = json!({"stage": "swapping", "upgrade_id": "u1", "target_version": "0.59.5"});
+        assert_eq!(
+            converge_upgrade_on_reconnect(Some(&cur), Some("0.59.5")),
+            None,
+            "版本匹配不等于成功——成功只认 registered 回执"
+        );
+    }
+
+    /// 已是终态的一律不覆盖：`rolled_back` 是助手给出的更精确结论
+    /// （它知道身份恢复到了哪一步），不能被 relay 的推断盖成泛泛的 failed。
+    #[test]
+    fn test_terminal_states_are_never_overwritten_by_reconnect() {
+        for stage in ["rolled_back", "registered", "failed"] {
+            let cur = json!({"stage": stage, "upgrade_id": "u1", "target_version": "0.59.5"});
+            assert_eq!(
+                converge_upgrade_on_reconnect(Some(&cur), Some("0.59.3")),
+                None,
+                "{stage} 是终态，重连不得覆盖"
+            );
+        }
+    }
+
+    /// `downloading` 之类的早期阶段不归这里管：agent 断线重连是常态，
+    /// 此时判失败只会在网络抖动时误伤。
+    #[test]
+    fn test_early_stages_are_left_to_the_agent() {
+        for stage in ["started", "checking", "downloading", "verified"] {
+            let cur = json!({"stage": stage, "upgrade_id": "u1", "target_version": "0.59.5"});
+            assert_eq!(
+                converge_upgrade_on_reconnect(Some(&cur), Some("0.59.3")),
+                None,
+                "{stage} 阶段不在这里判失败"
+            );
+        }
+    }
+
+    /// 版本缺失/非法时不猜（老 agent 不上报版本，或 relay 的任务没有目标版本）。
+    #[test]
+    fn test_unknown_versions_do_not_produce_a_failure() {
+        let cur = json!({"stage": "swapping", "upgrade_id": "u1", "target_version": "0.59.5"});
+        assert_eq!(converge_upgrade_on_reconnect(Some(&cur), None), None);
+        let no_target = json!({"stage": "swapping", "upgrade_id": "u1"});
+        assert_eq!(
+            converge_upgrade_on_reconnect(Some(&no_target), Some("0.59.3")),
+            None
+        );
+        let bad = json!({"stage": "swapping", "upgrade_id": "u1", "target_version": "not-semver"});
+        assert_eq!(
+            converge_upgrade_on_reconnect(Some(&bad), Some("0.59.3")),
+            None
+        );
+    }
+
+    /// 没有在途任务时什么都不做。
+    #[test]
+    fn test_no_upgrade_record_means_nothing_to_converge() {
+        assert_eq!(converge_upgrade_on_reconnect(None, Some("0.59.3")), None);
+    }
+
+    /// 端到端：注册路径真的把状态改成 `failed`，且保留 upgrade_id、给出
+    /// 目标版本、清掉过期的百分比。
+    #[tokio::test]
+    async fn test_registration_converges_a_stuck_swap_to_failed() {
+        let state = make_state("");
+        let sid = "stuck01";
+        {
+            let mut cm = ChannelMap::new();
+            let (tx, _rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+            cm.agent = Some(tx);
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .insert(sid.to_string(), cm);
+        }
+        state.agent_upgrades.write().await.insert(
+            sid.to_string(),
+            json!({
+                "stage": "swapping",
+                "upgrade_id": "u1",
+                "version": "0.59.5",
+                "target_version": "0.59.5",
+                "percent": 100,
+                "detail": "verified 0.59.5 from relay; handing over to update-apply",
+            }),
+        );
+        // 模拟注册路径里的那一段（与 handler 中的代码同构）。
+        let note = {
+            let upgrades = state.agent_upgrades.read().await;
+            converge_upgrade_on_reconnect(upgrades.get(sid), Some("0.59.3"))
+        }
+        .expect("必须收敛");
+        {
+            let mut upgrades = state.agent_upgrades.write().await;
+            if let Some(obj) = upgrades.get_mut(sid).and_then(|v| v.as_object_mut()) {
+                if let Some(t) = obj.get("target_version").cloned() {
+                    obj.insert("version".to_string(), t);
+                }
+                obj.insert("stage".to_string(), json!("failed"));
+                obj.insert("error".to_string(), json!(note));
+                obj.remove("percent");
+            }
+        }
+        let v = state.agent_upgrades.read().await.get(sid).cloned().unwrap();
+        assert_eq!(v["stage"], "failed", "{v}");
+        assert_eq!(
+            v["upgrade_id"], "u1",
+            "upgrade_id 必须保留，界面才看得出是哪一轮"
+        );
+        assert_eq!(
+            v["version"], "0.59.5",
+            "目标版本要留在 version 上供界面展示"
+        );
+        assert!(v["error"].as_str().unwrap_or("").contains("did not finish"));
+        assert!(v.get("percent").is_none(), "失败状态不该再显示下载百分比");
     }
 
     // ── /agent/resolve：鉴权与 host 白名单（MYS-2425）─────────────────

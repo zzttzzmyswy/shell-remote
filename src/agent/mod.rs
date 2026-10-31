@@ -15,6 +15,10 @@ pub mod lan;
                                 #[cfg(feature = "desktop")]
 pub mod p2p;
 pub mod shell;
+// MYS-2425-D：systemd 托管下的换机助手启动（transient unit），
+// 以及"当前是否受 cgroup 托管"的判定。判定在 Linux 之外恒为 false，
+// 因此 Windows / 其它平台的换机路径与本改动之前**完全一致**。
+pub mod systemd_helper;
 pub mod tcp_tunnel;
 // MYS-2425 阶段2 review：本地 TLS mock（测试 CA + 指定 SAN 证书），
 // `doh` 与 `upgrade` 的测试共用，避免各自维护一份。
@@ -1368,6 +1372,19 @@ async fn run_session(
         }
         if accepted {
             r.complete();
+            // 换机成功后**识别并报告** systemd 按 `Restart=always` 补起的重复
+            // 实例（MYS-2425-D）：只写日志给出可执行的运维命令，不终止任何
+            // 进程（自动杀会与 `Restart=always` 形成重启循环，详见
+            // `settle_duplicate_for`）。必须放到后台：它要占一个观察窗口
+            // （systemd 隔 `RestartSec` 才补起），在这条关键的启动路径上等会
+            // 推迟会话建立。非 systemd 环境（`service_cgroup == None`）直接返回。
+            if let Some(svc) = r.service_cgroup.clone() {
+                // 只把 cgroup 路径搬进任务：`RestoredIdentity` 是借用来的，
+                // 而收尾动作只需要这一个值。
+                tokio::task::spawn_blocking(move || {
+                    crate::agent::update_apply::settle_duplicate_for(Some(svc))
+                });
+            }
         }
     }
 

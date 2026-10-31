@@ -120,6 +120,7 @@ fn sample_ctx(dir: &TmpDir, upgrade_id: &str) -> RestartContext {
         target_path: target,
         new_binary,
         new_sha256: sha256_of(new_bytes),
+        service_cgroup: None,
     }
 }
 
@@ -320,6 +321,7 @@ fn test_restart_context_new_strips_restore_args() {
         ctx.new_sha256.clone(),
         ctx.upgrade_id.clone(),
         ctx.target_version.clone(),
+        None,
     );
     assert_eq!(rebuilt.argv, vec![OsString::from("agent")]);
 }
@@ -932,9 +934,13 @@ fn test_launch_helper_surfaces_a_readable_failure() {
     let dir = TmpDir::new("launch-bad");
     let handoff = dir.join("h.json");
     std::fs::write(&handoff, b"{}").unwrap();
-    let err = launch_helper_and_wait_ready(
+    // 显式钉住 `Direct` 路由：这组用例验证的是**非 systemd** 既有流程，
+    // 不能因为测试机本身跑在 systemd unit 里就悄悄换成 transient 路径。
+    let err = launch_helper_via(
+        ManagedRoute::Direct,
         &dir.join("does-not-exist"),
         &handoff,
+        "up-test",
         Duration::from_secs(2),
     )
     .expect_err("不存在的助手必须报错");
@@ -953,8 +959,14 @@ fn test_launch_helper_reports_the_helper_error_line() {
     );
     let handoff = dir.join("h.json");
     std::fs::write(&handoff, b"{}").unwrap();
-    let err = launch_helper_and_wait_ready(&helper, &handoff, Duration::from_secs(5))
-        .expect_err("必须报错");
+    let err = launch_helper_via(
+        ManagedRoute::Direct,
+        &helper,
+        &handoff,
+        "up-test",
+        Duration::from_secs(5),
+    )
+    .expect_err("必须报错");
     assert!(err.contains("not writable"), "原因要透传给旧 agent: {err}");
 }
 
@@ -968,8 +980,14 @@ fn test_launch_helper_times_out_without_ready() {
     let handoff = dir.join("h.json");
     std::fs::write(&handoff, b"{}").unwrap();
     let started = Instant::now();
-    let err = launch_helper_and_wait_ready(&helper, &handoff, Duration::from_millis(400))
-        .expect_err("没 ready 就必须报错");
+    let err = launch_helper_via(
+        ManagedRoute::Direct,
+        &helper,
+        &handoff,
+        "up-test",
+        Duration::from_millis(400),
+    )
+    .expect_err("没 ready 就必须报错");
     assert!(started.elapsed() < Duration::from_secs(20));
     assert!(err.contains("did not become ready"), "{err}");
 }
@@ -991,8 +1009,14 @@ fn test_launch_helper_waits_for_ready_before_returning() {
     );
     let handoff = dir.join("h.json");
     std::fs::write(&handoff, b"{}").unwrap();
-    let mut child = launch_helper_and_wait_ready(&helper, &handoff, Duration::from_secs(10))
-        .expect("ready 之后必须返回");
+    let mut child = launch_helper_via(
+        ManagedRoute::Direct,
+        &helper,
+        &handoff,
+        "up-test",
+        Duration::from_secs(10),
+    )
+    .expect("ready 之后必须返回");
     assert!(marker.exists(), "返回时助手必须已经跑过准备工作");
     let _ = child.kill();
     let _ = child.wait();
@@ -1425,6 +1449,7 @@ esac
             target_path: target.clone(),
             new_binary: new_bin.clone(),
             new_sha256: new_sha,
+            service_cgroup: None,
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
 
@@ -1973,6 +1998,7 @@ mod real_old_binary {
             target_path: target.clone(),
             new_binary: new_binary.clone(),
             new_sha256: sha256_of(b"not a real binary"),
+            service_cgroup: None,
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
 
@@ -2111,4 +2137,24 @@ fn check_binary_ready_line(name: &str, label: &str) {
         !first.contains("shell-remote"),
         "{label}: 日志不得出现在 ready 之前: {first}"
     );
+}
+
+// ── 9. 托管路由：Windows 行为不变（MYS-2425-D）──────────────────────
+
+/// 非 Linux 平台**恒**判为"非托管"，因此换机走既有的直接助手路径。
+///
+/// 这是设计硬约束（「Windows 行为不得因 Linux 修复改变」）：Windows 的进程
+/// 生命周期由 SCM/Job 负责，本次修复不涉及。
+#[test]
+fn test_non_linux_platform_never_takes_the_transient_route() {
+    if cfg!(not(target_os = "linux")) {
+        assert!(
+            !managed_detection(),
+            "非 Linux 平台不得判定为 systemd 托管"
+        );
+        assert_eq!(managed_route(false), ManagedRoute::Direct);
+    }
+    // 托管判定与路由的映射本身与平台无关，这里一并钉住：
+    assert_eq!(managed_route(false), ManagedRoute::Direct);
+    assert_eq!(managed_route(true), ManagedRoute::Transient);
 }

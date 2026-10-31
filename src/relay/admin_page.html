@@ -180,6 +180,9 @@
   .upg-status { font-size: 12px; display: inline-block; }
   .upg-status.upg-done { color: var(--success); }
   .upg-status.upg-fail { color: var(--danger); }
+  /* 失败原因可能很长（relay 判定的收敛原因 / helper 启动失败）：
+     允许换行，不能让它在设备行里被裁成一句看不懂的残句。 */
+  .upg-status .upg-reason { white-space: normal; word-break: break-word; }
   .upg-list { margin: 0; padding-left: 18px; }
   .upg-list li { margin: var(--space-1) 0; }
 
@@ -748,6 +751,9 @@
       upg_stage_rolled_back: "已回滚",
       upg_stage_checking: "检查中",
       upg_failed: "升级失败",
+      upg_stage_failed: "升级失败",
+      upg_target: "目标版本",
+      upg_failed_hint: "设备仍在旧版上运行，磁盘未被改动；排查后可直接重试升级",
       upg_done_suffix: "已升级 ",
       // 带宽限制（MYS-2287）
       bw_title: "带宽限制",
@@ -931,6 +937,9 @@
       upg_stage_rolled_back: "rolled back",
       upg_stage_checking: "checking",
       upg_failed: "upgrade failed",
+      upg_stage_failed: "upgrade failed",
+      upg_target: "target",
+      upg_failed_hint: "the device is still running the old version and nothing on disk was changed; retry the upgrade after checking the log",
       upg_done_suffix: "upgraded ",
       // Bandwidth limit (MYS-2287)
       bw_title: "Bandwidth limit",
@@ -1584,9 +1593,38 @@
     if (!u) { wrap.textContent = cur; return wrap; }
     // 回滚与失败都是"没升成"，必须显眼——否则面板会把一台退回旧版的设备
     // 显示成"升级过、版本没变"，运维看不出这里出过事。
+    //
+    // MYS-2425-D：失败原因**必须完整可读**。以前只渲染 `u.error`，而 relay
+    // 自己判定的失败（助手被 cgroup 清掉）和 helper 启动失败都可能带很长的
+    // 解释；截断或只给一句"升级失败"等于让运维回去翻日志。这里把 error 与
+    // detail 都渲染出来，并给出可悬停的完整文本。
     if (u.stage === 'failed' || u.stage === 'rolled_back') {
       wrap.className += ' upg-fail';
-      wrap.appendChild(textNode('✗ ' + (u.error || t('upg_stage_' + u.stage))));
+      const reason = u.error || u.detail || '';
+      wrap.appendChild(textNode('✗ ' + t('upg_stage_' + u.stage)));
+      if (reason) {
+        const dd = document.createElement('span');
+        dd.className = 'upg-reason';
+        dd.textContent = ' — ' + reason;
+        dd.title = reason;
+        wrap.appendChild(dd);
+      }
+      if (u.stage === 'failed') {
+        // 目标版本仍展示：运维要知道"本来要升到哪个版本"。
+        const want = u.version || u.target_version;
+        if (want) {
+          const w = document.createElement('span');
+          w.className = 'muted';
+          w.textContent = ' · ' + t('upg_target') + ' v' + want;
+          wrap.appendChild(w);
+        }
+        // 下一步动作：现场最常见的两种失败（助手被连带清掉 / 无权限起
+        // transient unit）都靠"再点一次升级"收敛，前提是先把原因说出来。
+        const hint = document.createElement('span');
+        hint.className = 'muted';
+        hint.textContent = ' · ' + t('upg_failed_hint');
+        wrap.appendChild(hint);
+      }
       return wrap;
     }
     if (u.stage === 'registered') {

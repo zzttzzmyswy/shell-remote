@@ -139,6 +139,15 @@ pub struct RestartContext {
     /// 已下载并校验通过的新文件（与 target 同目录，同一文件系统）。
     pub new_binary: PathBuf,
     pub new_sha256: String,
+    /// 旧 agent 所在的 systemd service cgroup（`/proc/self/cgroup` 的 v2 路径）。
+    ///
+    /// **只**用于换机后识别 systemd 按 `Restart=always` 补起的重复实例：新进程
+    /// 拿它和新旧进程的 cgroup 做比对，认出"服务侧补起的那个"并给出可执行的
+    /// 运维命令（只报告，不终止任何进程）。非 systemd 环境恒为 `None`，
+    /// 那条路径行为不变。
+    ///
+    /// 它是路径，不是凭据：不含 Token、不含 argv。
+    pub service_cgroup: Option<String>,
 }
 
 impl std::fmt::Debug for RestartContext {
@@ -160,6 +169,7 @@ impl std::fmt::Debug for RestartContext {
             .field("target_path", &self.target_path)
             .field("new_binary", &self.new_binary)
             .field("new_sha256", &self.new_sha256)
+            .field("service_cgroup", &self.service_cgroup)
             .finish()
     }
 }
@@ -190,6 +200,9 @@ struct HandoffFile {
     target_path: String,
     new_binary: String,
     new_sha256: String,
+    /// 旧 agent 的 service cgroup（systemd 托管时才有）。见 [`RestartContext`]。
+    #[serde(default)]
+    service_cgroup: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -294,6 +307,7 @@ impl RestartContext {
         new_sha256: String,
         upgrade_id: String,
         target_version: String,
+        service_cgroup: Option<String>,
     ) -> Self {
         Self {
             session_id,
@@ -310,6 +324,7 @@ impl RestartContext {
             target_path,
             new_binary,
             new_sha256,
+            service_cgroup,
         }
     }
 
@@ -338,6 +353,7 @@ impl RestartContext {
             target_path: encode_path(&self.target_path),
             new_binary: encode_path(&self.new_binary),
             new_sha256: self.new_sha256.clone(),
+            service_cgroup: self.service_cgroup.clone(),
         }
     }
 
@@ -392,6 +408,7 @@ impl RestartContext {
             target_path,
             new_binary,
             new_sha256: f.new_sha256.to_ascii_lowercase(),
+            service_cgroup: f.service_cgroup,
         })
     }
 
@@ -791,6 +808,9 @@ pub fn resolve_restore(flag: Option<&str>) -> Result<Option<RestoredIdentity>, S
 pub struct RestoredIdentity {
     pub restore: UpgradeRestore,
     pub handoff: PathBuf,
+    /// 旧 agent 的 service cgroup（systemd 托管时才有）。注册成功后用它识别
+    /// systemd 按 `Restart=always` 补起的重复实例；非 systemd 环境恒为 `None`。
+    pub service_cgroup: Option<String>,
     /// 是否已经完成（交接文件已删、助手已回执）。`start()` 用它在首次会话
     /// 结束后停止传递恢复语义。
     consumed: std::sync::atomic::AtomicBool,
@@ -844,6 +864,7 @@ impl RestoredIdentity {
                 rollback,
             },
             handoff: path.to_path_buf(),
+            service_cgroup: ctx.service_cgroup.clone(),
             consumed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -880,6 +901,10 @@ impl RestoredIdentity {
             &self.restore.target_version,
             &self.restore.session_id,
         );
+        // 重复进程的收尾**不在这里做**：它要占用一个观察窗口（systemd 是隔
+        // `RestartSec` 才补起的），而 `complete()` 紧跟在注册成功之后、排在
+        // 任何可能失败的初始化之前——在这里等窗口会平白推迟会话建立。由
+        // `start_with_restore` 起一个后台任务做，见 `settle_service_duplicate`。
     }
 
     /// 回滚后的重启要把失败原因送回 relay——否则管理界面只会看到一个
@@ -948,6 +973,43 @@ pub fn announce_registered(upgrade_id: &str, version: &str, session_id: &str) {
         "{REGISTERED_MARKER} upgrade_id={upgrade_id} version={version} session={session_id}"
     );
     let _ = err.flush();
+}
+
+/// 识别 systemd 按 `Restart=always` 补起的重复实例并如实报告（MYS-2425-D）。
+///
+/// `service_cgroup` 是旧 agent 所在 service 的 cgroup（交接文件里带过来的）。
+/// `None` = 非 systemd 场景，直接返回，行为与本改动之前一致。
+///
+/// 只识别、只记录，**不**终止任何进程：实测自动杀会与 `Restart=always` 形成
+/// 杀掉—重启循环（`NRestarts` 反而上涨），而 `systemctl stop` 在非 root 的
+/// agent 身份下会被 polkit 拒绝。语义与判据见
+/// [`super::systemd_helper::settle_service_duplicate`]。
+pub fn settle_duplicate_for(service_cgroup: Option<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        if service_cgroup.is_none() {
+            return;
+        }
+        let state = super::systemd_helper::SettleState::new(service_cgroup.clone());
+        match super::systemd_helper::settle_service_duplicate(&state) {
+            super::systemd_helper::SettleOutcome::Settled => tracing::info!(
+                service_cgroup = ?service_cgroup,
+                "no duplicate agent appeared after the swap"
+            ),
+            super::systemd_helper::SettleOutcome::DuplicatePresent { unit } => tracing::warn!(
+                service_cgroup = ?service_cgroup,
+                unit = %unit,
+                "systemd restarted {unit} after this agent exited for the upgrade, so the device \
+                 now runs two agents on the same session. Nothing on disk is wrong and the \
+                 upgraded agent is the one holding the session. Stop the unit to keep only one: \
+                 `systemctl stop {unit}` (needs root). To avoid it on future upgrades set \
+                 `Restart=on-failure` in the unit — the agent exits 0 when it hands over."
+            ),
+            super::systemd_helper::SettleOutcome::NotApplicable => {}
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = service_cgroup;
 }
 
 // ── 进程存活 / 等待（按确切 PID）────────────────────────────────────
@@ -2332,7 +2394,100 @@ fn delegate_when_running_from_target(
 /// 只有返回 `Ok` 才能让旧进程退出。`Err` 覆盖三种情况：助手起不来（spawn
 /// 失败）、助手自己报了错（目录不可写、新文件校验不符）、超时没有任何回应。
 /// 三者都发生在磁盘被改动之前，旧 agent 照常服务。
+///
+/// **受 systemd 托管时必须走 transient unit**（MYS-2425-D）：本函数用
+/// `process_group(0)` 起的助手仍在旧 service 的 cgroup 里，主进程一退出就会被
+/// `KillMode=control-group` 一起清掉——现场就是这么卡住的。判据与失败处理见
+/// [`launch_helper_managed`]。
 pub fn launch_helper_and_wait_ready(
+    helper_exe: &Path,
+    handoff: &Path,
+    upgrade_id: &str,
+    timeout: Duration,
+) -> Result<std::process::Child, String> {
+    launch_helper_via(
+        managed_helper_route(upgrade_id),
+        helper_exe,
+        handoff,
+        upgrade_id,
+        timeout,
+    )
+}
+
+/// [`launch_helper_and_wait_ready`] 的显式路由版本。
+///
+/// 抽出来有两个用处：让"非 systemd 流程不回归"可以被**确定地**测到（测试机
+/// 自己往往就跑在 systemd unit 里，靠环境判定会让用例时灵时不灵），以及让
+/// 两条路径的差异只体现在一个枚举上。
+pub fn launch_helper_via(
+    route: ManagedRoute,
+    helper_exe: &Path,
+    handoff: &Path,
+    upgrade_id: &str,
+    timeout: Duration,
+) -> Result<std::process::Child, String> {
+    match route {
+        ManagedRoute::Direct => launch_helper_direct(helper_exe, handoff, timeout),
+        ManagedRoute::Transient => launch_helper_managed(helper_exe, handoff, upgrade_id, timeout),
+    }
+}
+
+/// 换机助手该怎么起。
+///
+/// 单独抽出来是为了让"什么时候必须走 transient、什么时候可以直连"成为一条
+/// 可单测的判定，而不是埋在 `launch_*` 里的一个 `if`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedRoute {
+    /// 非 systemd 环境：沿用既有直接助手流程（行为与 v0.59.5 完全一致）。
+    Direct,
+    /// systemd 托管：必须放到独立 transient unit，否则会被同 cgroup 清理。
+    Transient,
+}
+
+/// 判定本次该走哪条路。`managed` 由 [`managed_detection`] 给出，便于测试注入。
+pub fn managed_route(managed: bool) -> ManagedRoute {
+    if managed {
+        ManagedRoute::Transient
+    } else {
+        ManagedRoute::Direct
+    }
+}
+
+/// 生产路径的托管判定，Linus/macOS/Windows 的差异都在这里收敛。
+///
+/// 非 Linux 平台恒为 `false`：Windows 有 SCM/Job 那套语义，本修复不涉及，
+/// 行为必须与本改动之前逐字节一致。
+pub fn managed_detection() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        super::systemd_helper::current_is_managed()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// [`managed_route`] 的生产入口：读环境后给结论。
+fn managed_helper_route(upgrade_id: &str) -> ManagedRoute {
+    let route = managed_route(managed_detection());
+    if route == ManagedRoute::Transient {
+        tracing::info!(
+            upgrade_id = %upgrade_id,
+            cgroup = ?super::systemd_helper::current_cgroup_path(),
+            "this agent runs under a systemd unit — starting the update helper in a transient \
+             unit so it outlives this service's cgroup"
+        );
+    }
+    route
+}
+
+/// 既有流程：直接 `spawn` 助手，自成进程组。
+///
+/// 只在**非** systemd 环境使用。systemd 下这里的 `process_group(0)` 不改变
+/// cgroup，主进程退出会把助手一起清掉——这正是 MYS-2425-D 的根因，所以托管
+/// 环境绝不走这里（见 [`launch_helper_managed`]）。
+fn launch_helper_direct(
     helper_exe: &Path,
     handoff: &Path,
     timeout: Duration,
@@ -2363,7 +2518,47 @@ pub fn launch_helper_and_wait_ready(
             return Err("the update helper has no stdout pipe".to_string());
         }
     };
+    await_ready_line(stdout, child, timeout)
+}
 
+/// systemd 托管下的启动：把同一个隐藏子命令放进独立 transient unit。
+///
+/// 失败语义与直接助手一致——旧进程继续运行、磁盘不动——但**不回退**到直接
+/// 助手：那样只是把同一个 bug 再演一遍，还会让管理界面以为升级在进行中。
+fn launch_helper_managed(
+    helper_exe: &Path,
+    handoff: &Path,
+    upgrade_id: &str,
+    timeout: Duration,
+) -> Result<std::process::Child, String> {
+    #[cfg(target_os = "linux")]
+    {
+        match super::systemd_helper::launch(helper_exe, handoff, upgrade_id, timeout) {
+            super::systemd_helper::TransientHelper::Ready(child) => Ok(child),
+            super::systemd_helper::TransientHelper::Failed(reason) => Err(format!(
+                "cannot start the update helper as a systemd transient unit: {reason}"
+            )),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // 不可达：非 Linux 的 managed_detection() 恒为 false。保留分支是为了
+        // 让类型对上，且显式说明"这里不该发生"。
+        let _ = (helper_exe, handoff, upgrade_id, timeout);
+        Err("transient update helpers are only supported on Linux".to_string())
+    }
+}
+
+/// 从助手的 stdout 读首行，判定就绪与否。
+///
+/// 直接助手与 transient 助手共用这一段（transient 侧在
+/// [`super::systemd_helper::launch`] 里内联了等价逻辑，因为要先读懂 `--pipe`
+/// 的握手再决定是否收掉 unit）。这里保留一份，保证两条路径的**判据**一致。
+fn await_ready_line(
+    stdout: impl std::io::Read + Send + 'static,
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::Child, String> {
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::Builder::new()
         .name("sr-upgrade-ready".into())
@@ -2388,6 +2583,8 @@ pub fn launch_helper_and_wait_ready(
         }
     };
     if first == READY_LINE {
+        // 读线程只持有 `stdout`（它读到 EOF 自行结束），child 的所有权仍在本
+        // 栈上——直接返回即可。
         return Ok(child);
     }
     let _ = child.kill();

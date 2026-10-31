@@ -87,6 +87,17 @@ unit 的关键点：
   agent 自身有指数退避重连（实测 2→4→8→16→32→60s 封顶），relay 挂掉期间进程不退出，
   `NRestarts` 保持 0，relay 恢复后自动重新注册。因此也不需要关掉 systemd 的启动频率限制。
 
+  > ⚠️ **自升级场景建议改成 `Restart=on-failure`。** 换机时 agent 是**正常退出
+  > （exit 0）**把控制权交给换机助手的，`Restart=always` 会立刻用刚换上的新版再起
+  > 一个，于是短暂出现两个 agent 抢同一个会话。`Restart=on-failure` 只在异常退出时
+  > 重启，正常退出（含换机交接）不补起，崩溃恢复能力不变。模板保持 `always` 是为了
+  > 不改变既有部署的行为；细节与排查见 [docs/upgrade.md](../../docs/upgrade.md) 的
+  > 「systemd 托管下的换机」。
+  >
+  > 另外 v0.59.6 起换机助手会自动放到独立的 transient unit 里跑，因此**不需要**给
+  > unit 加 `KillMode=` 之类的特殊配置——**升级本身在 `Restart=always` 下也能正常完成**，
+  > 上面的建议只是为了避免换机后短暂的双进程。
+
 ### 3. 开机自启动
 
 `install.sh` 执行 `systemctl enable`，在

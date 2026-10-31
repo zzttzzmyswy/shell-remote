@@ -78,8 +78,17 @@ agent_pid_for() { # $1 = index
   [ -f "$log" ] || { echo ""; return; }
   # 新版 agent 在启动时打印自己的 pid；没有就退回 pgrep（兼容）。
   pid="$(grep -o 'agent pid=[0-9]*' "$log" 2>/dev/null | tail -1 | cut -d= -f2)"
+  # **必须校验它还活着**：换机后由助手拉起的新进程，其 stderr 被助手接管
+  # （`spawn_agent` 给它 piped stderr，用来等注册回执），所以它的
+  # `agent pid=` 不会写进本文件的日志——日志里最后一条永远是**旧** pid。
+  # 只看日志会把"换机后新进程"判成"没换机"（MYS-2425-D 实测）。
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+    pid=""
+  fi
   if [ -z "$pid" ]; then
-    pid="$(pgrep -f "shell-remote agent .*--session-id cusag$1" 2>/dev/null | tail -1)"
+    # 按**确切 session id** 找活进程：换机后新进程带同一 sid，这正是要观察的。
+    pid="$(pgrep -f "shell-remote agent .*--session-id cusag$1$" 2>/dev/null | tail -1)"
+    [ -n "$pid" ] || pid="$(pgrep -f "shell-remote agent .*--session-id cusag$1 " 2>/dev/null | tail -1)"
   fi
   echo "$pid"
 }
