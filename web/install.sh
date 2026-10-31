@@ -35,13 +35,15 @@ else
 fi
 
 BASE="https://github.com/zzttzzmyswy/shell-remote/releases/latest/download"
+# 前缀镜像：镜像 origin + 完整官方 URL（`https://gh-proxy.com/${BASE}`），不是
+# origin + 相对路径。与 relay 的 DEFAULT_CDN_BASE_URLS 同一套语义。
 URLS="
 ${RELAY_URL}/download/shell-remote-${BIN_ARCH}
-${BASE}/shell-remote-${BIN_ARCH}
-https://edgeone.gh-proxy.com/${BASE}/shell-remote-${BIN_ARCH}
-https://hk.gh-proxy.com/${BASE}/shell-remote-${BIN_ARCH}
 https://gh-proxy.com/${BASE}/shell-remote-${BIN_ARCH}
-https://gh.llkk.cc/${BASE}/shell-remote-${BIN_ARCH}
+https://edgeone.gh-proxy.org/${BASE}/shell-remote-${BIN_ARCH}
+https://hk.gh-proxy.org/${BASE}/shell-remote-${BIN_ARCH}
+${BASE}/shell-remote-${BIN_ARCH}
+https://ghproxy.net/${BASE}/shell-remote-${BIN_ARCH}
 "
 
 # Prefer curl, fall back to wget. Mirrors combined with a timeout mean a

@@ -34,6 +34,17 @@ pub const OFFICIAL_REPO: &str = "zzttzzmyswy/shell-remote";
 pub const OFFICIAL_API_BASE: &str = "https://api.github.com";
 /// 官方下载根：`OFFICIAL_DOWNLOAD_BASE + official_path` 即 `browser_download_url`。
 pub const OFFICIAL_DOWNLOAD_BASE: &str = "https://github.com";
+/// 官方 release 资产真正落地的主机：`https://github.com/.../releases/download/...`
+/// 会 302 到 `release-assets.githubusercontent.com`（对象存储地址里含签名 URL）。
+///
+/// 这两个主机**不提供**任何新内容——它们只是官方 origin 的跳转目标，字节仍由
+/// 任务里的 SHA-256 钉死。agent 只在任务的 CDN 列表里含 `github.com` 这个裸
+/// origin 时才把它们加入重定向白名单（`download::cdn_redirect_hosts`），relay 的
+/// `/agent/resolve` 也放行它们，否则 DNS 被污染的网络里连跳转目标都解析不出来。
+pub const OFFICIAL_ASSET_REDIRECT_HOSTS: &[&str] = &[
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+];
 
 /// release 清单响应的硬上限。真实清单 ~10KB，1MiB 已足够并挡住异常/恶意大响应。
 pub const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
@@ -46,15 +57,20 @@ pub const MANIFEST_MAX_REDIRECTS: usize = 3;
 
 /// 首期预置 CDN 入口（`cdn_base_urls` 的默认值，relay 可用 `--upgrade-cdn` 覆盖）。
 ///
-/// 每项都是「前缀式镜像」：`base + official_path` 即为该源的完整 URL。第一项是
-/// 官方 origin，其后是 gh-proxy 系镜像（与 `web/install.sh` 的镜像列表同源，
-/// 便于运维只维护一套认知）。条目顺序是 relay 的建议优先级；agent 侧可以按
-/// 健康状态与地域调整，但不得改变制品身份。
+/// 每项都是「前缀式镜像」：`base + official_path` 即为该源的完整 URL。前缀镜像
+/// 必须把**完整的官方 URL** 接在镜像 origin 后面（`https://gh-proxy.com/https://github.com`
+/// 而非 `https://gh-proxy.com`），只写 origin 会 404。
+///
+/// 顺序即优先级（与 `web/install.sh` 的镜像列表同源，便于运维只维护一套认知）：
+/// 三个大陆可达的 gh-proxy 系镜像在前，官方 origin 第 4 位（它在大陆经常不可达，
+/// 放前面只会在每个失败源上白等一次超时），`ghproxy.net` 最后（实测能通但慢）。
+/// 已下线的 `gh.llkk.cc`（超时 / 522）不再内置。
 pub const DEFAULT_CDN_BASE_URLS: &[&str] = &[
+    "https://gh-proxy.com/https://github.com",
+    "https://edgeone.gh-proxy.org/https://github.com",
+    "https://hk.gh-proxy.org/https://github.com",
     "https://github.com",
-    "https://edgeone.gh-proxy.com",
-    "https://gh-proxy.com",
-    "https://gh.llkk.cc",
+    "https://ghproxy.net/https://github.com",
 ];
 
 /// 制品形态：CLI（lean，仅终端转发）或 UI（桌面 agent + 窗口面板）。
@@ -318,8 +334,113 @@ pub fn official_path_from_url(url: &str) -> Option<String> {
 
 /// 与官方 origin 拼接出完整下载 URL（agent 侧 `cdn_base_urls[i] + official_path`
 /// 的 relay 侧等价实现，用于校验与测试）。
+///
+/// **只做字符串拼接**：`base.trim_end_matches('/') + official_path`。不能用
+/// `Url::join` / `set_path`——它们会把前缀里的 `https://` 当成路径规范化掉
+/// （`/https://github.com` → `/https:/github.com`），前缀镜像全部失效。
 pub fn join_cdn(base: &str, official_path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), official_path)
+}
+
+/// 从 base URL 取主机名（`https://gh-proxy.com` → `gh-proxy.com`）。
+///
+/// 带路径前缀的条目同样只取 authority 部分
+/// （`https://gh-proxy.com/https://github.com` → `gh-proxy.com`）——白名单要的是
+/// 真正会被连接的主机，不是前缀里的那个域名。
+pub fn cdn_host(base_url: &str) -> Option<String> {
+    let rest = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))?;
+    let host = rest.split('/').next()?.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// CDN base 条目的长度上限（含 scheme 与前缀路径）。
+pub const CDN_BASE_MAX_LEN: usize = 256;
+
+/// 校验并规范化一个 CDN base 条目（agent / relay 共用同一套契约）。
+///
+/// 每项可以是裸 origin（`https://github.com`），也可以是前缀镜像
+/// （`https://gh-proxy.com/https://github.com`）——gh-proxy 一类镜像要求把**完整
+/// 的官方 URL** 接在镜像 origin 之后，只写 origin 会 404。完整下载 URL 一律由
+/// [`join_cdn`] 字符串拼接得到，本函数只负责形态。
+///
+/// 拒绝：带 userinfo / query / fragment；路径含 `..`、`\`、`%`、空白或控制
+/// 字符；长度超过 [`CDN_BASE_MAX_LEN`]；scheme 不是 http/https；以及任何会被
+/// URL 解析器改写的路径（`/a/./b`、`//x`）——配置写错就在启动时失败，而不是
+/// 让所有 agent 静默下载失败。
+///
+/// 返回值是**请求时逐字使用**的规范化字符串：保留大小写敏感的前缀路径，去掉
+/// 结尾多余的 `/`。
+pub fn normalize_cdn_base(raw: &str) -> Result<url::Url, String> {
+    // 不 trim：`Url::parse` 会静默吃掉前后空白，让畸形条目"看起来合法"。
+    if raw.is_empty() {
+        return Err("CDN base is empty".to_string());
+    }
+    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!(
+            "CDN base {raw:?} contains whitespace or control characters"
+        ));
+    }
+    if raw.len() > CDN_BASE_MAX_LEN {
+        return Err(format!(
+            "CDN base {raw:?} is {} bytes, above the {CDN_BASE_MAX_LEN} byte limit",
+            raw.len()
+        ));
+    }
+    // 百分号编码、反斜杠、`..` 都能让路径语义偏离字面（`%2e%2e`、`%2f`、`\`
+    // 被解析器当成 `/`）。镜像前缀里不需要任何转义，出现即拒绝。
+    for (bad, what) in [
+        ('%', "percent-encoding"),
+        ('\\', "a backslash"),
+        ('?', "a query"),
+        ('#', "a fragment"),
+    ] {
+        if raw.contains(bad) {
+            return Err(format!("CDN base {raw:?} must not contain {what}"));
+        }
+    }
+    if raw.contains("..") {
+        return Err(format!("CDN base {raw:?} must not contain '..'"));
+    }
+    let parsed =
+        url::Url::parse(raw).map_err(|e| format!("CDN base {raw:?} is not a valid URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "CDN base {raw:?} uses scheme {other:?}; only http/https are accepted"
+            ))
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "CDN base {raw:?} must not carry userinfo (credentials in a mirror URL)"
+        ));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(format!("CDN base {raw:?} has no host"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "CDN base {raw:?} must not carry a query or fragment (it is an origin or path prefix)"
+        ));
+    }
+    // 前缀路径必须逐字出现在请求里：解析器若改写了它（`/a/./b`、`//x`、`/a/b/`），
+    // 说明这条配置在描述一个和用户意图不同的 URL。
+    let authority_start = raw.find("://").map(|i| i + 3).unwrap_or(0);
+    let raw_path = match raw[authority_start..].find('/') {
+        Some(i) => &raw[authority_start + i..],
+        None => "",
+    };
+    let expect_path = if raw_path.is_empty() { "/" } else { raw_path };
+    if parsed.path() != expect_path {
+        return Err(format!(
+            "CDN base {raw:?} has a path that URL normalization would rewrite ({raw_path:?} → {:?})",
+            parsed.path()
+        ));
+    }
+    Ok(parsed)
 }
 
 // ── 版本判定 ────────────────────────────────────────────────────────
@@ -1159,6 +1280,62 @@ mod tests {
             join_cdn("https://github.com", "/a/b"),
             "https://github.com/a/b"
         );
+        // 前缀镜像：完整官方 URL 接在镜像 origin 之后，`//` 必须原样保留。
+        assert_eq!(
+            join_cdn("https://gh-proxy.com/https://github.com", "/a/b"),
+            "https://gh-proxy.com/https://github.com/a/b"
+        );
+        assert_eq!(
+            join_cdn("https://gh-proxy.com/https://github.com/", "/a/b"),
+            "https://gh-proxy.com/https://github.com/a/b"
+        );
+    }
+
+    /// 默认列表：顺序即优先级，官方 origin 不在首位（大陆常不可达），已下线的
+    /// `gh.llkk.cc` 不再内置，且每项都能拼出预期的完整 URL。
+    #[test]
+    fn test_default_cdn_list_order_and_urls() {
+        assert_eq!(
+            DEFAULT_CDN_BASE_URLS,
+            &[
+                "https://gh-proxy.com/https://github.com",
+                "https://edgeone.gh-proxy.org/https://github.com",
+                "https://hk.gh-proxy.org/https://github.com",
+                "https://github.com",
+                "https://ghproxy.net/https://github.com",
+            ]
+        );
+        // 官方 origin 在镜像之后（减少大陆网络的超时等待），且只有它一个裸 origin。
+        let bare: Vec<&&str> = DEFAULT_CDN_BASE_URLS
+            .iter()
+            .filter(|u| u.trim_start_matches("https://").find('/').is_none())
+            .collect();
+        assert_eq!(bare, vec![&"https://github.com"]);
+        assert_eq!(
+            DEFAULT_CDN_BASE_URLS
+                .iter()
+                .position(|u| *u == "https://github.com"),
+            Some(3),
+            "官方 origin 在第 4 位"
+        );
+        // 每一项都拼出正确 URL。
+        let path = "/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64";
+        for base in DEFAULT_CDN_BASE_URLS {
+            let joined = join_cdn(base, path);
+            assert!(
+                joined.contains(
+                    "/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64"
+                ),
+                "{base} → {joined}"
+            );
+            // 非官方 origin 必须保留完整的官方 URL 前缀。
+            if *base != "https://github.com" {
+                assert!(
+                    joined.ends_with(&format!("https://github.com{path}")),
+                    "{base} → {joined} 丢了 https://github.com 前缀"
+                );
+            }
+        }
     }
 
     // ── 版本比较与预发布 ────────────────────────────────────────────
