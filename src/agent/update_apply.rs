@@ -914,7 +914,7 @@ pub fn take_restore_pending_in(dir: &Path) -> Option<PathBuf> {
     Some(handoff)
 }
 
-/// 解析并加载一次性恢复信息（CLI/UI 共用的入口）。/// 解析并加载一次性恢复信息（CLI/UI 共用的入口）。
+/// 解析并加载一次性恢复信息（CLI/UI 共用的入口）。
 ///
 /// fail-closed：**明确要求了恢复**（隐藏参数或环境变量）但读不出来时返回
 /// `Err`，调用方必须让进程启动失败。这样助手会看到新进程提前退出并回滚，
@@ -1036,7 +1036,7 @@ impl RestoredIdentity {
         // 重复进程的收尾**不在这里做**：它要占用一个观察窗口（systemd 是隔
         // `RestartSec` 才补起的），而 `complete()` 紧跟在注册成功之后、排在
         // 任何可能失败的初始化之前——在这里等窗口会平白推迟会话建立。由
-        // `start_with_restore` 起一个后台任务做，见 `settle_service_duplicate`。
+        // 收尾动作（重复实例的识别）已随 fail-closed 方案移除。
     }
 
     /// 回滚后的重启要把失败原因送回 relay——否则管理界面只会看到一个
@@ -1105,43 +1105,6 @@ pub fn announce_registered(upgrade_id: &str, version: &str, session_id: &str) {
         "{REGISTERED_MARKER} upgrade_id={upgrade_id} version={version} session={session_id}"
     );
     let _ = err.flush();
-}
-
-/// 识别 systemd 按 `Restart=always` 补起的重复实例并如实报告（MYS-2425-D）。
-///
-/// `service_cgroup` 是旧 agent 所在 service 的 cgroup（交接文件里带过来的）。
-/// `None` = 非 systemd 场景，直接返回，行为与本改动之前一致。
-///
-/// 只识别、只记录，**不**终止任何进程：实测自动杀会与 `Restart=always` 形成
-/// 杀掉—重启循环（`NRestarts` 反而上涨），而 `systemctl stop` 在非 root 的
-/// agent 身份下会被 polkit 拒绝。语义与判据见
-/// [`super::systemd_helper::settle_service_duplicate`]。
-pub fn settle_duplicate_for(service_cgroup: Option<String>) {
-    #[cfg(target_os = "linux")]
-    {
-        if service_cgroup.is_none() {
-            return;
-        }
-        let state = super::systemd_helper::SettleState::new(service_cgroup.clone());
-        match super::systemd_helper::settle_service_duplicate(&state) {
-            super::systemd_helper::SettleOutcome::Settled => tracing::info!(
-                service_cgroup = ?service_cgroup,
-                "no duplicate agent appeared after the swap"
-            ),
-            super::systemd_helper::SettleOutcome::DuplicatePresent { unit } => tracing::warn!(
-                service_cgroup = ?service_cgroup,
-                unit = %unit,
-                "systemd restarted {unit} after this agent exited for the upgrade, so the device \
-                 now runs two agents on the same session. Nothing on disk is wrong and the \
-                 upgraded agent is the one holding the session. Stop the unit to keep only one: \
-                 `systemctl stop {unit}` (needs root). To avoid it on future upgrades set \
-                 `Restart=on-failure` in the unit — the agent exits 0 when it hands over."
-            ),
-            super::systemd_helper::SettleOutcome::NotApplicable => {}
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = service_cgroup;
 }
 
 // ── 进程存活 / 等待（按确切 PID）────────────────────────────────────
@@ -1713,6 +1676,49 @@ pub fn helper_main_with(
         }
     }
 
+    // ── 受管 service：协调 stop → swap → start，或 fail-closed ──────
+    //
+    // **必须在动磁盘之前分流**（MYS-2425-D 评审 #2）：
+    //
+    // - `Coordinated`：由 `coordinated_swap` 自己先 stop 再换盘，失败时能完整
+    //   回滚并如实报告。绝不能先在这里换盘、再进分支失败——那样磁盘已被改动，
+    //   消息却写着"未改动"。
+    // - `Refuse`：换机前的能力检查本该拦住它（`hand_over_to_helper` 已经做过
+    //   一次），走到这里说明判定与实际不符。**磁盘未动**，直接如实失败。
+    match ctx.managed_plan.as_ref() {
+        Some(super::systemd_helper::ManagedPlan::Coordinated { unit }) => {
+            let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+            let restore_dir = handoff
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| target_dir.clone());
+            let unit = unit.clone();
+            return coordinated_swap(
+                &ctx,
+                &unit,
+                handoff,
+                &backup,
+                &restore_dir,
+                &mut log,
+                timeouts,
+            );
+        }
+        Some(super::systemd_helper::ManagedPlan::Refuse { unit, reason }) => {
+            let msg = format!("refusing to swap: {reason}");
+            log.line(&msg);
+            let _ = unit;
+            // 旧 agent 已在等待我们接手时退出；把它按旧版拉回来，用户不至于失联。
+            return HelperOutcome::rolled_back(
+                msg,
+                RollbackIdentity::Lost {
+                    detail: "the service could not be coordinated; nothing on disk was changed"
+                        .to_string(),
+                },
+            );
+        }
+        _ => {}
+    }
+
     // ── 备份 → 原子替换 ────────────────────────────────────────────
     let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
     if let Err(e) = make_executable(&ctx.new_binary) {
@@ -1748,35 +1754,6 @@ pub fn helper_main_with(
     }
     fsync_dir(&target_dir);
     log.line("new binary installed");
-
-    // ── 受管 service：协调 stop/swap/start，否则 fail-closed ────────
-    //
-    // 这一步必须在**旧 agent 仍在运行、磁盘刚装好新字节但尚未生效**的位置判定。
-    // 实际上更早：`hand_over_to_helper` 已经做过一次能力检查，此处是落盘后的
-    // 复核——如果结论是"不可协调"，说明前面的检查与实际不符，一律按失败处理，
-    // 把磁盘恢复回去，绝不产生第二个实例。
-    match &ctx.managed_plan {
-        Some(super::systemd_helper::ManagedPlan::Coordinated { unit }) => {
-            return coordinated_swap(
-                &ctx,
-                unit,
-                handoff,
-                &backup,
-                &target_dir,
-                &mut log,
-                timeouts,
-            );
-        }
-        Some(super::systemd_helper::ManagedPlan::Refuse { unit, reason }) => {
-            // 走到这里说明判定与实际发生了偏差：把磁盘恢复，明确失败。
-            let msg = format!("refusing to swap: {reason}");
-            log.line(&msg);
-            let _ = rename_with_retry(&backup, &ctx.target_path, Duration::from_secs(15));
-            let _ = unit;
-            return HelperOutcome::aborted(msg);
-        }
-        _ => {}
-    }
 
     // ── 拉起新进程并等它注册 ──────────────────────────────────────
     let mut child = match spawn_agent(&ctx, handoff, None) {
@@ -1819,6 +1796,35 @@ pub fn helper_main_with(
     }
 }
 
+/// `coordinated_swap` 依赖的外部 systemd 操作。
+///
+/// 抽成 trait 是为了让"stop 失败 / 排空超时 / 磁盘校验失败"这三条分支能被
+/// **真正测到**（断言磁盘恢复为旧制品、outcome 与消息如实反映状态），不必在
+/// 单测里真的去停一个 systemd unit。
+trait SystemdOps {
+    /// `systemctl stop <unit>`。
+    fn stop(&self, unit: &str) -> Result<(), String>;
+    /// `systemctl start <unit>`。
+    fn start(&self, unit: &str) -> Result<(), String>;
+    /// 等 unit 的 cgroup 排空。
+    fn wait_empty(&self, unit: &str, timeout: Duration) -> bool;
+}
+
+/// 生产实现：真的调 `systemctl`。
+struct RealSystemd;
+
+impl SystemdOps for RealSystemd {
+    fn stop(&self, unit: &str) -> Result<(), String> {
+        super::systemd_helper::stop_unit_checked(unit)
+    }
+    fn start(&self, unit: &str) -> Result<(), String> {
+        super::systemd_helper::start_unit_checked(unit)
+    }
+    fn wait_empty(&self, unit: &str, timeout: Duration) -> bool {
+        super::systemd_helper::wait_unit_cgroup_empty(unit, timeout)
+    }
+}
+
 /// 受管 service 的协调式换机：stop → swap → start（MYS-2425-D 设计决定）。
 ///
 /// ## 只有一个受管 agent
@@ -1843,76 +1849,165 @@ fn coordinated_swap(
     unit: &str,
     handoff: &Path,
     backup: &Path,
-    dir: &Path,
+    restore_dir: &Path,
     log: &mut HelperLog,
     timeouts: HelperTimeouts,
 ) -> HelperOutcome {
-    // 1) 停旧 service：取消待执行重启，并让旧 cgroup 退干净。
-    if let Err(e) = super::systemd_helper::stop_unit_checked(unit) {
-        let msg = format!(
-            "cannot stop {unit} to coordinate the upgrade: {e}. Nothing on disk was changed."
-        );
+    coordinated_swap_with(
+        &RealSystemd,
+        ctx,
+        unit,
+        handoff,
+        backup,
+        restore_dir,
+        log,
+        timeouts,
+    )
+}
+
+/// [`coordinated_swap`] 的可注入版本（单测用它把三条失败分支逼出来）。
+///
+/// ## 失败一律「先恢复旧二进制，再拉起旧版」
+///
+/// 进入本函数时**旧 agent 已经退出**。任何一步失败都必须把磁盘恢复到旧版并用
+/// 同一 unit 把旧版拉回来，否则设备会停在一个"新版本在盘上但没人正确接管"的
+/// 状态；临时 agent 还会因为新进程没有交接指针而丢掉身份。
+///
+/// 因此这里的失败一律是 [`HelperOutcome::RolledBack`] + 如实的消息，
+/// **不能**用 "nothing changed" 的 `aborted`——那是事实错误。
+#[allow(clippy::too_many_arguments)]
+fn coordinated_swap_with(
+    ops: &dyn SystemdOps,
+    ctx: &RestartContext,
+    unit: &str,
+    handoff: &Path,
+    backup: &Path,
+    restore_dir: &Path,
+    log: &mut HelperLog,
+    _timeouts: HelperTimeouts,
+) -> HelperOutcome {
+    // 统一收尾：恢复旧二进制 → 拉起旧版 → 如实报告。
+    //
+    // 三条失败分支共用它，保证"绝不会留下已改的磁盘且不报实情"。
+    let fail_after_swap = |reason: String, log: &mut HelperLog| -> HelperOutcome {
+        // 备份不存在 = 还没走到换盘（stop / 排空阶段就失败了）。此时磁盘**确实**
+        // 没动过，如实这么说；不要谎称"已恢复"。
+        let swapped = backup.exists();
+        if !swapped {
+            log.line(&format!("{reason}; nothing on disk was changed"));
+            let start_failed = ops.start(unit).err();
+            let msg = match start_failed {
+                None => format!(
+                    "{reason}. Nothing on disk was changed and {unit} was started again. The old                      agent had already exited for the upgrade, so its temporary identity may have                      been re-registered as a new device."
+                ),
+                Some(e) => format!(
+                    "{reason}. Nothing on disk was changed, but {unit} could not be started ({e});                      the device is offline until it is started manually."
+                ),
+            };
+            log.line(&msg);
+            return HelperOutcome::rolled_back(
+                msg,
+                RollbackIdentity::Lost {
+                    detail: "the upgrade was interrupted before the swap; the old version was                              restarted"
+                        .to_string(),
+                },
+            );
+        }
+        log.line(&format!("{reason}; restoring the previous binary"));
+        let restored = rename_with_retry(backup, &ctx.target_path, Duration::from_secs(15));
+        let start_failed = ops.start(unit).err();
+        let msg = match (&restored, &start_failed) {
+            (Ok(()), None) => format!(
+                "{reason}. The old agent had already exited for the upgrade; the previous binary \
+                 was restored and {unit} was started again. Temporary identities may have been \
+                 lost because the restarted agent could not pick up the handoff."
+            ),
+            (Ok(()), Some(e)) => format!(
+                "{reason}. The previous binary was restored but {unit} could not be started ({e}); \
+                 the device is offline until it is started manually."
+            ),
+            (Err(e), _) => format!(
+                "{reason}. Rolling back also failed ({e}): the previous binary is kept at {} and \
+                 the device needs manual attention.",
+                backup.display()
+            ),
+        };
         log.line(&msg);
-        return HelperOutcome::aborted(msg);
+        HelperOutcome::rolled_back(
+            msg,
+            RollbackIdentity::Lost {
+                detail: "the upgrade was interrupted after the handoff; the relay must not treat \
+                         this device as successfully upgraded"
+                    .to_string(),
+            },
+        )
+    };
+
+    // 1) **先停 service**（MYS-2425-D 评审建议）。
+    //
+    // 旧 agent 已经 `exit 0`，`Restart=always` 会在 `RestartSec` 后补起一个实例。
+    // 先把 unit 停掉，就从时序上消除了"补起的实例没有交接指针"的竞态——不再依赖
+    // `RestartSec` 足够长。
+    if let Err(e) = ops.stop(unit) {
+        return fail_after_swap(
+            format!("cannot stop {unit} to coordinate the upgrade: {e}"),
+            log,
+        );
     }
-    if !super::systemd_helper::wait_unit_cgroup_empty(unit, Duration::from_secs(20)) {
-        let msg = format!(
-            "{unit} still has processes after stop; nothing on disk was changed. The old agent \
-             keeps running."
-        );
-        log.line(&msg);
-        // 旧 cgroup 没退干净：磁盘一律不动，把服务拉回去让人工处理。
-        let _ = super::systemd_helper::start_unit_checked(unit);
-        return HelperOutcome::aborted(msg);
+    if !ops.wait_empty(unit, Duration::from_secs(20)) {
+        return fail_after_swap(format!("{unit} still has processes 20s after stop"), log);
     }
     log.line(&format!("{unit} stopped; its cgroup is empty"));
 
-    // 2) 磁盘替换**已经在调用方完成**（外层统一做了"备份 → 原子就位"）。
+    // 2) 停稳之后再动磁盘：备份 → 原子替换。
     //
-    // 这里只做一次一致性确认：`target` 确实已经是那份新字节。之前在这里又
-    // 做了一遍"备份 + 替换"，第二次 rename 时源文件已被自己搬走，直接失败
-    // （实测：`cannot stat the downloaded binary: No such file or directory`）。
-    let _ = dir;
-    let _ = backup;
-    // 校验**已就位的那份文件**（`target_path`），不是 `.part`——`.part` 已被
-    // 原子 rename 到 target，再去 stat 它必然 `No such file`（实测）。
+    // 顺序很关键：服务已停，此刻替换不会与任何正在运行的进程冲突，也不会被
+    // systemd 的自动重启抢先。
+    if let Err(e) = make_executable(&ctx.new_binary) {
+        return fail_after_swap(format!("cannot mark the new binary executable: {e}"), log);
+    }
+    if let Err(e) = rename_with_retry(&ctx.target_path, backup, Duration::from_secs(10)) {
+        return fail_after_swap(
+            format!(
+                "cannot move the current binary to {}: {e}",
+                backup.display()
+            ),
+            log,
+        );
+    }
+    log.line(&format!("current binary backed up to {}", backup.display()));
+    if let Err(e) = rename_with_retry(&ctx.new_binary, &ctx.target_path, Duration::from_secs(10)) {
+        return fail_after_swap(format!("cannot install the new binary: {e}"), log);
+    }
+    if let Some(parent) = ctx.target_path.parent() {
+        fsync_dir(parent);
+    }
+    log.line("new binary installed");
+
+    // 3) 一致性确认：盘上就是要装的那份字节。
     if let Err(e) = verify_installed_binary(&ctx.target_path, &ctx.new_sha256) {
-        let msg = format!("the installed binary does not match the upgrade task: {e}");
-        log.line(&msg);
-        let _ = super::systemd_helper::start_unit_checked(unit);
-        return HelperOutcome::aborted(msg);
+        return fail_after_swap(
+            format!("the installed binary does not match the upgrade task: {e}"),
+            log,
+        );
     }
     log.line("new binary verified in place");
 
-    // 3) 用同一个 unit 启动新 agent。
+    // 4) 登记待恢复指针并用同一 unit 启动新 agent。
     //
-    // 注意：这里不 `spawn_agent`——那会造出第二个、无人托管的进程，正是本方案
-    // 要避免的。新 agent 由 systemd 以 `ExecStart` 拉起，argv 与服务配置一致，
-    // 身份恢复走交接文件（`RestorePending`）。
-    // 指针必须写进**交接文件所在的私有目录**：新 agent 启动时从这个固定位置
-    // 找它（`take_restore_pending` 只看 `RestartContext::private_dir()`）。
-    // 写到二进制目录会让恢复永远找不到，表现为"换盘成功但等不到注册"。
-    let restore_dir = handoff
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| dir.to_path_buf());
-    pending_restore_marker(&ctx.upgrade_id, handoff, &restore_dir);
-    if let Err(e) = super::systemd_helper::start_unit_checked(unit) {
-        let msg = format!("cannot start {unit} after installing the new binary: {e}");
-        log.line(&msg);
-        let _ = rename_with_retry(backup, &ctx.target_path, Duration::from_secs(15));
-        let _ = super::systemd_helper::start_unit_checked(unit);
-        return HelperOutcome::rolled_back(
-            msg,
-            RollbackIdentity::Lost {
-                detail: "the service could not be restarted after the swap".to_string(),
-            },
+    // 新 agent 由 systemd 以 `ExecStart` 拉起（不 `spawn_agent`，避免第二个
+    // 无人托管的进程）；身份走指针 + 既有恢复协议。
+    pending_restore_marker(&ctx.upgrade_id, handoff, restore_dir);
+    if let Err(e) = ops.start(unit) {
+        return fail_after_swap(
+            format!("cannot start {unit} after installing the new binary: {e}"),
+            log,
         );
     }
     log.line(&format!("{unit} started with the new binary"));
 
-    // 4) 等新 agent 注册成功（由交接文件被消费作为回执）。
-    match await_handoff_consumed(handoff, timeouts.register) {
+    // 5) 等新 agent 注册（交接文件被消费即回执）。
+    match await_handoff_consumed(handoff, _timeouts.register) {
         Ok(()) => {
             log.line("the restarted agent consumed the handoff and registered; upgrade complete");
             let _ = std::fs::remove_file(backup);
@@ -1921,24 +2016,16 @@ fn coordinated_swap(
             }
         }
         Err(reason) => {
-            log.line(&format!(
-                "the restarted agent did not register: {reason}; rolling back"
-            ));
-            let _ = super::systemd_helper::stop_unit_checked(unit);
-            let _ = rename_with_retry(backup, &ctx.target_path, Duration::from_secs(15));
-            let _ = super::systemd_helper::start_unit_checked(unit);
-            HelperOutcome::rolled_back(
-                reason,
-                RollbackIdentity::Lost {
-                    detail: "the new version did not register; the old binary was restored"
-                        .to_string(),
-                },
+            let _ = ops.stop(unit);
+            fail_after_swap(
+                format!("the restarted agent did not register: {reason}"),
+                log,
             )
         }
     }
 }
 
-/// 让"由服务拉起的进程"能拿到这次换机的交接信息。
+/// 让"由服务拉起的进程"能拿到这次换机的交接信息。/// 让"由服务拉起的进程"能拿到这次换机的交接信息。
 ///
 /// `systemctl start` 起来的进程带的是 unit 里声明的环境，拿不到助手设置的
 /// `SR_UPGRADE_RESTORE`。所以把交接文件路径写进私有目录里的一个**单文件**
@@ -1961,14 +2048,27 @@ fn pending_restore_marker(upgrade_id: &str, handoff: &Path, dir: &Path) {
 
 /// 交接文件被消费（新 agent 注册成功后删除）即成功。
 fn await_handoff_consumed(handoff: &Path, timeout: Duration) -> Result<(), String> {
+    // 必须**先看到它存在**再看到它消失。
+    //
+    // 只看"不存在"会把"交接文件根本不在"误判成成功（单测里当场暴露：没有真
+    // agent 消费，却报 Registered）。生产路径同理——文件被提前删掉或路径写错
+    // 时，面板会显示升级成功而磁盘上的新版本从未注册。
     let deadline = Instant::now() + timeout;
+    let mut seen = false;
     loop {
-        if !handoff.exists() {
+        if handoff.exists() {
+            seen = true;
+        } else if seen {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "no registration from the restarted agent within {timeout:?}"
+                "no registration from the restarted agent within {timeout:?}{}",
+                if seen {
+                    ""
+                } else {
+                    " (the handoff file was never there — the restarted agent could not pick it up)"
+                }
             ));
         }
         std::thread::sleep(POLL);

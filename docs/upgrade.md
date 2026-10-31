@@ -214,6 +214,30 @@ systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
 > `0`（实测连续 3s），事后无法确认"这台设备是不是该 unit 的主进程"。把检查
 > 放在动手之前，既拿得到答案，也天然满足"不能升级就别动磁盘"。
 
+### 时序：先 stop 再换盘（消除 `RestartSec` 竞态）
+
+协调模式的顺序是 **stop → 备份/替换 → start**，不是"先换盘再 stop"：
+
+旧 agent 为换机 `exit 0` 后，`Restart=always` 会在 `RestartSec`（systemd 默认
+100ms）后补起一个实例。如果先换盘再 stop，就必须在 `RestartSec` 窗口内完成
+"轮询旧进程退出 + 备份 + 替换 + stop"，否则会先补起一个**没有交接指针**的实例、
+再被 stop 掉——临时 agent 因此丢身份。把 stop 放在最前面，从时序上消除了这个
+竞态，不再依赖 `RestartSec` 的取值。
+
+### 失败一律先恢复旧二进制
+
+进入协调换机时旧 agent **已经退出**，所以任何一步失败都必须把磁盘恢复到旧版
+并用同一 unit 把旧版拉回来，否则设备会停在"新版本在盘上但没人正确接管"的状态。
+失败分两档、消息如实反映：
+
+| 失败位置 | 磁盘状态 | outcome 与消息 |
+|---|---|---|
+| `stop` 失败 / cgroup 20s 未排空 | **未动**（备份还没产生） | `rolled_back` + "Nothing on disk was changed … started again"，并说明临时身份可能已被重新注册为新设备 |
+| 备份后任一失败（替换、校验、start、等注册超时） | **已改成新版** → 恢复旧版 | `rolled_back` + "the previous binary was restored … temporary identities may have been lost" |
+| 恢复也失败 | 新版留在盘上、旧版在备份路径 | `rolled_back` + 指出备份路径，需要人工处理 |
+
+> 不能用 `aborted`（"未改动即放弃"）——那时旧进程已经退出、磁盘可能已被改。
+
 > 用户级 `systemd-run` 仍用于让助手活过旧 service 的 cgroup 清理（`KillMode=process`
 > 保证它拉起的进程不被一并收掉）。没有用户级 manager 的账户（例如 root 常无
 > `/run/user/0`）自动回退到系统级 transient unit。

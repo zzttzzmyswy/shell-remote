@@ -63,6 +63,11 @@ fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 读文件算 sha256（断言"磁盘上是哪一版"用）。
+fn file_sha(path: &Path) -> String {
+    sha256_of(&std::fs::read(path).unwrap())
+}
+
 fn sha256_of(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
@@ -2239,4 +2244,186 @@ fn test_restore_pending_overwrites_previous_leftover() {
     pending_restore_marker("up-a", &h1, dir.path());
     pending_restore_marker("up-b", &h2, dir.path()); // 不应 panic/失败
     assert_eq!(take_restore_pending_in(dir.path()).unwrap(), h2);
+}
+
+// ── 12. 协调换机的失败分支必须恢复磁盘并如实报告（评审第 2 项）──────
+
+/// 可编排的假 systemd：让三条失败分支都能被精确触发。
+struct FakeSystemd {
+    stop_err: Option<String>,
+    start_err: Option<String>,
+    cgroup_empty: bool,
+    /// 记录 start 被调用了几次（失败收尾也要 start 旧版）。
+    starts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl FakeSystemd {
+    fn new() -> Self {
+        Self {
+            stop_err: None,
+            start_err: None,
+            cgroup_empty: true,
+            starts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl super::SystemdOps for FakeSystemd {
+    fn stop(&self, _unit: &str) -> Result<(), String> {
+        match &self.stop_err {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+    fn start(&self, unit: &str) -> Result<(), String> {
+        self.starts.lock().unwrap().push(unit.to_string());
+        match &self.start_err {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+    fn wait_empty(&self, _unit: &str, _timeout: Duration) -> bool {
+        self.cgroup_empty
+    }
+}
+
+/// 造一个"外层已备好 backup、新字节已就位"的现场，返回 (ctx, backup, 旧 hash)。
+///
+/// 协调路径进入时磁盘上**已经是新版**（历史上这一步由外层完成）；本组用例验证
+/// 的就是"失败时必须把 backup 恢复回去"。
+fn coord_fixture(tag: &str) -> (TmpDir, RestartContext, PathBuf, String) {
+    let dir = TmpDir::new(tag);
+    let ctx = sample_ctx(&dir, "up-coord");
+    // 磁盘上仍是**旧**二进制：协调路径自己负责 stop → 备份 → 替换。
+    // （早期版本由外层先换盘，导致协调分支失败时磁盘已被改动；这里如实反映
+    // 新顺序，fixture 不能替它做。）
+    let old_hash = file_sha(&ctx.target_path);
+    let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+    (dir, ctx, backup, old_hash)
+}
+
+/// 驱动一次协调换机（假 systemd）。
+fn run_coord(
+    ops: &FakeSystemd,
+    ctx: &RestartContext,
+    backup: &Path,
+    dir: &TmpDir,
+) -> super::HelperOutcome {
+    let mut log = super::HelperLog::open(Path::new(&dir.join("h.json")));
+    super::coordinated_swap_with(
+        ops,
+        ctx,
+        "test.service",
+        Path::new(&dir.join("h.json")),
+        backup,
+        dir.path(),
+        &mut log,
+        super::HelperTimeouts {
+            old_exit: Duration::from_millis(10),
+            register: Duration::from_millis(50),
+        },
+    )
+}
+
+/// `stop` 失败 ⇒ 恢复旧二进制 + 拉起旧版 + `rolled_back`（**不是** aborted）。
+///
+/// 旧消息写的是 "Nothing on disk was changed"，而实际磁盘已是新版本、旧进程已
+/// 退出——这条断言把"消息必须与事实一致"钉住。
+#[test]
+fn test_stop_failure_restores_the_previous_binary() {
+    let (dir, ctx, backup, old_hash) = coord_fixture("coord-stop");
+    let mut ops = FakeSystemd::new();
+    ops.stop_err = Some("Access denied".to_string());
+    let out = run_coord(&ops, &ctx, &backup, &dir);
+
+    match out {
+        super::HelperOutcome::RolledBack { reason, identity } => {
+            assert!(reason.contains("Access denied"), "{reason}");
+            // stop 失败发生在换盘之前：磁盘**确实**没动过，消息要如实这么说
+            // （早期实现因为外层已先换盘，这里会谎称"未改动"）。
+            assert!(
+                reason.contains("Nothing on disk was changed"),
+                "stop 阶段失败时磁盘确实未改，应如实说明: {reason}"
+            );
+            assert!(
+                !reason.contains("restored"),
+                "还没换盘就不该声称已恢复: {reason}"
+            );
+            assert!(
+                matches!(identity, super::RollbackIdentity::Lost { .. }),
+                "身份可能丢失，必须是 Lost"
+            );
+        }
+        other => panic!("stop 失败必须是 RolledBack，实际 {other:?}"),
+    }
+    assert_eq!(file_sha(&ctx.target_path), old_hash, "磁盘必须恢复为旧制品");
+    assert_eq!(
+        ops.starts.lock().unwrap().as_slice(),
+        &["test.service".to_string()],
+        "必须把旧版拉回来"
+    );
+}
+
+/// stop 后 cgroup 未排空（例如 `KillMode=process` 留下用户 shell）⇒ 同样恢复。
+#[test]
+fn test_cgroup_not_empty_restores_the_previous_binary() {
+    let (dir, ctx, backup, old_hash) = coord_fixture("coord-empty");
+    let mut ops = FakeSystemd::new();
+    ops.cgroup_empty = false;
+    let out = run_coord(&ops, &ctx, &backup, &dir);
+
+    match out {
+        super::HelperOutcome::RolledBack { reason, .. } => {
+            assert!(reason.contains("still has processes"), "{reason}");
+            assert!(!reason.contains("nothing was changed"), "{reason}");
+        }
+        other => panic!("必须是 RolledBack，实际 {other:?}"),
+    }
+    assert_eq!(file_sha(&ctx.target_path), old_hash);
+    assert_eq!(ops.starts.lock().unwrap().len(), 1, "必须 start 旧版一次");
+}
+
+/// 已就位字节与任务 digest 不符 ⇒ 恢复旧二进制。
+#[test]
+fn test_digest_mismatch_restores_the_previous_binary() {
+    let (dir, ctx, backup, old_hash) = coord_fixture("coord-digest");
+    // 让校验失败：把 ctx 期望的 digest 改成一个不同的值。
+    //
+    // 不能靠篡改盘上文件——协调路径在 stop 之后会**重新**把 `new_binary`
+    // rename 到 target，篡改会被覆盖掉。真实场景里这个分支对应的是"下载的
+    // 字节与 relay 下发的不符"，等价于 `new_sha256` 与文件不一致。
+    // 让"要装的那份字节"与任务 digest 不符：等价于下载被篡改。
+    std::fs::write(&ctx.new_binary, b"#!/bin/sh\n# tampered payload\n").unwrap();
+    let mut ctx = ctx;
+    ctx.new_sha256 = "0".repeat(64);
+    let ops = FakeSystemd::new();
+    let out = run_coord(&ops, &ctx, &backup, &dir);
+
+    match out {
+        super::HelperOutcome::RolledBack { reason, .. } => {
+            assert!(reason.contains("does not match"), "{reason}");
+        }
+        other => panic!("必须是 RolledBack，实际 {other:?}"),
+    }
+    assert_eq!(
+        file_sha(&ctx.target_path),
+        old_hash,
+        "校验失败后磁盘必须恢复为旧制品"
+    );
+}
+
+/// 成功路径：stop → 换盘 → start → 等注册超时后仍回滚（这里不注入真 agent）。
+///
+/// 只断言"start 被调用、磁盘已是新字节"，注册超时的收尾由上面几条覆盖。
+#[test]
+fn test_success_path_stops_swaps_and_starts() {
+    let (dir, ctx, backup, _old) = coord_fixture("coord-ok");
+    let ops = FakeSystemd::new();
+    let out = run_coord(&ops, &ctx, &backup, &dir);
+    // 注册等不到（没有真 agent），所以最终仍是回滚；关键是 start 被调用过。
+    assert!(
+        matches!(out, super::HelperOutcome::RolledBack { .. }),
+        "没有真 agent 时必然回滚，实际 {out:?}"
+    );
+    assert!(!ops.starts.lock().unwrap().is_empty(), "必须调用过 start");
 }

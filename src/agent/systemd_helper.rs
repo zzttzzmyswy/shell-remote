@@ -198,6 +198,28 @@ impl RunTarget {
     }
 }
 
+/// 从 service 的 cgroup 路径取 unit 名（`/system.slice/<name>.service` → `<name>.service`）。
+///
+/// 认不出 `.service` 结尾时原样返回，不做猜测。
+pub fn service_unit_name(cgroup_path: &str) -> String {
+    cgroup_path
+        .trim()
+        .rsplit('/')
+        .next()
+        .filter(|s| s.ends_with(".service"))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| cgroup_path.trim().to_string())
+}
+
+/// 解析 `/proc/<pid>/cgroup` 里的 v2 路径（`0::/...`）。
+pub fn cgroup_path_of_pid(pid: u32) -> Option<String> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    raw.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+}
+
 /// 当前账户有没有可用的**用户级** systemd manager。
 ///
 /// 判据是 `/run/user/<uid>` 与其中的 bus socket 是否真的存在，而不是"看起来像
@@ -620,7 +642,9 @@ pub fn decide(probe: &Probe) -> ManagedPlan {
             return ManagedPlan::Refuse {
                 unit: Some(unit.to_string()),
                 reason: format!(
-                    "{REFUSE_CAUSE_EXECSTART_MISMATCH} (unit {unit} starts `{exec}`, this agent                      runs `{me}`). Coordinated upgrades need `ExecStart` to exec this binary                      directly."
+                    "{REFUSE_CAUSE_EXECSTART_MISMATCH} (unit {unit} starts `{exec}`, this agent \
+                     runs `{me}`). Coordinated upgrades need `ExecStart` to exec this binary \
+                     directly."
                 ),
             }
         }
@@ -812,20 +836,39 @@ pub fn lifecycle_authorized(unit: &str) -> bool {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
         let Ok(out) = cmd.output() else { return false };
-        // 输出形如 `polkit\56result=yes`（`\56` 是 `.` 的转义），也可能直接是
-        // `authorized`。两种都认。
-        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        if out.status.success() {
-            // pkcheck 退出码 0 = 已授权。
-            return true;
-        }
-        text.contains("result=yes") || text.contains("authorized")
+        parse_pkcheck(out.status.success(), &out.stdout, &out.stderr)
     }
     #[cfg(not(unix))]
     {
         false
     }
+}
+
+/// 解析 `pkcheck` 的结论——**纯函数**，便于穷举四种真实输出。
+///
+/// ## 为什么必须只看 `exit 0` 与精确的 `result=yes`
+///
+/// 曾经的实现用 `text.contains("authorized")` 兜底，结果 polkit **明确拒绝**时
+/// 的输出也被判成已授权（实测：`Not authorized.` 含子串 `authorized`），于是
+/// 被拒的账户反而走了协调分支——与 fail-closed 完全相反。
+///
+/// 现在的规则：只有两种信号算已授权，其余一律未授权。
+///
+/// - 退出码 `0`（`pkcheck` 的契约：0 = 已授权）；
+/// - 输出里出现**精确**的 `polkit\56result=yes` 或 `polkit.result=yes`
+///   （`\56` 是 polkit 对 `.` 的转义）。
+///
+/// `auth_admin*` / `auth_self*` / `no` / `Not authorized.` / 执行失败 / 解析不出
+/// 都算未授权。
+pub fn parse_pkcheck(success: bool, stdout: &[u8], stderr: &[u8]) -> bool {
+    if success {
+        return true;
+    }
+    let mut text = String::from_utf8_lossy(stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(stderr));
+    // 只认精确的 `=yes` 形式；不接受裸 `authorized`（会命中 `Not authorized.`）。
+    text.split_whitespace()
+        .any(|tok| tok == "polkit\\56result=yes" || tok == "polkit.result=yes")
 }
 
 /// 对一个已确认可协调的 unit 执行受控 stop。
@@ -904,182 +947,6 @@ pub fn wait_unit_cgroup_empty(unit: &str, timeout: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-// ── 重复进程识别（MYS-2425-D）──────────────────────────────────────
-
-/// 判定**另一个**进程是否是 systemd 按 `Restart=always` 补起的重复实例。
-///
-/// 判据（全部是可验证的系统事实，不靠进程名）：
-///
-/// 1. 与换机前的旧 agent 同处一个 service cgroup —— cgroup 归属由 systemd
-///    决定，进程自己改不了；
-/// 2. **没有**换机恢复意图（`SR_UPGRADE_RESTORE` / `--upgrade-restore`）——
-///    只有换机助手会设它，普通启动没有；
-/// 3. 与本进程是**同一份二进制**（`/proc/<pid>/exe` 指向同一路径）。
-///
-/// 助手拉起的新进程在 helper 的 transient unit 里（不是 service）且带恢复
-/// 意图，因此永远不会被判成重复实例——这正是它必须活下来的那个。
-///
-/// 读不到进程信息（跨用户 / 权限收紧 / 已退出）时一律**不**认定。
-pub fn is_service_side_duplicate(pid: u32, service_cgroup: &str) -> bool {
-    if pid == std::process::id() {
-        return false;
-    }
-    let Ok(my_exe) = std::fs::read_link("/proc/self/exe") else {
-        return false;
-    };
-    if std::fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
-        .as_deref()
-        != Some(my_exe.as_path())
-    {
-        return false;
-    }
-    if cgroup_path_of_pid(pid).as_deref() != Some(service_cgroup) {
-        return false;
-    }
-    // 读不到 environ 时不认定：宁可漏报，也不把助手拉起的新进程说成重复。
-    let Some(env) = std::fs::read(format!("/proc/{pid}/environ")).ok() else {
-        return false;
-    };
-    !env.split(|b| *b == 0).any(|kv| {
-        kv.starts_with(update_apply::RESTORE_ENV.as_bytes())
-            && kv.len() > update_apply::RESTORE_ENV.len()
-    })
-}
-
-/// 解析 `/proc/<pid>/cgroup` 里的 v2 路径（`0::/...`）。
-pub fn cgroup_path_of_pid(pid: u32) -> Option<String> {
-    let raw = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    raw.lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-}
-
-/// 在本 service 的 cgroup 里找"另一个 agent 进程"（systemd 补起的那个）。
-///
-/// 判据全部委托给 [`is_service_side_duplicate`]——生产路径与单测走**同一份**
-/// 判定逻辑，不给"测过的和实际跑的不是一回事"留缝。
-pub fn find_service_side_agent(service_cgroup: &str) -> Option<u32> {
-    let me = std::process::id();
-    let entries = std::fs::read_dir("/proc").ok()?;
-    entries.flatten().find_map(|entry| {
-        let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-        if pid == me {
-            return None;
-        }
-        is_service_side_duplicate(pid, service_cgroup).then_some(pid)
-    })
-}
-
-/// 读进程启动时刻（`/proc/<pid>/stat` 的 starttime），用于防止 PID 复用后
-/// 误杀一个无关进程。读不到返回 `None`（调用方据此放弃终止）。
-pub fn pid_start_stamp(pid: u32) -> Option<u64> {
-    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm 里可能有空格和括号：从最后一个 ')' 之后开始切字段。
-    let rest = raw.rsplit_once(')')?.1;
-    // 第 22 个字段是 starttime；`)` 之后的第一项是第 3 个字段，所以取第 20 项。
-    rest.split_whitespace().nth(19)?.parse().ok()
-}
-
-/// 交接后识别 systemd 按 `Restart=always` 补起的重复实例，并给出运维可执行的结论。
-///
-/// ## 为什么需要
-///
-/// 旧 agent 因为"要换机"而退出，systemd 看到主进程没了就按 `Restart=always`
-/// 再拉起一个——它跑的是刚换上的**新**版本，于是和新进程并存：两个 agent、
-/// 同一个 `session_id`。这是设计里点名的"避免新旧无限互相驱逐"要防的形状。
-///
-/// ## 判据
-///
-/// 见 [`is_service_side_duplicate`]：**同 service cgroup + 无恢复意图**。
-/// 这两个条件都由系统保证、进程自己伪造不了——助手拉起的新进程在 helper 的
-/// transient unit 里，且带 `SR_UPGRADE_RESTORE`。
-///
-/// ## 为什么只识别不终止
-///
-/// 实测过两种自动处置，都不可靠：
-///
-/// - **SIGTERM 那个 pid**：`Restart=always` 会立刻再补一个，形成我们主动发起的
-///   杀掉—重启循环。实测 `NRestarts` 因此从 0 涨到 3，等于亲手把设备推进
-///   "反复重启"的状态。
-/// - **`systemctl stop <unit>` 取消后续重启**：语义是对的（stop 会清掉待执行的
-///   重启），但 agent 现场是**非 root 运行**的（unit 里 `User=sr-agent`），
-///   实测被 polkit 拒绝（`Access denied ... interactive authentication`）。
-///
-/// 而设计明确要求"不扩大影响面、不做无限驱逐"。所以这里只做**有界观察 +
-/// 精确报告**：把确切的 unit 名与可执行的修复命令交给运维，不擅自对别人的
-/// unit 动手。运维侧的根治是让 service 不再在 agent 主动退出时重启
-/// （`Restart=on-failure`，或换机后 `systemctl stop`），见 docs/upgrade.md。
-pub fn settle_service_duplicate(state: &Arc<SettleState>) -> SettleOutcome {
-    settle_service_duplicate_with(state, SYSTEMD_RESTART_KILL_WINDOW)
-}
-
-/// [`settle_service_duplicate`] 的可注入窗口版本（测试用，避免真等 20s）。
-pub fn settle_service_duplicate_with(state: &Arc<SettleState>, window: Duration) -> SettleOutcome {
-    let Some(service_cg) = state.service_cgroup.as_deref() else {
-        return SettleOutcome::NotApplicable;
-    };
-    let deadline = std::time::Instant::now() + window;
-    // 观察整个窗口：systemd 是隔 `RestartSec` 才补起的，交接完成那一刻它往往
-    // 还不存在——只看一眼等于什么都没看到（实测就是这样漏掉的）。
-    loop {
-        if find_service_side_agent(service_cg).is_some() {
-            return SettleOutcome::DuplicatePresent {
-                unit: service_unit_name(service_cg),
-            };
-        }
-        if std::time::Instant::now() >= deadline {
-            return SettleOutcome::Settled;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-/// 从 service 的 cgroup 路径取 unit 名（`/system.slice/<name>.service` → `<name>.service`）。
-///
-/// 只用来拼一条给运维看的命令；取不出来时返回整个路径，不做猜测。
-pub fn service_unit_name(cgroup_path: &str) -> String {
-    cgroup_path
-        .trim()
-        .rsplit('/')
-        .next()
-        .filter(|s| s.ends_with(".service"))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| cgroup_path.trim().to_string())
-}
-
-/// 观察 systemd 补起新实例的窗口。
-///
-/// 必须**覆盖若干个** `RestartSec`（模板默认 5s、现场 10s）：交接完成的那一刻
-/// systemd 通常还没补起，只看一眼等于什么都没看到（实测正是如此）。
-pub const SYSTEMD_RESTART_KILL_WINDOW: Duration = Duration::from_secs(20);
-
-/// [`settle_service_duplicate`] 的结论。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SettleOutcome {
-    /// 窗口内没有出现重复实例——这是正常结果。
-    Settled,
-    /// 窗口内出现了 systemd 按 `Restart=always` 补起的重复实例。
-    ///
-    /// `unit` 是那个 service 的 unit 名，调用方据此给出可执行的运维命令。
-    DuplicatePresent { unit: String },
-    /// 不是 systemd 托管场景，或没有可供比对 cgroup：什么都不做。
-    NotApplicable,
-}
-
-/// 观察动作需要的输入。
-pub struct SettleState {
-    /// 旧 agent 所在的 service cgroup 路径（从交接上下文继承，不是现读的）。
-    pub service_cgroup: Option<String>,
-}
-
-impl SettleState {
-    pub fn new(service_cgroup: Option<String>) -> Arc<Self> {
-        Arc::new(Self { service_cgroup })
     }
 }
 

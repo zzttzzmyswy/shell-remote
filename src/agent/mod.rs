@@ -1372,19 +1372,10 @@ async fn run_session(
         }
         if accepted {
             r.complete();
-            // 换机成功后**识别并报告** systemd 按 `Restart=always` 补起的重复
-            // 实例（MYS-2425-D）：只写日志给出可执行的运维命令，不终止任何
-            // 进程（自动杀会与 `Restart=always` 形成重启循环，详见
-            // `settle_duplicate_for`）。必须放到后台：它要占一个观察窗口
-            // （systemd 隔 `RestartSec` 才补起），在这条关键的启动路径上等会
-            // 推迟会话建立。非 systemd 环境（`service_cgroup == None`）直接返回。
-            if let Some(svc) = r.service_cgroup.clone() {
-                // 只把 cgroup 路径搬进任务：`RestoredIdentity` 是借用来的，
-                // 而收尾动作只需要这一个值。
-                tokio::task::spawn_blocking(move || {
-                    crate::agent::update_apply::settle_duplicate_for(Some(svc))
-                });
-            }
+            // 不再需要"识别/收掉 systemd 补起的重复实例"（MYS-2425-D 评审）：
+            // `Restart=always` 的托管场景要么走 Coordinated（助手先 stop，补起
+            // 被取消，只有一个受管 MainPID），要么在换机前就 fail-closed 失败。
+            // 那条观察路径已无可达场景，故一并移除，缩小 diff。
         }
     }
 

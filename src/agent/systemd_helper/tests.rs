@@ -360,144 +360,6 @@ fn test_stop_unit_refuses_foreign_names() {
     stop_unit("shell-remote-agent");
 }
 
-// ── 4. 重复进程识别（MYS-2425-D）────────────────────────────────────
-
-/// 后台子进程封装：drop 时确保收掉，不留孤儿。
-struct Spawned(std::process::Child);
-
-impl Drop for Spawned {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// 把本进程的二进制复制一份到临时目录（`exe` 路径因此不同）。
-fn copied_binary(dir: &TmpDir) -> Option<PathBuf> {
-    let me = std::fs::read_link("/proc/self/exe").ok()?;
-    let copy = dir.join("agent-copy");
-    std::fs::copy(&me, &copy).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755));
-    }
-    Some(copy)
-}
-
-/// **不按进程名判断**：`exe` 不同的同名二进制绝不能被认成重复实例。
-///
-/// 同机跑两份 shell-remote（不同路径、不同设备）是常态；按名字扫会把别人的
-/// agent 杀掉。这条是那段判定最要紧的边界。
-#[cfg(target_os = "linux")]
-#[test]
-fn test_other_binary_in_the_same_cgroup_is_not_a_duplicate() {
-    let Some(cg) = current_cgroup_path() else {
-        return; // 没有 cgroup v2 的环境跳过
-    };
-    let dir = TmpDir::new("dup-exe");
-    let Some(copy) = copied_binary(&dir) else {
-        return;
-    };
-    let child = Spawned(
-        Command::new(&copy)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn a copy of this binary"),
-    );
-    let pid = child.0.id();
-    if std::fs::read_link(format!("/proc/{pid}/exe")).is_err() {
-        return; // 进程已退出：这条用例没有观察窗口
-    }
-    assert!(
-        !is_service_side_duplicate(pid, &cg),
-        "exe 与本体不同的同名二进制绝不能被判成重复实例"
-    );
-}
-
-/// 自己永远不是自己的重复实例。
-#[test]
-fn test_self_is_never_a_duplicate() {
-    assert!(!is_service_side_duplicate(
-        std::process::id(),
-        "/system.slice/shell-remote-agent.service"
-    ));
-}
-
-/// 读不到 `/proc/<pid>`（不存在的 pid）时不认定——宁可漏报，不误判。
-#[cfg(target_os = "linux")]
-#[test]
-fn test_missing_process_is_not_a_duplicate() {
-    // 取一个几乎不可能存在的 pid：先确认它真的不存在。
-    let pid = 4_000_000u32;
-    if std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok() {
-        return;
-    }
-    assert!(!is_service_side_duplicate(
-        pid,
-        "/system.slice/shell-remote-agent.service"
-    ));
-}
-
-/// 自己的服务 cgroup 读不到时，直接判定"不适用"——不去全盘扫进程。
-#[test]
-fn test_settle_is_a_noop_without_a_service_cgroup() {
-    let state = SettleState::new(None);
-    assert_eq!(
-        settle_service_duplicate(&state),
-        SettleOutcome::NotApplicable
-    );
-}
-
-/// 从 cgroup 路径取 unit 名：运维要拿它拼 `systemctl stop <unit>`。
-#[test]
-fn test_service_unit_name_is_extracted_from_the_cgroup_path() {
-    assert_eq!(
-        service_unit_name("/system.slice/shell-remote-agent.service"),
-        "shell-remote-agent.service"
-    );
-    // 末尾带换行（`/proc/self/cgroup` 原样读出来就是这样）也要能处理。
-    assert_eq!(
-        service_unit_name("/system.slice/shell-remote-agent.service\n"),
-        "shell-remote-agent.service"
-    );
-    // 认不出来的形态原样返回，不猜。
-    assert_eq!(service_unit_name("/system.slice"), "/system.slice");
-}
-
-/// 观察是**有界**的，且只会给出两种结论之一（不会无限挂着）。
-///
-/// "不终止任何进程"这条纪律由构造保证：[`settle_service_duplicate`] 里没有
-/// 任何发信号的调用（自动终止实测会与 `Restart=always` 形成杀掉—重启循环，
-/// `NRestarts` 反而上涨；`systemctl stop` 又被非 root 身份的 polkit 拒绝）。
-/// 这里断言的是它可被安全调用、按时返回、结论在预期集合内。
-#[cfg(target_os = "linux")]
-#[test]
-fn test_settle_is_bounded_and_returns_a_known_verdict() {
-    let Some(cg) = current_cgroup_path() else {
-        return; // 没有 cgroup v2 的环境跳过
-    };
-    // 注入一个短窗口：这条断言的是"有界"，不是"等满 20 秒"。
-    let window = Duration::from_millis(600);
-    let started = std::time::Instant::now();
-    let verdict = settle_service_duplicate_with(&SettleState::new(Some(cg)), window);
-    assert!(
-        started.elapsed() <= window + Duration::from_secs(5),
-        "观察必须封顶在窗口内，实际 {:?}",
-        started.elapsed()
-    );
-    assert!(
-        matches!(
-            verdict,
-            SettleOutcome::Settled | SettleOutcome::DuplicatePresent { .. }
-        ),
-        "意外结论: {verdict:?}"
-    );
-}
-
 // ── 5. fail-closed 协调能力判定（MYS-2425-D 设计决定）────────────────
 
 /// 构造一个"全部条件都满足"的探针，各用例只改一处。
@@ -677,4 +539,69 @@ fn test_managed_plan_survives_the_handoff_roundtrip() {
         let dec = super::super::update_apply::decode_plan_for_test(&enc);
         assert_eq!(dec.as_ref(), Some(&plan), "编码={enc}");
     }
+}
+
+// ── 6. pkcheck 解析：只认 exit 0 / 精确 result=yes（评审第 1 项）──────
+
+/// `exit 0` ⇒ 已授权（pkcheck 的契约）。
+#[test]
+fn test_pkcheck_exit_zero_is_authorized() {
+    assert!(parse_pkcheck(true, b"", b""));
+    assert!(parse_pkcheck(true, b"polkit\\56result=yes\n", b""));
+}
+
+/// **关键回归**：polkit 明确拒绝时的 `Not authorized.` **不能**被判成已授权。
+///
+/// 旧实现用 `text.contains("authorized")` 兜底，`Not authorized.` 含该子串，
+/// 于是被拒的账户反而走了协调分支——与 fail-closed 相反。本机实测输出：
+/// `$ pkcheck --action-id ... ; Not authorized. ; exit=1`
+#[test]
+fn test_pkcheck_not_authorized_is_rejected() {
+    assert!(
+        !parse_pkcheck(false, b"Not authorized.\n", b""),
+        "`Not authorized.` 不得被判成已授权"
+    );
+    // 放在 stderr 也一样。
+    assert!(!parse_pkcheck(false, b"", b"Not authorized.\n"));
+}
+
+/// `auth_admin`（需要交互认证）⇒ 未授权：非交互的 agent 做不到。
+#[test]
+fn test_pkcheck_auth_admin_is_rejected() {
+    assert!(!parse_pkcheck(
+        false,
+        b"polkit\\56result=auth_admin\n",
+        b"Authorization requires authentication and -u wasn't passed.\n"
+    ));
+    assert!(!parse_pkcheck(
+        false,
+        b"polkit\\56result=auth_admin_keep\n",
+        b""
+    ));
+    assert!(!parse_pkcheck(false, b"polkit\\56result=no\n", b""));
+}
+
+/// 执行失败 / 命令不存在 ⇒ 未授权（fail-closed）。
+#[test]
+fn test_pkcheck_error_output_is_rejected() {
+    assert!(!parse_pkcheck(
+        false,
+        b"",
+        b"Error spawning command line: No such file or directory\n"
+    ));
+    assert!(!parse_pkcheck(false, b"", b""));
+}
+
+/// 只认精确 token：`polkit.result=yes` 与转义形态都接受，其它 `=yes` 前缀不算。
+#[test]
+fn test_pkcheck_accepts_both_escaped_and_plain_result_tokens() {
+    assert!(parse_pkcheck(false, b"polkit\\56result=yes\n", b""));
+    assert!(parse_pkcheck(false, b"polkit.result=yes\n", b""));
+    // 不能因为出现 "yes" 就放行。
+    assert!(!parse_pkcheck(
+        false,
+        b"polkit\\56result=yes_but_not_really\n",
+        b""
+    ));
+    assert!(!parse_pkcheck(false, b"result=yes\n", b""));
 }
