@@ -180,46 +180,43 @@ systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
   出的更精确结论）；
 - 没有重连的悬挂任务由 30 分钟 TTL 收敛为过期清理。
 
-### `Restart=always` 下的行为
+### systemd 托管 service：先确认可协调，再换机
 
-换机时 agent 是**正常退出（exit 0）**把控制权交给助手，`Restart=always` 会随即
-用刚换上的新版再起一个实例。助手据三个条件决定"新 agent 归谁拉起"：
+换机时 agent 是**正常退出（exit 0）**把控制权交给助手。systemd 托管下，助手
+**在磁盘改动之前**先做一次能力检查，只有确认"能协调"才继续：
 
-| 条件 | 读法 | 不满足时 |
-|------|------|----------|
-| `Restart=` 为 `always` | `systemctl show -p Restart` | 助手自己拉起（`on-failure` 等不会因正常退出补起） |
-| 本 cgroup 里只有自己一个 agent | 枚举 `/proc` 同 exe + 同 cgroup | 助手自己拉起：多 agent 共用一个 service 时，systemd 补起的是该 unit 的**唯一** MainPID，与这台设备没有对应关系 |
-| **本进程就是该 unit 的 MainPID** | `systemctl show -p MainPID` | 助手自己拉起 |
+| 检查项 | 要求 | 不满足时 |
+|--------|------|----------|
+| 能否确定 unit | 自身 cgroup 落在 `*.service`，且能取到 unit 名 | 拒绝 |
+| 归属是否明确 | `systemctl show -p MainPID` **等于**当前 agent PID | 拒绝（多 agent 共享一个 service 时必然不相等） |
+| 是否单 agent | 同 cgroup 里没有同 exe 的其它 agent | 拒绝（stop 会连带停掉它们） |
+| 形态是否相符 | `ExecStart` **直接** exec 运行中的这份二进制 | 拒绝（wrapper 脚本下换文件不等于换服务启动的东西） |
+| 重启策略 | `Restart=always` | **`Restart=on-failure` / `no` 等 ⇒ 直接走既有路径**（不会补起，天然单实例） |
+| 是否已授权 | `pkcheck org.freedesktop.systemd1.manage-units` 返回 `yes` | 拒绝（**不探测、不提权、不改 sudoers/unit**） |
 
-三个条件都满足时，助手不起新进程，只把交接文件登记为"待认领"（私有目录里的
-`0600` 指针，按 unit 名区分），由 systemd 补起的那个进程启动时自行认领原身份。
-实测（临时单 agent unit，`KillMode=control-group` + `Restart=always` +
-`RestartSec=5`）：换机后 `NRestarts=1`、`MainPID` 指向新进程、同 sid 活进程数
-为 1、`session_id` 与 Token 不变、磁盘 hash 为新制品。
+**全部满足** ⇒ 助手执行受控的 `systemctl stop <unit>`（取消 `Restart=always` 的
+待执行重启）、等旧 cgroup 排空、替换磁盘、再用同一 unit `start`：新 agent 回到
+唯一受管 MainPID，不存在第二个实例。
 
-> ⚠️ **已知限制：第三个条件在换机窗口内无法判定。** 旧主进程一退出，systemd
-> 在整个 `RestartSec` 窗口内把 `MainPID` 置 `0`（实测：kill 主进程后连续 3s
-> 读到 `MainPID=0`、`ActiveState=activating`），而助手恰恰在这个窗口里做判定，
-> 因此**总会**读不到并退回"助手自己拉起"。
->
-> 退回路径是安全的：新 agent 会被助手拉起并正常注册（身份由交接文件保证），
-> 只是**多了一个 systemd 补起的实例**——两者同 `session_id`，relay 按 newest
-> wins 顶替，最终只剩一个（实测稳定，不抖动）。但这不是"一个受管 agent"，而是
-> "一个在跑 + 一个被顶替"。要彻底消除它，需要 systemd 侧配合（见下）。
+**任何一项不满足** ⇒ fail-closed：**在旧 agent 退出前**上报 `failed`，磁盘一点
+不动，旧 agent 继续服务，管理页显示可操作的原因（改 `Restart=on-failure`，或由
+管理员授权服务生命周期操作）。
 
-**运维侧收敛方式**（任选其一，均不需要改断言代码）：
+实测（本任务新建的临时 unit）：
 
-```sh
-# 一次性：换机结束后只保留受管实例
-systemctl stop <unit> && systemctl start <unit>
+| 场景 | 结果 |
+|------|------|
+| `Restart=on-failure`，单 agent | 换机成功：新 PID、Token 不变、磁盘 hash 为新制品、单进程、`NRestarts=0` |
+| `Restart=always`，未授权（普通账户） | **换机前** `failed` + 可读原因；磁盘 hash 未变、MainPID 未变、`NRestarts=0`、单进程 |
+| `Restart=always`，已授权（root 的测试 unit） | 协调成功：`NRestarts=0`、单进程、Token 不变、磁盘为新制品、`registered` |
 
-# 长期（推荐）：让 agent 主动退出时不再被重启
-# [Service] 里把 Restart=always 改成：
-Restart=on-failure
-```
+> 为什么不在换机后判定：`Restart=always` 的 `MainPID` 在 `RestartSec` 窗口内是
+> `0`（实测连续 3s），事后无法确认"这台设备是不是该 unit 的主进程"。把检查
+> 放在动手之前，既拿得到答案，也天然满足"不能升级就别动磁盘"。
 
-`Restart=on-failure` 只对异常退出生效，换机交接是 `exit 0`，因此不会被补起；
-崩溃自动恢复能力不变。这也是模板建议值。
+> 用户级 `systemd-run` 仍用于让助手活过旧 service 的 cgroup 清理（`KillMode=process`
+> 保证它拉起的进程不被一并收掉）。没有用户级 manager 的账户（例如 root 常无
+> `/run/user/0`）自动回退到系统级 transient unit。
 
 ### 排查清单
 

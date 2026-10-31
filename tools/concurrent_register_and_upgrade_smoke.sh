@@ -430,10 +430,51 @@ for _ in $(seq 1 120); do
 done
 [ -n "$new_pid" ] && APIDS[$UPG_IDX]="$new_pid"
 
+# fail-closed 是**合法结局**（MYS-2425-D 设计决定）：受管 service 归属无法确认
+# 或未授权时，agent 必须在磁盘改动之前明确失败并继续运行。测试环境正好是这种
+# 形状——8 个 agent 共享 `multica-daemon.service`。断言要区分两种合法结局：
+#   A) 换机发生：旧 pid 消失 + 新 pid 出现
+#   B) fail-closed：旧 pid 仍在 + relay 给出带原因的 failed + 磁盘未变
+read_stage() {
+  api /api/overview | python3 -c '
+import json,sys
+sid=sys.argv[1]
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for s in d.get("sessions",[]):
+  if s.get("session_id")==sid:
+    u=s.get("upgrade") or {}
+    print(u.get("stage",""), "|", (u.get("error") or "").replace("\n"," ")[:200])
+    break
+' "$1"
+}
+refused=0
+refuse_reason=""
+if [ -z "$new_pid" ]; then
+  # 等一小会儿让 fail-closed 的 failed 帧到达 relay
+  for _ in $(seq 1 20); do
+    line="$(read_stage "$UPG_SID")"
+    case "$line" in
+      failed*|rolled_back*) refuse_reason="$line"; refused=1; break ;;
+    esac
+    sleep 2
+  done
+fi
+
 if [ -n "$new_pid" ] && [ -z "$old_alive_after" ]; then
   ok "2.2 换机后 PID 变了（$OLD_PID → $new_pid）"
+elif [ "$refused" = "1" ] && [ -n "$old_alive_after" ]; then
+  # fail-closed：必须满足"旧进程仍在 + 磁盘未变 + 原因可读"。
+  disk_now="$(sha256sum "$BIN" 2>/dev/null | cut -d' ' -f1)"
+  if [ "$disk_now" = "$BIN_SHA" ]; then
+    ok "2.2 fail-closed 明确失败且磁盘未动（旧 pid $OLD_PID 仍在运行）"
+    echo "      原因: $refuse_reason"
+    FAIL_CLOSED=1
+  else
+    bad "2.2 fail-closed 却改动了磁盘（disk=${disk_now:0:12}）"
+  fi
 else
-  bad "2.2 未观察到换机（旧 pid $OLD_PID ${old_alive_after:+仍在运行}，新 pid ${new_pid:-无}）"
+  bad "2.2 未观察到换机，也没有明确的 fail-closed（旧 pid $OLD_PID ${old_alive_after:+仍在运行}，新 pid ${new_pid:-无}）"
 fi
 
 wait_identity "$UPG_SID" 60 || bad "2.3 换机后 $UPG_SID 未回到 relay"
@@ -443,6 +484,11 @@ after="$(sess_tokens "$UPG_SID" 2>/dev/null)"
   || bad "2.3 换机后身份变了：前 [$UPG_TOK_BEFORE] 后 [$(echo "$after" | cut -d' ' -f2-)]"
 
 # 磁盘上的二进制必须就是新制品（真实替换，不是"看起来升级了"）。
+# fail-closed 场景下则相反：磁盘必须**保持旧制品**（上面 2.2 已断言）。
+if [ "${FAIL_CLOSED:-0}" = "1" ]; then
+  echo "  · fail-closed：跳过 2.4（磁盘未被改动，已由 2.2 断言）"
+fi
+if [ "${FAIL_CLOSED:-0}" != "1" ]; then
 ON_DISK="$BIN"
 if [ -f "$ON_DISK" ]; then
   DISK_SHA="$(sha256sum "$ON_DISK" | cut -d' ' -f1)"
@@ -451,6 +497,7 @@ if [ -f "$ON_DISK" ]; then
     || bad "2.4 磁盘 hash 未变成新制品（disk=${DISK_SHA:0:12} art=${ART_SHA:0:12}）"
 fi
 
+fi
 # 换机状态必须收敛到终结态（不是一直"下载中"）。
 status_stage=""
 for _ in $(seq 1 30); do
@@ -470,6 +517,13 @@ for s in d.get("sessions",[]):
 done
 case "$status_stage" in
   registered) ok "2.5 升级状态收敛到 registered" ;;
+  # fail-closed 的合法终态：必须在**换机前**明确失败（2.2 已断言磁盘未动）。
+  failed|rolled_back)
+    if [ "${FAIL_CLOSED:-0}" = "1" ]; then
+      ok "2.5 升级状态收敛到 $status_stage（fail-closed）"
+    else
+      bad "2.5 升级失败: $status_stage（预期 registered）"
+    fi ;;
   "")         ok "2.5 状态已清空（终结态过期或未保留，不影响身份断言）" ;;
   *)          bad "2.5 升级状态停在非终结态: $status_stage" ;;
 esac
@@ -492,8 +546,14 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 [ -n "$new2" ] && APIDS[$UPG2_IDX]="$new2"
-[ -n "$new2" ] && ok "5.1 第二次换机 PID 变了（$OLD2_PID → $new2）" \
-  || bad "5.1 第二次换机 PID 未变化"
+if [ -n "$new2" ]; then
+  ok "5.1 第二次换机 PID 变了（$OLD2_PID → $new2）"
+elif [ "${FAIL_CLOSED:-0}" = "1" ]; then
+  # 同一台机器、同一服务归属 ⇒ 第二次同样被 fail-closed 拒绝，这是**正确**的。
+  ok "5.1 第二次换机同样 fail-closed（旧 pid $OLD2_PID 仍在运行，磁盘未动）"
+else
+  bad "5.1 第二次换机 PID 未变化"
+fi
 wait_identity "$UPG2_SID" 60 || bad "5.2 第二次换机后会话未回来"
 after2="$(sess_tokens "$UPG2_SID" 2>/dev/null)"
 [ "$(echo "$after2" | cut -d' ' -f2-)" = "$TOK2_BEFORE" ] \

@@ -125,6 +125,7 @@ fn test_transient_args_carry_no_secrets() {
         Path::new("/usr/local/bin/shell-remote"),
         handoff,
         "7c9a6795-5a1c-4b39-a6f4-f72a0a66ab23",
+        true,
     );
     let line = plan.command_line();
     // 交接文件路径本身允许（它只是个路径，内容在 0600 文件里）。
@@ -157,6 +158,7 @@ fn test_no_unit_property_carries_the_handoff() {
         Path::new("/usr/local/bin/shell-remote"),
         Path::new("/home/u/.shell-remote/upgrade/.handoff-0123456789abcdef.json"),
         "up1",
+        true,
     );
     for arg in &plan.args {
         if arg.starts_with("--property=") {
@@ -496,107 +498,183 @@ fn test_settle_is_bounded_and_returns_a_known_verdict() {
     );
 }
 
-// ── 5. Restart= 策略决定"谁拉起新 agent"（MYS-2425-D review #2）────
+// ── 5. fail-closed 协调能力判定（MYS-2425-D 设计决定）────────────────
 
-/// `always` 下必须交给 systemd：助手再起一个就是两个 agent 互相驱逐。
+/// 构造一个"全部条件都满足"的探针，各用例只改一处。
+fn good_probe() -> Probe {
+    Probe {
+        managed: true,
+        unit: Some("shell-remote-agent.service".to_string()),
+        main_pid: Some(4242),
+        self_pid: 4242,
+        restart_policy: Some("always".to_string()),
+        exec_start_exe: Some("/usr/local/bin/shell-remote".to_string()),
+        self_exe: Some("/usr/local/bin/shell-remote".to_string()),
+        shares_cgroup_with_other_agent: false,
+        lifecycle_authorized: true,
+    }
+}
+
+/// 三条都满足 ⇒ 允许协调 stop/swap/start。
 #[test]
-fn test_restart_always_hands_the_new_agent_to_systemd() {
-    assert!(restart_policy_respawns_on_success("always"));
+fn test_fully_qualified_service_is_coordinated() {
     assert_eq!(
-        new_agent_owner(Some("always"), true, true),
-        NewAgentOwner::Systemd
+        decide(&good_probe()),
+        ManagedPlan::Coordinated {
+            unit: "shell-remote-agent.service".to_string()
+        }
     );
 }
 
-/// 大小写与空白都要容忍：`systemctl show --value` 可能带换行。
+/// 非 systemd 托管 ⇒ 既有直接助手路径，行为不变。
 #[test]
-fn test_restart_policy_parsing_is_lenient() {
-    for v in ["always", "Always", " always\n", "ALWAYS\r\n"] {
-        assert!(
-            restart_policy_respawns_on_success(v),
-            "{v:?} 应被认成 always"
-        );
+fn test_unmanaged_environment_keeps_the_existing_path() {
+    let mut p = good_probe();
+    p.managed = false;
+    assert_eq!(decide(&p), ManagedPlan::Direct);
+}
+
+/// **非 MainPID ⇒ 拒绝**（普通 service 里套了 wrapper / 共享 daemon）。
+///
+/// 这是现场最要紧的一条：systemd 的重启语义绑定 unit 的主进程，主进程不是
+/// 本 agent 时，"stop 这个 unit"影响的对象与"这台设备"不是一回事。
+#[test]
+fn test_not_main_pid_is_refused_before_any_change() {
+    let mut p = good_probe();
+    p.main_pid = Some(1); // 主进程是别人
+    match decide(&p) {
+        ManagedPlan::Refuse { reason, unit } => {
+            assert!(reason.contains(REFUSE_CAUSE_NOT_MAIN_PID), "{reason}");
+            assert!(reason.contains("4242"), "原因里要带自己的 pid: {reason}");
+            assert_eq!(unit.as_deref(), Some("shell-remote-agent.service"));
+        }
+        other => panic!("必须拒绝，实际 {other:?}"),
+    }
+}
+
+/// MainPID 读不到同样拒绝（不猜）。
+#[test]
+fn test_unreadable_main_pid_is_refused() {
+    let mut p = good_probe();
+    p.main_pid = None;
+    match decide(&p) {
+        ManagedPlan::Refuse { reason, .. } => {
+            assert!(
+                reason.contains(REFUSE_CAUSE_MAIN_PID_UNREADABLE),
+                "{reason}"
+            )
+        }
+        other => panic!("必须拒绝，实际 {other:?}"),
+    }
+}
+
+/// **多 agent 共享 cgroup ⇒ 拒绝**：stop 会连带停掉同 service 里的其它 agent。
+#[test]
+fn test_shared_cgroup_is_refused() {
+    let mut p = good_probe();
+    p.shares_cgroup_with_other_agent = true;
+    match decide(&p) {
+        ManagedPlan::Refuse { reason, .. } => {
+            assert!(reason.contains(REFUSE_CAUSE_SHARED_CGROUP), "{reason}")
+        }
+        other => panic!("必须拒绝，实际 {other:?}"),
+    }
+}
+
+/// `ExecStart` 不是运行中的这份二进制 ⇒ 拒绝（换了文件服务也起不来新的）。
+#[test]
+fn test_execstart_mismatch_is_refused() {
+    let mut p = good_probe();
+    p.exec_start_exe = Some("/opt/other/shell-remote".to_string());
+    match decide(&p) {
+        ManagedPlan::Refuse { reason, .. } => {
+            assert!(reason.contains(REFUSE_CAUSE_EXECSTART_MISMATCH), "{reason}")
+        }
+        other => panic!("必须拒绝，实际 {other:?}"),
+    }
+}
+
+/// `Restart=on-failure` ⇒ **走既有直接路径**（systemd 不会因正常退出补起，
+/// 天然只有一个实例，不需要协调）。
+#[test]
+fn test_non_always_policy_uses_the_existing_direct_path() {
+    for policy in ["on-failure", "on-abnormal", "on-abort", "no"] {
+        let mut p = good_probe();
+        p.restart_policy = Some(policy.to_string());
         assert_eq!(
-            new_agent_owner(Some(v), true, true),
-            NewAgentOwner::Systemd,
-            "{v:?}"
+            decide(&p),
+            ManagedPlan::Direct,
+            "Restart={policy} 下不该走协调，也不该拒绝"
         );
     }
 }
 
-/// 其它策略下 systemd **不会**因正常退出补起，助手必须自己拉起——
-/// 否则设备直接失联。
+/// 策略读不到 ⇒ 拒绝（既不确认协调安全，也不确认直接路径安全）。
 #[test]
-fn test_other_policies_keep_the_helper_as_owner() {
-    for v in [
-        "on-failure",
-        "on-abnormal",
-        "on-abort",
-        "on-watchdog",
-        "on-success",
-        "no",
+fn test_unreadable_restart_policy_is_refused() {
+    let mut p = good_probe();
+    p.restart_policy = None;
+    match decide(&p) {
+        ManagedPlan::Refuse { reason, .. } => {
+            assert!(
+                reason.contains(REFUSE_CAUSE_RESTART_POLICY_UNREADABLE),
+                "{reason}"
+            )
+        }
+        other => panic!("必须拒绝，实际 {other:?}"),
+    }
+}
+
+/// **未授权 ⇒ 拒绝**（polkit 需要交互认证时 agent 做不到）。
+///
+/// 设计底线：不提权、不改 sudoers/unit、不降级成会产生第二实例的 helper-spawn。
+#[test]
+fn test_unauthorized_lifecycle_is_refused() {
+    let mut p = good_probe();
+    p.lifecycle_authorized = false;
+    match decide(&p) {
+        ManagedPlan::Refuse { reason, .. } => {
+            assert!(reason.contains(REFUSE_CAUSE_NOT_AUTHORIZED), "{reason}")
+        }
+        other => panic!("必须拒绝，实际 {other:?}"),
+    }
+}
+
+/// unit 确定不了（cgroup 读不到，或不是 `.service`）⇒ 拒绝。
+#[test]
+fn test_unknown_unit_is_refused() {
+    for unit in [None, Some("session-3.scope".to_string())] {
+        let mut p = good_probe();
+        p.unit = unit;
+        match decide(&p) {
+            ManagedPlan::Refuse { reason, unit } => {
+                assert!(reason.contains(REFUSE_CAUSE_UNIT_UNKNOWN), "{reason}");
+                assert!(unit.is_none());
+            }
+            other => panic!("必须拒绝，实际 {other:?}"),
+        }
+    }
+}
+
+/// 协调方案要能原样穿过交接文件（助手侧读回来必须等价）。
+#[test]
+fn test_managed_plan_survives_the_handoff_roundtrip() {
+    for plan in [
+        ManagedPlan::Direct,
+        ManagedPlan::Coordinated {
+            unit: "shell-remote-agent.service".to_string(),
+        },
+        ManagedPlan::Refuse {
+            unit: Some("x.service".to_string()),
+            reason: "cannot read the service's ExecStart".to_string(),
+        },
+        ManagedPlan::Refuse {
+            unit: None,
+            reason: "no unit".to_string(),
+        },
     ] {
-        assert!(
-            !restart_policy_respawns_on_success(v),
-            "{v} 不应被视为会补起"
-        );
-        assert_eq!(
-            new_agent_owner(Some(v), true, true),
-            NewAgentOwner::Helper,
-            "{v} 下必须由助手拉起"
-        );
+        let enc = super::super::update_apply::encode_plan_for_test(&plan);
+        let dec = super::super::update_apply::decode_plan_for_test(&enc);
+        assert_eq!(dec.as_ref(), Some(&plan), "编码={enc}");
     }
-}
-
-/// 策略读不到（无 systemd / 权限收紧 / unit 已消失）⇒ 按"助手拉起"处理。
-///
-/// 宁可多起一个能立刻注册的 agent（设备可用优先），也不要赌一个读不到的配置
-/// 会替我们补进程。
-#[test]
-fn test_unknown_policy_falls_back_to_the_helper() {
-    assert_eq!(new_agent_owner(None, true, true), NewAgentOwner::Helper);
-    assert_eq!(new_agent_owner(Some(""), true, true), NewAgentOwner::Helper);
-}
-
-/// **共享 cgroup 回归**（真实冒烟当场复现）：`Restart=always` 但同一个 service
-/// 里跑着多个 agent 时，必须由助手自己拉起。
-///
-/// systemd 补起的是 unit 的**主进程**，一个 unit 只有一个 MainPID；多 agent
-/// 共用 cgroup 时，补起的进程与该设备没有对应关系（可能带着别的设备的 argv），
-/// 交给 systemd 会换错身份、并让本次换机超时回滚。
-#[test]
-fn test_shared_cgroup_disables_the_systemd_takeover() {
-    assert_eq!(
-        new_agent_owner(Some("always"), false, true),
-        NewAgentOwner::Helper,
-        "同一 cgroup 里有多个 agent 时，systemd 的补起与这台设备无对应关系"
-    );
-}
-
-/// **MainPID 回归**（真实冒烟当场复现）：`Restart=always` 且 cgroup 里只剩自己，
-/// 但自己**不是** unit 的 MainPID 时，仍不能交给 systemd。
-///
-/// 复现：8 个 agent 共处 `multica-daemon.service`，逐个换机到最后只剩一个时，
-/// "cgroup 里只有一个 agent"成立，但该 unit 的 MainPID 是 daemon 本身；systemd
-/// 补起的是 daemon，新 agent 永远起不来，只能超时回滚。
-#[test]
-fn test_systemd_takeover_requires_being_the_main_pid() {
-    assert_eq!(
-        new_agent_owner(Some("always"), true, false),
-        NewAgentOwner::Helper,
-        "不是 unit MainPID 时，systemd 补起的不是这台设备"
-    );
-    // 三个条件同时成立才交给 systemd。
-    assert_eq!(
-        new_agent_owner(Some("always"), true, true),
-        NewAgentOwner::Systemd
-    );
-    assert_eq!(
-        new_agent_owner(Some("on-failure"), true, true),
-        NewAgentOwner::Helper
-    );
-    assert_eq!(
-        new_agent_owner(Some("always"), false, true),
-        NewAgentOwner::Helper
-    );
 }

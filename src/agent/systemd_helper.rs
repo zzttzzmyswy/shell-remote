@@ -35,7 +35,7 @@
 //! `.scope` 结尾的 unit 路径。普通 shell 里 `INVOCATION_ID` 可能被继承下来
 //! （在服务的终端里手工跑 agent 就是这种情况），单看它不够。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -143,24 +143,26 @@ impl TransientLaunch {
     ///
     /// **只有**交接文件路径进 argv。Token、`--key`、原始 agent 参数全留在那个
     /// `0600` 文件里；unit 属性（`systemctl show` 可读）一个字都不带。
-    pub fn new(helper_exe: &Path, handoff: &Path, upgrade_id: &str) -> Self {
+    /// 构造参数。`user_scope = true` 走用户级 manager（普通账户的常态），
+    /// `false` 走系统级（root / 没有用户会话的账户：`/run/user/<uid>` 不存在时
+    /// `systemd-run --user` 会直接报 `Failed to connect to user scope bus`）。
+    pub fn new(helper_exe: &Path, handoff: &Path, upgrade_id: &str, user_scope: bool) -> Self {
         let unit = helper_unit_name(upgrade_id);
-        Self {
-            args: vec![
-                "--user".to_string(),
-                format!("--unit={unit}"),
-                "--collect".to_string(),
-                "--quiet".to_string(),
-                "--property=KillMode=process".to_string(),
-                // `--pipe` 把 unit 的 stdout/stderr 接到客户端：首行 `ready`
-                // 的语义与直接助手完全一致（旧 agent 读的就是这一行）。
-                "--pipe".to_string(),
-                helper_exe.display().to_string(),
-                "update-apply".to_string(),
-                handoff.display().to_string(),
-            ],
-            unit,
+        let mut args: Vec<String> = Vec::new();
+        if user_scope {
+            args.push("--user".to_string());
         }
+        args.extend([
+            format!("--unit={unit}"),
+            "--collect".to_string(),
+            "--quiet".to_string(),
+            "--property=KillMode=process".to_string(),
+            "--pipe".to_string(),
+            helper_exe.display().to_string(),
+            "update-apply".to_string(),
+            handoff.display().to_string(),
+        ]);
+        Self { args, unit }
     }
 
     /// 供日志/测试断言用的命令行表示。生产路径不需要它，但把它做成函数是为了
@@ -193,6 +195,28 @@ impl RunTarget {
             Self::Path => std::path::PathBuf::from(SYSTEMD_RUN),
             Self::Explicit(p) => p.clone(),
         }
+    }
+}
+
+/// 当前账户有没有可用的**用户级** systemd manager。
+///
+/// 判据是 `/run/user/<uid>` 与其中的 bus socket 是否真的存在，而不是"看起来像
+/// root"：root 常常没有 `user@0.service`（实测 `systemd-run --user` 报
+/// `Failed to connect to user scope bus: No such file or directory`），而普通
+/// 登录账户一定有。不可用时回退到**系统级** transient unit（root 天然被授权）。
+pub fn user_manager_available() -> bool {
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        let dir = format!("/run/user/{uid}");
+        if !Path::new(&dir).is_dir() {
+            return false;
+        }
+        Path::new(&format!("{dir}/bus")).exists()
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -235,7 +259,7 @@ pub fn launch_with(
     upgrade_id: &str,
     timeout: Duration,
 ) -> TransientHelper {
-    let plan = TransientLaunch::new(helper_exe, handoff, upgrade_id);
+    let plan = TransientLaunch::new(helper_exe, handoff, upgrade_id, user_manager_available());
     let mut cmd = Command::new(target.program());
     cmd.args(&plan.args)
         .stdin(Stdio::null())
@@ -374,6 +398,36 @@ pub fn stop_unit(unit: &str) {
 
 // ── unit 的 Restart= 策略：决定"谁负责拉起新 agent" ────────────────
 
+/// 读 unit 当前的 `MainPID`（读不到 / 已无主进程返回 `None`）。
+///
+/// **只有旧 agent 仍在运行时读才有意义**：换机窗口内 systemd 会把它置 `0`。
+/// 本方案的检查因此全部安排在磁盘改动之前。
+pub fn unit_main_pid(unit: &str) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["show", "-p", "MainPID", "--value", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        apply_user_manager_env(&mut cmd);
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&out.stdout);
+        match v.trim().parse::<u32>() {
+            Ok(pid) if pid > 0 => Some(pid),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = unit;
+        None
+    }
+}
+
 /// 读某个 unit 的 `Restart=` 策略（`always` / `on-failure` / `no` / …）。
 ///
 /// 非 root 也能读（`systemctl show` 的属性读权限不受 polkit 限制，实测
@@ -416,127 +470,23 @@ pub fn restart_policy_respawns_on_success(policy: &str) -> bool {
     policy.trim().eq_ignore_ascii_case("always")
 }
 
-/// 换机成功后，"谁负责让新版 agent 跑起来"。
-///
-/// 这个判定是 MYS-2425-D review #2 的核心：`Restart=always` 下如果助手再自己
-/// 起一个新进程，设备就会有两个无人协调的 agent 互相驱逐；反之在
-/// `on-failure` 下如果助手不起，设备直接失联。两种都必须处理对。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewAgentOwner {
-    /// 由 systemd 补起（`Restart=always`）：助手**不**起新进程，只等它上线。
-    ///
-    /// 旧主进程退出 ⇒ systemd 按 `RestartSec` 用**已替换的新二进制**再起一个，
-    /// 成为原 service 的唯一 MainPID；它带原始 argv（交接文件里的 `--key` /
-    /// `--session-id` 等），因此身份自然延续。实测（临时 unit）：换机后
-    /// `NRestarts` 恰好 +1、`MainPID` 指向新进程、同 sid 活进程数为 1。
-    Systemd,
-    /// 由助手拉起（非 `always`，或策略未知）：保持既有行为。
-    Helper,
-}
-
-/// 依据 `Restart=` 策略与"本 cgroup 里是否只有一个 agent"决定新 agent 归谁拉起。
-///
-/// `alone_in_cgroup` 是**必须**的第二个条件，理由是语义而不是口味：
-/// `Restart=always` 补起的是 **unit 的主进程**（一个 unit 只有一个 MainPID），
-/// 它与"某一个 agent"一一对应**仅在 cgroup 里只有一个 agent 时**成立。
-///
-/// 同机把多个 agent 放进同一个 service（或用 `systemd-run` 一次性跑一批，
-/// 例如测试 harness）时，该 unit 的"补起"补的是那唯一的主进程，与正在升级的
-/// 这台设备没有对应关系：补起的进程可能带的是**别的**设备的 argv，认领到的
-/// 也可能是别人的交接。这种情况下交给 systemd 会得到错误结果，必须由助手
-/// 自己拉起。
-///
-/// 未知策略同样选 [`NewAgentOwner::Helper`]：宁可多起一个能立刻注册的 agent
-/// （设备可用优先），也不要赌一个读不到的配置替我们补进程。
-pub fn new_agent_owner(
-    restart_policy: Option<&str>,
-    alone_in_cgroup: bool,
-    is_main_pid: bool,
-) -> NewAgentOwner {
-    match restart_policy {
-        Some(p) if restart_policy_respawns_on_success(p) && alone_in_cgroup && is_main_pid => {
-            NewAgentOwner::Systemd
-        }
-        _ => NewAgentOwner::Helper,
-    }
-}
-
-/// 本进程是否就是所在 unit 的 **MainPID**。
-///
-/// 这是"交给 systemd 补起"能否成立的**决定性**条件：`Restart=always` 补起的
-/// 是 unit 的 MainPID，只有当**正在升级的这个进程就是 MainPID** 时，补起来的
-/// 才真的是它。非 root 可读该属性（`systemctl show -p MainPID`），实测可行。
-///
-/// 反例（真实冒烟复现）：8 个 agent 跑在 `multica-daemon.service` 里，该 unit
-/// 的 MainPID 是 daemon 自己；逐个换机到最后只剩一个 agent 时，"同 cgroup 只有
-/// 一个 agent" 成立，但 MainPID 仍不是它——systemd 补起的是 daemon，新 agent
-/// 永远起不来，只能超时回滚。
-pub fn is_unit_main_pid(unit: &str) -> bool {
-    is_unit_main_pid_of(unit, std::process::id())
-}
-
-/// [`is_unit_main_pid`] 的显式 pid 版本。
-///
-/// **必须传"旧 agent 的 pid"而不是调用者自己的 pid**：这个判定是在换机助手
-/// 里执行的，助手跑在独立的 transient unit 里，`process::id()` 是助手自己。
-/// 只有 `unit.MainPID == 旧 agent pid` 才说明"systemd 补起的会是这台设备"。
-pub fn is_unit_main_pid_of(unit: &str, expected_pid: u32) -> bool {
-    match unit_main_pid(unit) {
-        Some(pid) => pid == expected_pid,
-        None => false,
-    }
-}
-
-/// 读 unit 当前的 MainPID（读不到/已停止返回 `None`）。
-///
-/// 单独暴露出来是为了让调用方能把它写进日志：判定失败时运维需要看到
-/// "unit 说 MainPID 是谁"与"我们在等谁"这两个值。
-pub fn unit_main_pid(unit: &str) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        let mut cmd = Command::new("systemctl");
-        cmd.args(["show", "-p", "MainPID", "--value", unit])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        apply_user_manager_env(&mut cmd);
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let v = String::from_utf8_lossy(&out.stdout);
-        match v.trim().parse::<u32>() {
-            Ok(pid) if pid > 0 => Some(pid),
-            _ => None,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = unit;
-        None
-    }
-}
-
 /// 本进程所在 service cgroup 里，除了自己还有没有别的 agent。
 ///
 /// 判据与 [`is_service_side_duplicate`] 同源（同 `exe`、同 cgroup），但不要求
 /// "无恢复意图"：这里只问"是不是还有同伴"。读不到 `/proc` 时返回 `false`
-/// （当作"只有自己"）——读不到的情况下，systemd 的补起语义通常是成立的
-/// （真实部署每设备一个 unit）。
+/// （当作"只有自己"）。
 pub fn alone_in_service_cgroup(service_cgroup: &str) -> bool {
-    find_any_agent_in_cgroup(service_cgroup).is_none()
+    find_agent_in_cgroup(service_cgroup, None).is_none()
 }
 
-/// 在给定 cgroup 里找"除自己之外的另一个 agent"（不看恢复意图）。
-fn find_any_agent_in_cgroup(service_cgroup: &str) -> Option<u32> {
+/// 在给定 cgroup 里找 agent 进程（`exclude` 可排除某个 pid）。
+fn find_agent_in_cgroup(service_cgroup: &str, exclude: Option<u32>) -> Option<u32> {
     let me = std::process::id();
-    let Ok(my_exe) = std::fs::read_link("/proc/self/exe") else {
-        return None;
-    };
+    let my_exe = std::fs::read_link("/proc/self/exe").ok()?;
     let entries = std::fs::read_dir("/proc").ok()?;
     entries.flatten().find_map(|entry| {
         let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-        if pid == me {
+        if pid == me || Some(pid) == exclude {
             return None;
         }
         if std::fs::read_link(format!("/proc/{pid}/exe"))
@@ -548,6 +498,413 @@ fn find_any_agent_in_cgroup(service_cgroup: &str) -> Option<u32> {
         }
         (cgroup_path_of_pid(pid).as_deref() == Some(service_cgroup)).then_some(pid)
     })
+}
+
+// ── 换机前的协调能力检查（MYS-2425-D：fail-closed）────────────────
+
+/// 换机前对 systemd 托管环境的判定结果。
+///
+/// ## 为什么必须在**换机前**判定
+///
+/// 旧版尝试过"先让旧进程退出，再指望 systemd 自动补起新版"：这条路径要求
+/// 旧 PID 已经消失才能判定，而 systemd 在 `RestartSec` 窗口内把 `MainPID` 置
+/// `0`，判定永远拿不到答案；自动补起也无法可靠继承一次性身份恢复上下文，
+/// 注册失败时的回滚边界不清。设计决定因此改为：**在磁盘动之前**把"能不能
+/// 协调"问清楚，能就做，不能就当场失败。
+///
+/// ## 三条结论
+///
+/// - [`ManagedPlan::Direct`]：不是 systemd service 托管，走既有直接助手路径。
+/// - [`ManagedPlan::Coordinated`]：归属明确的单 agent service，且当前身份**已**
+///   被授权管理该 unit 的生命周期 ⇒ 由助手执行 stop → swap → start。
+/// - [`ManagedPlan::Refuse`]：其它一切情况。**在旧 agent 退出前**上报 `failed`
+///   并给出可操作的解决方法，磁盘一点不动，也不产生第二个实例。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedPlan {
+    /// 非 systemd service 托管：既有路径，行为不变。
+    Direct,
+    /// 可以协调：助手负责 stop/swap/start，新 agent 回到唯一受管 MainPID。
+    Coordinated { unit: String },
+    /// 拒绝协调。`reason` 是给运维看的可读原因，直接进 Web。
+    Refuse {
+        unit: Option<String>,
+        reason: String,
+    },
+}
+
+/// 判定所需的外部事实。全部由 [`probe`] 采集，测试可直接构造。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// 自身是否由 systemd service 托管（`INVOCATION_ID` + cgroup 落在 `*.service`）。
+    pub managed: bool,
+    /// 当前 cgroup 对应的 unit 名（读不到时为 `None`）。
+    pub unit: Option<String>,
+    /// `systemctl show -p MainPID` 的值。`None` = 读不到。
+    ///
+    /// 注意：**只有在旧 agent 仍在运行时读才有意义**，这正是本检查放在换机
+    /// 之前的原因；换机窗口内 systemd 会把它置 0。
+    pub main_pid: Option<u32>,
+    /// 当前 agent 自己的 PID。
+    pub self_pid: u32,
+    /// unit 的 `Restart=` 策略（读不到时为 `None`）。
+    pub restart_policy: Option<String>,
+    /// unit 的 `ExecStart` 首个可执行文件（`systemctl show -p ExecStart`）。
+    pub exec_start_exe: Option<String>,
+    /// 本进程的可执行文件（`/proc/self/exe`）。
+    pub self_exe: Option<String>,
+    /// 同一 cgroup 里是否还有**别的** agent（同 exe）。
+    pub shares_cgroup_with_other_agent: bool,
+    /// 当前身份是否**已**被授权管理该 unit 的生命周期。
+    ///
+    /// 由 `pkcheck --action-id org.freedesktop.systemd1.manage-units` 判定：
+    /// `polkit.result=yes` 才是已授权；`auth_admin*` 表示需要交互认证（即
+    /// 非交互的 agent 做不了）。**不探测、不提权、不改 sudoers。**
+    pub lifecycle_authorized: bool,
+}
+
+/// 纯判定：把 [`Probe`] 变成 [`ManagedPlan`]。不做任何 IO，便于穷举测试。
+pub fn decide(probe: &Probe) -> ManagedPlan {
+    // 非托管：既有直接助手路径，行为与本改动之前完全一致。
+    if !probe.managed {
+        return ManagedPlan::Direct;
+    }
+    let Some(unit) = probe.unit.as_deref().filter(|u| u.ends_with(".service")) else {
+        return ManagedPlan::Refuse {
+            unit: None,
+            reason: REFUSE_CAUSE_UNIT_UNKNOWN.to_string(),
+        };
+    };
+
+    // 归属必须明确：MainPID 要等于自己。不匹配说明这个 unit 的主进程不是本
+    // agent（多 agent 共享 daemon、或 unit 里套了 wrapper），systemd 的重启
+    // 语义对不上这台设备，不能猜。
+    match probe.main_pid {
+        Some(pid) if pid == probe.self_pid => {}
+        Some(pid) => {
+            return ManagedPlan::Refuse {
+                unit: Some(unit.to_string()),
+                reason: format!(
+                    "{REFUSE_CAUSE_NOT_MAIN_PID} (unit {unit} has MainPID {pid}, this agent is \
+                     pid {}). This usually means several agents share one service.",
+                    probe.self_pid
+                ),
+            }
+        }
+        None => {
+            return ManagedPlan::Refuse {
+                unit: Some(unit.to_string()),
+                reason: format!("{REFUSE_CAUSE_MAIN_PID_UNREADABLE} (unit {unit})"),
+            }
+        }
+    }
+
+    // 单 agent：同 cgroup 里还有别的 agent 时，stop 会连带影响它们。
+    if probe.shares_cgroup_with_other_agent {
+        return ManagedPlan::Refuse {
+            unit: Some(unit.to_string()),
+            reason: format!(
+                "{REFUSE_CAUSE_SHARED_CGROUP} (unit {unit}). Stopping it would also stop the other \
+                 agents it hosts."
+            ),
+        };
+    }
+
+    // 形态相符：ExecStart 指的就是这份二进制。
+    //
+    // 只接受"直接 exec 本二进制"。**不**接受 wrapper 脚本（`run.sh` 再 exec
+    // agent）：那种形态下 stop/start 能不能生效取决于脚本内容，我们读不到，
+    // 不能猜——猜错就是"换了文件却起不来"或"起了别的东西"。
+    match (&probe.exec_start_exe, &probe.self_exe) {
+        (Some(exec), Some(me)) if same_path(exec, me) => {}
+        (Some(exec), Some(me)) => {
+            return ManagedPlan::Refuse {
+                unit: Some(unit.to_string()),
+                reason: format!(
+                    "{REFUSE_CAUSE_EXECSTART_MISMATCH} (unit {unit} starts `{exec}`, this agent                      runs `{me}`). Coordinated upgrades need `ExecStart` to exec this binary                      directly."
+                ),
+            }
+        }
+        _ => {
+            return ManagedPlan::Refuse {
+                unit: Some(unit.to_string()),
+                reason: format!("{REFUSE_CAUSE_EXECSTART_UNREADABLE} (unit {unit})"),
+            }
+        }
+    }
+
+    // Restart 策略决定"能不能直接走既有路径"：
+    //
+    // - `always`：旧 agent 为换机正常退出后 systemd 会补起一个，必须由助手接管
+    //   服务生命周期（stop 取消待执行重启 → 换盘 → start 拿回唯一 MainPID）。
+    // - **其它策略**（`on-failure` / `on-abnormal` / `no` / …）：systemd **不会**
+    //   因正常退出补起，既有直接助手路径天然只有一个实例 ⇒ 不需要协调，直接
+    //   走 Direct。把它判成"拒绝"是错的：那条路径本来就能升级。
+    // - 读不到：无法确认"停掉之后会不会有别的东西复活"，也不确认"不协调是否
+    //   安全" ⇒ 拒绝（fail-closed）。
+    match probe.restart_policy.as_deref() {
+        Some(p) if restart_policy_respawns_on_success(p) => {}
+        Some(_) => return ManagedPlan::Direct,
+        None => {
+            return ManagedPlan::Refuse {
+                unit: Some(unit.to_string()),
+                reason: format!("{REFUSE_CAUSE_RESTART_POLICY_UNREADABLE} (unit {unit})"),
+            }
+        }
+    }
+
+    // 授权：只在**已经**授权时协调。需要交互认证 = 做不到，不偷偷提权。
+    if !probe.lifecycle_authorized {
+        return ManagedPlan::Refuse {
+            unit: Some(unit.to_string()),
+            reason: format!("{REFUSE_CAUSE_NOT_AUTHORIZED} (unit {unit})"),
+        };
+    }
+
+    ManagedPlan::Coordinated {
+        unit: unit.to_string(),
+    }
+}
+
+/// 拒绝原因的前半句：稳定的可断言前缀，后面接具体情况。
+pub const REFUSE_CAUSE_UNIT_UNKNOWN: &str = "cannot determine which systemd service hosts this \
+                                              agent, so the upgrade cannot coordinate it";
+pub const REFUSE_CAUSE_NOT_MAIN_PID: &str = "this agent is not the service's main process";
+pub const REFUSE_CAUSE_MAIN_PID_UNREADABLE: &str = "cannot read the service's main process";
+pub const REFUSE_CAUSE_SHARED_CGROUP: &str = "this service hosts more than one agent";
+pub const REFUSE_CAUSE_EXECSTART_MISMATCH: &str =
+    "the service starts a different binary than the one running";
+pub const REFUSE_CAUSE_EXECSTART_UNREADABLE: &str = "cannot read the service's ExecStart";
+pub const REFUSE_CAUSE_RESTART_POLICY: &str = "the service is not configured with Restart=always";
+pub const REFUSE_CAUSE_RESTART_POLICY_UNREADABLE: &str = "cannot read the service's Restart policy";
+pub const REFUSE_CAUSE_NOT_AUTHORIZED: &str =
+    "this agent is not authorized to manage the service lifecycle";
+
+/// 路径比较：解析符号链接后相等即可（同一份二进制换个写法也算相符）。
+fn same_path(a: &str, b: &str) -> bool {
+    let ra = std::fs::canonicalize(a).unwrap_or_else(|_| PathBuf::from(a));
+    let rb = std::fs::canonicalize(b).unwrap_or_else(|_| PathBuf::from(b));
+    ra == rb
+}
+
+// ── 采集真实事实 & 执行协调 ──────────────────────────────────────
+
+/// 采集判定所需的事实（只读，无副作用）。
+///
+/// 全部通过 `systemctl show` / `/proc` / `pkcheck` 读取；**不**停启任何 unit、
+/// **不**探测性提权。任何一项读不到都如实记为 `None`，交由 [`decide`] 拒绝。
+pub fn probe() -> Probe {
+    #[cfg(unix)]
+    let self_pid = std::process::id();
+    #[cfg(not(unix))]
+    let self_pid = std::process::id();
+
+    let self_exe = std::fs::read_link("/proc/self/exe")
+        .ok()
+        .map(|p| p.display().to_string());
+
+    #[cfg(target_os = "linux")]
+    let (managed, unit) = {
+        let managed = current_is_managed();
+        let unit = current_cgroup_path().map(|cg| service_unit_name(&cg));
+        // 只有 service 才谈得上"主进程/重启策略"。
+        let unit = unit.filter(|u| u.ends_with(".service"));
+        (managed, unit)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (managed, unit) = (false, None);
+
+    let main_pid = unit.as_deref().and_then(unit_main_pid);
+    let restart_policy = unit.as_deref().and_then(service_restart_policy);
+    let exec_start_exe = unit.as_deref().and_then(service_exec_start_exe);
+    let shares_cgroup_with_other_agent = match (managed, unit.as_deref()) {
+        (true, Some(u)) => {
+            let cg = unit_cgroup_path(u);
+            cg.as_deref()
+                .map(|c| !alone_in_service_cgroup(c))
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
+    let lifecycle_authorized = unit.as_deref().is_some_and(lifecycle_authorized);
+
+    Probe {
+        managed,
+        unit,
+        main_pid,
+        self_pid,
+        restart_policy,
+        exec_start_exe,
+        self_exe,
+        shares_cgroup_with_other_agent,
+        lifecycle_authorized,
+    }
+}
+
+/// unit 的 cgroup 路径（按 unit 名推导，v2 直接在 `/sys/fs/cgroup` 下）。
+fn unit_cgroup_path(unit: &str) -> Option<String> {
+    // 自身 cgroup 已包含完整路径；优先用它（同一 unit 必然一致）。
+    if let Some(cg) = current_cgroup_path() {
+        if service_unit_name(&cg) == unit {
+            return Some(cg);
+        }
+    }
+    None
+}
+
+/// 读 unit 的 `ExecStart` 首个可执行文件路径。
+///
+/// `systemctl show -p ExecStart` 的输出形如：
+/// `{ path=/usr/local/bin/shell-remote ; argv[]=/usr/local/bin/shell-remote agent ... }`
+fn service_exec_start_exe(unit: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["show", "-p", "ExecStart", "--value", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        apply_user_manager_env(&mut cmd);
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let at = text.find("path=")?;
+        let rest = &text[at + "path=".len()..];
+        let end = rest.find(" ;").or_else(|| rest.find(';'))?;
+        let p = rest[..end].trim();
+        if p.is_empty() {
+            None
+        } else {
+            Some(p.to_string())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = unit;
+        None
+    }
+}
+
+/// 当前身份是否**已经**被授权管理 unit 生命周期（`systemd1.manage-units`）。
+///
+/// 用 polkit 官方探针 `pkcheck`：**只查询、不尝试提权**。判定规则：
+///
+/// - `polkit.result=yes` ⇒ 已授权（例如管理员配了 polkit 规则或 agent 以 root 跑）；
+/// - `auth_admin` / `auth_admin_keep` / `auth_self*` ⇒ 需要交互认证，非交互的
+///   agent 做不到 ⇒ 未授权；
+/// - `no` ⇒ 明确拒绝；
+/// - `pkcheck` 不存在或输出无法解析 ⇒ 未授权（fail-closed）。
+///
+/// 这与设计决定一致：授权只走系统既有机制，不提权、不改 sudoers/unit。
+pub fn lifecycle_authorized(unit: &str) -> bool {
+    let _ = unit; // 结论与具体 unit 无关：polkit 按 action + 调用者身份判定。
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("pkcheck");
+        cmd.args([
+            "--action-id",
+            "org.freedesktop.systemd1.manage-units",
+            "--process",
+            &std::process::id().to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let Ok(out) = cmd.output() else { return false };
+        // 输出形如 `polkit\56result=yes`（`\56` 是 `.` 的转义），也可能直接是
+        // `authorized`。两种都认。
+        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        if out.status.success() {
+            // pkcheck 退出码 0 = 已授权。
+            return true;
+        }
+        text.contains("result=yes") || text.contains("authorized")
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// 对一个已确认可协调的 unit 执行受控 stop。
+///
+/// 前置条件（由 [`decide`] 保证）：单 agent、自己是 MainPID、ExecStart 相符、
+/// `Restart=always`、**已授权**。语义：
+///
+/// - `systemctl stop` 会取消 `Restart=always` 的待执行重启（这是选它而不是
+///   "杀进程等补起"的原因）；
+/// - 必须在**旧 agent 退出之前**调用，且 helper 自身**不在**该 service 的
+///   cgroup 里（helper 跑在独立 transient unit，见 [`launch`] 的
+///   `KillMode=process`），否则 stop 会把 helper 一起清掉。
+pub fn stop_unit_checked(unit: &str) -> Result<(), String> {
+    if !unit.starts_with(UNIT_PREFIX) && !unit.ends_with(".service") {
+        return Err(format!("refusing to stop a non-service unit: {unit}"));
+    }
+    run_systemctl(&["stop", unit]).map_err(|e| format!("cannot stop {unit}: {e}"))
+}
+
+/// 对一个已确认可协调的 unit 执行 start（把新 agent 拉回唯一受管 MainPID）。
+pub fn start_unit_checked(unit: &str) -> Result<(), String> {
+    if !unit.starts_with(UNIT_PREFIX) && !unit.ends_with(".service") {
+        return Err(format!("refusing to start a non-service unit: {unit}"));
+    }
+    run_systemctl(&["start", unit]).map_err(|e| format!("cannot start {unit}: {e}"))
+}
+
+/// 跑一条 `systemctl` 子命令，失败时把 stderr 带回来。
+fn run_systemctl(args: &[&str]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_user_manager_env(&mut cmd);
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            format!("systemctl {} failed", args.join(" "))
+        } else {
+            err
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Err("systemctl is not available".to_string())
+    }
+}
+
+/// 等 unit 的 cgroup 里不再有进程（stop 之后确认残留已退出）。
+///
+/// 有界等待：`systemctl stop` 正常是同步的，但 cgroup 排空可能滞后几毫秒。
+pub fn wait_unit_cgroup_empty(unit: &str, timeout: Duration) -> bool {
+    let Some(cg) = unit_cgroup_path(unit) else {
+        return true; // 拿不到 cgroup 路径时不阻塞流程
+    };
+    let path = format!("/sys/fs/cgroup{cg}/cgroup.procs");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                if text.split_whitespace().next().is_none() {
+                    return true;
+                }
+            }
+            // 路径不存在 = cgroup 已经没了，同样算空。
+            Err(_) => return true,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 // ── 重复进程识别（MYS-2425-D）──────────────────────────────────────
