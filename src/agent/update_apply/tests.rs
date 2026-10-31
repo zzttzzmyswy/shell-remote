@@ -2148,10 +2148,7 @@ fn check_binary_ready_line(name: &str, label: &str) {
 #[test]
 fn test_non_linux_platform_never_takes_the_transient_route() {
     if cfg!(not(target_os = "linux")) {
-        assert!(
-            !managed_detection(),
-            "非 Linux 平台不得判定为 systemd 托管"
-        );
+        assert!(!managed_detection(), "非 Linux 平台不得判定为 systemd 托管");
         assert_eq!(managed_route(false), ManagedRoute::Direct);
     }
     // 托管判定与路由的映射本身与平台无关，这里一并钉住：
