@@ -78,6 +78,14 @@ const BACKUP_INFIX: &str = ".sr-old-";
 /// Windows 自我搬运出来的助手副本前缀（用完即删，启动时顺手清理残留）。
 const HELPER_COPY_PREFIX: &str = ".shell-remote-update-apply-";
 
+/// "本次换机待恢复"的指针文件名（`0700` 私有目录，内容两行：
+/// `upgrade_id` + 交接文件路径）。
+///
+/// 只在**受管 service 协调式换机**里写：那时新 agent 由 `systemctl start`
+/// 拉起，环境由 unit 决定，拿不到助手设置的 `SR_UPGRADE_RESTORE`，只能靠这个
+/// 指针找到交接文件。指针本身不含 Token。
+const RESTORE_PENDING_FILE: &str = ".restore-pending";
+
 /// 助手的三段等待上限。
 ///
 /// 抽成值而不是写死常量，是为了让测试能用毫秒级的上限跑**同一条**代码路径
@@ -139,6 +147,33 @@ pub struct RestartContext {
     /// 已下载并校验通过的新文件（与 target 同目录，同一文件系统）。
     pub new_binary: PathBuf,
     pub new_sha256: String,
+    /// 旧 agent 所在的 systemd service cgroup（`/proc/self/cgroup` 的 v2 路径）。
+    ///
+    /// **只**用于换机后识别 systemd 按 `Restart=always` 补起的重复实例：新进程
+    /// 拿它和新旧进程的 cgroup 做比对，认出"服务侧补起的那个"并给出可执行的
+    /// 运维命令（只报告，不终止任何进程）。非 systemd 环境恒为 `None`，
+    /// 那条路径行为不变。
+    ///
+    /// 它是路径，不是凭据：不含 Token、不含 argv。
+    pub service_cgroup: Option<String>,
+    /// **换机前**算好的 systemd 协调方案（MYS-2425-D 设计决定：fail-closed）。
+    ///
+    /// 必须在旧 agent 退出、磁盘改动之前算出来：`Restart=always` 的
+    /// `MainPID` 在重启窗口内是 0，事后无法判定；而且"能不能协调"本就该在
+    /// 动手之前问清楚。`None` = 非 systemd 托管（走既有直接助手路径）。
+    pub managed_plan: Option<super::systemd_helper::ManagedPlan>,
+    /// 旧 agent 所在 unit 的 `Restart=` 策略（`always` / `on-failure` / …）。
+    ///
+    /// 换机成功后在 `Restart=always` 下的行为与其它策略**根本不同**：
+    ///
+    /// - `always`：旧主进程一退出，systemd 就用**已替换的新二进制**再起一个，
+    ///   得到一个受原 service 托管的唯一 MainPID。此时助手**不能**再自己起
+    ///   新进程，否则就是两个无人协调的 agent 互相驱逐。
+    /// - 其它（`on-failure` / `no` / 空）：systemd 不会因"正常退出"补起，
+    ///   助手必须自己拉起新 agent，否则设备直接失联。
+    ///
+    /// 由旧 agent 在交接时读一次写进来（非 systemd 环境恒为 `None`）。
+    pub service_restart_policy: Option<String>,
 }
 
 impl std::fmt::Debug for RestartContext {
@@ -160,6 +195,9 @@ impl std::fmt::Debug for RestartContext {
             .field("target_path", &self.target_path)
             .field("new_binary", &self.new_binary)
             .field("new_sha256", &self.new_sha256)
+            .field("service_cgroup", &self.service_cgroup)
+            .field("managed_plan", &self.managed_plan)
+            .field("service_restart_policy", &self.service_restart_policy)
             .finish()
     }
 }
@@ -190,6 +228,17 @@ struct HandoffFile {
     target_path: String,
     new_binary: String,
     new_sha256: String,
+    /// 旧 agent 的 service cgroup（systemd 托管时才有）。见 [`RestartContext`]。
+    #[serde(default)]
+    service_cgroup: Option<String>,
+    /// 旧 agent 所在 unit 的 `Restart=` 策略（systemd 托管时才有）。
+    #[serde(default)]
+    service_restart_policy: Option<String>,
+    /// 换机前算好的协调方案：`None` / `direct` / `coordinated:<unit>` / `refuse:<原因>`。
+    ///
+    /// 用字符串而不是枚举序列化，是为了让交接文件对旧版/未来版都保持可读。
+    #[serde(default)]
+    managed_plan: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -277,6 +326,56 @@ fn encode_path(p: &Path) -> String {
     encode_os(p.as_os_str())
 }
 
+/// 测试入口：把协调方案编码（供 systemd_helper 的测试复用同一份编码逻辑）。
+#[cfg(test)]
+pub(crate) fn encode_plan_for_test(plan: &super::systemd_helper::ManagedPlan) -> String {
+    encode_plan(plan)
+}
+
+/// 测试入口：解码。
+#[cfg(test)]
+pub(crate) fn decode_plan_for_test(raw: &str) -> Option<super::systemd_helper::ManagedPlan> {
+    decode_plan(raw)
+}
+
+/// 把协调方案编码成交接文件里的一行（不含任何凭据）。
+fn encode_plan(plan: &super::systemd_helper::ManagedPlan) -> String {
+    use super::systemd_helper::ManagedPlan;
+    match plan {
+        ManagedPlan::Direct => "direct".to_string(),
+        ManagedPlan::Coordinated { unit } => format!("coordinated:{unit}"),
+        ManagedPlan::Refuse { unit, reason } => match unit {
+            Some(u) => format!("refuse:{u}:{reason}"),
+            None => format!("refuse::{reason}"),
+        },
+    }
+}
+
+/// [`encode_plan`] 的逆过程。无法解析时返回 `None`（当作非托管，交给既有路径）。
+fn decode_plan(raw: &str) -> Option<super::systemd_helper::ManagedPlan> {
+    use super::systemd_helper::ManagedPlan;
+    if raw == "direct" {
+        return Some(ManagedPlan::Direct);
+    }
+    if let Some(rest) = raw.strip_prefix("coordinated:") {
+        return Some(ManagedPlan::Coordinated {
+            unit: rest.to_string(),
+        });
+    }
+    if let Some(rest) = raw.strip_prefix("refuse:") {
+        let (unit, reason) = rest.split_once(':').unwrap_or(("", rest));
+        return Some(ManagedPlan::Refuse {
+            unit: if unit.is_empty() {
+                None
+            } else {
+                Some(unit.to_string())
+            },
+            reason: reason.to_string(),
+        });
+    }
+    None
+}
+
 impl RestartContext {
     /// 从旧 agent 的视角构造：`argv` 必须已剥掉隐藏恢复参数（否则新进程
     /// 会去读上一轮的交接文件，身份与 upgrade_id 全错）。
@@ -294,6 +393,9 @@ impl RestartContext {
         new_sha256: String,
         upgrade_id: String,
         target_version: String,
+        service_cgroup: Option<String>,
+        service_restart_policy: Option<String>,
+        managed_plan: Option<super::systemd_helper::ManagedPlan>,
     ) -> Self {
         Self {
             session_id,
@@ -310,6 +412,9 @@ impl RestartContext {
             target_path,
             new_binary,
             new_sha256,
+            service_cgroup,
+            service_restart_policy,
+            managed_plan,
         }
     }
 
@@ -338,6 +443,9 @@ impl RestartContext {
             target_path: encode_path(&self.target_path),
             new_binary: encode_path(&self.new_binary),
             new_sha256: self.new_sha256.clone(),
+            service_cgroup: self.service_cgroup.clone(),
+            service_restart_policy: self.service_restart_policy.clone(),
+            managed_plan: self.managed_plan.as_ref().map(encode_plan),
         }
     }
 
@@ -392,6 +500,9 @@ impl RestartContext {
             target_path,
             new_binary,
             new_sha256: f.new_sha256.to_ascii_lowercase(),
+            service_cgroup: f.service_cgroup,
+            service_restart_policy: f.service_restart_policy,
+            managed_plan: f.managed_plan.as_deref().and_then(decode_plan),
         })
     }
 
@@ -774,6 +885,35 @@ pub fn restore_handoff_path(flag: Option<&str>) -> Result<Option<PathBuf>, Strin
     }
 }
 
+/// 读取并**消费**"本次换机待恢复"指针。
+///
+/// 只认 `0700` 私有目录里、`0600`、属主为自己的指针（复用私有文件校验），
+/// 指向的交接文件必须真实存在；读到后立刻删除指针，保证只恢复一次。
+///
+/// 返回 `None` = 没有待恢复的换机（普通启动）。
+pub fn take_restore_pending() -> Option<PathBuf> {
+    let dir = RestartContext::private_dir().ok()?;
+    take_restore_pending_in(&dir)
+}
+
+/// [`take_restore_pending`] 的显式目录版本（测试用，校验逻辑完全相同）。
+pub fn take_restore_pending_in(dir: &Path) -> Option<PathBuf> {
+    let ptr = dir.join(RESTORE_PENDING_FILE);
+    if !ptr.exists() {
+        return None;
+    }
+    verify_private_file(&ptr).ok()?;
+    let body = std::fs::read_to_string(&ptr).ok()?;
+    let handoff = body.lines().nth(1).map(PathBuf::from)?;
+    // 交接文件必须在同一私有目录里（不给"指向任意路径"留口子）。
+    if handoff.parent() != Some(dir) || !handoff.is_file() {
+        let _ = std::fs::remove_file(&ptr);
+        return None;
+    }
+    let _ = std::fs::remove_file(&ptr);
+    Some(handoff)
+}
+
 /// 解析并加载一次性恢复信息（CLI/UI 共用的入口）。
 ///
 /// fail-closed：**明确要求了恢复**（隐藏参数或环境变量）但读不出来时返回
@@ -782,7 +922,16 @@ pub fn restore_handoff_path(flag: Option<&str>) -> Result<Option<PathBuf>, Strin
 pub fn resolve_restore(flag: Option<&str>) -> Result<Option<RestoredIdentity>, String> {
     match restore_handoff_path(flag)? {
         Some(path) => RestoredIdentity::load(&path).map(Some),
-        None => Ok(None),
+        // 没有显式恢复通道 → 看是否有"受管 service 协调式换机"留下的指针。
+        //
+        // 这条只在 `systemctl start` 拉起的新进程上命中（它拿不到
+        // `SR_UPGRADE_RESTORE`）。指针由**助手**在换机前写入、启动成功后删除，
+        // 因此不存在"自动补起的进程误认领别人的交接"：整个过程只有助手安排，
+        // 没有 systemd 自动补起参与（设计决定 MYS-2425-D）。
+        None => match take_restore_pending() {
+            Some(path) => RestoredIdentity::load(&path).map(Some),
+            None => Ok(None),
+        },
     }
 }
 
@@ -791,6 +940,9 @@ pub fn resolve_restore(flag: Option<&str>) -> Result<Option<RestoredIdentity>, S
 pub struct RestoredIdentity {
     pub restore: UpgradeRestore,
     pub handoff: PathBuf,
+    /// 旧 agent 的 service cgroup（systemd 托管时才有）。注册成功后用它识别
+    /// systemd 按 `Restart=always` 补起的重复实例；非 systemd 环境恒为 `None`。
+    pub service_cgroup: Option<String>,
     /// 是否已经完成（交接文件已删、助手已回执）。`start()` 用它在首次会话
     /// 结束后停止传递恢复语义。
     consumed: std::sync::atomic::AtomicBool,
@@ -844,6 +996,7 @@ impl RestoredIdentity {
                 rollback,
             },
             handoff: path.to_path_buf(),
+            service_cgroup: ctx.service_cgroup.clone(),
             consumed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -880,6 +1033,10 @@ impl RestoredIdentity {
             &self.restore.target_version,
             &self.restore.session_id,
         );
+        // 重复进程的收尾**不在这里做**：它要占用一个观察窗口（systemd 是隔
+        // `RestartSec` 才补起的），而 `complete()` 紧跟在注册成功之后、排在
+        // 任何可能失败的初始化之前——在这里等窗口会平白推迟会话建立。由
+        // 收尾动作（重复实例的识别）已随 fail-closed 方案移除。
     }
 
     /// 回滚后的重启要把失败原因送回 relay——否则管理界面只会看到一个
@@ -1121,6 +1278,29 @@ fn probe_dir_writable(dir: &Path) -> std::io::Result<()> {
     drop(f);
     let _ = std::fs::remove_file(&path);
     res
+}
+
+/// 校验"已经就位"的那份二进制（`target_path`）与任务 digest 一致。
+///
+/// 协调式换机在替换完成之后才调用它：此时 `.part` 已不存在，`verify_new_binary`
+/// 用不上。
+fn verify_installed_binary(target: &Path, expected_sha: &str) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(target)
+        .map_err(|e| format!("cannot stat the installed binary: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("the installed binary is not a regular file".to_string());
+    }
+    if meta.len() == 0 {
+        return Err("the installed binary is empty".to_string());
+    }
+    let actual = crate::agent::download::sha256_hex_file(target)
+        .map_err(|e| format!("cannot hash the installed binary: {e}"))?;
+    if !crate::agent::download::verify_sha256(&actual, expected_sha) {
+        return Err(format!(
+            "the installed binary does not match its digest (got {actual}, expected {expected_sha})"
+        ));
+    }
+    Ok(())
 }
 
 fn verify_new_binary(ctx: &RestartContext) -> Result<(), String> {
@@ -1496,6 +1676,49 @@ pub fn helper_main_with(
         }
     }
 
+    // ── 受管 service：协调 stop → swap → start，或 fail-closed ──────
+    //
+    // **必须在动磁盘之前分流**（MYS-2425-D 评审 #2）：
+    //
+    // - `Coordinated`：由 `coordinated_swap` 自己先 stop 再换盘，失败时能完整
+    //   回滚并如实报告。绝不能先在这里换盘、再进分支失败——那样磁盘已被改动，
+    //   消息却写着"未改动"。
+    // - `Refuse`：换机前的能力检查本该拦住它（`hand_over_to_helper` 已经做过
+    //   一次），走到这里说明判定与实际不符。**磁盘未动**，直接如实失败。
+    match ctx.managed_plan.as_ref() {
+        Some(super::systemd_helper::ManagedPlan::Coordinated { unit }) => {
+            let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+            let restore_dir = handoff
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| target_dir.clone());
+            let unit = unit.clone();
+            return coordinated_swap(
+                &ctx,
+                &unit,
+                handoff,
+                &backup,
+                &restore_dir,
+                &mut log,
+                timeouts,
+            );
+        }
+        Some(super::systemd_helper::ManagedPlan::Refuse { unit, reason }) => {
+            let msg = format!("refusing to swap: {reason}");
+            log.line(&msg);
+            let _ = unit;
+            // 旧 agent 已在等待我们接手时退出；把它按旧版拉回来，用户不至于失联。
+            return HelperOutcome::rolled_back(
+                msg,
+                RollbackIdentity::Lost {
+                    detail: "the service could not be coordinated; nothing on disk was changed"
+                        .to_string(),
+                },
+            );
+        }
+        _ => {}
+    }
+
     // ── 备份 → 原子替换 ────────────────────────────────────────────
     let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
     if let Err(e) = make_executable(&ctx.new_binary) {
@@ -1570,6 +1793,289 @@ pub fn helper_main_with(
                 timeouts,
             )
         }
+    }
+}
+
+/// `coordinated_swap` 依赖的外部 systemd 操作。
+///
+/// 抽成 trait 是为了让"stop 失败 / 排空超时 / 磁盘校验失败"这三条分支能被
+/// **真正测到**（断言磁盘恢复为旧制品、outcome 与消息如实反映状态），不必在
+/// 单测里真的去停一个 systemd unit。
+trait SystemdOps {
+    /// `systemctl stop <unit>`。
+    fn stop(&self, unit: &str) -> Result<(), String>;
+    /// `systemctl start <unit>`。
+    fn start(&self, unit: &str) -> Result<(), String>;
+    /// 等 unit 的 cgroup 排空。
+    fn wait_empty(&self, unit: &str, timeout: Duration) -> bool;
+}
+
+/// 生产实现：真的调 `systemctl`。
+struct RealSystemd;
+
+impl SystemdOps for RealSystemd {
+    fn stop(&self, unit: &str) -> Result<(), String> {
+        super::systemd_helper::stop_unit_checked(unit)
+    }
+    fn start(&self, unit: &str) -> Result<(), String> {
+        super::systemd_helper::start_unit_checked(unit)
+    }
+    fn wait_empty(&self, unit: &str, timeout: Duration) -> bool {
+        super::systemd_helper::wait_unit_cgroup_empty(unit, timeout)
+    }
+}
+
+/// 受管 service 的协调式换机：stop → swap → start（MYS-2425-D 设计决定）。
+///
+/// ## 只有一个受管 agent
+///
+/// `systemctl stop` 会**取消** `Restart=always` 的待执行重启（这正是选它、
+/// 而不是"杀掉进程等 systemd 补起"的原因），等旧 cgroup 退干净后再替换磁盘，
+/// 最后用同一个 unit `start`：新 agent 回到唯一受管 MainPID，不存在第二个实例。
+///
+/// ## 前置条件由 [`ManagedPlan`] 保证
+///
+/// 单 agent、自己是 MainPID、`ExecStart` 与运行中的二进制相符、`Restart=always`、
+/// 且**当前身份已被授权**管理该 unit。任何一项不成立都不会走到这里——调用方
+/// 会在磁盘改动之前上报 `failed`。
+///
+/// ## 身份
+///
+/// 新 agent 仍由**助手**用既有恢复协议拉起（`spawn_agent` 传交接文件路径），
+/// 因此拿到 `SR_UPGRADE_RESTORE`，身份照常保住。start 之后等它 `registered`；
+/// 超时就恢复旧二进制并用同一 unit 拉起旧版，回到受管状态。
+fn coordinated_swap(
+    ctx: &RestartContext,
+    unit: &str,
+    handoff: &Path,
+    backup: &Path,
+    restore_dir: &Path,
+    log: &mut HelperLog,
+    timeouts: HelperTimeouts,
+) -> HelperOutcome {
+    coordinated_swap_with(
+        &RealSystemd,
+        ctx,
+        unit,
+        handoff,
+        backup,
+        restore_dir,
+        log,
+        timeouts,
+    )
+}
+
+/// [`coordinated_swap`] 的可注入版本（单测用它把三条失败分支逼出来）。
+///
+/// ## 失败一律「先恢复旧二进制，再拉起旧版」
+///
+/// 进入本函数时**旧 agent 已经退出**。任何一步失败都必须把磁盘恢复到旧版并用
+/// 同一 unit 把旧版拉回来，否则设备会停在一个"新版本在盘上但没人正确接管"的
+/// 状态；临时 agent 还会因为新进程没有交接指针而丢掉身份。
+///
+/// 因此这里的失败一律是 [`HelperOutcome::RolledBack`] + 如实的消息，
+/// **不能**用 "nothing changed" 的 `aborted`——那是事实错误。
+#[allow(clippy::too_many_arguments)]
+fn coordinated_swap_with(
+    ops: &dyn SystemdOps,
+    ctx: &RestartContext,
+    unit: &str,
+    handoff: &Path,
+    backup: &Path,
+    restore_dir: &Path,
+    log: &mut HelperLog,
+    _timeouts: HelperTimeouts,
+) -> HelperOutcome {
+    // 统一收尾：恢复旧二进制 → 拉起旧版 → 如实报告。
+    //
+    // 三条失败分支共用它，保证"绝不会留下已改的磁盘且不报实情"。
+    let fail_after_swap = |reason: String, log: &mut HelperLog| -> HelperOutcome {
+        // 备份不存在 = 还没走到换盘（stop / 排空阶段就失败了）。此时磁盘**确实**
+        // 没动过，如实这么说；不要谎称"已恢复"。
+        let swapped = backup.exists();
+        if !swapped {
+            log.line(&format!("{reason}; nothing on disk was changed"));
+            let start_failed = ops.start(unit).err();
+            let msg = match start_failed {
+                None => format!(
+                    "{reason}. Nothing on disk was changed and {unit} was started again. The old \
+                     agent had already exited for the upgrade, so its temporary identity may have \
+                     been re-registered as a new device."
+                ),
+                Some(e) => format!(
+                    "{reason}. Nothing on disk was changed, but {unit} could not be started ({e}); \
+                     the device is offline until it is started manually."
+                ),
+            };
+            log.line(&msg);
+            return HelperOutcome::rolled_back(
+                msg,
+                RollbackIdentity::Lost {
+                    detail: "the upgrade was interrupted before the swap; the old version was \
+                             restarted"
+                        .to_string(),
+                },
+            );
+        }
+        log.line(&format!("{reason}; restoring the previous binary"));
+        let restored = rename_with_retry(backup, &ctx.target_path, Duration::from_secs(15));
+        let start_failed = ops.start(unit).err();
+        let msg = match (&restored, &start_failed) {
+            (Ok(()), None) => format!(
+                "{reason}. The old agent had already exited for the upgrade; the previous binary \
+                 was restored and {unit} was started again. Temporary identities may have been \
+                 lost because the restarted agent could not pick up the handoff."
+            ),
+            (Ok(()), Some(e)) => format!(
+                "{reason}. The previous binary was restored but {unit} could not be started ({e}); \
+                 the device is offline until it is started manually."
+            ),
+            (Err(e), _) => format!(
+                "{reason}. Rolling back also failed ({e}): the previous binary is kept at {} and \
+                 the device needs manual attention.",
+                backup.display()
+            ),
+        };
+        log.line(&msg);
+        HelperOutcome::rolled_back(
+            msg,
+            RollbackIdentity::Lost {
+                detail: "the upgrade was interrupted after the handoff; the relay must not treat \
+                         this device as successfully upgraded"
+                    .to_string(),
+            },
+        )
+    };
+
+    // 1) **先停 service**（MYS-2425-D 评审建议）。
+    //
+    // 旧 agent 已经 `exit 0`，`Restart=always` 会在 `RestartSec` 后补起一个实例。
+    // 先把 unit 停掉，就从时序上消除了"补起的实例没有交接指针"的竞态——不再依赖
+    // `RestartSec` 足够长。
+    if let Err(e) = ops.stop(unit) {
+        return fail_after_swap(
+            format!("cannot stop {unit} to coordinate the upgrade: {e}"),
+            log,
+        );
+    }
+    if !ops.wait_empty(unit, Duration::from_secs(20)) {
+        return fail_after_swap(format!("{unit} still has processes 20s after stop"), log);
+    }
+    log.line(&format!("{unit} stopped; its cgroup is empty"));
+
+    // 2) 停稳之后再动磁盘：备份 → 原子替换。
+    //
+    // 顺序很关键：服务已停，此刻替换不会与任何正在运行的进程冲突，也不会被
+    // systemd 的自动重启抢先。
+    if let Err(e) = make_executable(&ctx.new_binary) {
+        return fail_after_swap(format!("cannot mark the new binary executable: {e}"), log);
+    }
+    if let Err(e) = rename_with_retry(&ctx.target_path, backup, Duration::from_secs(10)) {
+        return fail_after_swap(
+            format!(
+                "cannot move the current binary to {}: {e}",
+                backup.display()
+            ),
+            log,
+        );
+    }
+    log.line(&format!("current binary backed up to {}", backup.display()));
+    if let Err(e) = rename_with_retry(&ctx.new_binary, &ctx.target_path, Duration::from_secs(10)) {
+        return fail_after_swap(format!("cannot install the new binary: {e}"), log);
+    }
+    if let Some(parent) = ctx.target_path.parent() {
+        fsync_dir(parent);
+    }
+    log.line("new binary installed");
+
+    // 3) 一致性确认：盘上就是要装的那份字节。
+    if let Err(e) = verify_installed_binary(&ctx.target_path, &ctx.new_sha256) {
+        return fail_after_swap(
+            format!("the installed binary does not match the upgrade task: {e}"),
+            log,
+        );
+    }
+    log.line("new binary verified in place");
+
+    // 4) 登记待恢复指针并用同一 unit 启动新 agent。
+    //
+    // 新 agent 由 systemd 以 `ExecStart` 拉起（不 `spawn_agent`，避免第二个
+    // 无人托管的进程）；身份走指针 + 既有恢复协议。
+    pending_restore_marker(&ctx.upgrade_id, handoff, restore_dir);
+    if let Err(e) = ops.start(unit) {
+        return fail_after_swap(
+            format!("cannot start {unit} after installing the new binary: {e}"),
+            log,
+        );
+    }
+    log.line(&format!("{unit} started with the new binary"));
+
+    // 5) 等新 agent 注册（交接文件被消费即回执）。
+    match await_handoff_consumed(handoff, _timeouts.register) {
+        Ok(()) => {
+            log.line("the restarted agent consumed the handoff and registered; upgrade complete");
+            let _ = std::fs::remove_file(backup);
+            HelperOutcome::Registered {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }
+        }
+        Err(reason) => {
+            let _ = ops.stop(unit);
+            fail_after_swap(
+                format!("the restarted agent did not register: {reason}"),
+                log,
+            )
+        }
+    }
+}
+
+/// 让"由服务拉起的进程"能拿到这次换机的交接信息。
+///
+/// `systemctl start` 起来的进程带的是 unit 里声明的环境，拿不到助手设置的
+/// `SR_UPGRADE_RESTORE`。所以把交接文件路径写进私有目录里的一个**单文件**
+/// 指针，由 agent 启动时读取（与既有恢复协议同一个入口，只是发现方式不同）。
+///
+/// 指针只含路径、`0600`、写在 `0700` 目录里；Token 始终只在交接文件内。
+fn pending_restore_marker(upgrade_id: &str, handoff: &Path, dir: &Path) {
+    let ptr = dir.join(RESTORE_PENDING_FILE);
+    // 上一轮残留必须清掉：`write_private_new` 用 `create_new`，已存在就失败。
+    let _ = std::fs::remove_file(&ptr);
+    let body = format!("{}\n{}", upgrade_id, handoff.display());
+    match write_private_new(&ptr, body.as_bytes()) {
+        Ok(()) => {}
+        Err(e) => {
+            // 写不进指针不影响换机本体：helper 会继续等注册，超时即回滚。
+            let _ = e;
+        }
+    }
+}
+
+/// 交接文件被消费（新 agent 注册成功后删除）即成功。
+fn await_handoff_consumed(handoff: &Path, timeout: Duration) -> Result<(), String> {
+    // 必须**先看到它存在**再看到它消失。
+    //
+    // 只看"不存在"会把"交接文件根本不在"误判成成功（单测里当场暴露：没有真
+    // agent 消费，却报 Registered）。生产路径同理——文件被提前删掉或路径写错
+    // 时，面板会显示升级成功而磁盘上的新版本从未注册。
+    let deadline = Instant::now() + timeout;
+    let mut seen = false;
+    loop {
+        if handoff.exists() {
+            seen = true;
+        } else if seen {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no registration from the restarted agent within {timeout:?}{}",
+                if seen {
+                    ""
+                } else {
+                    " (the handoff file was never there — the restarted agent could not pick it up)"
+                }
+            ));
+        }
+        std::thread::sleep(POLL);
     }
 }
 
@@ -2332,7 +2838,100 @@ fn delegate_when_running_from_target(
 /// 只有返回 `Ok` 才能让旧进程退出。`Err` 覆盖三种情况：助手起不来（spawn
 /// 失败）、助手自己报了错（目录不可写、新文件校验不符）、超时没有任何回应。
 /// 三者都发生在磁盘被改动之前，旧 agent 照常服务。
+///
+/// **受 systemd 托管时必须走 transient unit**（MYS-2425-D）：本函数用
+/// `process_group(0)` 起的助手仍在旧 service 的 cgroup 里，主进程一退出就会被
+/// `KillMode=control-group` 一起清掉——现场就是这么卡住的。判据与失败处理见
+/// [`launch_helper_managed`]。
 pub fn launch_helper_and_wait_ready(
+    helper_exe: &Path,
+    handoff: &Path,
+    upgrade_id: &str,
+    timeout: Duration,
+) -> Result<std::process::Child, String> {
+    launch_helper_via(
+        managed_helper_route(upgrade_id),
+        helper_exe,
+        handoff,
+        upgrade_id,
+        timeout,
+    )
+}
+
+/// [`launch_helper_and_wait_ready`] 的显式路由版本。
+///
+/// 抽出来有两个用处：让"非 systemd 流程不回归"可以被**确定地**测到（测试机
+/// 自己往往就跑在 systemd unit 里，靠环境判定会让用例时灵时不灵），以及让
+/// 两条路径的差异只体现在一个枚举上。
+pub fn launch_helper_via(
+    route: ManagedRoute,
+    helper_exe: &Path,
+    handoff: &Path,
+    upgrade_id: &str,
+    timeout: Duration,
+) -> Result<std::process::Child, String> {
+    match route {
+        ManagedRoute::Direct => launch_helper_direct(helper_exe, handoff, timeout),
+        ManagedRoute::Transient => launch_helper_managed(helper_exe, handoff, upgrade_id, timeout),
+    }
+}
+
+/// 换机助手该怎么起。
+///
+/// 单独抽出来是为了让"什么时候必须走 transient、什么时候可以直连"成为一条
+/// 可单测的判定，而不是埋在 `launch_*` 里的一个 `if`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedRoute {
+    /// 非 systemd 环境：沿用既有直接助手流程（行为与 v0.59.5 完全一致）。
+    Direct,
+    /// systemd 托管：必须放到独立 transient unit，否则会被同 cgroup 清理。
+    Transient,
+}
+
+/// 判定本次该走哪条路。`managed` 由 [`managed_detection`] 给出，便于测试注入。
+pub fn managed_route(managed: bool) -> ManagedRoute {
+    if managed {
+        ManagedRoute::Transient
+    } else {
+        ManagedRoute::Direct
+    }
+}
+
+/// 生产路径的托管判定，Linus/macOS/Windows 的差异都在这里收敛。
+///
+/// 非 Linux 平台恒为 `false`：Windows 有 SCM/Job 那套语义，本修复不涉及，
+/// 行为必须与本改动之前逐字节一致。
+pub fn managed_detection() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        super::systemd_helper::current_is_managed()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// [`managed_route`] 的生产入口：读环境后给结论。
+fn managed_helper_route(upgrade_id: &str) -> ManagedRoute {
+    let route = managed_route(managed_detection());
+    if route == ManagedRoute::Transient {
+        tracing::info!(
+            upgrade_id = %upgrade_id,
+            cgroup = ?super::systemd_helper::current_cgroup_path(),
+            "this agent runs under a systemd unit — starting the update helper in a transient \
+             unit so it outlives this service's cgroup"
+        );
+    }
+    route
+}
+
+/// 既有流程：直接 `spawn` 助手，自成进程组。
+///
+/// 只在**非** systemd 环境使用。systemd 下这里的 `process_group(0)` 不改变
+/// cgroup，主进程退出会把助手一起清掉——这正是 MYS-2425-D 的根因，所以托管
+/// 环境绝不走这里（见 [`launch_helper_managed`]）。
+fn launch_helper_direct(
     helper_exe: &Path,
     handoff: &Path,
     timeout: Duration,
@@ -2363,7 +2962,47 @@ pub fn launch_helper_and_wait_ready(
             return Err("the update helper has no stdout pipe".to_string());
         }
     };
+    await_ready_line(stdout, child, timeout)
+}
 
+/// systemd 托管下的启动：把同一个隐藏子命令放进独立 transient unit。
+///
+/// 失败语义与直接助手一致——旧进程继续运行、磁盘不动——但**不回退**到直接
+/// 助手：那样只是把同一个 bug 再演一遍，还会让管理界面以为升级在进行中。
+fn launch_helper_managed(
+    helper_exe: &Path,
+    handoff: &Path,
+    upgrade_id: &str,
+    timeout: Duration,
+) -> Result<std::process::Child, String> {
+    #[cfg(target_os = "linux")]
+    {
+        match super::systemd_helper::launch(helper_exe, handoff, upgrade_id, timeout) {
+            super::systemd_helper::TransientHelper::Ready(child) => Ok(child),
+            super::systemd_helper::TransientHelper::Failed(reason) => Err(format!(
+                "cannot start the update helper as a systemd transient unit: {reason}"
+            )),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // 不可达：非 Linux 的 managed_detection() 恒为 false。保留分支是为了
+        // 让类型对上，且显式说明"这里不该发生"。
+        let _ = (helper_exe, handoff, upgrade_id, timeout);
+        Err("transient update helpers are only supported on Linux".to_string())
+    }
+}
+
+/// 从助手的 stdout 读首行，判定就绪与否。
+///
+/// 直接助手与 transient 助手共用这一段（transient 侧在
+/// [`super::systemd_helper::launch`] 里内联了等价逻辑，因为要先读懂 `--pipe`
+/// 的握手再决定是否收掉 unit）。这里保留一份，保证两条路径的**判据**一致。
+fn await_ready_line(
+    stdout: impl std::io::Read + Send + 'static,
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::Child, String> {
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::Builder::new()
         .name("sr-upgrade-ready".into())
@@ -2388,6 +3027,8 @@ pub fn launch_helper_and_wait_ready(
         }
     };
     if first == READY_LINE {
+        // 读线程只持有 `stdout`（它读到 EOF 自行结束），child 的所有权仍在本
+        // 栈上——直接返回即可。
         return Ok(child);
     }
     let _ = child.kill();

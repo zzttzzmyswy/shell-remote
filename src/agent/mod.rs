@@ -15,6 +15,10 @@ pub mod lan;
                                 #[cfg(feature = "desktop")]
 pub mod p2p;
 pub mod shell;
+// MYS-2425-D：systemd 托管下的换机助手启动（transient unit），
+// 以及"当前是否受 cgroup 托管"的判定。判定在 Linux 之外恒为 false，
+// 因此 Windows / 其它平台的换机路径与本改动之前**完全一致**。
+pub mod systemd_helper;
 pub mod tcp_tunnel;
 // MYS-2425 阶段2 review：本地 TLS mock（测试 CA + 指定 SAN 证书），
 // `doh` 与 `upgrade` 的测试共用，避免各自维护一份。
@@ -1368,6 +1372,10 @@ async fn run_session(
         }
         if accepted {
             r.complete();
+            // 不再需要"识别/收掉 systemd 补起的重复实例"（MYS-2425-D 评审）：
+            // `Restart=always` 的托管场景要么走 Coordinated（助手先 stop，补起
+            // 被取消，只有一个受管 MainPID），要么在换机前就 fail-closed 失败。
+            // 那条观察路径已无可达场景，故一并移除，缩小 diff。
         }
     }
 

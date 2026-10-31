@@ -1137,7 +1137,26 @@ async fn trigger_upgrade(
     {
         let broadcast = state.agent_broadcast.read().await;
         match broadcast.get(&sid).and_then(|cm| cm.agent.as_ref()) {
-            Some(tx) => crate::relay::ws::deliver(tx, "agent:upgrade", text),
+            // `deliver` 返回 false = 通道满或已关闭（**不是**"排队了"）。换机
+            // 指令静默丢掉会让界面显示"已触发"却什么都没发生，然后一路停在
+            // `started`（MYS-2425-D 冒烟实测过一次）。这种情况必须明确拒绝，
+            // 让管理员知道重试——而不是留下一个假的在途状态。
+            Some(tx) if crate::relay::ws::deliver(tx, "agent:upgrade", text) => {}
+            Some(_) => {
+                tracing::warn!(
+                    session = %sid,
+                    "agent:upgrade could not be queued — the agent uplink channel is full or closed"
+                );
+                return Err(Box::new((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "ok": false,
+                        "error": "agent uplink is busy or reconnecting; the upgrade command was not                                   delivered — retry in a moment",
+                        "code": "agent_uplink_unavailable",
+                    })),
+                )
+                    .into_response()));
+            }
             None => {
                 return Err(Box::new((
                     StatusCode::CONFLICT,
@@ -3212,5 +3231,77 @@ mod tests {
         assert_eq!(bw["dropped_frames"], 3);
         assert!(bw["throttled_waits"].is_u64());
         assert!(bw["down_bps_10s"].is_u64());
+    }
+}
+
+#[cfg(test)]
+mod admin_page_tests {
+    //! 管理页渲染契约（MYS-2425-D）：升级失败必须在**中英文**下都给出可读原因。
+    //!
+    //! 页面是 `include_str!` 进来的静态资源，没有类型检查兜底。以前只渲染
+    //! `u.error`，一旦某个阶段的文案键漏了，界面会显示 `upg_stage_undefined`
+    //! 或干脆空白——运维看到的是一台"卡住的设备"，而不是一条能照着做的结论。
+    //! 这组用例把"键必须两边都有"钉住。
+
+    const PAGE: &str = include_str!("admin_page.html");
+
+    /// 取某个语言字典里某个键的取值。
+    fn dict_value(lang: &str, key: &str) -> Option<String> {
+        let start = PAGE.find(&format!("    {lang}: {{"))?;
+        let rest = &PAGE[start..];
+        let needle = format!("{key}: \"");
+        let at = rest.find(&needle)?;
+        let after = &rest[at + needle.len()..];
+        let end = after.find('"')?;
+        Some(after[..end].to_string())
+    }
+
+    /// 失败/回滚两类终态在中英文下都必须有文案，且不能互相借用。
+    #[test]
+    fn test_failure_states_have_text_in_both_locales() {
+        for key in [
+            "upg_stage_failed",
+            "upg_stage_rolled_back",
+            "upg_stage_swapping",
+            "upg_failed_hint",
+            "upg_target",
+        ] {
+            let zh = dict_value("zh", key).unwrap_or_else(|| panic!("中文缺少 {key}"));
+            let en = dict_value("en", key).unwrap_or_else(|| panic!("英文缺少 {key}"));
+            assert!(!zh.trim().is_empty(), "中文 {key} 不能为空");
+            assert!(!en.trim().is_empty(), "英文 {key} 不能为空");
+            assert_ne!(zh, en, "{key} 的中英文不能相同（说明漏翻或写错位置）");
+        }
+    }
+
+    /// 失败分支必须把原因渲染出来，而不是只显示一句"升级失败"。
+    ///
+    /// 断言的是渲染代码里的关键动作：读 `u.error`、把原因写进文本、并带上
+    /// 目标版本与下一步提示。
+    #[test]
+    fn test_failed_stage_renders_the_reason() {
+        let at = PAGE
+            .find("function buildUpgradeStatus")
+            .expect("找不到 buildUpgradeStatus");
+        let body = &PAGE[at..];
+        let end = body.find("\n  }\n").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("u.error"),
+            "失败分支必须读 u.error（relay 判定的失败原因在这里）"
+        );
+        assert!(
+            body.contains("upg_failed_hint"),
+            "失败分支要给下一步动作提示"
+        );
+        assert!(
+            body.contains("upg_target"),
+            "失败分支要说明本来要升到哪个版本"
+        );
+        // 原因不能被截断成一行看不清的残句：允许换行。
+        assert!(
+            PAGE.contains(".upg-status .upg-reason"),
+            "失败原因需要 upg-reason 样式（允许换行）"
+        );
     }
 }

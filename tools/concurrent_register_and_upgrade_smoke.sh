@@ -78,8 +78,17 @@ agent_pid_for() { # $1 = index
   [ -f "$log" ] || { echo ""; return; }
   # 新版 agent 在启动时打印自己的 pid；没有就退回 pgrep（兼容）。
   pid="$(grep -o 'agent pid=[0-9]*' "$log" 2>/dev/null | tail -1 | cut -d= -f2)"
+  # **必须校验它还活着**：换机后由助手拉起的新进程，其 stderr 被助手接管
+  # （`spawn_agent` 给它 piped stderr，用来等注册回执），所以它的
+  # `agent pid=` 不会写进本文件的日志——日志里最后一条永远是**旧** pid。
+  # 只看日志会把"换机后新进程"判成"没换机"（MYS-2425-D 实测）。
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+    pid=""
+  fi
   if [ -z "$pid" ]; then
-    pid="$(pgrep -f "shell-remote agent .*--session-id cusag$1" 2>/dev/null | tail -1)"
+    # 按**确切 session id** 找活进程：换机后新进程带同一 sid，这正是要观察的。
+    pid="$(pgrep -f "shell-remote agent .*--session-id cusag$1$" 2>/dev/null | tail -1)"
+    [ -n "$pid" ] || pid="$(pgrep -f "shell-remote agent .*--session-id cusag$1 " 2>/dev/null | tail -1)"
   fi
   echo "$pid"
 }
@@ -174,20 +183,72 @@ fire_upgrades() { # $@ = session ids
     -H 'Content-Type: application/json' -d '{"session_id":"{}"}' 2>/dev/null
 }
 
-# 进程数：同名二进制必须恰好是"每台设备一个"，不能因为换机留下双进程。
-proc_count() { python3 - "$WORKDIR" "$N" <<'PY'
-import os,re,sys
-work,n=sys.argv[1],int(sys.argv[2])
-pids=set()
-for i in range(1,n+1):
+# 每个 session 的**活进程**数（MYS-2425-D review #3）。
+#
+# 旧实现数的是"日志里出现过的最后一个 pid"，有两个致命漏洞：
+#   1. 换机后由助手拉起的新进程 stderr 被助手接管，它的 `agent pid=` 根本
+#      不会写进日志文件——数出来的是**旧** pid，永远证明不了实际有几个进程；
+#   2. 断言是 `<= N`，少一个也算"通过"，无法证明"每个 sid 恰好 1 个"。
+#
+# 现在直接按**精确二进制路径 + 精确 `--session-id`** 枚举 /proc：
+#   - argv 必须含 `--session-id <sid>`（按独立词匹配，避免 cusag1 命中 cusag10）；
+#   - exe 必须就是本次被测的 `$BIN`（排除同机其它 shell-remote）；
+#   - stat 状态不能是 Z（僵尸不算活进程）。
+# 每行输出 `<sid> <count>`，由调用方逐个断言 == 1。
+live_proc_per_session() { python3 - "$BIN" "$N" <<'PY'
+import os,sys
+binarg,n=sys.argv[1],int(sys.argv[2])
+target=os.path.realpath(binarg)
+target_base=os.path.basename(target)
+def same_binary(argv0):
+    """argv[0] 是否指向被测二进制。
+
+    换机后磁盘上的二进制被原子替换：旧进程的 `/proc/<pid>/exe` 会变成
+    `... (deleted)`，新进程的 argv[0] 也可能被规范化成 `/proc/self/exe`
+    的解析路径。所以三重比较：realpath 相等 / basename 相等 / exe 的
+    realpath 相等（去掉 deleted 后缀）。任何一条成立即认为是同一份二进制。
+    """
     try:
-        text=open(os.path.join(work,f'agent{i}.log')).read()
-    except FileNotFoundError:
-        continue
-    found=re.findall(r'agent pid=(\d+)',text)
-    if found:
-        pids.add(found[-1])
-print(len(pids))
+        if os.path.realpath(argv0)==target:
+            return True
+    except OSError:
+        pass
+    if os.path.basename(argv0)==target_base:
+        return True
+    return False
+
+for i in range(1,n+1):
+    sid='cusag%d'%i
+    cnt=0
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        try:
+            with open('/proc/'+pid+'/cmdline','rb') as f:
+                argv=[a.decode('utf-8','replace') for a in f.read().split(b'\x00') if a]
+        except OSError:
+            continue
+        if len(argv)<2:
+            continue
+        if not same_binary(argv[0]):
+            continue
+        hit=False
+        for j,a in enumerate(argv):
+            if a=='--session-id' and j+1<len(argv) and argv[j+1]==sid:
+                hit=True; break
+            if a=='--session-id='+sid:
+                hit=True; break
+        if not hit:
+            continue
+        try:
+            with open('/proc/'+pid+'/stat') as f:
+                state=f.read().rsplit(')',1)[1].split()[0]
+            if state=='Z':
+                continue
+        except OSError:
+            continue
+        cnt+=1
+    print(sid,cnt)
 PY
 }
 
@@ -369,10 +430,51 @@ for _ in $(seq 1 120); do
 done
 [ -n "$new_pid" ] && APIDS[$UPG_IDX]="$new_pid"
 
+# fail-closed 是**合法结局**（MYS-2425-D 设计决定）：受管 service 归属无法确认
+# 或未授权时，agent 必须在磁盘改动之前明确失败并继续运行。测试环境正好是这种
+# 形状——8 个 agent 共享 `multica-daemon.service`。断言要区分两种合法结局：
+#   A) 换机发生：旧 pid 消失 + 新 pid 出现
+#   B) fail-closed：旧 pid 仍在 + relay 给出带原因的 failed + 磁盘未变
+read_stage() {
+  api /api/overview | python3 -c '
+import json,sys
+sid=sys.argv[1]
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for s in d.get("sessions",[]):
+  if s.get("session_id")==sid:
+    u=s.get("upgrade") or {}
+    print(u.get("stage",""), "|", (u.get("error") or "").replace("\n"," ")[:200])
+    break
+' "$1"
+}
+refused=0
+refuse_reason=""
+if [ -z "$new_pid" ]; then
+  # 等一小会儿让 fail-closed 的 failed 帧到达 relay
+  for _ in $(seq 1 20); do
+    line="$(read_stage "$UPG_SID")"
+    case "$line" in
+      failed*|rolled_back*) refuse_reason="$line"; refused=1; break ;;
+    esac
+    sleep 2
+  done
+fi
+
 if [ -n "$new_pid" ] && [ -z "$old_alive_after" ]; then
   ok "2.2 换机后 PID 变了（$OLD_PID → $new_pid）"
+elif [ "$refused" = "1" ] && [ -n "$old_alive_after" ]; then
+  # fail-closed：必须满足"旧进程仍在 + 磁盘未变 + 原因可读"。
+  disk_now="$(sha256sum "$BIN" 2>/dev/null | cut -d' ' -f1)"
+  if [ "$disk_now" = "$BIN_SHA" ]; then
+    ok "2.2 fail-closed 明确失败且磁盘未动（旧 pid $OLD_PID 仍在运行）"
+    echo "      原因: $refuse_reason"
+    FAIL_CLOSED=1
+  else
+    bad "2.2 fail-closed 却改动了磁盘（disk=${disk_now:0:12}）"
+  fi
 else
-  bad "2.2 未观察到换机（旧 pid $OLD_PID ${old_alive_after:+仍在运行}，新 pid ${new_pid:-无}）"
+  bad "2.2 未观察到换机，也没有明确的 fail-closed（旧 pid $OLD_PID ${old_alive_after:+仍在运行}，新 pid ${new_pid:-无}）"
 fi
 
 wait_identity "$UPG_SID" 60 || bad "2.3 换机后 $UPG_SID 未回到 relay"
@@ -382,6 +484,11 @@ after="$(sess_tokens "$UPG_SID" 2>/dev/null)"
   || bad "2.3 换机后身份变了：前 [$UPG_TOK_BEFORE] 后 [$(echo "$after" | cut -d' ' -f2-)]"
 
 # 磁盘上的二进制必须就是新制品（真实替换，不是"看起来升级了"）。
+# fail-closed 场景下则相反：磁盘必须**保持旧制品**（上面 2.2 已断言）。
+if [ "${FAIL_CLOSED:-0}" = "1" ]; then
+  echo "  · fail-closed：跳过 2.4（磁盘未被改动，已由 2.2 断言）"
+fi
+if [ "${FAIL_CLOSED:-0}" != "1" ]; then
 ON_DISK="$BIN"
 if [ -f "$ON_DISK" ]; then
   DISK_SHA="$(sha256sum "$ON_DISK" | cut -d' ' -f1)"
@@ -390,6 +497,7 @@ if [ -f "$ON_DISK" ]; then
     || bad "2.4 磁盘 hash 未变成新制品（disk=${DISK_SHA:0:12} art=${ART_SHA:0:12}）"
 fi
 
+fi
 # 换机状态必须收敛到终结态（不是一直"下载中"）。
 status_stage=""
 for _ in $(seq 1 30); do
@@ -409,6 +517,13 @@ for s in d.get("sessions",[]):
 done
 case "$status_stage" in
   registered) ok "2.5 升级状态收敛到 registered" ;;
+  # fail-closed 的合法终态：必须在**换机前**明确失败（2.2 已断言磁盘未动）。
+  failed|rolled_back)
+    if [ "${FAIL_CLOSED:-0}" = "1" ]; then
+      ok "2.5 升级状态收敛到 $status_stage（fail-closed）"
+    else
+      bad "2.5 升级失败: $status_stage（预期 registered）"
+    fi ;;
   "")         ok "2.5 状态已清空（终结态过期或未保留，不影响身份断言）" ;;
   *)          bad "2.5 升级状态停在非终结态: $status_stage" ;;
 esac
@@ -431,18 +546,31 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 [ -n "$new2" ] && APIDS[$UPG2_IDX]="$new2"
-[ -n "$new2" ] && ok "5.1 第二次换机 PID 变了（$OLD2_PID → $new2）" \
-  || bad "5.1 第二次换机 PID 未变化"
+if [ -n "$new2" ]; then
+  ok "5.1 第二次换机 PID 变了（$OLD2_PID → $new2）"
+elif [ "${FAIL_CLOSED:-0}" = "1" ]; then
+  # 同一台机器、同一服务归属 ⇒ 第二次同样被 fail-closed 拒绝，这是**正确**的。
+  ok "5.1 第二次换机同样 fail-closed（旧 pid $OLD2_PID 仍在运行，磁盘未动）"
+else
+  bad "5.1 第二次换机 PID 未变化"
+fi
 wait_identity "$UPG2_SID" 60 || bad "5.2 第二次换机后会话未回来"
 after2="$(sess_tokens "$UPG2_SID" 2>/dev/null)"
 [ "$(echo "$after2" | cut -d' ' -f2-)" = "$TOK2_BEFORE" ] \
   && ok "5.2 第二次换机后身份不变" \
   || bad "5.2 第二次换机后身份变了"
 
-# ── 6. 无重复进程 / 无 panic ───────────────────────────────────────
-procs="$(proc_count)"
-[ "$procs" -le "$N" ] && ok "无重复 agent 进程（$procs ≤ $N）" \
-  || bad "出现重复 agent 进程（$procs > $N）——换机残留旧进程"
+# ── 6. 每个 session 恰好 1 个活进程 / 无 panic ────────────────────
+#
+# 「恰好 1」而不是「≤ N」：少一个说明有设备失联，多一个说明换机留下了重复
+# 进程。两种都必须报出来。
+bad_sids=""
+while read -r sid cnt; do
+  [ -z "$sid" ] && continue
+  [ "$cnt" = "1" ] || bad_sids="$bad_sids $sid=$cnt"
+done <<< "$(live_proc_per_session)"
+[ -z "$bad_sids" ] && ok "每个 session 恰好 1 个活 agent 进程（共 $N 个）" \
+  || bad "活进程数不等于 1:$bad_sids"
 panics=$(grep -l 'panicked' "$WORKDIR"/*.log 2>/dev/null | wc -l)
 [ "$panics" -eq 0 ] && ok "无 panic" || bad "$panics 个日志含 panic"
 kill -0 "$RELAY_PID" 2>/dev/null && ok "relay 存活" || bad "relay 已退出"

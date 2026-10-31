@@ -259,6 +259,31 @@ async fn smoke_test(_path: &std::path::Path) -> bool {
     true
 }
 
+/// 换机前算出的 systemd 协调方案（MYS-2425-D 设计决定：fail-closed）。
+///
+/// **必须在旧 agent 仍在线、磁盘未动时调用**：
+///
+/// - `Restart=always` 的 `MainPID` 在重启窗口内是 0，事后判定拿不到答案；
+/// - "能不能协调"本就该在动手之前问清楚——不能协调就当场失败，旧进程继续服务。
+///
+/// 返回 `None` = 非 systemd 托管（走既有直接助手路径，行为不变）。
+fn managed_plan_for_upgrade() -> Option<crate::agent::systemd_helper::ManagedPlan> {
+    #[cfg(target_os = "linux")]
+    {
+        // 只读探测：`systemctl show` + `/proc` + `pkcheck`，不停启任何 unit。
+        let probe = crate::agent::systemd_helper::probe();
+        let plan = crate::agent::systemd_helper::decide(&probe);
+        if matches!(plan, crate::agent::systemd_helper::ManagedPlan::Direct) {
+            return None;
+        }
+        Some(plan)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// 「已校验的制品」到「正在运行的二进制」之间的那一步。
 ///
 /// 阶段 3 起这一步**不由本进程执行**：Windows 无法替换运行中的 `.exe`，
@@ -270,6 +295,24 @@ fn hand_over_to_helper(
     task: &UpgradeTask,
     artifact: &std::path::Path,
 ) -> Result<std::process::Child, String> {
+    // ── 先判定"能不能把服务生命周期协调好"再动手 ────────────────────
+    //
+    // fail-closed（MYS-2425-D 设计决定）：只有归属明确的单 agent service 且当前
+    // 身份**已**被授权管理它时，才允许继续换机；否则**在这里、旧进程仍在线、
+    // 磁盘未动**的情况下上报失败，并给出可操作的原因。
+    //
+    // 绝不降级成"助手 spawn 一个无人托管的进程"（会留下第二个实例），也绝不
+    // 偷偷提权/改 sudoers/改 unit。
+    let managed_plan = managed_plan_for_upgrade();
+    if let Some(crate::agent::systemd_helper::ManagedPlan::Refuse { unit, reason }) = &managed_plan
+    {
+        let hint = "Nothing on disk was changed and this agent keeps running. To upgrade this device, either set `Restart=on-failure` in the service (the agent exits 0 when it hands over, so it will not be restarted), or have an administrator grant this account permission to manage the service lifecycle (polkit `org.freedesktop.systemd1.manage-units`).";
+        return Err(match unit {
+            Some(u) => format!("{reason} {hint} Affected unit: {u}."),
+            None => format!("{reason} {hint}"),
+        });
+    }
+
     // 原始 argv（去掉 argv[0]）。隐藏恢复参数由 `RestartContext::new` 剥掉，
     // 避免上一轮的交接信息被当成这一轮的。
     let raw_argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -299,6 +342,16 @@ fn hand_over_to_helper(
         task.sha256.clone(),
         task.upgrade_id.clone(),
         task.target_version.clone(),
+        // systemd 托管时把本轮 service 的 cgroup 一并交接：新进程靠它认出
+        // systemd 按 `Restart=always` 补起的重复实例并报告（MYS-2425-D）。
+        // 非 systemd 环境为 `None`，那条路径行为不变。
+        // service cgroup / Restart 策略供 helper 记录与诊断；真正的决策是
+        // 上面 probe 算出的 managed_plan。
+        crate::agent::systemd_helper::current_cgroup_path(),
+        crate::agent::systemd_helper::current_cgroup_path()
+            .map(|cg| crate::agent::systemd_helper::service_unit_name(&cg))
+            .and_then(|u| crate::agent::systemd_helper::service_restart_policy(&u)),
+        managed_plan.clone(),
     );
     // Token 只进 0600/当前用户 ACL 的交接文件：argv 会出现在 `ps` 里，
     // 日志会被收集走，两者都不能碰。
@@ -313,6 +366,8 @@ fn hand_over_to_helper(
     match update_apply::launch_helper_and_wait_ready(
         &ctx.helper_exe,
         &handoff,
+        // transient unit 名要按 upgrade_id 唯一，避免并发换机撞名。
+        &task.upgrade_id,
         update_apply::HELPER_READY_TIMEOUT,
     ) {
         Ok(child) => Ok(child),
@@ -1033,6 +1088,9 @@ mod tests {
             task.sha256.clone(),
             task.upgrade_id.clone(),
             task.target_version.clone(),
+            None,
+            None,
+            None,
         );
         // 上一轮的恢复参数必须被剥掉，否则新一轮会去读上一轮的身份。
         assert_eq!(

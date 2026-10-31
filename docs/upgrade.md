@@ -119,6 +119,140 @@ TTL 上限 300s，解析失败有 15s 负缓存（仍带 `expires_at`，让 agen
 
 升级全程在设备行的"版本"列实时显示状态（已触发 / 下载中 n% / 校验中 / 安装重启中 / 失败原因）；完成后显示绿色"已升级 v<版本>"，device 版本列同步刷新。
 
+## systemd 托管下的换机
+
+### 为什么需要单独处理
+
+换机的正常路径是**旧 agent 主动退出**，让助手替换二进制。systemd 默认的
+`KillMode=control-group` 会在 service 主进程退出时，把该 service cgroup 里的
+**所有**进程一起杀掉——包括刚被拉起的助手。
+
+`setsid` / `nohup` / `process_group(0)` 都救不了这一点：它们只改进程组或会话，
+**不改 cgroup**。v0.59.5 及更早版本的现场故障就是这个形状：助手日志停在
+`ready announced; waiting for the old process to exit`，磁盘仍是旧版，relay 收
+不到终结帧，管理页永远停在"换机中"。
+
+### v0.59.6 起怎么做
+
+agent 启动助手前先判断自己是否受 systemd 托管，判据是**两个条件同时成立**：
+
+| 条件 | 读法 | 为什么不能只用其中一个 |
+|------|------|------------------------|
+| `INVOCATION_ID` 非空 | 环境变量 | 在服务的终端里手工跑 agent 会继承它，但那种进程不在 unit cgroup 里 |
+| 自身 cgroup 落在 `*.service` | `/proc/self/cgroup` | 只认 `.service`：只有 service 有"主进程"，`KillMode` 的清理由主进程退出触发；scope 没有主进程，不会因某个成员退出而拆掉 |
+
+托管时，助手不再直接 `spawn`，而是通过 `systemd-run` 起成**独立的 transient
+unit**（用户级 manager，`--user`）：
+
+```text
+systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
+  --property=KillMode=process --pipe \
+  /usr/local/bin/shell-remote update-apply /home/sr-agent/.shell-remote/upgrade/.handoff-….json
+```
+
+- `--property=KillMode=process`：助手退出时只收掉它自己，**不连带杀掉它拉起的
+  新 agent**——默认的 `control-group` 会把新 agent 一起清掉，等于把问题下移一层。
+- `--pipe`：stdout 仍是 `ready` 握手通道，旧 agent 的判据与直接助手完全一致。
+- 只有交接文件**路径**进 argv。Token、`--key`、原始 argv 全在 `0600` 的交接
+  文件里，不进 unit 属性（`systemctl show` 可读）、不进日志。
+- 非 systemd 环境（容器、普通 shell、Windows）继续走既有的直接助手流程，
+  行为与之前逐字节一致。
+
+### 失败时不会卡住
+
+`systemd-run` 不存在 / 无权限（系统级 `systemd-run` 需要 polkit 授权）/ 起不来 /
+20s 内没报 `ready` 时：
+
+1. 删除本轮交接文件；
+2. 上报 `failed` 并**继续运行**（磁盘一点没动）；
+3. 绝不回退到会被同 cgroup 清理的直接助手。
+
+### relay 侧的状态收敛
+
+助手被连带杀掉时不会有人发终结帧。relay 因此会在 agent **重新注册**时收敛：
+
+- 同一个 `upgrade_id` 仍在换机中途（`verifying` / `swapping` / `installing`），
+  而重连回来的版本**低于**目标版本 ⇒ 当场转 `failed`，原因写明"助手未完成、
+  磁盘未变、请查设备上的 `update-apply.log` 后重试"；
+- 重连版本**等于**目标版本 **不算成功**——成功只认新进程的 `registered` 回执，
+  版本号不能用来推断；
+- 已是 `registered` / `rolled_back` / `failed` 的不覆盖（`rolled_back` 是助手给
+  出的更精确结论）；
+- 没有重连的悬挂任务由 30 分钟 TTL 收敛为过期清理。
+
+### systemd 托管 service：先确认可协调，再换机
+
+换机时 agent 是**正常退出（exit 0）**把控制权交给助手。systemd 托管下，助手
+**在磁盘改动之前**先做一次能力检查，只有确认"能协调"才继续：
+
+| 检查项 | 要求 | 不满足时 |
+|--------|------|----------|
+| 能否确定 unit | 自身 cgroup 落在 `*.service`，且能取到 unit 名 | 拒绝 |
+| 归属是否明确 | `systemctl show -p MainPID` **等于**当前 agent PID | 拒绝（多 agent 共享一个 service 时必然不相等） |
+| 是否单 agent | 同 cgroup 里没有同 exe 的其它 agent | 拒绝（stop 会连带停掉它们） |
+| 形态是否相符 | `ExecStart` **直接** exec 运行中的这份二进制 | 拒绝（wrapper 脚本下换文件不等于换服务启动的东西） |
+| 重启策略 | `Restart=always` | **`Restart=on-failure` / `no` 等 ⇒ 直接走既有路径**（不会补起，天然单实例） |
+| 是否已授权 | `pkcheck org.freedesktop.systemd1.manage-units` 返回 `yes` | 拒绝（**不探测、不提权、不改 sudoers/unit**） |
+
+**全部满足** ⇒ 助手执行受控的 `systemctl stop <unit>`（取消 `Restart=always` 的
+待执行重启）、等旧 cgroup 排空、替换磁盘、再用同一 unit `start`：新 agent 回到
+唯一受管 MainPID，不存在第二个实例。
+
+**任何一项不满足** ⇒ fail-closed：**在旧 agent 退出前**上报 `failed`，磁盘一点
+不动，旧 agent 继续服务，管理页显示可操作的原因（改 `Restart=on-failure`，或由
+管理员授权服务生命周期操作）。
+
+实测（本任务新建的临时 unit）：
+
+| 场景 | 结果 |
+|------|------|
+| `Restart=on-failure`，单 agent | 换机成功：新 PID、Token 不变、磁盘 hash 为新制品、单进程、`NRestarts=0` |
+| `Restart=always`，未授权（普通账户） | **换机前** `failed` + 可读原因；磁盘 hash 未变、MainPID 未变、`NRestarts=0`、单进程 |
+| `Restart=always`，已授权（root 的测试 unit） | 协调成功：`NRestarts=0`、单进程、Token 不变、磁盘为新制品、`registered` |
+
+> 为什么不在换机后判定：`Restart=always` 的 `MainPID` 在 `RestartSec` 窗口内是
+> `0`（实测连续 3s），事后无法确认"这台设备是不是该 unit 的主进程"。把检查
+> 放在动手之前，既拿得到答案，也天然满足"不能升级就别动磁盘"。
+
+### 时序：先 stop 再换盘
+
+协调模式的顺序是 **旧 agent 退出 → stop → 备份/替换 → start**，不是"先换盘再 stop"。
+
+旧 agent 收到 ready 后为换机 `exit 0`，`Restart=always` 会在 `RestartSec`（systemd
+默认 100ms，模板 5s）后补起一个实例；helper 检测到旧进程退出后才执行 stop，因此
+`RestartSec` 很短时，stop 之前仍可能先补起一个实例。由于此时**磁盘还没动**，补起的
+是旧版本，只会短暂注册一次，随后被 stop 终止；之后才换盘、start 并通过交接指针
+恢复身份。最终仍只有一个受管 agent，磁盘状态一致。若之前"先换盘再 stop"，补起的
+就会是**没有交接指针的新版本**，临时 agent 会因此丢失身份。
+
+### 失败一律先恢复旧二进制
+
+进入协调换机时旧 agent **已经退出**，所以任何一步失败都必须把磁盘恢复到旧版
+并用同一 unit 把旧版拉回来，否则设备会停在"新版本在盘上但没人正确接管"的状态。
+失败分两档、消息如实反映：
+
+| 失败位置 | 磁盘状态 | outcome 与消息 |
+|---|---|---|
+| `stop` 失败 / cgroup 20s 未排空 | **未动**（备份还没产生） | `rolled_back` + "Nothing on disk was changed … started again"，并说明临时身份可能已被重新注册为新设备 |
+| 备份后任一失败（替换、校验、start、等注册超时） | **已改成新版** → 恢复旧版 | `rolled_back` + "the previous binary was restored … temporary identities may have been lost" |
+| 恢复也失败 | 新版留在盘上、旧版在备份路径 | `rolled_back` + 指出备份路径，需要人工处理 |
+
+> 不能用 `aborted`（"未改动即放弃"）——那时旧进程已经退出、磁盘可能已被改。
+
+> 用户级 `systemd-run` 仍用于让助手活过旧 service 的 cgroup 清理（`KillMode=process`
+> 保证它拉起的进程不被一并收掉）。没有用户级 manager 的账户（例如 root 常无
+> `/run/user/0`）自动回退到系统级 transient unit。
+
+### 排查清单
+
+| 现象 | 查看 | 结论 |
+|------|------|------|
+| 管理页停在"换机中" | 设备上 `~/.shell-remote/upgrade/update-apply.log` | 末行是 `ready announced` 却无后续 ⇒ 助手被 cgroup 清掉（旧版本）；有 `cannot ...` ⇒ 按原因处理 |
+| 管理页显示"升级失败 / 助手未完成" | 同上 + `systemctl status <unit>` | relay 在重连时判定助手没完成；磁盘未变，可直接重试 |
+| 声明"无法作为 transient unit 启动" | `systemd-run --user --unit=probe --collect true` | 失败 ⇒ 该账户没有可用的用户级 manager（无 `XDG_RUNTIME_DIR` / 无 dbus session），升级会被明确拒绝而不是卡住 |
+| 两个 agent | `pgrep -af 'shell-remote agent'`；`systemctl show -p NRestarts <unit>` | `Restart=always` 补起的重复实例，见上一节 |
+
+
 ## 身份保持与回滚
 
 - **制品目录必须可读**（relay 需要现场算 hash）；**agent 所在目录必须可写**（替换需要该目录写权限），失败会在后台明确提示
