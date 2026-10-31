@@ -432,7 +432,8 @@ impl UpgradeTask {
     /// 这次下载允许解析的主机白名单（本任务**合法** CDN base 的主机）。
     ///
     /// 只收通过 [`normalize_cdn_base`] 的 base：非法条目本来就不会被下载，让它
-    /// 进入 DNS 白名单只会平白扩大可解析面。
+    /// 进入 DNS 白名单只会平白扩大可解析面。带路径前缀的 base 同样只取 host
+    /// 部分（`https://gh-proxy.com/https://github.com` → `gh-proxy.com`）。
     pub fn cdn_hosts(&self) -> Vec<String> {
         if !self.allows_cdn() {
             return Vec::new();
@@ -450,6 +451,46 @@ impl UpgradeTask {
             }
         }
         hosts
+    }
+
+    /// 这次下载的重定向白名单：CDN 主机 + （仅在任务含官方 origin 时）官方
+    /// 资产主机。
+    ///
+    /// `https://github.com/<o>/<r>/releases/download/...` 会 302 到
+    /// `release-assets.githubusercontent.com`。不放行这个主机，官方源就永远
+    /// 失败——而这恰恰是「CDN 全挂、只能靠 relay 兜底」的现场形态。
+    ///
+    /// **只在任务的 CDN 列表里出现裸 `github.com` origin 时才扩展**：没有官方
+    /// origin 的任务不该多出两个可跳转目标。扩展不扩大可下载内容——字节仍由
+    /// 任务里的 SHA-256 钉死，跳转目标只是同一个官方资产的另一种取法。
+    pub fn cdn_redirect_hosts(&self) -> Vec<String> {
+        let mut hosts = self.cdn_hosts();
+        if self.has_official_origin() {
+            for host in crate::relay::artifact_store::OFFICIAL_ASSET_REDIRECT_HOSTS {
+                if !hosts.iter().any(|h| h == host) {
+                    hosts.push((*host).to_string());
+                }
+            }
+        }
+        hosts
+    }
+
+    /// 本任务的 CDN 列表里是否有作者仓库的官方 origin（`github.com`）。
+    ///
+    /// 按 host 精确比对，不做后缀匹配：`github.com.evil.test` 不是官方 origin。
+    fn has_official_origin(&self) -> bool {
+        let official = crate::relay::artifact_store::cdn_host(
+            crate::relay::artifact_store::OFFICIAL_DOWNLOAD_BASE,
+        );
+        let Some(official) = official else {
+            return false;
+        };
+        self.cdn_base_urls.iter().any(|base| {
+            normalize_cdn_base(base)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                .is_some_and(|h| h == official)
+        })
     }
 
     /// 按契约排出下载源：CDN 依次，relay 最后。
@@ -647,49 +688,17 @@ pub fn validate_relay_path(raw: &str) -> Result<String, String> {
     Ok(path.to_string())
 }
 
-/// CDN base 的规范化形态：`scheme://host[:port]`，无 userinfo / path / query /
-/// fragment。
+/// CDN base 的规范化形态：裸 origin（`scheme://host[:port]`）或前缀镜像
+/// （`scheme://host[:port]/<前缀路径>`），无 userinfo / query / fragment。
 ///
 /// 用标准 URL parser 而不是字符串前缀判断——后者放行
 /// `https://user:pass@cdn.test/?x#y` 这类会让请求落到奇怪目标、并把凭据写进日志
 /// 的写法。
+///
+/// 契约与 relay 侧是同一份实现（[`crate::relay::artifact_store::normalize_cdn_base`]）：
+/// 前缀镜像要求把完整官方 URL 接在镜像 origin 之后，只写 origin 会 404。
 pub fn normalize_cdn_base(raw: &str) -> Result<url::Url, String> {
-    // 不 trim：`url::Url::parse` 会静默吃掉前后空白，让畸形条目"看起来合法"。
-    // 带空白的 base 是配置错误，明确报出来比悄悄修好更安全。
-    if raw.trim() != raw {
-        return Err(format!("CDN base {raw:?} has leading/trailing whitespace"));
-    }
-    let parsed =
-        url::Url::parse(raw).map_err(|e| format!("CDN base {raw:?} is not a valid URL: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(format!(
-                "CDN base {raw:?} uses scheme {other:?}; only http/https are accepted"
-            ))
-        }
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(format!(
-            "CDN base {raw:?} must not carry userinfo (credentials in a mirror URL)"
-        ));
-    }
-    if parsed.host_str().is_none_or(str::is_empty) {
-        return Err(format!("CDN base {raw:?} has no host"));
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(format!(
-            "CDN base {raw:?} must not carry a query or fragment (it is an origin prefix)"
-        ));
-    }
-    // 只接受裸 origin：`/` 是唯一可接受的 path。镜像约定是 base + official_path。
-    if parsed.path() != "/" && !parsed.path().is_empty() {
-        return Err(format!(
-            "CDN base {raw:?} must be a bare origin without a path (got {:?})",
-            parsed.path()
-        ));
-    }
-    Ok(parsed)
+    crate::relay::artifact_store::normalize_cdn_base(raw)
 }
 
 /// 校验 `official_path`：必须就是官方 release 的下载路径。
@@ -757,10 +766,16 @@ pub fn validate_official_path(raw: &str, filename: &str) -> Result<String, Strin
 /// `base + official_path`，两段都按 URL 语法校验（不接受 userinfo、query、
 /// fragment、`..`、反斜杠、控制字符）。拼不出合法 URL 就跳过该源。
 ///
-/// 返回值仍带 origin 校验：拼好后再确认 host 与 base 一致——万一 `Url::join`
-/// 的路径规范化把目标改到别的 host，这里会拒绝。
+/// **必须是字符串拼接**：`base.trim_end_matches('/') + official_path`。前缀镜像
+/// 的写法是 `https://gh-proxy.com/https://github.com`，用 `Url::join` /
+/// `set_path` 会把其中的 `//` 归一成 `/`，镜像侧认不出目标而回 404。
+///
+/// 拼好后再解析一次做 origin 校验：host 必须还是 base 的 host，且没有引入
+/// query/fragment——任何让请求落到别的主机的拼接结果都拒绝。
 pub fn join_cdn_url(base: &str, official_path: &str) -> Option<String> {
     let base_url = normalize_cdn_base(base).ok()?;
+    let base_host = base_url.host_str()?.to_ascii_lowercase();
+    let base_port = base_url.port();
     // 不 trim：畸形 path 一律拒绝（见 `validate_relay_path`）。
     let path = official_path;
     if !path.starts_with('/')
@@ -774,15 +789,27 @@ pub fn join_cdn_url(base: &str, official_path: &str) -> Option<String> {
     {
         return None;
     }
-    let mut url = base_url;
-    url.set_path(path);
-    url.set_query(None);
-    url.set_fragment(None);
-    // 再确认一次：host 必须还是 base 的 host，且没有引入 query/fragment。
-    if url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
+    let joined = crate::relay::artifact_store::join_cdn(base, path);
+    let parsed = url::Url::parse(&joined).ok()?;
+    if parsed.host_str()?.to_ascii_lowercase() != base_host || parsed.port() != base_port {
         return None;
     }
-    Some(url.to_string().trim_end_matches('/').to_string())
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    // 前缀路径必须原样保留（`/https://github.com/...`）：解析器若改写了它，
+    // 镜像拿到的是另一个路径。
+    let expected_path = {
+        let authority_start = joined.find("://")? + 3;
+        match joined[authority_start..].find('/') {
+            Some(i) => joined[authority_start + i..].to_string(),
+            None => "/".to_string(),
+        }
+    };
+    if parsed.path() != expected_path {
+        return None;
+    }
+    Some(joined)
 }
 
 // ── 进度 ────────────────────────────────────────────────────────────
@@ -830,35 +857,63 @@ impl std::fmt::Debug for RelaySource {
 /// CDN 把请求引到内网地址或攻击者服务器（SSRF / 流量劫持）。折中：跳转目标
 /// 必须仍在本次任务的 CDN 主机白名单内，否则请求直接失败。
 ///
+/// 单次跳转的放行判定（[`redirect_policy`] 的唯一决策点，单独可测）。
+///
+/// `allowed` 已小写去空；`previous` 是已经走过的 URL 链（最后一个 = 直接来源）。
+/// 返回 `Ok(())` 表示跟随，`Err(原因)` 表示拒绝并终止请求。
+pub(crate) fn check_redirect(
+    next: &url::Url,
+    previous: &[url::Url],
+    allowed: &[String],
+) -> Result<(), String> {
+    if previous.len() >= 5 {
+        return Err("too many redirects while downloading the upgrade artifact".to_string());
+    }
+    let host = next.host_str().unwrap_or("").to_ascii_lowercase();
+    // 降级到 http 会把「已校验的 TLS 通道」换成明文，直接拒绝。
+    let downgrade =
+        next.scheme() == "http" && previous.last().is_some_and(|p| p.scheme() == "https");
+    if !matches!(next.scheme(), "http" | "https") {
+        return Err(format!(
+            "refusing redirect to {next} — scheme {:?} is not http/https",
+            next.scheme()
+        ));
+    }
+    if downgrade {
+        return Err(format!(
+            "refusing redirect to {next} — it downgrades https to http"
+        ));
+    }
+    if !allowed.iter().any(|a| a == &host) {
+        return Err(format!(
+            "refusing redirect to {next} — host {host:?} is not one of this upgrade task's \
+             CDN hosts {allowed:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// 白名单为空 → 一个跳转都不跟随（调用方无法给出可信集合时的保守默认）。
 pub fn redirect_policy(allowed_hosts: Vec<String>) -> reqwest::redirect::Policy {
-    let allowed: Vec<String> = allowed_hosts
-        .into_iter()
-        .map(|h| h.trim().to_ascii_lowercase())
-        .filter(|h| !h.is_empty())
-        .collect();
+    let allowed: Vec<String> = normalize_host_list(allowed_hosts);
     reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 5 {
-            return attempt.error("too many redirects while downloading the upgrade artifact");
-        }
-        let next = attempt.url().clone();
-        let host = next.host_str().unwrap_or("").to_ascii_lowercase();
-        let scheme_ok = matches!(next.scheme(), "http" | "https");
-        // 降级到 http 会把「已校验的 TLS 通道」换成明文，直接拒绝。
-        let downgrade = next.scheme() == "http"
-            && attempt
-                .previous()
-                .last()
-                .is_some_and(|p| p.scheme() == "https");
-        if scheme_ok && !downgrade && allowed.iter().any(|a| a == &host) {
-            attempt.follow()
-        } else {
-            attempt.error(format!(
-                "refusing redirect to {next} — host {host:?} is not one of this upgrade task's \
-                 CDN hosts {allowed:?} (or the redirect downgrades https to http)"
-            ))
+        match check_redirect(attempt.url(), attempt.previous(), &allowed) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
         }
     })
+}
+
+/// 主机白名单的规范化：trim + 小写 + 去空 + 去重（保持顺序）。
+pub(crate) fn normalize_host_list(hosts: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for host in hosts {
+        let host = host.trim().to_ascii_lowercase();
+        if !host.is_empty() && !out.contains(&host) {
+            out.push(host);
+        }
+    }
+    out
 }
 
 /// 下载成功的结果。
@@ -2407,6 +2462,9 @@ mod tests {
 
     /// 畸形 CDN base 不会让整条任务解析失败（relay 可能给多个源，坏一个不该
     /// 拦住全部），但**不能**进白名单、也不能被拼成请求。
+    ///
+    /// 带路径前缀的镜像（`https://gh-proxy.com/https://github.com`）是合法条目，
+    /// 不再是畸形输入——见 [`test_prefix_mirror_base_is_accepted`]。
     #[test]
     fn test_payload_with_malformed_cdn_base_is_excluded_not_normalized() {
         let hash = {
@@ -2421,11 +2479,12 @@ mod tests {
             "sha256": hash,
             "official_path": format!("/zzttzzmyswy/shell-remote/releases/download/v9.9.9/{name}"),
             "cdn_base_urls": [
-                "https://user:pass@evil.test",       // userinfo
-                "https://cdn.test/?x=1",             // query
-                " https://cdn.test",                 // 前后空白
-                "https://cdn.test/mirror",           // 带路径
-                "https://good.test",                 // 唯一合法的
+                "https://user:pass@evil.test",          // userinfo
+                "https://cdn.test/?x=1",                // query
+                " https://cdn.test",                    // 前后空白
+                "https://cdn.test/mirror/../evil",      // 路径穿越
+                "https://cdn.test/%2e%2e/evil",         // 百分号编码
+                "https://good.test",                    // 唯一合法的
             ],
         }))
         .expect("任务本身仍可解析");
@@ -2439,6 +2498,95 @@ mod tests {
             assert!(!s.url.contains("user:pass"));
             assert!(!s.url.contains('?'));
         }
+    }
+
+    /// 前缀镜像 base：完整 URL = `base + official_path`，且 `/https://github.com/`
+    /// 必须逐字保留（用 `Url::join` / `set_path` 会把它压成 `/https:/github.com/`）。
+    #[test]
+    fn test_prefix_mirror_base_is_accepted() {
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(ARTIFACT))
+        };
+        let name = local_filename();
+        let path = format!("/zzttzzmyswy/shell-remote/releases/download/v9.9.9/{name}");
+        let task = UpgradeTask::from_payload(&serde_json::json!({
+            "target_version": "9.9.9",
+            "filename": name,
+            "size": ARTIFACT.len(),
+            "sha256": hash,
+            "official_path": path,
+            "cdn_base_urls": [
+                "https://gh-proxy.com/https://github.com",
+                "https://gh-proxy.com/https://github.com/",   // 结尾斜杠等价
+            ],
+        }))
+        .expect("带路径前缀的 base 是合法条目");
+        // 两条 base 是同一个 host，白名单去重成一个。
+        assert_eq!(task.cdn_hosts(), vec!["gh-proxy.com".to_string()]);
+        let sources = task.sources();
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        for s in &sources {
+            assert_eq!(
+                s.url,
+                format!("https://gh-proxy.com/https://github.com{path}"),
+                "前缀路径必须原样保留"
+            );
+            assert!(s.label.contains("gh-proxy.com"), "{}", s.label);
+        }
+    }
+
+    /// `cdn_redirect_hosts`：官方资产跳转主机只在任务含裸 `github.com` origin
+    /// 时出现——没有官方 origin 的任务不该多出可跳转目标。
+    #[test]
+    fn test_redirect_hosts_add_official_asset_hosts_only_with_official_origin() {
+        let name = local_filename();
+        let with_official = task_with(
+            &name,
+            ARTIFACT,
+            vec![
+                "https://gh-proxy.com/https://github.com".into(),
+                "https://github.com".into(),
+            ],
+            None,
+        );
+        let hosts = with_official.cdn_redirect_hosts();
+        for host in crate::relay::artifact_store::OFFICIAL_ASSET_REDIRECT_HOSTS {
+            assert!(hosts.iter().any(|h| h == host), "缺少 {host}: {hosts:?}");
+        }
+        assert!(hosts.contains(&"github.com".to_string()));
+        assert!(hosts.contains(&"gh-proxy.com".to_string()));
+
+        // 只有镜像、没有官方 origin → 不扩展。
+        let mirror_only = task_with(
+            &name,
+            ARTIFACT,
+            vec![
+                "https://gh-proxy.com/https://github.com".into(),
+                "https://edgeone.gh-proxy.org/https://github.com".into(),
+            ],
+            None,
+        );
+        let hosts = mirror_only.cdn_redirect_hosts();
+        for host in crate::relay::artifact_store::OFFICIAL_ASSET_REDIRECT_HOSTS {
+            assert!(!hosts.iter().any(|h| h == host), "不该有 {host}: {hosts:?}");
+        }
+        assert_eq!(hosts, vec!["gh-proxy.com", "edgeone.gh-proxy.org"]);
+
+        // 形似官方但后缀不同 → 不算官方 origin。
+        let lookalike = task_with(
+            &name,
+            ARTIFACT,
+            vec!["https://github.com.evil.test".into()],
+            None,
+        );
+        assert!(
+            !lookalike
+                .cdn_redirect_hosts()
+                .iter()
+                .any(|h| h == "release-assets.githubusercontent.com"),
+            "github.com.evil.test 不是官方 origin"
+        );
     }
 
     /// official_path 与任务制品名不符时整条任务拒绝（不能把 UI 路径配给 CLI）。
@@ -3339,38 +3487,142 @@ mod tests {
 
     // ── CDN URL 校验（review #5）────────────────────────────────
 
+    /// 官方源的真实跳转：`github.com/.../releases/download/...` → 302 到
+    /// `release-assets.githubusercontent.com`。`redirect_policy` 的 allow/deny
+    /// 判定直接单测——真实主机名无法映射到本地 mock 服务。
     #[test]
-    fn test_normalize_cdn_base_rejects_malformed_origins() {
-        // 合法：裸 origin，可带显式端口（测试用本地 mock）。
+    fn test_redirect_to_official_asset_host_is_allowed_only_when_task_lists_it() {
+        let name = local_filename();
+        let github = url::Url::parse(&format!(
+            "https://github.com/zzttzzmyswy/shell-remote/releases/download/v0.59.7/{name}"
+        ))
+        .unwrap();
+        let asset = url::Url::parse(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2",
+        )
+        .unwrap();
+        let objects = url::Url::parse("https://objects.githubusercontent.com/x").unwrap();
+
+        // 任务含官方 origin：允许 github → asset 的跳转。
+        let with_official = task_with(
+            &name,
+            ARTIFACT,
+            vec![
+                "https://gh-proxy.com/https://github.com".into(),
+                "https://github.com".into(),
+            ],
+            None,
+        );
+        let allowed = normalize_host_list(with_official.cdn_redirect_hosts());
+        assert!(check_redirect(&github, &[], &allowed).is_ok());
+        assert!(
+            check_redirect(&asset, std::slice::from_ref(&github), &allowed).is_ok(),
+            "官方 origin 的 302 目标必须放行（否则这个源永远失败）"
+        );
+        assert!(check_redirect(&objects, std::slice::from_ref(&github), &allowed).is_ok());
+
+        // 任务不含官方 origin：只有镜像主机，asset 主机不在白名单里。
+        let mirror_only = task_with(
+            &name,
+            ARTIFACT,
+            vec!["https://gh-proxy.com/https://github.com".into()],
+            None,
+        );
+        let allowed = normalize_host_list(mirror_only.cdn_redirect_hosts());
+        assert!(
+            check_redirect(&asset, std::slice::from_ref(&github), &allowed).is_err(),
+            "任务没有官方 origin 时不该多出可跳转目标"
+        );
+        // 任意其它主机一律拒绝。
+        let evil = url::Url::parse("https://evil.example/x").unwrap();
+        assert!(check_redirect(&evil, &[], &allowed).is_err());
+
+        // https → http 降级拒绝；跳数上限仍为 5。
+        let plain = url::Url::parse("https://gh-proxy.com/x").unwrap();
+        let downgraded = url::Url::parse("http://gh-proxy.com/x").unwrap();
+        assert!(check_redirect(&downgraded, std::slice::from_ref(&plain), &allowed).is_err());
+        let hops: Vec<url::Url> = (0..5)
+            .map(|_| url::Url::parse("https://gh-proxy.com/x").unwrap())
+            .collect();
+        assert!(
+            check_redirect(&plain, &hops, &allowed).is_err(),
+            "超过 5 跳必须拒绝"
+        );
+        assert!(check_redirect(&plain, &hops[..4], &allowed).is_ok());
+    }
+
+    /// 白名单规范化：trim + 小写 + 去空 + 去重。
+    #[test]
+    fn test_normalize_host_list() {
+        assert_eq!(
+            normalize_host_list(vec![
+                " GitHub.COM ".to_string(),
+                "gh-proxy.com".to_string(),
+                "".to_string(),
+                "  ".to_string(),
+                "GH-PROXY.COM".to_string(),
+            ]),
+            vec!["github.com".to_string(), "gh-proxy.com".to_string()]
+        );
+        assert!(normalize_host_list(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn test_normalize_cdn_base_accepts_prefix_mirrors_and_rejects_malformed() {
+        // 合法：裸 origin（可带端口），以及带路径前缀的镜像。前缀路径必须逐字
+        // 保留——前缀镜像就靠这段 `https://github.com` 认目标仓库。
         for ok in [
             "https://cdn.test",
             "https://cdn.test:8443",
             "http://127.0.0.1:47812",
             "https://cdn.test/", // 单个结尾斜杠等价
+            "https://gh-proxy.com/https://github.com",
+            "https://gh-proxy.com/https://github.com/",
+            "https://ghproxy.net/a/b",
         ] {
             let parsed = normalize_cdn_base(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
             assert!(parsed.host_str().is_some());
+            assert!(parsed.query().is_none() && parsed.fragment().is_none());
         }
-        // 非法：userinfo / path / query / fragment / 非 http(s) / 无 host。
+        // 前缀里的 `/https://github.com` 不能被解析器改写。
+        let parsed = normalize_cdn_base("https://gh-proxy.com/https://github.com").unwrap();
+        assert_eq!(parsed.path(), "/https://github.com");
+        assert_eq!(parsed.host_str(), Some("gh-proxy.com"));
+
+        // 非法：userinfo / query / fragment / 穿越 / 编码 / 空白 / 超长 / 非 http(s)。
         for bad in [
             "https://user:pass@cdn.test",
             "https://user@cdn.test",
-            "https://cdn.test/path",
+            "https://cdn.test/path?x=1",
             "https://cdn.test/?x=1",
             "https://cdn.test/#frag",
-            "https://cdn.test/a/b",
+            "https://cdn.test/a#frag",
+            "https://cdn.test/../etc",
+            "https://cdn.test/a/../b",
+            "https://cdn.test/%2e%2e/x",
+            "https://cdn.test/a%2fb",
+            "https://cdn.test/a\\b",
+            "https://cdn.test/a b",
+            "https://cdn.test/a\tb",
             "ftp://cdn.test",
             "file:///etc/passwd",
             "javascript:alert(1)",
             "cdn.test",
             "https://",
             "   ",
+            "",
         ] {
             assert!(
                 normalize_cdn_base(bad).is_err(),
                 "必须拒绝畸形 CDN base: {bad:?}"
             );
         }
+        // 超长（> CDN_BASE_MAX_LEN）——连 scheme/host 带前缀一起算。
+        let long = format!(
+            "https://gh-proxy.com/https://github.com/{}",
+            "a".repeat(crate::relay::artifact_store::CDN_BASE_MAX_LEN)
+        );
+        assert!(normalize_cdn_base(&long).is_err(), "超长 base 必须拒绝");
     }
 
     #[test]
@@ -3411,7 +3663,7 @@ mod tests {
         assert!(validate_official_path(&ui, "shell-remote-x86_64").is_err());
     }
 
-    /// `join_cdn_url` 拼出来的 URL 必须仍属于 base 的 origin。
+    /// `join_cdn_url` 拼出来的 URL 必须仍属于 base 的 origin，且前缀路径逐字保留。
     #[test]
     fn test_join_cdn_url_preserves_origin_and_drops_query() {
         let name = local_filename();
@@ -3425,16 +3677,16 @@ mod tests {
         assert!(parsed.query().is_none());
         assert!(parsed.fragment().is_none());
 
-        // base 带 userinfo / query / path → 整体拒绝（不会静默"修好"）。
+        // base 带 userinfo / query / fragment / 穿越 → 整体拒绝（不会静默"修好"）。
         for base in [
             "https://user:pass@cdn.test",
             "https://cdn.test/?x=1",
             "https://cdn.test/#f",
-            "https://cdn.test/mirror",
+            "https://cdn.test/mirror/../evil",
         ] {
             assert!(
                 join_cdn_url(base, &path).is_none(),
-                "带 userinfo/query/path 的 base 必须被拒: {base:?}"
+                "带 userinfo/query/穿越的 base 必须被拒: {base:?}"
             );
         }
         // path 带 query/fragment/穿越/编码 → 拒绝。
@@ -3450,6 +3702,61 @@ mod tests {
                 join_cdn_url("https://cdn.test", &bad_path).is_none(),
                 "畸形 official path 必须被拒: {bad_path:?}"
             );
+        }
+    }
+
+    /// 契约钉死项：前缀镜像必须是纯字符串拼接，`/https://github.com/` 原样保留。
+    ///
+    /// 用 `Url::join` / `set_path` 的实现在这里会得到
+    /// `https://gh-proxy.com/zzttzzmyswy/...`（丢掉前缀）或
+    /// `https://gh-proxy.com/https:/github.com/...`（压掉一个 `/`），两者都会被
+    /// 镜像当成别的路径而 404——正是 MYS-2518 现场 4 个源全挂的形态。
+    #[test]
+    fn test_join_cdn_url_keeps_full_github_prefix() {
+        let path = "/o/r/releases/download/v1/x";
+        assert_eq!(
+            join_cdn_url("https://gh-proxy.com/https://github.com", path).unwrap(),
+            "https://gh-proxy.com/https://github.com/o/r/releases/download/v1/x"
+        );
+        // base 带结尾 `/` 结果相同。
+        assert_eq!(
+            join_cdn_url("https://gh-proxy.com/https://github.com/", path).unwrap(),
+            "https://gh-proxy.com/https://github.com/o/r/releases/download/v1/x"
+        );
+        // 裸 origin 行为不变。
+        assert_eq!(
+            join_cdn_url("https://github.com", path).unwrap(),
+            "https://github.com/o/r/releases/download/v1/x"
+        );
+        assert_eq!(
+            join_cdn_url("https://github.com/", path).unwrap(),
+            "https://github.com/o/r/releases/download/v1/x"
+        );
+        // 默认列表里每一项都拼出预期 URL。
+        let tag_path = "/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64";
+        for (base, want) in [
+            (
+                "https://gh-proxy.com/https://github.com",
+                "https://gh-proxy.com/https://github.com/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64",
+            ),
+            (
+                "https://edgeone.gh-proxy.org/https://github.com",
+                "https://edgeone.gh-proxy.org/https://github.com/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64",
+            ),
+            (
+                "https://hk.gh-proxy.org/https://github.com",
+                "https://hk.gh-proxy.org/https://github.com/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64",
+            ),
+            (
+                "https://github.com",
+                "https://github.com/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64",
+            ),
+            (
+                "https://ghproxy.net/https://github.com",
+                "https://ghproxy.net/https://github.com/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64",
+            ),
+        ] {
+            assert_eq!(join_cdn_url(base, tag_path).unwrap(), want, "base={base}");
         }
     }
 
@@ -3535,5 +3842,145 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("no download source"), "{err}");
         let _ = std::fs::remove_dir_all(part.parent().unwrap());
+    }
+
+    // ── 真实网络验证（MYS-2425-G，需 `--ignored`）──────────────────
+
+    /// v0.59.7 的 `shell-remote-x86_64` 官方 SHA-256（GitHub release API digest）。
+    const REAL_ASSET_SHA256: &str =
+        "4e84ef83050de47af80564ea7e6b321e31b8d720be0c954a5aabd33c9759b5d6";
+    const REAL_ASSET_SIZE: u64 = 8_461_896;
+
+    /// 对默认 CDN 列表里的**每一个源单独**下载 v0.59.7 的 `shell-remote-x86_64`，
+    /// 走 agent 自己的下载实现（不是 curl），逐源报告状态、耗时、SHA-256。
+    ///
+    /// 跑法（13.24）：
+    /// ```text
+    /// cargo test --lib --no-default-features -- --ignored --nocapture \
+    ///     real_default_cdn_sources_download_v0597
+    /// ```
+    ///
+    /// 官方 origin 在大陆网络可能连不上——那是网络原因，可以接受；但**不能**是
+    /// 「重定向被拒」，所以这里把 `cdn_redirect_hosts()` 原样交给下载器，官方源
+    /// 的 302 到 `release-assets.githubusercontent.com` 必须能走通。
+    #[tokio::test]
+    #[ignore = "需要真实网络；用 --ignored 显式运行（MYS-2425-G 验收）"]
+    async fn real_default_cdn_sources_download_v0597() {
+        let bases: Vec<String> = crate::relay::default_cdn_base_urls();
+        assert!(!bases.is_empty());
+        let path = "/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64";
+        // 宽松预算：跨洋链路慢源（ghproxy.net）实测 ~30s。
+        let b = DownloadBudget {
+            connect: Duration::from_secs(15),
+            first_byte: Duration::from_secs(30),
+            chunk: Duration::from_secs(30),
+            total: Duration::from_secs(180),
+            attempts_per_source: 1,
+            backoff: Duration::from_millis(200),
+        };
+        let mut lines: Vec<String> = Vec::new();
+        for base in &bases {
+            let task = UpgradeTask {
+                upgrade_id: "real".into(),
+                target_version: "0.59.7".into(),
+                filename: "shell-remote-x86_64".into(),
+                size: REAL_ASSET_SIZE,
+                sha256: REAL_ASSET_SHA256.into(),
+                official_path: Some(path.to_string()),
+                cdn_base_urls: vec![base.clone()],
+                relay_url: None,
+                relay_fallback: false,
+                source: "official".into(),
+            };
+            let hosts = normalize_host_list(task.cdn_redirect_hosts());
+            let dl = downloader_with_hosts(None, b.clone(), hosts);
+            let part = tmp_part(&format!(
+                "real-{}",
+                base.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+            ));
+            let started = Instant::now();
+            let outcome = dl.fetch(&task, &part).await;
+            let elapsed = started.elapsed();
+            match outcome {
+                Ok(d) => {
+                    assert_eq!(
+                        d.sha256, REAL_ASSET_SHA256,
+                        "{base}: 下载成功但 SHA-256 不符"
+                    );
+                    assert_eq!(d.bytes, REAL_ASSET_SIZE, "{base}: 长度不符");
+                    lines.push(format!(
+                        "| `{base}` | 200 | {:.1}s | {} | 一致 |",
+                        elapsed.as_secs_f64(),
+                        &d.sha256[..16]
+                    ));
+                }
+                Err(e) => lines.push(format!(
+                    "| `{base}` | 失败 | {:.1}s | — | {e} |",
+                    elapsed.as_secs_f64()
+                )),
+            }
+            let _ = std::fs::remove_dir_all(part.parent().unwrap());
+        }
+        let ok = lines.iter().filter(|l| l.contains("| 200 |")).count();
+        println!("\n### 逐源真实下载结果\n");
+        println!("| 源 | HTTP | 耗时 | SHA-256(前 16) | 校验 |");
+        println!("|---|---|---|---|---|");
+        for l in &lines {
+            println!("{l}");
+        }
+        println!("\n成功 {ok}/{} 个源\n", lines.len());
+        assert!(ok > 0, "默认 CDN 列表里至少要有一个源能下载成功");
+        // 官方 origin 必须成功——若失败，原因只能是网络，不能是「重定向被拒」。
+        let official_line = lines
+            .iter()
+            .find(|l| l.starts_with("| `https://github.com`"))
+            .expect("官方 origin 一定在结果里");
+        assert!(
+            !official_line.contains("refusing redirect"),
+            "官方源失败原因是重定向被拒，不是网络: {official_line}"
+        );
+        assert!(
+            official_line.contains("| 200 |"),
+            "官方 origin 本次未成功（可能是网络原因，看上面的错误）: {official_line}"
+        );
+    }
+
+    /// 反向对照：**不给**官方资产主机白名单时，官方 origin 必须因「重定向被拒」
+    /// 失败。这条证明上面的成功确实来自第 3 项修复，而不是别的巧合。
+    #[tokio::test]
+    #[ignore = "需要真实网络；用 --ignored 显式运行"]
+    async fn real_official_origin_fails_without_asset_redirect_host() {
+        let path = "/zzttzzmyswy/shell-remote/releases/download/v0.59.7/shell-remote-x86_64";
+        let task = UpgradeTask {
+            upgrade_id: "real-neg".into(),
+            target_version: "0.59.7".into(),
+            filename: "shell-remote-x86_64".into(),
+            size: REAL_ASSET_SIZE,
+            sha256: REAL_ASSET_SHA256.into(),
+            official_path: Some(path.to_string()),
+            cdn_base_urls: vec!["https://github.com".into()],
+            relay_url: None,
+            relay_fallback: false,
+            source: "official".into(),
+        };
+        let b = DownloadBudget {
+            connect: Duration::from_secs(15),
+            first_byte: Duration::from_secs(30),
+            chunk: Duration::from_secs(30),
+            total: Duration::from_secs(120),
+            attempts_per_source: 1,
+            backoff: Duration::from_millis(200),
+        };
+        // 只放行 github.com 本身——重现修复前的白名单。
+        let dl = downloader_with_hosts(None, b, vec!["github.com".to_string()]);
+        let part = tmp_part("real-neg");
+        let err = dl.fetch(&task, &part).await.unwrap_err();
+        println!("\n修复前白名单下的官方源错误：{err}\n");
+        let _ = std::fs::remove_dir_all(part.parent().unwrap());
+        assert!(
+            err.contains("refusing redirect")
+                || err.contains("release-assets.githubusercontent.com"),
+            "官方源应当因为跳转目标不在白名单而失败（网络问题也会失败，但原因不同）: {err}"
+        );
     }
 }

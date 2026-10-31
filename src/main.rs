@@ -86,10 +86,13 @@ enum Command {
         #[arg(long)]
         download_dir: Option<String>,
 
-        /// 升级任务下发给 agent 的外部 CDN 基础地址（可重复）。每项是
-        /// 「前缀 + 官方 release 相对路径」，如 `https://gh-proxy.com`。
-        /// 未指定时用内置的官方 origin + 镜像列表。这些域名同时构成
-        /// `/agent/resolve` 代解析的白名单。
+        /// 升级任务下发给 agent 的外部 CDN 入口（可重复/逗号分隔）。每项可以是
+        /// 裸 origin（`https://github.com`），也可以是前缀镜像——把**完整的官方
+        /// URL** 接在镜像 origin 之后，如
+        /// `https://gh-proxy.com/https://github.com`；完整下载地址一律是
+        /// `entry + official_path`（只写镜像 origin 会 404）。未指定时用内置
+        /// 列表（3 个 gh-proxy 系镜像 → 官方 origin → ghproxy.net）。这些域名
+        /// 同时构成 `/agent/resolve` 代解析的白名单。
         #[arg(long = "upgrade-cdn", value_delimiter = ',')]
         upgrade_cdn: Vec<String>,
 

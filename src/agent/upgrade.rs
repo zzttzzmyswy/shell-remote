@@ -458,7 +458,10 @@ fn build_relay_download_client(ctx: &UpgradeContext) -> anyhow::Result<reqwest::
 /// 构造下载器：外部客户端（无任何凭据）+ relay 客户端（禁重定向、TLS 同源的
 /// 独立客户端）。
 pub fn build_downloader(ctx: &UpgradeContext, task: &UpgradeTask) -> anyhow::Result<Downloader> {
-    // 解析链：只允许本次任务的 CDN 主机；relay 代解析作为第三级。
+    // 重定向白名单：CDN 主机 +（任务含官方 origin 时）官方资产跳转主机。DNS
+    // 白名单用同一份集合——跳转目标同样得能解析出来。
+    let redirect_hosts = task.cdn_redirect_hosts();
+    // 解析链：只允许本次任务的主机；relay 代解析作为第三级。
     let resolver = if task.allows_cdn() {
         let relay = RelayResolver {
             http: ctx.relay_http.clone(),
@@ -470,7 +473,7 @@ pub fn build_downloader(ctx: &UpgradeContext, task: &UpgradeTask) -> anyhow::Res
         doh_cfg.proxy = ctx.proxy.clone();
         doh_cfg.extra_roots = ctx.extra_roots.clone();
         Some(download::chain_resolver(
-            task.cdn_hosts(),
+            redirect_hosts.clone(),
             doh_cfg,
             Some(relay),
         ))
@@ -478,7 +481,7 @@ pub fn build_downloader(ctx: &UpgradeContext, task: &UpgradeTask) -> anyhow::Res
         None
     };
     let external =
-        Downloader::build_external_client(&ctx.proxy, resolver, &ctx.budget, task.cdn_hosts())?;
+        Downloader::build_external_client(&ctx.proxy, resolver, &ctx.budget, redirect_hosts)?;
     let relay = match task.relay_url.as_ref() {
         // 建不出来就**整体失败**，绝不回退到会跟随重定向的客户端——那等于让
         // Token 处于可被 302 带走的状态。

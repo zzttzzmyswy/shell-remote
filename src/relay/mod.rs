@@ -238,70 +238,48 @@ pub fn default_cdn_base_urls() -> Vec<String> {
 
 /// 把 `--upgrade-cdn` 的原始字符串规范化成 base URL 列表，并校验形态。
 ///
-/// 只接受 `http://` / `https://` 且无路径（镜像约定是「前缀 + official_path」）、
-/// 无凭据、无查询串。任一条目不合法即报错——一个坏条目会让所有 agent 静默
-/// 下载失败，宁可在启动时失败。
+/// 每项可以是裸 origin（`https://github.com`），也可以是带路径前缀的镜像
+/// （`https://gh-proxy.com/https://github.com`）。gh-proxy 一类镜像要求把**完整
+/// 的官方 URL** 接在镜像 origin 之后，只写 origin 会 404（MYS-2425 现场根因）。
+/// 完整下载 URL 一律是 `base.trim_end_matches('/') + official_path`，见
+/// [`artifact_store::join_cdn`]。
+///
+/// 任一条目不合法即报错——一个坏条目会让所有 agent 静默下载失败，宁可在启动时
+/// 失败。校验规则与 agent 侧同一份实现：[`artifact_store::normalize_cdn_base`]。
 pub fn normalize_cdn_base_urls(raw: &[String]) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     for item in raw {
+        // 容忍用户写的收尾空白与结尾斜杠（`https://cdn.example/` 与不带斜杠等价）。
         let url = item.trim();
         if url.is_empty() {
             continue;
         }
-        let rest = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .ok_or_else(|| {
-                anyhow::anyhow!("--upgrade-cdn {url:?}: only http:// or https:// is accepted")
-            })?;
-        // 容忍用户写的结尾斜杠（`https://cdn.example/` 与不带斜杠等价），
-        // 之后再校验形态：主机名必须有，且不能带凭据/路径/查询/片段。
-        let rest = rest.trim_end_matches('/');
-        if rest.is_empty()
-            || rest.contains('@')
-            || rest.contains('/')
-            || rest.contains('?')
-            || rest.contains('#')
-            || rest.contains('\\')
-        {
-            return Err(anyhow::anyhow!(
-                "--upgrade-cdn {url:?}: must be a bare origin like https://cdn.example"
-            ));
-        }
-        let host = rest
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if host.is_empty()
-            || !host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-        {
-            return Err(anyhow::anyhow!("--upgrade-cdn {url:?}: invalid host"));
-        }
+        artifact_store::normalize_cdn_base(url)
+            .map_err(|e| anyhow::anyhow!("--upgrade-cdn {url:?}: {e}"))?;
         out.push(url.trim_end_matches('/').to_string());
     }
     if out.is_empty() {
-        anyhow::bail!("--upgrade-cdn: at least one CDN origin is required");
+        anyhow::bail!("--upgrade-cdn: at least one CDN entry is required");
     }
     Ok(out)
 }
 
-/// 从 base URL 取主机名（`https://gh-proxy.com` → `gh-proxy.com`）。
+/// [`artifact_store::cdn_host`] 的转发（relay 内外一贯的调用名）。
 pub fn cdn_host(base_url: &str) -> Option<String> {
-    let rest = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"))?;
-    let host = rest.split('/').next()?.split(':').next()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    artifact_store::cdn_host(base_url)
 }
 
-/// `/agent/resolve` 的白名单：升级任务可用 CDN 的主机名，外加官方下载 origin。
+/// `/agent/resolve` 的白名单：升级任务可用 CDN 的主机名，外加官方下载 origin
+/// 以及官方 release 资产的跳转目标主机。
 ///
 /// 令牌大小写不敏感比较。**不包含**任意其它主机——这个接口不能成为内网 DNS
 /// 代理。`host` 参数只接受裸主机名（无端口/路径/空白），杜绝 `host:port` 走私
 /// 与非 HTTP 用途的解析请求。
+///
+/// 官方资产主机（`release-assets.githubusercontent.com` 等）必须放行：官方
+/// `github.com/.../releases/download/...` 会 302 到那里，DNS 被污染的网络里
+/// agent 连跳转目标都解析不出来。它们只提供 GitHub 官方 release 资产，且字节
+/// 由任务里的 SHA-256 钉死，不构成可下载内容的扩张。
 pub fn is_resolvable_host(host: &str, cdn_base_urls: &[String]) -> bool {
     // 不 trim：空白本身就该被判为非法主机名（`host=" gh-proxy.com"` 不是
     // `gh-proxy.com` 的别名，静默修剪只会让"看起来通过"的输入混进白名单）。
@@ -317,12 +295,13 @@ pub fn is_resolvable_host(host: &str, cdn_base_urls: &[String]) -> bool {
     {
         return false;
     }
-    let official = cdn_host(&format!("https://{}", artifact_store::OFFICIAL_DOWNLOAD_BASE
-        .trim_start_matches("https://")))
-    .unwrap_or_default();
+    let official = cdn_host(artifact_store::OFFICIAL_DOWNLOAD_BASE).unwrap_or_default();
     let mut allowed: Vec<String> = cdn_base_urls.iter().filter_map(|u| cdn_host(u)).collect();
     if !official.is_empty() {
         allowed.push(official);
+    }
+    for host in artifact_store::OFFICIAL_ASSET_REDIRECT_HOSTS {
+        allowed.push((*host).to_string());
     }
     allowed.iter().any(|a| a == &h)
 }
@@ -1741,22 +1720,60 @@ mod tests {
         );
     }
 
+    /// 前缀镜像（`--upgrade-cdn https://gh-proxy.com/https://github.com`）：整段
+    /// 路径原样保留，拼接后仍带完整的官方 URL。
+    #[test]
+    fn test_normalize_cdn_base_urls_accepts_prefix_mirrors() {
+        let got = normalize_cdn_base_urls(&[
+            "https://gh-proxy.com/https://github.com".to_string(),
+            "https://ghproxy.net/https://github.com/".to_string(),
+            "https://github.com".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "https://gh-proxy.com/https://github.com".to_string(),
+                "https://ghproxy.net/https://github.com".to_string(),
+                "https://github.com".to_string(),
+            ],
+            "前缀路径必须逐字保留，只去掉结尾多余的斜杠"
+        );
+        // 拼出来的完整 URL 与原契约一致。
+        assert_eq!(
+            artifact_store::join_cdn(&got[0], "/o/r/releases/download/v1/x"),
+            "https://gh-proxy.com/https://github.com/o/r/releases/download/v1/x"
+        );
+        // 带路径的 base 取出的是镜像主机，不是前缀里的 github.com。
+        assert_eq!(
+            cdn_host(&got[0]).as_deref(),
+            Some("gh-proxy.com"),
+            "白名单要的是真正会被连接的主机"
+        );
+    }
+
     #[test]
     fn test_normalize_cdn_base_urls_rejects_malformed() {
         for bad in [
-            "ftp://cdn.example",       // 非 http(s)
-            "cdn.example",             // 缺 scheme
-            "https://cdn.example/path",// 带路径（镜像约定是纯 origin）
-            "https://cdn.example/?q=1",// 带查询
-            "https://user:pw@cdn.example", // 带凭据
-            "https:///x",              // 空主机
-            "https://cd n.example",    // 主机里有空白
+            "ftp://cdn.example",            // 非 http(s)
+            "cdn.example",                  // 缺 scheme
+            "https://cdn.example/?q=1",     // 带查询
+            "https://cdn.example/#f",       // 带片段
+            "https://user:pw@cdn.example",  // 带凭据
+            "https:///x",                   // 空主机
+            "https://cd n.example",         // 主机里有空白
+            "https://cdn.example/a/../b",   // 前缀路径穿越
+            "https://cdn.example/%2e%2e/x", // 前缀路径编码
+            "https://cdn.example/a\\b",     // 反斜杠
         ] {
             assert!(
                 normalize_cdn_base_urls(&[bad.to_string()]).is_err(),
                 "{bad:?} must be rejected"
             );
         }
+        // 超长前缀路径
+        let long = format!("https://cdn.example/{}", "a".repeat(300));
+        assert!(normalize_cdn_base_urls(&[long]).is_err(), "超长必须拒绝");
         // 全空 → 报错（不允许"零个 CDN"的静默配置）
         assert!(normalize_cdn_base_urls(&["".to_string()]).is_err());
     }
@@ -1765,7 +1782,7 @@ mod tests {
     fn test_default_cdn_urls_have_at_least_two_independent_origins() {
         let cdns = default_cdn_base_urls();
         assert!(cdns.len() >= 2, "首期至少两个独立入口: {cdns:?}");
-        // 每项都是合法 origin
+        // 每项都是合法条目（裸 origin 或前缀镜像）
         assert_eq!(normalize_cdn_base_urls(&cdns).unwrap(), cdns);
         // 主机名去重后仍然 >= 2（不是同一个故障点）
         let mut hosts: Vec<String> = cdns.iter().filter_map(|u| cdn_host(u)).collect();
@@ -1774,14 +1791,31 @@ mod tests {
         assert!(hosts.len() >= 2, "CDN 必须是不同主机: {cdns:?}");
         // 官方 origin 在列表里
         assert!(hosts.contains(&"github.com".to_string()));
+        // 已下线的 gh.llkk.cc 不再内置（超时 / 522）
+        assert!(
+            !cdns.iter().any(|u| u.contains("gh.llkk.cc")),
+            "gh.llkk.cc 已下线: {cdns:?}"
+        );
     }
 
     #[test]
     fn test_cdn_host_extraction() {
-        assert_eq!(cdn_host("https://gh-proxy.com").as_deref(), Some("gh-proxy.com"));
+        assert_eq!(
+            cdn_host("https://gh-proxy.com").as_deref(),
+            Some("gh-proxy.com")
+        );
         assert_eq!(
             cdn_host("http://mirror.example:8443").as_deref(),
             Some("mirror.example")
+        );
+        // 带路径前缀的镜像：取镜像主机，不是前缀里的域名。
+        assert_eq!(
+            cdn_host("https://gh-proxy.com/https://github.com").as_deref(),
+            Some("gh-proxy.com")
+        );
+        assert_eq!(
+            cdn_host("https://ghproxy.net/a/b").as_deref(),
+            Some("ghproxy.net")
         );
         assert_eq!(cdn_host("ftp://x"), None);
         assert_eq!(cdn_host("https://").as_deref(), None);
@@ -1814,6 +1848,44 @@ mod tests {
         assert!(!is_resolvable_host("a..b", &cdns));
         assert!(!is_resolvable_host(&"a".repeat(254), &cdns), "超长主机名");
         assert!(!is_resolvable_host("内网.example", &cdns), "非 ASCII");
+    }
+
+    /// 官方 release 资产的跳转目标必须能由 relay 代解析：DNS 被污染的网络里，
+    /// `github.com/.../releases/download/...` 302 到
+    /// `release-assets.githubusercontent.com`，agent 连这个主机都解析不出来就
+    /// 永远升不了级。其它主机仍拒绝。
+    #[test]
+    fn test_is_resolvable_host_allows_official_asset_hosts_only() {
+        let cdns = vec!["https://gh-proxy.com/https://github.com".to_string()];
+        for host in artifact_store::OFFICIAL_ASSET_REDIRECT_HOSTS {
+            assert!(
+                is_resolvable_host(host, &cdns),
+                "{host} 必须可由 relay 代解析"
+            );
+            assert!(
+                is_resolvable_host(&host.to_ascii_uppercase(), &cdns),
+                "{host} 大小写不敏感"
+            );
+        }
+        // 带路径前缀的 base：镜像主机也在白名单里。
+        assert!(is_resolvable_host("gh-proxy.com", &cdns));
+        // 任意其它主机仍被拒绝——这个端点不是通用 DNS 代理。
+        for host in [
+            "evil.example",
+            "x.release-assets.githubusercontent.com",
+            "release-assets.githubusercontent.com.evil.example",
+            "objects.githubusercontent.com.evil.example",
+            "githubusercontent.com",
+        ] {
+            assert!(!is_resolvable_host(host, &cdns), "{host} 不该被放行");
+        }
+        // 空 CDN 列表也不影响官方 origin 与资产主机。
+        assert!(is_resolvable_host("github.com", &[]));
+        assert!(is_resolvable_host(
+            "release-assets.githubusercontent.com",
+            &[]
+        ));
+        assert!(!is_resolvable_host("evil.example", &[]));
     }
 
     // ── HTTPS / 自签证书（MYS-886）─────────────────────────────

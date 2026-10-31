@@ -60,7 +60,30 @@ GitHub 不可达时：已缓存的清单继续可用（不因网络波动让已�
 
 ### CDN 列表
 
-`--upgrade-cdn` 每项是一个纯 origin（如 `https://gh-proxy.com`），`origin + official_path` 即完整下载 URL。未指定时用 `DEFAULT_CDN_BASE_URLS`：`https://github.com`、`https://edgeone.gh-proxy.com`、`https://gh-proxy.com`、`https://gh.llkk.cc`。这些主机名同时构成 `/agent/resolve` 代解析白名单。
+`--upgrade-cdn` 每项是**下载前缀**，完整下载 URL 一律为 `entry.trim_end_matches('/') + official_path`（纯字符串拼接，`/https://github.com/` 原样保留）。两种写法都合法：
+
+| 写法 | 例子 | 结果 URL |
+|---|---|---|
+| 裸 origin | `https://github.com` | `https://github.com/<o>/<r>/releases/download/v1/x` |
+| 前缀镜像 | `https://gh-proxy.com/https://github.com` | `https://gh-proxy.com/https://github.com/<o>/<r>/releases/download/v1/x` |
+
+gh-proxy 一类镜像要求把**完整的官方 URL** 接在后面；只写 `https://gh-proxy.com` 会 404。合法条目不得带 userinfo / query / fragment，路径不得含 `..`、`\`、`%`、空白或控制字符，长度不超过 256，scheme 只能是 http/https。
+
+未指定时用 `DEFAULT_CDN_BASE_URLS`（顺序即优先级）：
+
+```
+https://gh-proxy.com/https://github.com
+https://edgeone.gh-proxy.org/https://github.com
+https://hk.gh-proxy.org/https://github.com
+https://github.com
+https://ghproxy.net/https://github.com
+```
+
+官方 origin 排第 4 位：它在大陆经常不可达，放前面只会在每个失败源上白等一次超时。这些主机的 **host 部分**（带路径的条目取镜像主机，不是前缀里的 `github.com`）构成 `/agent/resolve` 代解析白名单。
+
+任务里含裸 `github.com` origin 时，agent 的重定向白名单与 `/agent/resolve` 还会额外放行官方 release 资产的跳转目标 `release-assets.githubusercontent.com`、`objects.githubusercontent.com`——`https://github.com/.../releases/download/...` 会 302 到前者，不放行这个源就永远失败。这两个主机只提供 GitHub 官方资产，字节仍由任务里的 SHA-256 钉死，不构成可下载内容的扩张。
+
+已部署的旧 agent（< v0.59.8）会把带路径的条目当畸形输入跳过（只打 warn）并继续用其余源与 relay 兜底，不会崩溃——所以改动上线后老版本仍能升级，只是拿不到前缀镜像带来的可达性改善。
 
 ## 下发字段
 
@@ -74,7 +97,7 @@ GitHub 不可达时：已缓存的清单继续可用（不因网络波动让已�
   "size": 16956344,
   "sha256": "e8233ca1…d851",
   "official_path": "/zzttzzmyswy/shell-remote/releases/download/v0.59.2/shell-remote-ui-aarch64",
-  "cdn_base_urls": ["https://github.com", "https://edgeone.gh-proxy.com"],
+  "cdn_base_urls": ["https://gh-proxy.com/https://github.com", "https://github.com"],
   "relay_url": "/agent/upgrade/blob/shell-remote-ui-aarch64",
   "relay_fallback": true,
   "source": "local",
@@ -91,7 +114,7 @@ GitHub 不可达时：已缓存的清单继续可用（不因网络波动让已�
 
 ## 代解析端点
 
-`GET /agent/resolve?host=<CDN 主机>`（rw Token 鉴权）供系统 DNS 与 DoH 都不可用时使用。它**不是**通用 DNS 代理：只解析 `--upgrade-cdn` 列出的主机（外加官方 `github.com`），裸主机名形态，其他一律 `403`（响应不回显允许列表，不给探测者提供枚举素材）。
+`GET /agent/resolve?host=<CDN 主机>`（rw Token 鉴权）供系统 DNS 与 DoH 都不可用时使用。它**不是**通用 DNS 代理：只解析 `--upgrade-cdn` 列出的主机的 host 部分（外加官方 `github.com` 与两个官方资产跳转主机），裸主机名形态，其他一律 `403`（响应不回显允许列表，不给探测者提供枚举素材）。
 
 ```json
 { "host": "gh-proxy.com", "addresses": ["1.2.3.4"], "expires_at": 1793000000, "cached": false }
