@@ -78,13 +78,28 @@ const BACKUP_INFIX: &str = ".sr-old-";
 /// Windows 自我搬运出来的助手副本前缀（用完即删，启动时顺手清理残留）。
 const HELPER_COPY_PREFIX: &str = ".shell-remote-update-apply-";
 
-/// "本次换机待恢复"的指针文件名（`0700` 私有目录，内容两行：
-/// `upgrade_id` + 交接文件路径）。
+/// "本次换机待恢复"的指针文件名（`0700` 私有目录）。
 ///
-/// 只在**受管 service 协调式换机**里写：那时新 agent 由 `systemctl start`
-/// 拉起，环境由 unit 决定，拿不到助手设置的 `SR_UPGRADE_RESTORE`，只能靠这个
-/// 指针找到交接文件。指针本身不含 Token。
+/// 两种格式都要认：
+///
+/// - **两行**（`upgrade_id` + 交接文件路径）：`Coordinated` 换机写入。新 agent 由
+///   `systemctl start` 拉起，环境由 unit 决定，拿不到助手设置的
+///   `SR_UPGRADE_RESTORE`，只能靠这个指针找到交接文件。
+/// - **三行**（`upgrade_id` + 交接文件路径 + backup 路径）：`SystemdRestart` 换机
+///   由旧 agent 自己写入，第三行是新 agent 自回滚时要恢复的旧二进制。
+///
+/// 指针本身不含 Token。
 const RESTORE_PENDING_FILE: &str = ".restore-pending";
+
+/// 自回滚默认窗口。与助手的 `REGISTER_TIMEOUT`（75s）同量级：正常情况下新
+/// agent 连上 relay 只需几秒，180s 足够覆盖弱网重连，又不会让一台"起不来"的
+/// 设备在坏版本上挂太久。
+pub const SELF_ROLLBACK_SECS: u64 = 180;
+/// 自回滚窗口的可调下限/上限（`SR_UPGRADE_SELF_ROLLBACK_SECS`）。
+pub const SELF_ROLLBACK_MIN_SECS: u64 = 30;
+pub const SELF_ROLLBACK_MAX_SECS: u64 = 900;
+/// 自回滚窗口的环境变量覆盖（仅测试与运维调参用）。越界按默认值处理。
+pub const SELF_ROLLBACK_ENV: &str = "SR_UPGRADE_SELF_ROLLBACK_SECS";
 
 /// 助手的三段等待上限。
 ///
@@ -344,6 +359,7 @@ fn encode_plan(plan: &super::systemd_helper::ManagedPlan) -> String {
     match plan {
         ManagedPlan::Direct => "direct".to_string(),
         ManagedPlan::Coordinated { unit } => format!("coordinated:{unit}"),
+        ManagedPlan::SystemdRestart { unit } => format!("systemd-restart:{unit}"),
         ManagedPlan::Refuse { unit, reason } => match unit {
             Some(u) => format!("refuse:{u}:{reason}"),
             None => format!("refuse::{reason}"),
@@ -359,6 +375,11 @@ fn decode_plan(raw: &str) -> Option<super::systemd_helper::ManagedPlan> {
     }
     if let Some(rest) = raw.strip_prefix("coordinated:") {
         return Some(ManagedPlan::Coordinated {
+            unit: rest.to_string(),
+        });
+    }
+    if let Some(rest) = raw.strip_prefix("systemd-restart:") {
+        return Some(ManagedPlan::SystemdRestart {
             unit: rest.to_string(),
         });
     }
@@ -885,33 +906,107 @@ pub fn restore_handoff_path(flag: Option<&str>) -> Result<Option<PathBuf>, Strin
     }
 }
 
-/// 读取并**消费**"本次换机待恢复"指针。
+/// 指针的内容（已解析、已校验）。
+///
+/// 第三行 `backup` 只有 `SystemdRestart` 换机才有；两行的旧格式（`Coordinated`
+/// 换机）解析成 `backup: None`，那条路径的自回滚由助手负责，新进程不需要动手。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePending {
+    /// 交接文件路径（必须在同一私有目录里）。
+    pub handoff: PathBuf,
+    /// 自回滚时要恢复回 `target` 的旧二进制。
+    pub backup: Option<PathBuf>,
+}
+
+/// 读取并**消费**"本次换机待恢复"指针，同时返回自回滚所需的 backup 路径。
 ///
 /// 只认 `0700` 私有目录里、`0600`、属主为自己的指针（复用私有文件校验），
 /// 指向的交接文件必须真实存在；读到后立刻删除指针，保证只恢复一次。
 ///
 /// 返回 `None` = 没有待恢复的换机（普通启动）。
-pub fn take_restore_pending() -> Option<PathBuf> {
+pub fn take_restore_pending() -> Option<RestorePending> {
     let dir = RestartContext::private_dir().ok()?;
     take_restore_pending_in(&dir)
 }
 
 /// [`take_restore_pending`] 的显式目录版本（测试用，校验逻辑完全相同）。
-pub fn take_restore_pending_in(dir: &Path) -> Option<PathBuf> {
+pub fn take_restore_pending_in(dir: &Path) -> Option<RestorePending> {
     let ptr = dir.join(RESTORE_PENDING_FILE);
     if !ptr.exists() {
         return None;
     }
     verify_private_file(&ptr).ok()?;
     let body = std::fs::read_to_string(&ptr).ok()?;
-    let handoff = body.lines().nth(1).map(PathBuf::from)?;
+    let mut lines = body.lines();
+    let _upgrade_id = lines.next()?;
+    let handoff = PathBuf::from(lines.next()?);
     // 交接文件必须在同一私有目录里（不给"指向任意路径"留口子）。
     if handoff.parent() != Some(dir) || !handoff.is_file() {
         let _ = std::fs::remove_file(&ptr);
         return None;
     }
+    // 第三行可选。不可用的 backup 不致命：那只是"新进程没有自回滚能力"，
+    // 身份恢复本身仍然可以做——把整个换机丢掉才是更糟的选择。
+    let backup = lines.next().and_then(|line| {
+        let path = PathBuf::from(line);
+        validate_self_rollback_backup(&path, &handoff).then_some(path)
+    });
     let _ = std::fs::remove_file(&ptr);
-    Some(handoff)
+    Some(RestorePending { handoff, backup })
+}
+
+/// 校验指针里的 backup 路径是否可信。
+///
+/// 三条约束，都是为了防止"私有目录里的一个文件诱导新进程把任意路径改名回来"：
+///
+/// 1. 必须是**绝对路径**且已存在（不存在的 backup 无从恢复）；
+/// 2. 必须与 target 同目录——跨越文件系统的 `rename` 会失败，而且那意味着
+///    backup 根本不在二进制旁边；
+/// 3. 文件名必须带 [`backup_path_for`] 的前缀（`<原名>.sr-old-`），即确实是
+///    本轮换机产生的备份，而不是指针里随手写的一个路径。
+///
+/// target 取自交接文件（`RestartContext::target_path`）；交接文件读不出来时一律
+/// 拒绝——没有 target 就无从校验"同目录/同前缀"，宁可不做自回滚。
+fn validate_self_rollback_backup(backup: &Path, handoff: &Path) -> bool {
+    if !backup.is_absolute() || !backup.is_file() {
+        return false;
+    }
+    let Ok(ctx) = RestartContext::read_handoff(handoff) else {
+        return false;
+    };
+    self_rollback_backup_belongs_to(backup, &ctx.target_path)
+}
+
+/// [`validate_self_rollback_backup`] 的纯判定部分（不读文件，便于穷举测试）。
+///
+/// 两条约束，都是为了不让私有目录里的一个文件诱导新进程把任意路径 rename
+/// 回来：
+///
+/// 1. **同目录**：备份是同一次 `rename` 的产物，必然与 target 同级；跨目录
+///    意味着它根本不是本轮的备份（也可能跨文件系统，rename 必败）；
+/// 2. **名字前缀**：必须是 `<target 名>.sr-old-<tag>`，即 [`backup_path_for`]
+///    的产物。
+///
+/// 不再检查"备份不在私有目录里"：那条约束没有依据（备份与私有目录重合只在
+/// 测试里出现），而前两条已经把可指向的范围收窄到了"本轮换机自己产生的
+/// 那个文件"。
+fn self_rollback_backup_belongs_to(backup: &Path, target: &Path) -> bool {
+    if !backup.is_absolute() {
+        return false;
+    }
+    // 同目录：备份就是同一次 `rename` 的产物，必然与 target 同级。
+    if backup.parent() != target.parent() {
+        return false;
+    }
+    let Some(name) = backup.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(base) = target.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    // 名字必须是 `<target 名> + .sr-old- + tag`，不接受别的样式。
+    name.starts_with(&format!("{base}{BACKUP_INFIX}"))
+        && name.len() > base.len() + BACKUP_INFIX.len()
 }
 
 /// 解析并加载一次性恢复信息（CLI/UI 共用的入口）。
@@ -922,17 +1017,54 @@ pub fn take_restore_pending_in(dir: &Path) -> Option<PathBuf> {
 pub fn resolve_restore(flag: Option<&str>) -> Result<Option<RestoredIdentity>, String> {
     match restore_handoff_path(flag)? {
         Some(path) => RestoredIdentity::load(&path).map(Some),
-        // 没有显式恢复通道 → 看是否有"受管 service 协调式换机"留下的指针。
+        // 没有显式恢复通道 → 看是否有换机留下的指针。两条换机路径都会写它：
         //
-        // 这条只在 `systemctl start` 拉起的新进程上命中（它拿不到
-        // `SR_UPGRADE_RESTORE`）。指针由**助手**在换机前写入、启动成功后删除，
-        // 因此不存在"自动补起的进程误认领别人的交接"：整个过程只有助手安排，
-        // 没有 systemd 自动补起参与（设计决定 MYS-2425-D）。
+        // - `Coordinated`：新 agent 由 `systemctl start` 拉起，拿不到
+        //   `SR_UPGRADE_RESTORE`；指针两行，自回滚由助手负责。
+        // - `SystemdRestart`：新 agent 由 systemd 按 `Restart=always` 拉起，同
+        //   样拿不到环境变量；指针三行，第三行是旧二进制备份，由**本进程**在
+        //   注册失败时自行回滚（MYS-2425-E）。
+        //
+        // 指针由旧 agent / 助手在磁盘改动的同时写入、启动时消费一次，因此不存在
+        // "自动补起的进程误认领别人的交接"：两次补起之间指针已被消费。
         None => match take_restore_pending() {
-            Some(path) => RestoredIdentity::load(&path).map(Some),
+            Some(pending) => {
+                let mut id = RestoredIdentity::load(&pending.handoff)?;
+                id.self_rollback = pending.backup.map(|backup| SelfRollback {
+                    backup,
+                    deadline: self_rollback_window(),
+                });
+                Ok(Some(id))
+            }
             None => Ok(None),
         },
     }
+}
+
+/// 新 agent 的自回滚约定：截至 `deadline` 仍未注册成功，就把 `backup` 恢复回
+/// 原路径并退出，让 systemd 拉起旧版。
+///
+/// 只有 `SystemdRestart` 换机（指针带第三行 backup）才会产生它：那条路径上
+/// **没有任何外部监督者**——旧 agent 已经退出，没有助手在等 `registered`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfRollback {
+    /// 本轮换机产生的旧二进制备份（与 target 同目录）。
+    pub backup: PathBuf,
+    /// 从进程启动算起的自回滚窗口。
+    pub deadline: Duration,
+}
+
+/// 自回滚窗口：默认 [`SELF_ROLLBACK_SECS`]，`SR_UPGRADE_SELF_ROLLBACK_SECS`
+/// 可在 `SELF_ROLLBACK_MIN_SECS..=SELF_ROLLBACK_MAX_SECS` 范围内覆盖。
+///
+/// 越界/非数字一律按默认值处理，不报错：这是个运维旋钮，写错不该让设备起不来。
+pub fn self_rollback_window() -> Duration {
+    let secs = std::env::var(SELF_ROLLBACK_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| (SELF_ROLLBACK_MIN_SECS..=SELF_ROLLBACK_MAX_SECS).contains(v))
+        .unwrap_or(SELF_ROLLBACK_SECS);
+    Duration::from_secs(secs)
 }
 
 /// 一次性身份恢复的完整输入：交给 `connect_with_retry` 的初始 cached_tokens
@@ -945,7 +1077,11 @@ pub struct RestoredIdentity {
     pub service_cgroup: Option<String>,
     /// 是否已经完成（交接文件已删、助手已回执）。`start()` 用它在首次会话
     /// 结束后停止传递恢复语义。
-    consumed: std::sync::atomic::AtomicBool,
+    consumed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `SystemdRestart` 换机专属：注册不上时把旧二进制恢复回磁盘再退出。
+    ///
+    /// `None` = 这条路径上有人替我们回滚（助手 / 普通启动），本进程不必自己动手。
+    pub self_rollback: Option<SelfRollback>,
 }
 
 impl std::fmt::Debug for RestoredIdentity {
@@ -960,6 +1096,10 @@ impl std::fmt::Debug for RestoredIdentity {
             .field("upgrade_id", &self.restore.upgrade_id)
             .field("handoff", &self.handoff)
             .field("consumed", &self.consumed())
+            .field(
+                "self_rollback",
+                &self.self_rollback.as_ref().map(|r| &r.backup),
+            )
             .finish()
     }
 }
@@ -997,7 +1137,8 @@ impl RestoredIdentity {
             },
             handoff: path.to_path_buf(),
             service_cgroup: ctx.service_cgroup.clone(),
-            consumed: std::sync::atomic::AtomicBool::new(false),
+            consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            self_rollback: None,
         })
     }
 
@@ -1033,10 +1174,80 @@ impl RestoredIdentity {
             &self.restore.target_version,
             &self.restore.session_id,
         );
+        // `SystemdRestart` 换机：升级已确认成功，旧二进制备份再无用，删掉。
+        // 留着它只是让磁盘上多一份几十 MB 的旧版本。
+        if let Some(rb) = &self.self_rollback {
+            match std::fs::remove_file(&rb.backup) {
+                Ok(()) => tracing::info!(
+                    backup = %rb.backup.display(),
+                    "upgrade confirmed; removed the previous binary"
+                ),
+                Err(e) => tracing::warn!(
+                    backup = %rb.backup.display(),
+                    error = %e,
+                    "cannot remove the previous binary after a confirmed upgrade"
+                ),
+            }
+        }
         // 重复进程的收尾**不在这里做**：它要占用一个观察窗口（systemd 是隔
         // `RestartSec` 才补起的），而 `complete()` 紧跟在注册成功之后、排在
         // 任何可能失败的初始化之前——在这里等窗口会平白推迟会话建立。由
         // 收尾动作（重复实例的识别）已随 fail-closed 方案移除。
+    }
+
+    /// 启动"注册不上就回滚"的后台计时（`SystemdRestart` 换机专用）。
+    ///
+    /// 这条路径上**没有外部监督者**：旧 agent 已经退出，没有助手在等
+    /// `registered`。注册不上时若什么都不做，设备就永久停在一个起不来的新
+    /// 版本上——而且因为 `Restart=always`，systemd 会一次次把它拉起来、一次次
+    /// 失败。所以由新进程自己看着窗口，到期未 `consumed()` 就恢复旧二进制并
+    /// 退出，把设备交回旧版。
+    ///
+    /// 只在 Linux 上生效（Windows 走 SCM/无此路径，且无法替换运行中的 exe）。
+    /// 没有 `self_rollback` 时是空操作，普通启动完全不受影响。
+    #[cfg(target_os = "linux")]
+    pub fn spawn_self_rollback_watchdog(
+        &self,
+        exit: impl Fn(i32) + Send + 'static,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let rb = self.self_rollback.clone()?;
+        // 窗口从"进程启动"算起，而不是从"线程起来"算起：注册可能要重试若干轮，
+        // 而 `resolve_restore` 到这里的间隔可以忽略；用启动时刻更接近运维的直觉
+        //（"起了 180 秒还没注册成功"）。
+        let deadline = Instant::now() + rb.deadline;
+        let backup = rb.backup;
+        // 目标路径由备份名反推：`<target>.sr-old-<tag>` → `<target>`。
+        let Some(target) = self_rollback_target(&backup) else {
+            tracing::error!(
+                backup = %backup.display(),
+                "cannot derive the installed binary path from the backup name; \
+                 self-rollback is disabled for this upgrade"
+            );
+            return None;
+        };
+        let handoff = self.handoff.clone();
+        // 线程里只能持有 `'static` 的东西：`consumed` 是 `Arc<AtomicBool>`，
+        // 克隆一份进去，`complete()` 一置位线程就退出。
+        let consumed = self.consumed.clone();
+        Some(std::thread::spawn(move || {
+            run_self_rollback_watchdog(
+                deadline,
+                &backup,
+                &target,
+                &handoff,
+                || consumed.load(std::sync::atomic::Ordering::SeqCst),
+                exit,
+            );
+        }))
+    }
+
+    /// 非 Linux：没有这条路径。保留签名一致的占位，调用方不必写 `cfg`。
+    #[cfg(not(target_os = "linux"))]
+    pub fn spawn_self_rollback_watchdog(
+        &self,
+        _exit: impl Fn(i32) + Send + 'static,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        None
     }
 
     /// 回滚后的重启要把失败原因送回 relay——否则管理界面只会看到一个
@@ -1090,6 +1301,106 @@ impl RestoredIdentity {
             payload,
         };
         serde_json::to_string(&msg).ok()
+    }
+}
+
+/// 自回滚计时的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfRollbackOutcome {
+    /// 到期仍未注册成功：旧二进制已恢复，调用方应以非 0 退出。
+    RolledBack,
+    /// 已经注册成功（`consumed()`），什么都没做。
+    Registered,
+    /// 恢复失败：设备需要人工介入，但**仍然**要退出，否则 systemd 会一直把
+    /// 这个起不来的新版拉起来。
+    RollbackFailed,
+}
+
+/// 从备份名反推被替换的二进制路径：`<target>.sr-old-<tag>` → `<target>`。
+///
+/// 备份一定与 target 同目录、名字带固定中缀（见 [`backup_path_for`]），所以
+/// 反推是确定的；名字不合规就返回 `None`（宁可禁用自回滚，也不能猜错路径去
+/// `rename` 一个无关文件）。
+pub fn self_rollback_target(backup: &Path) -> Option<PathBuf> {
+    let name = backup.file_name()?.to_str()?;
+    let idx = name.rfind(BACKUP_INFIX)?;
+    let base = &name[..idx];
+    if base.is_empty() {
+        return None;
+    }
+    // 中缀之后必须还有 tag（`backup_path_for` 总会写一个，`unknown` 兜底）。
+    if name.len() == idx + BACKUP_INFIX.len() {
+        return None;
+    }
+    Some(backup.with_file_name(base))
+}
+
+/// 自回滚计时的主体（与线程解耦，退出动作注入，便于测试直接调用）。
+///
+/// 语义：每 100ms 检查一次 `consumed()`；到期仍未消费就 `rename(backup →
+/// target)`，然后**总是**调用 `exit`（1 = 已回滚到旧版，2 = 恢复失败需要人工）。
+/// 退出这一步不能省：留在新版上等于让 `Restart=always` 反复拉起一个起不来的
+/// 进程，systemd 的启动频率限制最终会把它彻底停掉。
+///
+/// **不删交接文件**：旧版二进制根本不认识指针协议（指针已在读取时删除），
+/// 保留它不影响旧版启动，反而留下现场供排查。
+pub fn run_self_rollback_watchdog(
+    deadline: Instant,
+    backup: &Path,
+    target: &Path,
+    handoff: &Path,
+    consumed: impl Fn() -> bool,
+    exit: impl Fn(i32),
+) -> SelfRollbackOutcome {
+    loop {
+        if consumed() {
+            return SelfRollbackOutcome::Registered;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(POLL);
+    }
+    // 到期与"注册成功"之间有一瞬的竞态：`complete()` 先置位 `consumed`、随后
+    // 才删备份，而本线程可能在置位之前刚看过一眼。这里再确认一次——否则会把
+    // 一个**已经注册成功**的正常进程杀掉。
+    if consumed() {
+        return SelfRollbackOutcome::Registered;
+    }
+    match std::fs::rename(backup, target) {
+        Ok(()) => {
+            fsync_dir(target.parent().unwrap_or(Path::new(".")));
+            tracing::warn!(
+                backup = %backup.display(),
+                target = %target.display(),
+                handoff = %handoff.display(),
+                "the new version did not register in time; the previous binary was restored and \
+                 this process will exit so systemd restarts the previous version"
+            );
+            exit(1);
+            SelfRollbackOutcome::RolledBack
+        }
+        Err(e) => {
+            // 同一条竞态的另一种结局：备份已被 `complete()` 删掉（注册其实成功了）。
+            // 这种情况下**绝不能**退出——那会把一台健康的设备打回旧版。
+            if consumed() {
+                tracing::info!(
+                    backup = %backup.display(),
+                    "the upgrade confirmed registration while the rollback timer expired; \
+                     keeping the new version"
+                );
+                return SelfRollbackOutcome::Registered;
+            }
+            tracing::error!(
+                backup = %backup.display(),
+                target = %target.display(),
+                error = %e,
+                "the new version did not register and the previous binary could not be restored; \
+                 this device needs manual attention"
+            );
+            exit(2);
+            SelfRollbackOutcome::RollbackFailed
+        }
     }
 }
 
@@ -2031,23 +2342,175 @@ fn coordinated_swap_with(
 
 /// 让"由服务拉起的进程"能拿到这次换机的交接信息。
 ///
-/// `systemctl start` 起来的进程带的是 unit 里声明的环境，拿不到助手设置的
-/// `SR_UPGRADE_RESTORE`。所以把交接文件路径写进私有目录里的一个**单文件**
-/// 指针，由 agent 启动时读取（与既有恢复协议同一个入口，只是发现方式不同）。
+/// `systemctl start` / `Restart=always` 起来的进程带的是 unit 里声明的环境，
+/// 拿不到旧 agent 或助手设置的 `SR_UPGRADE_RESTORE`。所以把交接文件路径写进
+/// 私有目录里的一个**单文件**指针，由 agent 启动时读取（与既有恢复协议同一个
+/// 入口，只是发现方式不同）。
 ///
 /// 指针只含路径、`0600`、写在 `0700` 目录里；Token 始终只在交接文件内。
 fn pending_restore_marker(upgrade_id: &str, handoff: &Path, dir: &Path) {
+    pending_restore_marker_with(upgrade_id, handoff, None, dir)
+}
+
+/// [`pending_restore_marker`] 的两行/三行版本：`backup` 非空时写第三行。
+///
+/// 第三行只在 `SystemdRestart` 换机里出现——那条路径没有助手，新 agent 必须
+/// 自己知道该把哪份备份恢复回去。
+fn pending_restore_marker_with(
+    upgrade_id: &str,
+    handoff: &Path,
+    backup: Option<&Path>,
+    dir: &Path,
+) {
     let ptr = dir.join(RESTORE_PENDING_FILE);
     // 上一轮残留必须清掉：`write_private_new` 用 `create_new`，已存在就失败。
     let _ = std::fs::remove_file(&ptr);
-    let body = format!("{}\n{}", upgrade_id, handoff.display());
-    match write_private_new(&ptr, body.as_bytes()) {
-        Ok(()) => {}
-        Err(e) => {
-            // 写不进指针不影响换机本体：helper 会继续等注册，超时即回滚。
-            let _ = e;
-        }
+    let mut body = format!("{}\n{}", upgrade_id, handoff.display());
+    if let Some(backup) = backup {
+        body.push('\n');
+        body.push_str(&backup.display().to_string());
     }
+    if let Err(e) = write_private_new(&ptr, body.as_bytes()) {
+        // 写不进指针不影响换机本体：helper 会继续等注册，超时即回滚。
+        let _ = e;
+    }
+}
+
+/// 换盘用到的文件系统操作。
+///
+/// 抽成 trait 只有一个目的：**让每条失败分支都能被测到**。真实路径上"第二次
+/// `rename` 失败"极难稳定复现（要跨文件系统或恰好撞上权限变化），而这条分支
+/// 恰恰是"磁盘必须恢复原状"的关键，不能不测。生产路径永远用 [`RealSwapFs`]，
+/// 判定与恢复逻辑只有一份。
+trait SwapFs {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn make_executable(&self, path: &Path) -> std::io::Result<()>;
+    fn verify(&self, target: &Path, expected_sha: &str) -> Result<(), String>;
+    /// 写三行指针；返回是否成功落盘。
+    fn write_pointer(&self, upgrade_id: &str, handoff: &Path, backup: &Path, dir: &Path) -> bool;
+}
+
+struct RealSwapFs;
+
+impl SwapFs for RealSwapFs {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        rename_with_retry(from, to, Duration::from_secs(10))
+    }
+    fn make_executable(&self, path: &Path) -> std::io::Result<()> {
+        make_executable(path)
+    }
+    fn verify(&self, target: &Path, expected_sha: &str) -> Result<(), String> {
+        verify_installed_binary(target, expected_sha)
+    }
+    fn write_pointer(&self, upgrade_id: &str, handoff: &Path, backup: &Path, dir: &Path) -> bool {
+        pending_restore_marker_with(upgrade_id, handoff, Some(backup), dir);
+        dir.join(RESTORE_PENDING_FILE).is_file()
+    }
+}
+
+/// `SystemdRestart` 换机：由**旧 agent 自己**换盘（MYS-2425-E）。
+///
+/// 与助手路径的区别，处处都是为了"零权限、只有一个受管进程"：
+///
+/// - 不启动助手、不调 `systemd-run`/`systemctl`——非 root 账户做不了，也不需要；
+/// - 换盘在本进程内完成：Linux 允许 `rename` 一个正在运行的可执行文件，进程
+///   继续用已经映射的旧 inode 跑完手头的活；
+/// - 写三行指针（带 backup）后由调用方 `exit 0`，systemd 按 `Restart=always`
+///   用磁盘上的新字节拉起新版，新版仍是原 service 的 MainPID；
+/// - 新版注册不上时由它自己回滚（[`SelfRollback`]），不需要外部监督者。
+///
+/// 失败语义：**任何一步失败都要把磁盘恢复原状并返回 `Err`**，调用方据此上报
+/// `failed` 并继续在线。绝不 `exit`——旧进程还活着是这台设备唯一的保障。交接
+/// 文件的清理由调用方负责（凭据不该由失败路径静默丢弃）。
+///
+/// 返回 `Ok(())` 表示"换盘完成、指针就位，调用方现在可以退出"。
+pub fn systemd_restart_swap(
+    ctx: &RestartContext,
+    handoff: &Path,
+    restore_dir: &Path,
+) -> Result<(), String> {
+    systemd_restart_swap_with(&RealSwapFs, ctx, handoff, restore_dir)
+}
+
+/// [`systemd_restart_swap`] 的可注入文件系统版本。生产与测试共用这段逻辑。
+fn systemd_restart_swap_with(
+    fs: &dyn SwapFs,
+    ctx: &RestartContext,
+    handoff: &Path,
+    restore_dir: &Path,
+) -> Result<(), String> {
+    let target_dir = ctx
+        .target_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "the running executable has no parent directory".to_string())?;
+    let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
+
+    // 1) `.part` 再校验一次：从旧 agent 校验完到真正换盘之间，同用户的其它进程
+    //    仍可能改写它。这是最后一个可信检查点。
+    verify_new_binary(ctx)?;
+
+    // 2) 备份 → 新文件就位。第二步失败要把备份立刻恢复回去。
+    fs.make_executable(&ctx.new_binary).map_err(|e| {
+        format!("cannot mark the new binary executable: {e}; nothing on disk was changed")
+    })?;
+    fs.rename(&ctx.target_path, &backup).map_err(|e| {
+        format!(
+            "cannot move the current binary to {}: {e}; nothing on disk was changed",
+            backup.display()
+        )
+    })?;
+    if let Err(e) = fs.rename(&ctx.new_binary, &ctx.target_path) {
+        // 回到旧二进制。恢复失败时如实说明备份在哪——但**仍然返回错误**，
+        // 让调用方保持在线（此时磁盘上是备份缺失的旧版，仍能跑）。
+        let restored = fs.rename(&backup, &ctx.target_path);
+        return Err(match restored {
+            Ok(()) => {
+                format!("cannot install the new binary: {e}; the previous binary is back in place")
+            }
+            Err(re) => format!(
+                "cannot install the new binary ({e}) nor restore the previous one ({re}); \
+                 the previous binary is kept at {}",
+                backup.display()
+            ),
+        });
+    }
+    fsync_dir(&target_dir);
+
+    // 3) 一致性确认：盘上就是要装的那份字节。
+    if let Err(e) = fs.verify(&ctx.target_path, &ctx.new_sha256) {
+        let restored = fs.rename(&backup, &ctx.target_path);
+        return Err(match restored {
+            Ok(()) => format!(
+                "the installed binary does not match the upgrade task ({e}); the previous binary \
+                 was restored"
+            ),
+            Err(re) => format!(
+                "the installed binary does not match the upgrade task ({e}) and the previous \
+                 binary could not be restored ({re}); it is kept at {}",
+                backup.display()
+            ),
+        });
+    }
+
+    // 4) 三行指针：新 agent 靠它恢复身份，并知道注册不上时该恢复哪份备份。
+    //    写不进去就等于新 agent 会以全新身份注册、而且没有自回滚能力，比不
+    //    升级更糟，所以必须回滚。
+    if !fs.write_pointer(&ctx.upgrade_id, handoff, &backup, restore_dir) {
+        let restored = fs.rename(&backup, &ctx.target_path);
+        return Err(match restored {
+            Ok(()) => {
+                "cannot write the restore pointer, so the new version could not recover this \
+                 device's identity; the previous binary was restored"
+                    .to_string()
+            }
+            Err(re) => format!(
+                "cannot write the restore pointer ({re}); the previous binary is kept at {}",
+                backup.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// 交接文件被消费（新 agent 注册成功后删除）即成功。

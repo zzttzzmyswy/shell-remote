@@ -333,6 +333,13 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("upgrade restore failed: {e}");
                 }
             };
+            // `SystemdRestart` 换机没有外部监督者（旧 agent 已退出、没有助手在等
+            // `registered`）。注册不上时必须自己回滚，否则设备永久停在一个起不来
+            // 的新版上，而 `Restart=always` 会一次次把它拉起来。计时在这里起，
+            // 注册成功即由 `complete()` 取消。
+            if let Some(r) = restored.as_ref() {
+                r.spawn_self_rollback_watchdog(|code| std::process::exit(code));
+            }
             let root = root.unwrap_or_else(agent::home_dir);
             #[cfg(feature = "desktop")]
             {

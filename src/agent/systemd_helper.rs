@@ -425,28 +425,10 @@ pub fn stop_unit(unit: &str) {
 /// **只有旧 agent 仍在运行时读才有意义**：换机窗口内 systemd 会把它置 `0`。
 /// 本方案的检查因此全部安排在磁盘改动之前。
 pub fn unit_main_pid(unit: &str) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        let mut cmd = Command::new("systemctl");
-        cmd.args(["show", "-p", "MainPID", "--value", unit])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        apply_user_manager_env(&mut cmd);
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let v = String::from_utf8_lossy(&out.stdout);
-        match v.trim().parse::<u32>() {
-            Ok(pid) if pid > 0 => Some(pid),
-            _ => None,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = unit;
-        None
+    let v = show_unit_property(unit, "MainPID")?;
+    match v.parse::<u32>() {
+        Ok(pid) if pid > 0 => Some(pid),
+        _ => None,
     }
 }
 
@@ -458,30 +440,7 @@ pub fn unit_main_pid(unit: &str) -> Option<u32> {
 /// 读不到时返回 `None`——调用方必须把它当作"**不知道**"，而不是"不会重启"：
 /// 知道不清楚时宁可自己拉起新 agent（设备不失联优先），也不要赌 systemd 会补。
 pub fn service_restart_policy(unit: &str) -> Option<String> {
-    #[cfg(unix)]
-    {
-        let mut cmd = Command::new("systemctl");
-        cmd.args(["show", "-p", "Restart", "--value", unit])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        apply_user_manager_env(&mut cmd);
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if v.is_empty() {
-            None
-        } else {
-            Some(v)
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = unit;
-        None
-    }
+    show_unit_property(unit, "Restart")
 }
 
 /// `Restart=` 是否会让 systemd 在**正常退出**后补起一个实例。
@@ -534,11 +493,15 @@ fn find_agent_in_cgroup(service_cgroup: &str, exclude: Option<u32>) -> Option<u3
 /// 注册失败时的回滚边界不清。设计决定因此改为：**在磁盘动之前**把"能不能
 /// 协调"问清楚，能就做，不能就当场失败。
 ///
-/// ## 三条结论
+/// ## 四条结论
 ///
 /// - [`ManagedPlan::Direct`]：不是 systemd service 托管，走既有直接助手路径。
 /// - [`ManagedPlan::Coordinated`]：归属明确的单 agent service，且当前身份**已**
 ///   被授权管理该 unit 的生命周期 ⇒ 由助手执行 stop → swap → start。
+/// - [`ManagedPlan::SystemdRestart`]：同一个归属明确的单 agent service，但身份
+///   **没有**管理权限（默认部署形态：非 root + `Restart=always`）。旧 agent 在
+///   自己进程内换盘、留指针后退出，由 systemd 按 `Restart=always` 拉起新版
+///   ⇒ 全程零权限、零额外进程。
 /// - [`ManagedPlan::Refuse`]：其它一切情况。**在旧 agent 退出前**上报 `failed`
 ///   并给出可操作的解决方法，磁盘一点不动，也不产生第二个实例。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,6 +510,8 @@ pub enum ManagedPlan {
     Direct,
     /// 可以协调：助手负责 stop/swap/start，新 agent 回到唯一受管 MainPID。
     Coordinated { unit: String },
+    /// 不需要权限：旧 agent 自己换盘后退出，systemd 按 `Restart=always` 拉起新版。
+    SystemdRestart { unit: String },
     /// 拒绝协调。`reason` 是给运维看的可读原因，直接进 Web。
     Refuse {
         unit: Option<String>,
@@ -656,36 +621,48 @@ pub fn decide(probe: &Probe) -> ManagedPlan {
         }
     }
 
-    // Restart 策略决定"能不能直接走既有路径"：
+    // Restart 策略 + 授权共同决定走哪条路（MYS-2425-E 判定表）：
     //
-    // - `always`：旧 agent 为换机正常退出后 systemd 会补起一个，必须由助手接管
-    //   服务生命周期（stop 取消待执行重启 → 换盘 → start 拿回唯一 MainPID）。
-    // - **其它策略**（`on-failure` / `on-abnormal` / `no` / …）：systemd **不会**
-    //   因正常退出补起，既有直接助手路径天然只有一个实例 ⇒ 不需要协调，直接
-    //   走 Direct。把它判成"拒绝"是错的：那条路径本来就能升级。
-    // - 读不到：无法确认"停掉之后会不会有别的东西复活"，也不确认"不协调是否
-    //   安全" ⇒ 拒绝（fail-closed）。
-    match probe.restart_policy.as_deref() {
-        Some(p) if restart_policy_respawns_on_success(p) => {}
-        Some(_) => return ManagedPlan::Direct,
+    // | Restart   | 已授权 | 未授权 |
+    // |-----------|--------|--------|
+    // | `always`  | Coordinated | **SystemdRestart** |
+    // | 其它      | Coordinated | Refuse（新进程会脱离 service） |
+    // | 读不到    | Refuse | Refuse |
+    //
+    // `always` 是唯一让 systemd 在**正常退出**后补起实例的策略，因此也是唯一
+    // 能"免权限换机"的策略：旧 agent 自己换盘后 `exit 0`，systemd 就用新字节
+    // 拉起新版，新 agent 仍是原 service 的 MainPID。
+    //
+    // 未授权 + 其它策略必须拒绝：`on-failure` 下旧 agent 正常退出后没人补起，
+    // 只能由助手在独立 transient unit 里 spawn 新进程——那个进程**不在**原
+    // service 里，升级后 service 变 inactive，崩溃不再被恢复（v0.59.6 的缺陷）。
+    // 已授权时这条策略仍走 Coordinated：stop 之后 start 会按需拉起，与策略无关。
+    let respawns = match probe.restart_policy.as_deref() {
+        Some(p) => restart_policy_respawns_on_success(p),
         None => {
             return ManagedPlan::Refuse {
                 unit: Some(unit.to_string()),
                 reason: format!("{REFUSE_CAUSE_RESTART_POLICY_UNREADABLE} (unit {unit})"),
             }
         }
-    }
+    };
 
-    // 授权：只在**已经**授权时协调。需要交互认证 = 做不到，不偷偷提权。
-    if !probe.lifecycle_authorized {
-        return ManagedPlan::Refuse {
-            unit: Some(unit.to_string()),
-            reason: format!("{REFUSE_CAUSE_NOT_AUTHORIZED} (unit {unit})"),
+    if probe.lifecycle_authorized {
+        // 授权：只在**已经**授权时协调。需要交互认证 = 做不到，不偷偷提权。
+        return ManagedPlan::Coordinated {
+            unit: unit.to_string(),
         };
     }
 
-    ManagedPlan::Coordinated {
-        unit: unit.to_string(),
+    if respawns {
+        return ManagedPlan::SystemdRestart {
+            unit: unit.to_string(),
+        };
+    }
+
+    ManagedPlan::Refuse {
+        unit: Some(unit.to_string()),
+        reason: format!("{REFUSE_CAUSE_RESTART_POLICY} (unit {unit})"),
     }
 }
 
@@ -698,10 +675,11 @@ pub const REFUSE_CAUSE_SHARED_CGROUP: &str = "this service hosts more than one a
 pub const REFUSE_CAUSE_EXECSTART_MISMATCH: &str =
     "the service starts a different binary than the one running";
 pub const REFUSE_CAUSE_EXECSTART_UNREADABLE: &str = "cannot read the service's ExecStart";
-pub const REFUSE_CAUSE_RESTART_POLICY: &str = "the service is not configured with Restart=always";
+pub const REFUSE_CAUSE_RESTART_POLICY: &str = "the service does not use Restart=always (required \
+                                                 for a handover without service-management \
+                                                 permission) and this agent is not authorized to \
+                                                 manage the service lifecycle";
 pub const REFUSE_CAUSE_RESTART_POLICY_UNREADABLE: &str = "cannot read the service's Restart policy";
-pub const REFUSE_CAUSE_NOT_AUTHORIZED: &str =
-    "this agent is not authorized to manage the service lifecycle";
 
 /// 路径比较：解析符号链接后相等即可（同一份二进制换个写法也算相符）。
 fn same_path(a: &str, b: &str) -> bool {
@@ -764,6 +742,62 @@ pub fn probe() -> Probe {
     }
 }
 
+/// 本进程所在的 unit 是否属于**用户级** manager。
+///
+/// 用户级 service 的 cgroup 在 `/user.slice/user-<uid>.slice/user@<uid>.service/`
+/// 之下；系统级在 `/system.slice/`。这个区分决定 `systemctl` 要不要带 `--user`
+/// ——不带的话，`systemctl show <user-unit>` 返回 "Unit ... could not be found"，
+/// `MainPID` 读成 `None`，整个判定被 fail-closed 拒绝。默认部署（非 root 用户
+/// 级 service）正是这一档，所以必须分对。
+fn unit_lives_in_the_user_manager() -> bool {
+    current_cgroup_path()
+        .map(|cg| is_user_manager_cgroup(&cg))
+        .unwrap_or(false)
+}
+
+/// 纯判定：这个 cgroup 路径属于用户级 manager 吗？
+///
+/// 用户级 unit（`systemd --user` / `loginctl enable-linger` 的 service）落在
+/// `/user.slice/` 之下；系统级在 `/system.slice/`。抽成独立函数是为了能直接
+/// 单测这条判据——它一错，整条免权限换机路径就不可达。
+fn is_user_manager_cgroup(cgroup: &str) -> bool {
+    cgroup.starts_with("/user.slice/")
+}
+
+/// 读 unit 的一个属性（`systemctl show -p <prop> --value`）。
+///
+/// 按 [`unit_lives_in_the_user_manager`] 自动补 `--user`。读不到/空值都返回
+/// `None`——调用方必须当作"**不知道**"，不能当成"没有"。
+fn show_unit_property(unit: &str, prop: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("systemctl");
+        if unit_lives_in_the_user_manager() {
+            cmd.arg("--user");
+        }
+        cmd.args(["show", "-p", prop, "--value", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        apply_user_manager_env(&mut cmd);
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (unit, prop);
+        None
+    }
+}
+
 /// unit 的 cgroup 路径（按 unit 名推导，v2 直接在 `/sys/fs/cgroup` 下）。
 fn unit_cgroup_path(unit: &str) -> Option<String> {
     // 自身 cgroup 已包含完整路径；优先用它（同一 unit 必然一致）。
@@ -780,33 +814,26 @@ fn unit_cgroup_path(unit: &str) -> Option<String> {
 /// `systemctl show -p ExecStart` 的输出形如：
 /// `{ path=/usr/local/bin/shell-remote ; argv[]=/usr/local/bin/shell-remote agent ... }`
 fn service_exec_start_exe(unit: &str) -> Option<String> {
-    #[cfg(unix)]
-    {
-        let mut cmd = Command::new("systemctl");
-        cmd.args(["show", "-p", "ExecStart", "--value", unit])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        apply_user_manager_env(&mut cmd);
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let at = text.find("path=")?;
-        let rest = &text[at + "path=".len()..];
-        let end = rest.find(" ;").or_else(|| rest.find(';'))?;
-        let p = rest[..end].trim();
-        if p.is_empty() {
-            None
-        } else {
-            Some(p.to_string())
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = unit;
+    parse_exec_start_path(&show_unit_property(unit, "ExecStart")?)
+}
+
+/// 从 `systemctl show -p ExecStart --value` 的输出里取首个可执行文件。
+///
+/// 输出形如
+/// `{ path=/usr/local/bin/x ; argv[]=/usr/local/bin/x agent ... ; ignore_errors=no ; ... }`。
+/// 解析失败返回 `None`——调用方按"形态未知"拒绝。
+fn parse_exec_start_path(text: &str) -> Option<String> {
+    let at = text.find("path=")?;
+    let rest = &text[at + "path=".len()..];
+    let end = rest
+        .find(" ;")
+        .or_else(|| rest.find(';'))
+        .unwrap_or(rest.len());
+    let p = rest[..end].trim();
+    if p.is_empty() {
         None
+    } else {
+        Some(p.to_string())
     }
 }
 
@@ -901,6 +928,11 @@ fn run_systemctl(args: &[&str]) -> Result<(), String> {
     #[cfg(unix)]
     {
         let mut cmd = Command::new("systemctl");
+        // 用户级 service（默认部署形态）必须带 `--user`，否则 `stop`/`start`
+        // 会报 "Unit ... not found"。系统级 unit 不能带（会去 user manager 找）。
+        if unit_lives_in_the_user_manager() {
+            cmd.arg("--user");
+        }
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

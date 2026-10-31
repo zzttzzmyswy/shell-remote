@@ -389,11 +389,113 @@ fn test_fully_qualified_service_is_coordinated() {
 }
 
 /// 非 systemd 托管 ⇒ 既有直接助手路径，行为不变。
+///
+/// 授权与否、重启策略如何，都不影响：那台机器上根本没有 systemd 需要协调。
 #[test]
 fn test_unmanaged_environment_keeps_the_existing_path() {
+    for authorized in [true, false] {
+        for policy in [Some("always"), Some("on-failure"), None] {
+            let mut p = good_probe();
+            p.managed = false;
+            p.lifecycle_authorized = authorized;
+            p.restart_policy = policy.map(str::to_string);
+            assert_eq!(
+                decide(&p),
+                ManagedPlan::Direct,
+                "非托管环境必须走直接路径（authorized={authorized}, policy={policy:?}）"
+            );
+        }
+    }
+}
+
+/// 判定表的**全组合**穷举：`Restart` 策略 × 是否已授权。
+///
+/// 设计表（MYS-2425-E）：
+///
+/// | Restart  | 已授权 | 未授权 |
+/// |----------|--------|--------|
+/// | `always` | Coordinated | SystemdRestart |
+/// | 其它     | Coordinated | Refuse |
+/// | 读不到   | Refuse | Refuse |
+#[test]
+fn test_decision_matrix_covers_every_combination() {
+    use ManagedPlan::*;
+    let unit = "shell-remote-agent.service".to_string();
+    let cases: &[(&str, Option<&str>, bool, fn(&str) -> ManagedPlan)] = &[
+        // `Restart=always`
+        ("always", Some("always"), true, |u| Coordinated {
+            unit: u.to_string(),
+        }),
+        ("always", Some("always"), false, |u| SystemdRestart {
+            unit: u.to_string(),
+        }),
+        // 其它策略
+        ("on-failure", Some("on-failure"), true, |u| Coordinated {
+            unit: u.to_string(),
+        }),
+        ("on-failure", Some("on-failure"), false, |_| Refuse {
+            unit: Some("shell-remote-agent.service".to_string()),
+            reason: REFUSE_CAUSE_RESTART_POLICY.to_string(),
+        }),
+        ("no", Some("no"), true, |u| Coordinated {
+            unit: u.to_string(),
+        }),
+        ("no", Some("no"), false, |_| Refuse {
+            unit: Some("shell-remote-agent.service".to_string()),
+            reason: REFUSE_CAUSE_RESTART_POLICY.to_string(),
+        }),
+    ];
+    for (label, policy, authorized, want) in cases {
+        let mut p = good_probe();
+        p.restart_policy = policy.map(str::to_string);
+        p.lifecycle_authorized = *authorized;
+        let got = decide(&p);
+        let expected = want(&unit);
+        match (&expected, &got) {
+            (
+                Refuse { reason, .. },
+                Refuse {
+                    reason: got_reason, ..
+                },
+            ) => {
+                assert!(
+                    got_reason.contains(reason.as_str()),
+                    "{label}/authorized={authorized}: 原因不含前缀 {reason:?}，实际 {got_reason:?}"
+                );
+            }
+            _ => assert_eq!(got, expected, "{label}/authorized={authorized} 的判定不符"),
+        }
+    }
+
+    // 读不到策略：两种授权状态都必须拒绝。
+    for authorized in [true, false] {
+        let mut p = good_probe();
+        p.restart_policy = None;
+        p.lifecycle_authorized = authorized;
+        match decide(&p) {
+            Refuse { reason, .. } => assert!(
+                reason.contains(REFUSE_CAUSE_RESTART_POLICY_UNREADABLE),
+                "{reason}"
+            ),
+            other => panic!("策略读不到必须拒绝（authorized={authorized}），实际 {other:?}"),
+        }
+    }
+}
+
+/// 非 MainPID 优先于"免权限换机"：归属不明时**不能**走 `SystemdRestart`。
+///
+/// 这条比什么都重要：`SystemdRestart` 会替换磁盘上的二进制并退出，期望
+/// systemd 用新字节拉起。若主进程不是自己（多 agent 共享一个 service、或 unit
+/// 里套了 wrapper），拉起的是别的东西，新版本永远跑不起来。
+#[test]
+fn test_not_main_pid_blocks_systemd_restart() {
     let mut p = good_probe();
-    p.managed = false;
-    assert_eq!(decide(&p), ManagedPlan::Direct);
+    p.lifecycle_authorized = false; // 本可以走 SystemdRestart
+    p.main_pid = Some(1);
+    assert!(
+        matches!(decide(&p), ManagedPlan::Refuse { .. }),
+        "归属不明时不得走 SystemdRestart"
+    );
 }
 
 /// **非 MainPID ⇒ 拒绝**（普通 service 里套了 wrapper / 共享 daemon）。
@@ -457,17 +559,45 @@ fn test_execstart_mismatch_is_refused() {
 }
 
 /// `Restart=on-failure` ⇒ **走既有直接路径**（systemd 不会因正常退出补起，
-/// 天然只有一个实例，不需要协调）。
+/// 非 `always` 策略 + **已授权** ⇒ 仍走协调（stop 之后 start 会按需拉起，
+/// 与重启策略无关）。
 #[test]
-fn test_non_always_policy_uses_the_existing_direct_path() {
+fn test_non_always_policy_is_still_coordinated_when_authorized() {
     for policy in ["on-failure", "on-abnormal", "on-abort", "no"] {
         let mut p = good_probe();
         p.restart_policy = Some(policy.to_string());
         assert_eq!(
             decide(&p),
-            ManagedPlan::Direct,
-            "Restart={policy} 下不该走协调，也不该拒绝"
+            ManagedPlan::Coordinated {
+                unit: "shell-remote-agent.service".to_string()
+            },
+            "Restart={policy} 且已授权时应走协调"
         );
+    }
+}
+
+/// 非 `always` 策略 + **未授权** ⇒ 拒绝。
+///
+/// 这是 v0.59.6 的缺陷所在：`on-failure` 下旧 agent 正常退出后没人补起，只能由
+/// 助手在独立 transient unit 里 spawn 新进程——那个进程不在原 service 里，升级
+/// 后 service 变 inactive，崩溃不再被恢复。所以必须当场拒绝，而不是走 Direct。
+#[test]
+fn test_non_always_policy_unauthorized_is_refused() {
+    for policy in ["on-failure", "on-abnormal", "on-abort", "no"] {
+        let mut p = good_probe();
+        p.restart_policy = Some(policy.to_string());
+        p.lifecycle_authorized = false;
+        match decide(&p) {
+            ManagedPlan::Refuse { reason, unit } => {
+                assert!(reason.contains(REFUSE_CAUSE_RESTART_POLICY), "{reason}");
+                assert!(
+                    reason.contains("Restart=always"),
+                    "原因必须点明需要 Restart=always: {reason}"
+                );
+                assert_eq!(unit.as_deref(), Some("shell-remote-agent.service"));
+            }
+            other => panic!("Restart={policy} 未授权必须拒绝，实际 {other:?}"),
+        }
     }
 }
 
@@ -487,19 +617,32 @@ fn test_unreadable_restart_policy_is_refused() {
     }
 }
 
-/// **未授权 ⇒ 拒绝**（polkit 需要交互认证时 agent 做不到）。
+/// **未授权 + `Restart=always` ⇒ `SystemdRestart`**（免权限换机主路径）。
 ///
-/// 设计底线：不提权、不改 sudoers/unit、不降级成会产生第二实例的 helper-spawn。
+/// 默认部署形态就是这一档：非 root 账户、模板自带的 `Restart=always`。旧 agent
+/// 自己换盘后 `exit 0`，systemd 用新字节拉起新版，全程不需要任何权限。
 #[test]
-fn test_unauthorized_lifecycle_is_refused() {
+fn test_always_policy_unauthorized_uses_systemd_restart() {
     let mut p = good_probe();
     p.lifecycle_authorized = false;
-    match decide(&p) {
-        ManagedPlan::Refuse { reason, .. } => {
-            assert!(reason.contains(REFUSE_CAUSE_NOT_AUTHORIZED), "{reason}")
+    assert_eq!(
+        decide(&p),
+        ManagedPlan::SystemdRestart {
+            unit: "shell-remote-agent.service".to_string()
         }
-        other => panic!("必须拒绝，实际 {other:?}"),
-    }
+    );
+}
+
+/// 已授权 + `Restart=always` ⇒ 仍是协调路径（stop → swap → start），语义不变。
+#[test]
+fn test_always_policy_authorized_stays_coordinated() {
+    let p = good_probe();
+    assert_eq!(
+        decide(&p),
+        ManagedPlan::Coordinated {
+            unit: "shell-remote-agent.service".to_string()
+        }
+    );
 }
 
 /// unit 确定不了（cgroup 读不到，或不是 `.service`）⇒ 拒绝。
@@ -526,6 +669,9 @@ fn test_managed_plan_survives_the_handoff_roundtrip() {
         ManagedPlan::Coordinated {
             unit: "shell-remote-agent.service".to_string(),
         },
+        ManagedPlan::SystemdRestart {
+            unit: "shell-remote-agent.service".to_string(),
+        },
         ManagedPlan::Refuse {
             unit: Some("x.service".to_string()),
             reason: "cannot read the service's ExecStart".to_string(),
@@ -539,6 +685,42 @@ fn test_managed_plan_survives_the_handoff_roundtrip() {
         let dec = super::super::update_apply::decode_plan_for_test(&enc);
         assert_eq!(dec.as_ref(), Some(&plan), "编码={enc}");
     }
+}
+
+/// **用户级 service（默认部署形态）必须带 `--user`**。
+///
+/// 现场实测：不带 `--user` 时 `systemctl show -p MainPID --value sr-x.service`
+/// 返回空、退出码非 0（"Unit could not be found"），`MainPID` 读成 `None`，
+/// 判定被 fail-closed 拒绝——`Restart=always` + 非 root 的免权限换机整条路径
+/// 都不可达。这条用例把"按 cgroup 前缀选 manager"钉住。
+#[test]
+fn test_user_manager_detection_drives_the_systemctl_scope() {
+    // 用户级：`/user.slice/user-1000.slice/user@1000.service/app.slice/x.service`
+    assert!(is_user_manager_cgroup(
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/sr-mys2425e-cg.service"
+    ));
+    // 系统级：`/system.slice/shell-remote-agent.service`
+    assert!(!is_user_manager_cgroup(
+        "/system.slice/shell-remote-agent.service"
+    ));
+    // 会话 scope 也是用户级（手工在终端里跑的情形）。
+    assert!(is_user_manager_cgroup(
+        "/user.slice/user-1000.slice/session-3.scope"
+    ));
+}
+
+/// `ExecStart` 解析要能吃下 systemd 的真实输出形态。
+#[test]
+fn test_exec_start_path_is_parsed_from_systemd_output() {
+    let text = "{ path=/usr/local/bin/shell-remote ; argv[]=/usr/local/bin/shell-remote agent \
+                --relay-url http://x ; ignore_errors=no ; start_time=[n/a] ; pid=0 ; \
+                code=(null) ; status=0/0 }";
+    assert_eq!(
+        parse_exec_start_path(text).as_deref(),
+        Some("/usr/local/bin/shell-remote")
+    );
+    // 读不到路径就返回 None（调用方按"形态未知"拒绝）。
+    assert_eq!(parse_exec_start_path("argv[]=/bin/true"), None);
 }
 
 // ── 6. pkcheck 解析：只认 exit 0 / 精确 result=yes（评审第 1 项）──────
