@@ -300,7 +300,7 @@ target 即可。
 |------|------|
 | `Restart=always` + 未授权，`KillMode=control-group` | `SystemdRestart` 成功：`active`、MainPID 为新进程、`NRestarts` 恰好 +1、`/proc/<pid>/exe` 指向 target、Token 不变、单进程、backup 已删 |
 | `Restart=always` + 未授权，`KillMode=mixed` | 同上 |
-| 自回滚（`SR_UPGRADE_SELF_ROLLBACK_SECS=30`，relay 停机） | 磁盘恢复为旧 hash、service 仍 `active` 且 MainPID 为旧版进程、relay 最终 `failed` |
+| 自回滚（`SR_UPGRADE_SELF_ROLLBACK_SECS=30`，换盘完成后立刻剪断 agent↔relay 链路） | 磁盘恢复为旧 hash、service 仍 `active` 且 MainPID 为新拉起的旧版进程、`NRestarts=2`、relay 恢复连通后收敛为 `failed` |
 | `Restart=on-failure` + 未授权 | **换机前** `failed`、磁盘未动、旧 agent 在线，原因含 `Restart=always` |
 | `Restart=always` + 已授权（root 的测试 unit） | `Coordinated` 成功：`NRestarts=0`、单进程、Token 不变、磁盘为新制品、`registered` |
 

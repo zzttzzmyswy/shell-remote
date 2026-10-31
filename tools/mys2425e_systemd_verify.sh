@@ -15,18 +15,23 @@ set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 被换的**已安装**二进制。必须是**带本特性**的版本（v0.59.7），否则它不具备
-# SystemdRestart 能力，换机会被 fail-closed 拒绝——这正是"首次部署"的
-# chicken-and-egg：v0.59.6 只能靠人工/SOP 升上来，一旦跑到 v0.59.7，后续升级
-# 就都能免权限自升级。
+# SystemdRestart 能力、换机会被 fail-closed 拒绝——这正是"首次部署"的
+# chicken-and-egg：v0.59.6 只能靠人工/SOP 升上来，一旦跑到 v0.59.7，之后每次
+# 升级都能免权限自升级。
 OLD="${OLD:-$REPO/target/release/shell-remote}"
-# 升级**目标**版本：靠 relay 的清单 fixture 声明为 0.59.8（比已安装的高一个
-# 补丁号），这样 relay 才判为"需要升级"。制品字节与 v0.59.7 相同 + 尾部标记，
-# 所以"磁盘 hash 变成新制品"仍然是被证明的。
-TARGET_VERSION="${TARGET_VERSION:-0.59.8}"
-# v0.59.7 制品来源（会被追加标记串，hash 必然不同）。
-NEW="${NEW:-$REPO/target/release/shell-remote}"
+# relay 与升级目标：0.59.8（比已安装的高一个补丁号）。relay 用自身
+# `CARGO_PKG_VERSION` 当升级目标版本，所以 relay 必须是 0.59.8 那份构建——否则
+# 它会说"无需升级"。制品就是 0.59.8 的 relay 二进制 + 尾部标记串，所以"磁盘
+# hash 变成新制品"仍然是被证明的。
+NEW="${NEW:-/tmp/sr-next-target/release/shell-remote}"
+# relay 监听 UPSTREAM；agent 连 AGENT_PORT，中间是本脚本起的 TCP 代理。
+# 用代理而不是直接连 relay，是为了能在 C 用例里"剪断链路"而**不丢 relay 内存
+# 里的任务状态**（杀掉 relay 会连同 upgrade_id 一起消失，就没有 failed 可收敛）。
 PORT="${PORT:-3131}"
+UPSTREAM_PORT="${UPSTREAM_PORT:-$((PORT + 1))}"
+UPSTREAM="http://127.0.0.1:${UPSTREAM_PORT}"
 BASE="http://127.0.0.1:${PORT}"
+PROXY_PID=""
 ADMIN_PATH=/sr-admin-cus
 W="$(mktemp -d)"
 # 安装位置：换机真的会 rename 掉这个文件，所以必须在可写目录里，不能直接用
@@ -46,6 +51,7 @@ cleanup() {
   set +e
   echo
   echo "════ 清理 ════"
+  cut_link
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null && echo "  relay $RELAY_PID 已停止"
   for u in "$UNITDIR"/sr-mys2425e-*.service; do
     [ -e "$u" ] || continue
@@ -71,7 +77,7 @@ trap cleanup EXIT
 
 login() {
   for _ in $(seq 1 40); do
-    curl -s -c "$W/cookie" -X POST "$BASE${ADMIN_PATH}/login" \
+    curl -s -c "$W/cookie" -X POST "$UPSTREAM${ADMIN_PATH}/login" \
       -H 'Content-Type: application/json' -d '{"user":"admin","pass":"cspass"}' \
       -o /dev/null 2>/dev/null
     grep -q sr_admin "$W/cookie" 2>/dev/null && return 0
@@ -79,28 +85,69 @@ login() {
   done
   return 1
 }
-api() { local p="$1"; shift; curl -s -b "$W/cookie" "$BASE${ADMIN_PATH}${p}" "$@"; }
+# 管理面直连 relay（UPSTREAM）：C 用例会剪断 agent↔relay 的链路，管理面不能
+# 跟着断——否则读不到 relay 持有的任务状态。
+api() { local p="$1"; shift; curl -s -b "$W/cookie" "$UPSTREAM${ADMIN_PATH}${p}" "$@"; }
 
 # relay 必须跑**新版**（0.59.7）：它用自身的 `CARGO_PKG_VERSION` 作为升级目标
 # 版本，旧版 relay 会说"无需升级"。
+# 起/停 agent→relay 的 TCP 代理（剪断=杀掉代理进程）。
+start_proxy() {
+  [ -n "$PROXY_PID" ] && return 0
+  python3 - "$PORT" "$UPSTREAM_PORT" <<'PYPROXY' > "$W/proxy.log" 2>&1 &
+import socket, sys, threading
+listen, target = int(sys.argv[1]), int(sys.argv[2])
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", listen)); srv.listen(64)
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d: break
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        try: b.shutdown(socket.SHUT_WR)
+        except OSError: pass
+while True:
+    try: c, _ = srv.accept()
+    except OSError: break
+    try: u = socket.create_connection(("127.0.0.1", target))
+    except OSError:
+        c.close(); continue
+    threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+    threading.Thread(target=pipe, args=(u, c), daemon=True).start()
+PYPROXY
+  PROXY_PID=$!
+  for _ in $(seq 1 40); do (echo > /dev/tcp/127.0.0.1/$PORT) 2>/dev/null && return 0; sleep 0.2; done
+  return 1
+}
+
+cut_link() {
+  [ -n "$PROXY_PID" ] && kill -9 "$PROXY_PID" 2>/dev/null
+  wait "$PROXY_PID" 2>/dev/null
+  PROXY_PID=""
+}
+
+restore_link() { start_proxy; }
+
 start_relay() { # $1 = artifact dir (optional)
   local art="${1:-}"
   if [ -n "$art" ]; then
-    "$NEW" relay --bind "127.0.0.1:${PORT}" --auth cus-pass --no-tls \
+    "$NEW" relay --bind "127.0.0.1:${UPSTREAM_PORT}" --auth cus-pass --no-tls \
       --admin-path "$ADMIN_PATH" --admin-user admin --admin-pass cspass \
       --download-dir "$art" --allow-custom-upgrade \
       --upgrade-cdn "http://127.0.0.1:1" >> "$W/relay.log" 2>&1 &
   else
-    "$NEW" relay --bind "127.0.0.1:${PORT}" --auth cus-pass --no-tls \
+    "$NEW" relay --bind "127.0.0.1:${UPSTREAM_PORT}" --auth cus-pass --no-tls \
       --admin-path "$ADMIN_PATH" --admin-user admin --admin-pass cspass \
       >> "$W/relay.log" 2>&1 &
   fi
   RELAY_PID=$!
-  for _ in $(seq 1 80); do curl -s -o /dev/null "$BASE/" && break; sleep 0.2; done
+  for _ in $(seq 1 80); do curl -s -o /dev/null "$UPSTREAM/" && break; sleep 0.2; done
   login
 }
-
-stop_relay() { [ -n "$RELAY_PID" ] && kill -9 "$RELAY_PID" 2>/dev/null; wait "$RELAY_PID" 2>/dev/null; RELAY_PID=""; }
 
 # 某 session 当前的 tokens（身份对账单位）。
 sess_tokens() {
@@ -181,6 +228,19 @@ UNIT
   systemctl --user daemon-reload
 }
 
+# 等 unit 回到 active（且有 MainPID）。
+wait_active() { # $1=name  $2=timeout
+  local t0=$SECONDS
+  while [ $((SECONDS - t0)) -lt "$2" ]; do
+    if [ "$(systemctl --user show "$1.service" -p ActiveState --value)" = active ] \
+       && [ "$(systemctl --user show "$1.service" -p MainPID --value)" != 0 ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 show_unit() { # $1=name
   systemctl --user show "$1.service" -p ActiveState,MainPID,NRestarts,KillMode,Restart 2>/dev/null | tr '\n' ' '; echo
 }
@@ -207,29 +267,6 @@ prepare_artifacts() {
   ART_SIZE="$(stat -c %s "$ART/$ART_NAME")"
   "$ART/$ART_NAME" --version >/dev/null 2>&1 || { echo "FAIL: 制品不可执行"; exit 1; }
 
-  # 让 relay 判"需要升级"：清单里声明的版本比已安装的高。
-  # relay 的 `version_decision` 比较 relay 自身版本（0.59.7）与 agent 版本
-  # （0.59.7）⇒ UpToDate；`force` 只允许同版本重装，而我们要验证的是**真实的
-  # 换机流程**。清单 fixture 让任务目标变成 0.59.8：`build_task` 用清单的
-  # version 作为 target，relay 仍按自身版本决策——所以这里同时把 relay 的
-  # 决策改成"目标更高"。
-  mkdir -p "$ART/.metadata/manifests"
-  cat > "$ART/.metadata/manifests/v${TARGET_VERSION}.json" <<JSON
-{
-  "schema_version": 1,
-  "tag": "v${TARGET_VERSION}",
-  "version": "${TARGET_VERSION}",
-  "fetched_at": $(date +%s),
-  "assets": [
-    {
-      "name": "$ART_NAME",
-      "size": $ART_SIZE,
-      "sha256": "$ART_SHA",
-      "download_url": "https://github.com/zzttzzmyswy/shell-remote/releases/download/v${TARGET_VERSION}/$ART_NAME"
-    }
-  ]
-}
-JSON
   echo "  制品 $ART_NAME sha=${ART_SHA:0:16}… size=$ART_SIZE"
 }
 
@@ -277,15 +314,44 @@ OLD_SHA="$(sha256sum "$INSTALLED" | cut -d' ' -f1)"
 echo "  安装旧版到 $INSTALLED sha=${OLD_SHA:0:16}…"
 [ "$OLD_SHA" != "$ART_SHA" ] || { echo "FAIL: 新旧制品 hash 相同，换机无法被证明"; exit 1; }
 start_relay "$ART" || { echo "FAIL: relay 未启动"; exit 1; }
-echo "  relay 已起在 $BASE"
+start_proxy || { echo "FAIL: TCP 代理未启动"; exit 1; }
+echo "  relay 已起在 $UPSTREAM，agent 经代理连 $BASE"
 
 # ══════════════════════════════════════════════════════════════════
 # A / B：成功路径（KillMode=control-group / mixed）
 # ══════════════════════════════════════════════════════════════════
+# 每个用例前把磁盘恢复成"已安装旧版"的状态。
+#
+# 必须先停掉**所有**本脚本的 unit 再覆盖：上一轮的新 agent 还在跑时，直接 `cp`
+# 到同一个路径会撞 ETXTBSY（"Text file busy"），覆盖失败但又没有报错退出，
+# 于是本用例从一个错误的磁盘状态开始（实测把 C 用例的断言全带偏了）。
+reinstall_old() {
+  local u
+  for u in "$UNITDIR"/sr-mys2425e-*.service; do
+    [ -e "$u" ] || continue
+    u="$(basename "$u")"
+    systemctl --user stop "$u" 2>/dev/null
+    systemctl --user reset-failed "$u" 2>/dev/null
+  done
+  # 等所有本脚本的 agent 进程退出，否则仍是 ETXTBSY。
+  local t0=$SECONDS
+  while [ $((SECONDS - t0)) -lt 20 ]; do
+    [ -z "$(pgrep -f "sr-mys2425e" | grep -v $$ 2>/dev/null)" ] && break
+    sleep 0.3
+  done
+  rm -f "$(dirname "$INSTALLED")"/*.sr-old-*
+  # 先写临时文件再 rename：与真实换机同一手法，避免任何 ETXTBSY 窗口。
+  cp "$OLD" "$INSTALLED.new"
+  chmod +x "$INSTALLED.new"
+  mv -f "$INSTALLED.new" "$INSTALLED"
+  OLD_SHA="$(sha256sum "$INSTALLED" | cut -d' ' -f1)"
+}
+
 run_success_case() { # $1=tag  $2=killmode  $3=sid-index
   local tag="$1" km="$2" idx="$3" name="sr-mys2425e-$1" sid="veri$3"
   echo
   echo "════ A/B. 成功路径：KillMode=$km ════"
+  reinstall_old
   write_unit "$name" always "$km" "" "$idx"
   systemctl --user start "$name.service" 2>/dev/null
   for _ in $(seq 1 60); do sess_tokens "$sid" >/dev/null 2>&1 && break; sleep 1; done
@@ -331,26 +397,37 @@ run_success_case "cg" control-group 1
 run_success_case "mx" mixed 2
 
 # ══════════════════════════════════════════════════════════════════
-# C：自回滚（SR_UPGRADE_SELF_ROLLBACK_SECS=30，relay 停机）
+# C：自回滚（SR_UPGRADE_SELF_ROLLBACK_SECS=30，新 agent 注册不上）
+#
+# 用**TCP 代理**在 relay 与 agent 之间剪断链路，而不是把 relay 杀掉：
+#   - 杀掉 relay 会连同它内存里的任务状态一起消失，重启后没有 `failed` 可收敛；
+#   - 代理剪断后 relay 仍持有本轮 `upgrade_id` 与 `swapping` 状态，旧版回滚后
+#     重连时 relay 才能按"重连版本低于目标"给出 `failed`——这正是要验证的收敛。
 # ══════════════════════════════════════════════════════════════════
 echo
 echo "════ C. 自回滚路径（窗口 30s，新 agent 注册不上）════"
 name="sr-mys2425e-rb"; sid="veri3"
+reinstall_old
 write_unit "$name" always control-group 30 3
 systemctl --user start "$name.service" 2>/dev/null
 for _ in $(seq 1 60); do sess_tokens "$sid" >/dev/null 2>&1 && break; sleep 1; done
 old_sha_pre="$(sha256sum "$INSTALLED" 2>/dev/null | cut -d' ' -f1)"
-chk "$([ "$old_sha_pre" = "$OLD_SHA" ] && echo 1)" "C 升级前磁盘是旧版 v0.59.6"
+chk "$([ "$old_sha_pre" = "$(sha256sum "$OLD" | cut -d' ' -f1)" ] && echo 1)" "C 升级前磁盘是已安装旧版"
 pid_old="$(systemctl --user show "$name.service" -p MainPID --value)"
 echo "  升级前: $(show_unit "$name") hash=${old_sha_pre:0:16}…"
 
-# 先把旧版留一份真实副本，用于"恢复后 hash 应等于旧版"的断言：
-# 换盘前磁盘是新制品的 hash，所以"旧 hash"就是当前 $BIN 的 hash。
 trigger_upgrade "$sid" && ok "C relay 下发了升级任务" || bad "C relay 未下发任务"
-# 新进程拉起后立刻把 relay 停掉，让它在 30s 窗口内注册不上。
-sleep 8
-stop_relay
-echo "  relay 已停机，等自回滚窗口（30s）到期…"
+
+# 换盘完成（磁盘已是新 hash）后立刻剪断链路，让新 agent 在 30s 窗口内注册不上。
+t0=$SECONDS; swapped=0
+while [ $((SECONDS - t0)) -lt 60 ]; do
+  cur="$(sha256sum "$INSTALLED" 2>/dev/null | cut -d' ' -f1)"
+  [ "$cur" = "$ART_SHA" ] && { swapped=1; break; }
+  sleep 1
+done
+chk "$swapped" "C 换盘完成（磁盘已是新制品）"
+cut_link
+echo "  链路已剪断，等自回滚窗口（30s）到期…"
 
 # 等磁盘回到旧 hash（新旧 hash 不同，所以这是明确判据）。
 t0=$SECONDS; rolled=0
@@ -361,7 +438,9 @@ while [ $((SECONDS - t0)) -lt 120 ]; do
 done
 chk "$rolled" "C 磁盘恢复为旧 hash（${old_sha_pre:0:16}…）"
 
-sleep 3
+# systemd 在 `RestartSec` 内会把 MainPID 置 0、ActiveState 置 activating：
+# 必须等它稳定，否则断言读到的是"正在重启"这个中间态而不是结论。
+wait_active "$name" 60
 now="$(show_unit "$name")"
 echo "  回滚后: $now"
 pid_rb="$(systemctl --user show "$name.service" -p MainPID --value)"
@@ -369,12 +448,12 @@ exe_rb="$(exe_of "$pid_rb")"
 chk "$([ "$(systemctl --user show "$name.service" -p ActiveState --value)" = active ] && echo 1)" "C service 仍 active"
 chk "$([ -n "$pid_rb" ] && [ "$pid_rb" != 0 ] && [ "$pid_rb" != "$pid_old" ] && echo 1)" "C MainPID 是新拉起的旧版进程（$pid_old → $pid_rb）"
 chk "$([ "$exe_rb" = "$INSTALLED" ] && echo 1)" "C /proc/$pid_rb/exe 指向 target"
-chk "$([ "$(sha256sum "$INSTALLED" | cut -d' ' -f1)" = "$OLD_SHA" ] && echo 1)" "C 磁盘是旧版 v0.59.6 的字节"
+chk "$([ "$(sha256sum "$INSTALLED" | cut -d' ' -f1)" = "$(sha256sum "$OLD" | cut -d' ' -f1)" ] && echo 1)" "C 磁盘是已安装旧版的字节"
 
-# relay 重启后，旧版重连应被 relay 按"重连版本低于目标"判为 failed。
-start_relay "$ART" || bad "C relay 未能重启"
-for _ in $(seq 1 90); do sess_tokens "$sid" >/dev/null 2>&1 && break; sleep 1; done
-st="$(wait_stage "$sid" "" 90)"
+# 恢复链路：旧版重连后，relay 按"重连版本低于目标"给出 failed。
+restore_link
+echo "  链路已恢复，等 relay 收敛终态…"
+st="$(wait_stage "$sid" "" 120)"
 echo "  relay 最终状态: $st"
 case "$st" in failed*) ok "C relay 最终显示 failed";; *) bad "C relay 最终不是 failed: $st";; esac
 systemctl --user stop "$name.service" 2>/dev/null
@@ -385,6 +464,7 @@ systemctl --user stop "$name.service" 2>/dev/null
 echo
 echo "════ D. Restart=on-failure + 未授权 ⇒ 换机前拒绝 ════"
 name="sr-mys2425e-of"; sid="veri4"
+reinstall_old
 write_unit "$name" on-failure control-group "" 4
 systemctl --user start "$name.service" 2>/dev/null
 for _ in $(seq 1 60); do sess_tokens "$sid" >/dev/null 2>&1 && break; sleep 1; done
