@@ -452,16 +452,18 @@ fn test_decision_matrix_covers_every_combination() {
         let got = decide(&p);
         let expected = want(&unit);
         match (&expected, &got) {
-            (Refuse { reason, .. }, Refuse { reason: got_reason, .. }) => {
+            (
+                Refuse { reason, .. },
+                Refuse {
+                    reason: got_reason, ..
+                },
+            ) => {
                 assert!(
                     got_reason.contains(reason.as_str()),
                     "{label}/authorized={authorized}: 原因不含前缀 {reason:?}，实际 {got_reason:?}"
                 );
             }
-            _ => assert_eq!(
-                got, expected,
-                "{label}/authorized={authorized} 的判定不符"
-            ),
+            _ => assert_eq!(got, expected, "{label}/authorized={authorized} 的判定不符"),
         }
     }
 

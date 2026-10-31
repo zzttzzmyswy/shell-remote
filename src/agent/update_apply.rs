@@ -2465,9 +2465,9 @@ fn systemd_restart_swap_with(
         // 让调用方保持在线（此时磁盘上是备份缺失的旧版，仍能跑）。
         let restored = fs.rename(&backup, &ctx.target_path);
         return Err(match restored {
-            Ok(()) => format!(
-                "cannot install the new binary: {e}; the previous binary is back in place"
-            ),
+            Ok(()) => {
+                format!("cannot install the new binary: {e}; the previous binary is back in place")
+            }
             Err(re) => format!(
                 "cannot install the new binary ({e}) nor restore the previous one ({re}); \
                  the previous binary is kept at {}",

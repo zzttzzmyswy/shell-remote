@@ -2348,7 +2348,10 @@ fn test_self_rollback_target_is_derived_from_the_backup_name() {
         Some(PathBuf::from("/usr/local/bin/shell-remote"))
     );
     // 不合规的名字一律拒绝，绝不猜路径。
-    assert_eq!(self_rollback_target(Path::new("/usr/local/bin/plain")), None);
+    assert_eq!(
+        self_rollback_target(Path::new("/usr/local/bin/plain")),
+        None
+    );
     assert_eq!(
         self_rollback_target(Path::new("/usr/local/bin/.sr-old-abcd")),
         None,
@@ -2390,7 +2393,11 @@ fn test_self_rollback_restores_the_previous_binary_when_not_registered() {
         "target 必须恢复成旧版字节"
     );
     assert!(!backup.exists(), "备份已被 rename 走");
-    assert_eq!(*exited.lock().unwrap(), vec![1], "必须以 1 退出让 systemd 拉起旧版");
+    assert_eq!(
+        *exited.lock().unwrap(),
+        vec![1],
+        "必须以 1 退出让 systemd 拉起旧版"
+    );
 }
 
 /// **已注册 ⇒ 不回滚**，且退出回调不被调用（进程继续服务）。
@@ -2518,7 +2525,6 @@ fn test_self_rollback_window_falls_back_to_default() {
     );
 }
 
-
 // ── 11c. 旧 agent 侧换盘：SystemdRestart（MYS-2425-E）──────────────────
 //
 // 这条路径上**没有任何外部监督者**：不启助手、不调 systemd。所以每个失败分支
@@ -2553,7 +2559,11 @@ impl FakeSwapFs {
     }
 
     fn count(&self) -> usize {
-        self.calls.borrow().iter().filter(|c| c.starts_with("rename")).count()
+        self.calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("rename"))
+            .count()
     }
 }
 
@@ -2576,15 +2586,22 @@ impl SwapFs for FakeSwapFs {
     }
 
     fn make_executable(&self, path: &Path) -> std::io::Result<()> {
-        self.calls.borrow_mut().push(format!("make_executable {}", path.display()));
+        self.calls
+            .borrow_mut()
+            .push(format!("make_executable {}", path.display()));
         match &self.make_executable_err {
-            Some(e) => Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.clone())),
+            Some(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                e.clone(),
+            )),
             None => make_executable(path),
         }
     }
 
     fn verify(&self, target: &Path, expected_sha: &str) -> Result<(), String> {
-        self.calls.borrow_mut().push(format!("verify {}", target.display()));
+        self.calls
+            .borrow_mut()
+            .push(format!("verify {}", target.display()));
         match &self.verify_err {
             Some(e) => Err(e.clone()),
             None => verify_installed_binary(target, expected_sha),
@@ -2592,7 +2609,9 @@ impl SwapFs for FakeSwapFs {
     }
 
     fn write_pointer(&self, upgrade_id: &str, handoff: &Path, backup: &Path, dir: &Path) -> bool {
-        self.calls.borrow_mut().push(format!("write_pointer {upgrade_id}"));
+        self.calls
+            .borrow_mut()
+            .push(format!("write_pointer {upgrade_id}"));
         if !self.write_pointer_ok {
             return false;
         }
@@ -2694,7 +2713,10 @@ fn test_systemd_restart_swap_rejects_a_tampered_artifact_before_touching_the_dis
     assert_eq!(file_sha(&ctx.target_path), old_sha, "校验失败不得动 target");
     let backup = backup_path_for(&ctx.target_path, &ctx.upgrade_id);
     assert!(!backup.exists(), "校验失败不得产生备份");
-    assert!(!dir.join(RESTORE_PENDING_FILE).exists(), "校验失败不得留指针");
+    assert!(
+        !dir.join(RESTORE_PENDING_FILE).exists(),
+        "校验失败不得留指针"
+    );
 }
 
 /// 换盘后一致性复核失败 ⇒ 恢复旧二进制。
