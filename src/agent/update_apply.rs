@@ -1898,17 +1898,21 @@ fn coordinated_swap_with(
             let start_failed = ops.start(unit).err();
             let msg = match start_failed {
                 None => format!(
-                    "{reason}. Nothing on disk was changed and {unit} was started again. The old                      agent had already exited for the upgrade, so its temporary identity may have                      been re-registered as a new device."
+                    "{reason}. Nothing on disk was changed and {unit} was started again. The old \
+                     agent had already exited for the upgrade, so its temporary identity may have \
+                     been re-registered as a new device."
                 ),
                 Some(e) => format!(
-                    "{reason}. Nothing on disk was changed, but {unit} could not be started ({e});                      the device is offline until it is started manually."
+                    "{reason}. Nothing on disk was changed, but {unit} could not be started ({e}); \
+                     the device is offline until it is started manually."
                 ),
             };
             log.line(&msg);
             return HelperOutcome::rolled_back(
                 msg,
                 RollbackIdentity::Lost {
-                    detail: "the upgrade was interrupted before the swap; the old version was                              restarted"
+                    detail: "the upgrade was interrupted before the swap; the old version was \
+                             restarted"
                         .to_string(),
                 },
             );
@@ -2025,7 +2029,7 @@ fn coordinated_swap_with(
     }
 }
 
-/// 让"由服务拉起的进程"能拿到这次换机的交接信息。/// 让"由服务拉起的进程"能拿到这次换机的交接信息。
+/// 让"由服务拉起的进程"能拿到这次换机的交接信息。
 ///
 /// `systemctl start` 起来的进程带的是 unit 里声明的环境，拿不到助手设置的
 /// `SR_UPGRADE_RESTORE`。所以把交接文件路径写进私有目录里的一个**单文件**
@@ -2075,7 +2079,7 @@ fn await_handoff_consumed(handoff: &Path, timeout: Duration) -> Result<(), Strin
     }
 }
 
-/// 回滚：恢复旧文件 → **把旧身份重新绑回 relay** → 拉起旧版 → 确认它上线。/// 回滚：恢复旧文件 → **把旧身份重新绑回 relay** → 拉起旧版 → 确认它上线。
+/// 回滚：恢复旧文件 → **把旧身份重新绑回 relay** → 拉起旧版 → 确认它上线。
 ///
 /// 为什么助手要亲自绑定身份（而不是指望旧版自己搞定）：被恢复的是**不认识
 /// 交接协议**的旧二进制。它只会用原始 argv 注册：

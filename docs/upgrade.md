@@ -214,15 +214,16 @@ systemd-run --user --unit=shell-remote-upgrade-<id> --collect --quiet \
 > `0`（实测连续 3s），事后无法确认"这台设备是不是该 unit 的主进程"。把检查
 > 放在动手之前，既拿得到答案，也天然满足"不能升级就别动磁盘"。
 
-### 时序：先 stop 再换盘（消除 `RestartSec` 竞态）
+### 时序：先 stop 再换盘
 
-协调模式的顺序是 **stop → 备份/替换 → start**，不是"先换盘再 stop"：
+协调模式的顺序是 **旧 agent 退出 → stop → 备份/替换 → start**，不是"先换盘再 stop"。
 
-旧 agent 为换机 `exit 0` 后，`Restart=always` 会在 `RestartSec`（systemd 默认
-100ms）后补起一个实例。如果先换盘再 stop，就必须在 `RestartSec` 窗口内完成
-"轮询旧进程退出 + 备份 + 替换 + stop"，否则会先补起一个**没有交接指针**的实例、
-再被 stop 掉——临时 agent 因此丢身份。把 stop 放在最前面，从时序上消除了这个
-竞态，不再依赖 `RestartSec` 的取值。
+旧 agent 收到 ready 后为换机 `exit 0`，`Restart=always` 会在 `RestartSec`（systemd
+默认 100ms，模板 5s）后补起一个实例；helper 检测到旧进程退出后才执行 stop，因此
+`RestartSec` 很短时，stop 之前仍可能先补起一个实例。由于此时**磁盘还没动**，补起的
+是旧版本，只会短暂注册一次，随后被 stop 终止；之后才换盘、start 并通过交接指针
+恢复身份。最终仍只有一个受管 agent，磁盘状态一致。若之前"先换盘再 stop"，补起的
+就会是**没有交接指针的新版本**，临时 agent 会因此丢失身份。
 
 ### 失败一律先恢复旧二进制
 
