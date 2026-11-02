@@ -248,7 +248,7 @@ async fn process_mcp_request_with_grace(
 WINDOWS / SHELL SELECTION:
   `shell` picks the interpreter on Windows (ignored on Unix): \"auto\" (default) = \"powershell\" when PowerShell is available, otherwise cmd; \"powershell\" prefers PowerShell; \"cmd\" forces cmd.exe.
   On Windows the default shell is PowerShell, falling back to cmd.exe only when PowerShell is missing. Write PowerShell syntax: PowerShell 5.1 has no `&&` or `||`, so separate statements with `;`. For cmd-only syntax (`dir /b`, `%VAR%`, `&`) pass shell:\"cmd\" instead of nesting `powershell -Command \"...\"`.
-  `cwd` sets the working directory; on Windows it defaults to the agent root. Output is decoded as UTF-8, falling back to GBK.
+  `cwd` sets the working directory; on Windows it defaults to the agent root. Output is decoded per line: UTF-8, else the system ANSI code page (GBK on Chinese Windows).
 
 READING THE RESULT:
   A non-zero exit code is reported as a trailing `[exit code: N]` line; with no output at all you get `Exit code: N`. A non-zero code is not a tool error (`grep` returning 1 is normal).
