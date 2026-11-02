@@ -520,7 +520,10 @@ fn test_replay_v1_register_response_reads_new_fields() {
     let hs = crate::agent::client::parse_register_handshake(&response)
         .expect("v1 注册响应必须能被解析");
     assert_eq!(hs.relay_protocol_version, crate::proto::PROTOCOL_VERSION);
-    assert_eq!(hs.relay_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    // 冻结夹具里记录的是录制时的 relay 版本，与当前构建版本无关：
+    // 用 CARGO_PKG_VERSION 比对会让每次发版的版本号 bump 都打破本用例。
+    assert_eq!(hs.relay_version.as_deref(), response["relay_version"].as_str());
+    assert!(hs.relay_version.is_some(), "v1 注册响应必须带 relay_version");
     assert!(hs.desktop_binary, "v1 声明了 desktop:binary-uplink");
     assert_eq!(hs.tokens.len(), 2);
 }
