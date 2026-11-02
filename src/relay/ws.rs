@@ -936,41 +936,20 @@ pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, tex
             }
         }
 
-        // 未知消息丢弃（R3 丙137 / R5#21）：agent 上行类型不在白名单 →
+        // 未知消息丢弃（R3 丙137 / R5#21）：agent 上行类型不在注册表 →
         // 显式丢弃并记日志（防垃圾/未知控制消息进入广播或 MCP 通道）。
-        // 白名单 = 上方已处理的所有类型 + 浏览器控制输入（terminal:input
-        // 等经 /agent/send 单独路由，不在此函数）。这里只防"agent 侧未知
-        // 类型"静默吞掉造成排障盲区——记一条 info 足够，不误杀新增类型。
-        {
-            const KNOWN: &[&str] = &[
-                "agent:upgrade_progress",
-                "terminal:output",
-                "desktop:video",
-                "desktop:started",
-                "desktop:stopped",
-                "desktop:error",
-                "desktop:capabilities",
-                "desktop:uplink",
-                "desktop:clipboard",
-                "desktop:qos-ack",
-                "desktop:cmd-ack",
-                "desktop:cursor",
-                "test-delay-ack",
-                "mcp:result",
-                "mcp:exec_result",
-                "fs:result",
-                "fs:mkdir",
-                "session:users",
-                "session:tab_list",
-                "session:tab_switched",
-            ];
-            if !KNOWN.contains(&proto_msg.msg_type.as_str()) {
-                tracing::info!(
-                    session = %session_id,
-                    msg_type = %proto_msg.msg_type,
-                    "dropping unknown agent message (not in whitelist)"
-                );
-            }
+        // 判据是 [`crate::proto::AGENT_TO_RELAY_TYPES`]——**唯一**登记处，
+        // 不再在路由函数里维护第二份列表。此前那份手写列表漏了
+        // `desktop:p2p-answer` / `desktop:p2p-state`（它们本就被广播），
+        // 于是每条 P2P 信令都白打一条 unknown 日志。
+        // 这里只防"agent 侧未知类型"静默吞掉造成排障盲区——记一条 info 足够，
+        // 不误杀新增类型。
+        if !crate::proto::is_known_agent_type(&proto_msg.msg_type) {
+            tracing::info!(
+                session = %session_id,
+                msg_type = %proto_msg.msg_type,
+                "dropping unknown agent message (not in registry)"
+            );
         }
     }
 }
@@ -1353,6 +1332,19 @@ pub async fn agent_send_handler(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
+        // 重注册前先抓住**将会被覆盖**的会话状态（MYS-2553）。
+        //
+        // `register` / `register_existing` 会丢掉同 sid 的旧条目再插一条全新
+        // 的（其余字段默认空），因此「本次请求没带某字段」在注册之后已经无从
+        // 判断——必须在这之前留一份快照，注册完再把请求没声明的字段填回去。
+        // 这条路径就是回滚重绑（`update_apply.rs::bind_identity`）：它只带
+        // 身份，不带 capabilities/device/lan_addr，旧逻辑会把一台设备的全部
+        // 能力与硬件信息抹成空。
+        let carried = match desired_session_id.as_deref() {
+            Some(sid) => state.sessions.get(sid).await,
+            None => None,
+        };
+
         // 注册抢占防护（P0）：同 id 的会话**当前有在线 agent** 时，请求必须
         // 证明归属（fixed key 相同，或缓存 token 仍属于该会话），否则返回
         // 409。离线会话仍可直接接管（agent 崩溃后重启的正常路径）。
@@ -1411,34 +1403,50 @@ pub async fn agent_send_handler(
 
         // R5#44 capability 协商最小子集：注册消息可带 capabilities 数组
         // （agent 声明 codec/后端/功能），存入会话供 admin overview 展示与
-        // 浏览器协商。老版本 agent 不带 → 保持空。
+        // 浏览器协商。
         //
-        // MYS-2383：**每次注册都覆盖**（含空数组）。同一 sid 的新 incarnation
-        // 若不覆盖，旧能力会残留——旧 agent 重连后仍被当成支持 `web:proxy-v1`，
-        // UI 会显示一个必然 404 的入口。`body["capabilities"]` 缺失时同样写空，
-        // 效果与 `register` 新建的默认值一致。
-        {
-            let caps: Vec<String> = body["capabilities"]
+        // MYS-2383：同一 sid 的新 incarnation **带了字段就覆盖**（含空数组）。
+        // 不覆盖的话，旧 agent 重连后仍被当成支持 `web:proxy-v1`，UI 会显示
+        // 一个必然 404 的入口。
+        //
+        // MYS-2553：**只有请求里带了 `capabilities` 才覆盖**——「字段存在」
+        // （含 `null` / 非数组，一律按空能力处理）算显式声明，「字段缺省」才
+        // 是保留原值。回滚重绑消息（`update_apply.rs` 的 `bind_identity`，
+        // 等价于旧版普通断线重连）根本不带这个字段，旧逻辑会把已登记的会话
+        // 能力一把清空——那台设备明明支持网页代理/桌面，后台却立刻显示成
+        // 不支持。
+        //
+        // 缺省时取 `carried` 快照：注册是把整个会话条目换掉的，所以必须回填，
+        // 只"跳过覆盖"在注册之后已经无从谈起。
+        let caps = match body.get("capabilities") {
+            Some(v) => v
                 .as_array()
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|c| c.as_str().map(|s| s.to_string()))
                         .collect()
                 })
-                .unwrap_or_default();
-            state
-                .sessions
-                .update_capabilities(&session_id, caps)
-                .await;
-        }
+                .unwrap_or_default(),
+            None => carried
+                .as_ref()
+                .map(|c| c.capabilities.clone())
+                .unwrap_or_default(),
+        };
+        state
+            .sessions
+            .update_capabilities(&session_id, caps)
+            .await;
 
         // 阶段2 LAN 直连：注册消息可带 `lan_addr`（"ip:port"），存入会话表
         // 供 admin 展示；浏览器经 agent 的 desktop:capabilities.lan_addrs 拿到
-        // 同网段探测直连地址。老版本 / 未开启 --desktop-lan-port → None。
-        state
-            .sessions
-            .set_lan_addr(&session_id, parse_lan_addr(&body))
-            .await;
+        // 同网段探测直连地址。老版本 / 未开启 --desktop-lan-port → 不带该字段。
+        // MYS-2553：与 capabilities 同口径——**带了才覆盖**，缺省保留原值。
+        let lan_addr = if body.get("lan_addr").is_some() {
+            parse_lan_addr(&body)
+        } else {
+            carried.as_ref().and_then(|c| c.lan_addr.clone())
+        };
+        state.sessions.set_lan_addr(&session_id, lan_addr).await;
 
         let tokens_json: Vec<Value> = tokens
             .iter()
@@ -1493,10 +1501,15 @@ pub async fn agent_send_handler(
         // Store the agent's best-effort host probe (CPU model, arch, OS, …).
         // Older agents omit `device` entirely → stays None; a malformed object
         // is ignored rather than failing the registration.
-        let device = body
-            .get("device")
-            .and_then(|v| serde_json::from_value::<crate::proto::DeviceInfo>(v.clone()).ok())
-            .filter(|d| !d.is_empty());
+        // MYS-2553：**带了该字段才覆盖**——回滚重绑消息不带 device，旧逻辑
+        // 会把一台设备的硬件信息从后台抹掉（升级回滚后型号/内核列变空）。
+        let device = if body.get("device").is_some() {
+            body.get("device")
+                .and_then(|v| serde_json::from_value::<crate::proto::DeviceInfo>(v.clone()).ok())
+                .filter(|d| !d.is_empty())
+        } else {
+            carried.as_ref().and_then(|c| c.device.clone())
+        };
         state.sessions.set_device(&session_id, device).await;
 
         // Agent binary version (drives the admin upgrade UI). Older agents
@@ -1509,6 +1522,15 @@ pub async fn agent_send_handler(
         state
             .sessions
             .set_agent_version(&session_id, agent_version.clone())
+            .await;
+
+        // 协议代次（MYS-2553）：注册消息可带 `protocol_version`。缺失/非法
+        // 一律记为 0（= 标记出现之前的旧 agent），绝不因此拒绝注册。
+        let agent_protocol_version =
+            crate::proto::parse_protocol_version(body.get("protocol_version"));
+        state
+            .sessions
+            .set_agent_protocol_version(&session_id, agent_protocol_version)
             .await;
 
         // 升级任务的终态收敛（MYS-2425-D）：agent 重新注册了，但它带的版本
@@ -1560,6 +1582,13 @@ pub async fn agent_send_handler(
             // desktop:video 二进制帧（Message::Binary → route_bin_desktop_frame）。
             // 老 relay 无此字段 → agent 保持 JSON+base64（兼容回退）。
             "desktop_binary": true,
+            // MYS-2553：协议代次 + relay 版本 + relay 能力声明。三项都是
+            // **新增可选字段**——老 agent 只认 `desktop_binary` 就够，多余
+            // 字段被 serde 忽略；新 agent 优先看 `relay_capabilities`，
+            // 缺字段时回退到 `desktop_binary`。
+            "protocol_version": crate::proto::PROTOCOL_VERSION,
+            "relay_version": env!("CARGO_PKG_VERSION"),
+            "relay_capabilities": crate::proto::RELAY_CAPABILITIES,
             "payload": { "tokens": tokens_json }
         }))
         .into_response();
@@ -2967,6 +2996,174 @@ mod tests {
         ];
         state.sessions.update_capabilities(&sid, caps.clone()).await;
         assert_eq!(state.sessions.get_capabilities(&sid).await, caps);
+    }
+
+    // ── 协议版本标记（MYS-2553 兼容 1a）──────────────────────────────
+
+    /// 注册一台 agent 并回读它被记下的协议版本。`pv` 为 `None` 时请求里
+    /// 完全不带该字段（= 旧 agent）。
+    async fn register_and_read_protocol_version(
+        state: &Arc<SharedState>,
+        sid: &str,
+        pv: Option<serde_json::Value>,
+    ) -> u32 {
+        let mut body = json!({
+            "type": "agent:register",
+            "token_type": "rw",
+            "session_id": sid,
+        });
+        if let Some(v) = pv {
+            body["protocol_version"] = v;
+        }
+        let resp = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 200, "注册必须成功（版本字段绝不阻断注册）");
+        state
+            .sessions
+            .get(sid)
+            .await
+            .expect("session must exist")
+            .agent_protocol_version
+    }
+
+    /// 验收 2-1：注册不带 `protocol_version` → 会话记 0；带 1 → 记 1；
+    /// 带非法值 → 记 0。
+    #[tokio::test]
+    async fn test_register_stores_agent_protocol_version() {
+        let state = make_state("");
+        // 旧 agent：字段完全缺失 → 0
+        assert_eq!(
+            register_and_read_protocol_version(&state, "pvold01", None).await,
+            0,
+            "不带 protocol_version 的旧 agent 必须记为 0"
+        );
+        // 新 agent：带 1 → 1
+        assert_eq!(
+            register_and_read_protocol_version(&state, "pvnew01", Some(json!(1))).await,
+            crate::proto::PROTOCOL_VERSION
+        );
+        // 非法值（字符串 / 负数 / 浮点）→ 0，且不阻断注册
+        for bad in [json!("1"), json!(-3), json!(1.5), json!(null)] {
+            let sid = format!("pvbad{:02}", bad.to_string().len());
+            assert_eq!(
+                register_and_read_protocol_version(&state, &sid, Some(bad.clone())).await,
+                0,
+                "非法 protocol_version {bad} 必须记为 0"
+            );
+        }
+    }
+
+    /// 验收 2-2：relay 的 `agent:registered` 响应带 `protocol_version` /
+    /// `relay_version` / `relay_capabilities`，并且**仍然**有
+    /// `desktop_binary: true`（旧 agent 只认它）。
+    #[tokio::test]
+    async fn test_register_response_declares_protocol_and_capabilities() {
+        let state = make_state("");
+        let body = json!({"type": "agent:register", "token_type": "rw"});
+        let resp = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), 200);
+        let raw = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["type"], "agent:registered");
+        assert_eq!(v["protocol_version"], crate::proto::PROTOCOL_VERSION);
+        assert_eq!(v["relay_version"], env!("CARGO_PKG_VERSION"));
+        let caps = v["relay_capabilities"]
+            .as_array()
+            .expect("relay_capabilities 必须是数组");
+        assert!(
+            caps.iter()
+                .any(|c| c.as_str() == Some(crate::proto::CAP_DESKTOP_BINARY_UPLINK)),
+            "relay 必须声明 desktop:binary-uplink，实际 {caps:?}"
+        );
+        // 旧 agent 的兼容位必须保留。
+        assert_eq!(v["desktop_binary"], true, "desktop_binary 不能删——旧 agent 靠它");
+        // tokens 仍然是老格式。
+        assert!(v["payload"]["tokens"].is_array());
+    }
+
+    /// 验收 2-8：重绑注册（不带 capabilities）**不得**清空已有能力。
+    /// 修的是回滚路径：`update_apply.rs::bind_identity` 的消息不带
+    /// capabilities，旧逻辑会把会话能力抹成空。
+    #[tokio::test]
+    async fn test_rebind_without_capabilities_keeps_them() {
+        let state = make_state("");
+        let sid = "rebind01";
+        let register = |body: Value| {
+            let state = state.clone();
+            async move {
+                let resp = agent_send_handler(
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(body),
+                )
+                .await
+                .into_response();
+                assert_eq!(resp.status(), 200);
+            }
+        };
+
+        // 第一次：新 agent 声明能力 + device + lan_addr。
+        register(json!({
+            "type": "agent:register",
+            "token_type": "rw",
+            "session_id": sid,
+            "capabilities": ["web:proxy-v1", "codec:av1"],
+            "lan_addr": "192.168.1.5:43210",
+            "device": {"hostname": "box-a", "arch": "x86_64"},
+        }))
+        .await;
+        let before = state.sessions.get(sid).await.unwrap();
+        assert_eq!(before.capabilities, vec!["web:proxy-v1", "codec:av1"]);
+        assert_eq!(before.lan_addr.as_deref(), Some("192.168.1.5:43210"));
+        assert!(before.device.is_some());
+
+        // 回滚重绑：只带身份，不带 capabilities / device / lan_addr。
+        register(json!({
+            "type": "agent:register",
+            "session_id": sid,
+            "tokens": [{"token": "cached-rw", "permission": "rw"}],
+            "agent_version": env!("CARGO_PKG_VERSION"),
+        }))
+        .await;
+        let after = state.sessions.get(sid).await.unwrap();
+        assert_eq!(
+            after.capabilities, before.capabilities,
+            "不带 capabilities 的重绑不得清空已有能力"
+        );
+        assert_eq!(
+            after.lan_addr, before.lan_addr,
+            "不带 lan_addr 的重绑不得抹掉已登记的 LAN 地址"
+        );
+        assert_eq!(
+            after.device, before.device,
+            "不带 device 的重绑不得抹掉已登记的硬件信息"
+        );
+
+        // 显式带空数组仍然覆盖（同一 sid 换成「真不支持」的新 incarnation）。
+        register(json!({
+            "type": "agent:register",
+            "token_type": "rw",
+            "session_id": sid,
+            "capabilities": [],
+        }))
+        .await;
+        assert!(
+            state.sessions.get(sid).await.unwrap().capabilities.is_empty(),
+            "显式空数组必须覆盖（新 incarnation 不再支持任何能力）"
+        );
     }
 
     #[tokio::test]
