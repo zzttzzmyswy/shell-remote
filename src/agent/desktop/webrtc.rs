@@ -658,7 +658,8 @@ mod tests {
         let sa = Arc::new(Mutex::new(MemState::default()));
         let agent_addr: SocketAddr = "147.147.147.2:53301".parse().unwrap();
         let t = MemTransport { state: sa.clone(), local: agent_addr };
-        let (mut agent, answer) = begin_answer(agent_addr, Box::new(t), &offer_rfc, &[]).unwrap();
+        // 这条用例只读 agent 状态（喂候选的用例在下面），不需要 mut。
+        let (agent, answer) = begin_answer(agent_addr, Box::new(t), &offer_rfc, &[]).unwrap();
 
         assert!(
             answer.sdp.starts_with("v=0"),

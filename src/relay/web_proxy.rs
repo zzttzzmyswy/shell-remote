@@ -2295,7 +2295,6 @@ mod tests {
         );
         let st = state.clone();
         let sid_c = sid.clone();
-        let sid_c = sid.clone();
         tokio::spawn(async move {
             let rid = next_request(&mut bulk_rx).await;
             feed(
@@ -2468,7 +2467,6 @@ mod tests {
         assert_eq!(state.web_proxy.inflight(&sid).await, max - 1);
         let st = state.clone();
         let sid_c = sid.clone();
-        let sid_c = sid.clone();
         tokio::spawn(async move {
             let rid = next_request(&mut bulk_rx).await;
             feed(
@@ -2505,7 +2503,6 @@ mod tests {
         let state = make_state("");
         let (sid, tokens, mut bulk_rx) = setup(&state, &[CAPABILITY]).await;
         let st = state.clone();
-        let sid_c = sid.clone();
         let sid_c = sid.clone();
         tokio::spawn(async move {
             let rid = next_request(&mut bulk_rx).await;

@@ -1029,7 +1029,7 @@ async fn proxy_inner(
     // 设备重启），`is_closed()` 的检查有竞态窗口。此时请求根本没被目标处理过
     // （hyper 会把它判为 `canceled`/`incomplete`），换一条新管道重发是安全的。
     let mut attempt = 0;
-    let (mut sender, conn_task, resp) = loop {
+    let (sender, conn_task, resp) = loop {
         let reused = if ws { None } else { runtime.take_idle() };
         let was_reused = reused.is_some();
         let (mut sender, conn_task) = match reused {

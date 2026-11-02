@@ -1017,7 +1017,7 @@ async fn run_desktop_loop(
     idr_request: Arc<std::sync::atomic::AtomicBool>,
     last_active_at: Arc<std::sync::atomic::AtomicI64>,
 ) {
-        let mut src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
+        let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok((src, backend)) => (src, backend),
         Err(e) => {
             tracing::error!("desktop capture open failed: {}", e);
@@ -1955,7 +1955,9 @@ impl QosAdaptive {
             self.median_window.pop_front();
         }
         self.median_window.push_back(delay);
-        let med = self.median_delay().max(10);
+        // 中值不在这里取：本函数只负责喂样本，中值读取统一走
+        // `median_delay()`（`rtt_band`/`adjust_ratio`/`update_quality_state`
+        // 各自按需调），此处再算一遍没人读。
         // TestDelay 探针窗口（R5#148 对齐 rustdesk cm::TestDelay）：
         // probe_ms=0 表示未上报（老浏览器/测试），跳过——probe_median_delay()
         // 返回 0 = 无探针，沿用原 e2e 判据。
@@ -2385,7 +2387,7 @@ mod tests {
         assert_eq!(pool.stats(), (1, 1), "第二次借应复用池中 buffer");
         pool.release(b2);
         // 归还后借出仍命中，不新增分配。
-        let b3 = pool.acquire(100);
+        let _b3 = pool.acquire(100);
         assert_eq!(pool.stats(), (2, 1));
     }
 
@@ -2396,12 +2398,9 @@ mod tests {
         for _ in 0..3 {
             pool.release(vec![0u8; 64]);
         }
-        let mut nonempty = 0;
         for _ in 0..3 {
+            // 复用保留 cap 的 buffer，但内容已 clear 为空 Vec。
             let b = pool.acquire(64);
-            if !b.is_empty() {
-                nonempty += 1; // 复用保留 cap 的 buffer（已 clear 为空 Vec）
-            }
             assert!(b.is_empty(), "acquire 返回的空 Vec（cap 保留）");
         }
         // 第三次借因池中只有 2 个 → 新分配 1 次。
@@ -2641,7 +2640,8 @@ mod tests {
         let mut now = 2_000_000u64; // 越过 new_user 1s 窗口
         let (fps1, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
         now += 1_000_000;
-        let (fps2, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
+        // 中间那次采样只为推进 QoS 内部计时（结果不参与断言）。
+        let _ = q.on_delay(40, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
         now += 1_000_000;
         let (fps3, _) = q.on_delay(40, 0, 30, 1.0, &qos_ctx(QOS_BR_BALANCED, 600, now));
         assert!(fps3 >= fps1 && fps3 >= QOS_FPS, "good net must keep full fps");
@@ -2813,8 +2813,9 @@ mod tests {
         // （relay_congest_delta>0）→ 必须按拥塞降档。
         let mut ctx = qos_ctx(QOS_BR_BALANCED, 600, now);
         ctx.relay_congest_delta = 1;
+        // ctx 在进循环前就固定，循环内推进 now 不会影响任何输入（原来那两句
+        // `now += 300_000` 从来没被读过），故只喂固定 ctx。
         for _ in 0..24 {
-            now += 300_000;
             warm.on_delay(800, 20, 30, 1.0, &ctx);
         }
         let p = warm.ratio_permille();

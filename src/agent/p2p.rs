@@ -30,7 +30,6 @@ pub(crate) struct P2pSession {
     id: u64,
     peer: Arc<Mutex<WebRtcPeer>>,
     driver: Option<tokio::task::JoinHandle<()>>,
-    started: Instant,
 }
 
 /// 当前 P2P 会话状态（消息循环与驱动任务共享）。
@@ -254,13 +253,12 @@ pub(crate) async fn handle_offer(
         id,
         peer,
         driver: Some(driver),
-        started: Instant::now(),
     });
 }
 
 /// 收到 `desktop:p2p-candidate {candidate}`：喂共享 peer（无会话/坏候选忽略）。
 pub(crate) async fn handle_candidate(state: &P2pState, candidate: &str) {
-    let mut guard = state.inner.lock().await;
+    let guard = state.inner.lock().await;
     let Some(session) = guard.as_ref() else {
         tracing::debug!("desktop p2p candidate ignored — no active session");
         return;

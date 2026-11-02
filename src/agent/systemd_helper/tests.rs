@@ -173,7 +173,12 @@ fn test_no_unit_property_carries_the_handoff() {
 // ── 3. 失败路径（进程级）────────────────────────────────────────────
 
 /// 造一个假的 `systemd-run` 可执行脚本。
-struct FakeRun(PathBuf, TmpDir);
+struct FakeRun {
+    path: PathBuf,
+    /// 只用于**保活**：脚本写在这个临时目录里，目录一 drop 文件就没了。
+    /// 没有读取点，前导下划线表明这是有意保留而不是漏用。
+    _dir: TmpDir,
+}
 
 impl FakeRun {
     /// `body` 是脚本主体，可用 `$@` 读参数。
@@ -186,7 +191,7 @@ impl FakeRun {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        Self(path, dir)
+        Self { path, _dir: dir }
     }
 }
 
@@ -202,9 +207,6 @@ impl TmpDir {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
-    }
-    fn path(&self) -> &Path {
-        &self.0
     }
     fn join(&self, n: &str) -> PathBuf {
         self.0.join(n)
@@ -250,7 +252,7 @@ fn test_systemd_run_start_failure_surfaces_its_stderr() {
     );
     let dir = TmpDir::new("denied-h");
     match launch_with(
-        RunTarget::Explicit(fake.0.clone()),
+        RunTarget::Explicit(fake.path.clone()),
         Path::new("/usr/local/bin/shell-remote"),
         &dir.join("handoff.json"),
         "up2",
@@ -280,7 +282,7 @@ fn test_ready_timeout_is_bounded() {
     let dir = TmpDir::new("silent-h");
     let started = std::time::Instant::now();
     match launch_with(
-        RunTarget::Explicit(fake.0.clone()),
+        RunTarget::Explicit(fake.path.clone()),
         Path::new("/usr/local/bin/shell-remote"),
         &dir.join("handoff.json"),
         "up3",
@@ -308,7 +310,7 @@ fn test_helper_reported_error_is_passed_through() {
     );
     let dir = TmpDir::new("reporterr-h");
     match launch_with(
-        RunTarget::Explicit(fake.0.clone()),
+        RunTarget::Explicit(fake.path.clone()),
         Path::new("/usr/local/bin/shell-remote"),
         &dir.join("handoff.json"),
         "up4",
@@ -331,7 +333,7 @@ fn test_ready_handshake_succeeds() {
     let fake = FakeRun::new("ready", "echo ready\nsleep 5");
     let dir = TmpDir::new("ready-h");
     match launch_with(
-        RunTarget::Explicit(fake.0.clone()),
+        RunTarget::Explicit(fake.path.clone()),
         Path::new("/usr/local/bin/shell-remote"),
         &dir.join("handoff.json"),
         "up5",
@@ -693,6 +695,10 @@ fn test_managed_plan_survives_the_handoff_roundtrip() {
 /// 返回空、退出码非 0（"Unit could not be found"），`MainPID` 读成 `None`，
 /// 判定被 fail-closed 拒绝——`Restart=always` + 非 root 的免权限换机整条路径
 /// 都不可达。这条用例把"按 cgroup 前缀选 manager"钉住。
+///
+/// 判定函数本身按 `cfg(unix)` 编译（非 unix 上没有 systemctl 调用点），
+/// 这条用例同步收窄。
+#[cfg(unix)]
 #[test]
 fn test_user_manager_detection_drives_the_systemctl_scope() {
     // 用户级：`/user.slice/user-1000.slice/user@1000.service/app.slice/x.service`

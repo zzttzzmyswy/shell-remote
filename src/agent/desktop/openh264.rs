@@ -44,7 +44,8 @@ fn strip_startcode(na: &[u8]) -> &[u8] {
 pub struct H264Encoder {
     api: openh264_sys2::DynamicAPI,
     enc: *mut *const ISVCEncoderVtbl,
-    initialize_ext: unsafe extern "C" fn(*mut ISVCEncoder, *const SEncParamExt) -> c_int,
+    // InitializeExt 只在 new_ext 里用一次（拿到 param 后立刻初始化），之后
+    // 不再需要，故不入结构体——留着只会被当成"漏用的字段"。
     uninitialize: unsafe extern "C" fn(*mut ISVCEncoder) -> c_int,
     encode_frame: unsafe extern "C" fn(*mut ISVCEncoder, *const SSourcePicture, *mut SFrameBSInfo) -> c_int,
     set_option: unsafe extern "C" fn(*mut ISVCEncoder, ENCODER_OPTION, *mut c_void) -> c_int,
@@ -161,7 +162,6 @@ impl H264Encoder {
         Ok(Self {
             api,
             enc,
-            initialize_ext,
             uninitialize,
             encode_frame,
             set_option,
@@ -185,7 +185,7 @@ impl H264Encoder {
 
         // Safety: the encoder reads these planes during EncodeFrame; the slices
         // outlive the single synchronous call.
-        let mut src = SSourcePicture {
+        let src = SSourcePicture {
             iColorFormat: videoFormatI420,
             iStride: [
                 w as c_int,

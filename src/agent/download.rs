@@ -1654,7 +1654,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
-    use axum::response::{IntoResponse, Response};
+    use axum::response::Response;
     use axum::routing::get;
     use axum::Router;
     use std::sync::atomic::{AtomicUsize, Ordering};

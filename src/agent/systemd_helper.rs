@@ -749,6 +749,10 @@ pub fn probe() -> Probe {
 /// ——不带的话，`systemctl show <user-unit>` 返回 "Unit ... could not be found"，
 /// `MainPID` 读成 `None`，整个判定被 fail-closed 拒绝。默认部署（非 root 用户
 /// 级 service）正是这一档，所以必须分对。
+///
+/// 只被 `systemctl` 调用点（全部是 `cfg(unix)` 块）使用——非 unix 平台上没有
+/// systemd，收窄到 unix 编译，避免 dead_code。
+#[cfg(unix)]
 fn unit_lives_in_the_user_manager() -> bool {
     current_cgroup_path()
         .map(|cg| is_user_manager_cgroup(&cg))
@@ -760,6 +764,9 @@ fn unit_lives_in_the_user_manager() -> bool {
 /// 用户级 unit（`systemd --user` / `loginctl enable-linger` 的 service）落在
 /// `/user.slice/` 之下；系统级在 `/system.slice/`。抽成独立函数是为了能直接
 /// 单测这条判据——它一错，整条免权限换机路径就不可达。
+///
+/// 与 [`unit_lives_in_the_user_manager`] 一样只在 unix 上有调用点。
+#[cfg(unix)]
 fn is_user_manager_cgroup(cgroup: &str) -> bool {
     cgroup.starts_with("/user.slice/")
 }
