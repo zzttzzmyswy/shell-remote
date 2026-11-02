@@ -26,7 +26,16 @@ chmod +x shell-remote-armv7 shell-remote-ui-armv7
 
 ### 一行安装脚本
 
-relay 内置安装脚本（`/agent/install` 与 `/agent/install.ps1`），会自动注入 relay 地址，优先从本 relay 的 `/download/<文件名>` 取二进制，GitHub 镜像仅作回退，内部同时支持 curl 与 wget：
+relay 内置安装脚本（`/agent/install` 与 `/agent/install.ps1`），会自动注入 relay 地址，内部同时支持 curl 与 wget（Windows 用 PowerShell 5.1 自带的 .NET 流式下载）。下载源按以下顺序尝试，前一个失败或卡住（连不通 10s、或连续 20s 平均速度低于 10 KB/s）就自动切下一个：
+
+1. GitHub 直连 `releases/latest/download`
+2. CDN 镜像 `gh-proxy.com`
+3. CDN 镜像 `edgeone.gh-proxy.org`
+4. CDN 镜像 `hk.gh-proxy.org`
+5. CDN 镜像 `ghproxy.net`
+6. 本 relay 的 `/download/<文件名>`
+
+每个源开始前打印 `[i/6] trying <源> (<host>)`，下载中实时刷新百分比 / 已下载量 / 速度，成功后打印一行大小、耗时与平均速度汇总。
 
 ```bash
 curl -fsSL http://your-relay:3000/agent/install | sh
@@ -38,7 +47,7 @@ curl -fsSL http://your-relay:3000/agent/install | sh
 curl -fsSL http://your-relay:3000/agent/install | sh -s -- --download-only
 ```
 
-`/download/<文件名>` 需要 relay 配置 `--download-dir`（见 [upgrade.md](upgrade.md)），未配置时脚本回退到 GitHub。
+relay 的 `/download/<文件名>` 是最后一道兜底，需要配置 `--download-dir`（见 [upgrade.md](upgrade.md)），未配置时这一档直接跳过——前 5 个源都失败才会用到它。
 
 ## 编译
 
