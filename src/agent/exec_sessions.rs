@@ -581,21 +581,6 @@ impl ExecSessionManager {
         }
     }
 
-    /// Wait until the session leaves `Running` (or `timeout` elapses).
-    /// Returns true when it settled.
-    async fn wait_settled(&self, session: &InnerSession, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if *session.status.read().await != ExecStatus::Running {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
     pub async fn shutdown_all(&self) {
         let exec_ids: Vec<String> = {
             let sessions = self.sessions.read().await;

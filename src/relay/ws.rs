@@ -2449,7 +2449,6 @@ pub async fn browser_sse_handler(
     let _sse_sid_clone = sse_sid.clone();
     let perm_clone = perm_str.to_string();
     let token_prefix_clone = token_prefix(&token).to_string();
-    let token_clone = token.clone();
     let state_snapshot_clone = state.clone();
     let sid_snapshot = session_id.clone();
 
@@ -2983,8 +2982,8 @@ mod tests {
             .update_capabilities(&sid, vec![crate::relay::web_proxy::CAPABILITY.to_string()])
             .await;
         // 一条 agent 通道 + 一条「浏览器」SSE 通道。
-        let (agent_tx, mut agent_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
-        let (bulk_tx, mut bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        let (agent_tx, agent_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (bulk_tx, bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
         let (browser_tx, mut browser_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
         let sse_sid = "bs_web_isolation".to_string();
         state

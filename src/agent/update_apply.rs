@@ -3007,40 +3007,6 @@ fn spawn_agent(
     cmd.spawn()
 }
 
-/// spawn 时对 ETXTBSY 做有界重试。
-///
-/// 只重试这一个 errno：其它错误（ENOENT/EACCES/ENOEXEC）重试也没用，只会
-/// 拖慢失败上报。
-fn spawn_with_etxtbsy_retry(
-    cmd: &mut std::process::Command,
-    budget: Duration,
-) -> std::io::Result<std::process::Child> {
-    let deadline = Instant::now() + budget;
-    loop {
-        match cmd.spawn() {
-            Ok(child) => return Ok(child),
-            Err(e) => {
-                let busy = e.raw_os_error() == Some(libc_etxtbsy());
-                if !busy || Instant::now() >= deadline {
-                    return Err(e);
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-const fn libc_etxtbsy() -> i32 {
-    26
-}
-
-#[cfg(not(unix))]
-const fn libc_etxtbsy() -> i32 {
-    // Windows 没有这个 errno：给一个不可能命中的值，重试逻辑自然不生效。
-    -1
-}
-
 /// 读新进程的 stderr，直到看到注册标记、进程退出或超时。
 ///
 /// 返回 `Ok(version)` 只在真的收到 `registered` 时——"进程起来了"不等于

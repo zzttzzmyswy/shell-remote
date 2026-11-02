@@ -89,7 +89,11 @@ pub struct DxgiSource {
     /// 重建时用它找回同一个 output。
     output_index: usize,
     _factory: IDXGIFactory1,
-    device: ID3D11Device,
+    /// D3D11 device 本身在 build 之后不再直接调用，但必须由本结构体持有：
+    /// 一旦提前 Release，duplication/context 的驱动侧资源会被连带销毁
+    /// （后续 access-lost 重建再 `CreateTexture2D` 就会拿到已失效的 device）。
+    /// 前导下划线 = 有意保活，不是漏用的字段。
+    _device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     staging: ID3D11Texture2D,
@@ -235,7 +239,7 @@ impl DxgiSource {
             height,
             output_index: index,
             _factory: factory,
-            device,
+            _device: device,
             context,
             duplication,
             staging,

@@ -421,7 +421,10 @@ fn self_rss_kb() -> u64 {
 /// 从 `/proc/self/stat` 文本解析累计 CPU 毫秒（utime+stime，字段 14/15；
 /// comm 可含空格/括号 → `rsplit(") ")` 取后半，utime/stime 是后半字段
 /// 11/12）。`hz` = 时钟 tick/秒（`sysconf(_SC_CLK_TCK)`）。纯函数便于单测。
-                                #[cfg(feature = "desktop")]
+///
+/// 只有 Linux 读 `/proc/self/stat`（`self_cpu_ms` 的非 Linux 分支直接回退 0），
+/// 所以按 `target_os = "linux"` 收窄——否则 Windows/macOS 桌面构建会报 dead_code。
+#[cfg(all(feature = "desktop", target_os = "linux"))]
 fn cpu_ms_from_stat(stat: &str, hz: u64) -> u64 {
     let Some(tail) = stat.rsplit(") ").next() else {
         return 0;
@@ -611,6 +614,10 @@ fn kind_for_io(e: &std::io::Error) -> &'static str {
 
 /// 构造 WS 升级请求，附带 `X-SR-Agent-Token`（relay 侧 WS 上行路径据此
 /// 判定身份）。`token` 为空时与直接传 URL 等价。
+///
+/// 唯一调用点是桌面视频上行（`sender_loop` 内 `cfg(feature = "desktop")`
+/// 块）——lean 构建没有这条路径，按同一 cfg 收窄，避免 dead_code。
+#[cfg(feature = "desktop")]
 fn ws_request(url: &str, token: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = url
@@ -1401,7 +1408,6 @@ async fn run_session(
         //   （Token 由 key 派生，身份仍是同一台；旧 Token 的浏览器会掉线）；
         // - 其余（尤其纯临时设备换了 sid 或 Token）→ 不消费交接文件、
         //   不上报 registered，直接结束会话让助手按超时/提前退出回滚。
-        let mut accepted = false;
         match crate::agent::update_apply::restore_verdict(
             r.restore.fixed_key.as_deref(),
             &r.restore.session_id,
@@ -1409,9 +1415,8 @@ async fn run_session(
             &client.session_id,
             &client.tokens,
         ) {
-            Ok(crate::agent::update_apply::RollbackIdentity::Preserved) => {
-                accepted = true;
-            }
+            // 身份完整保留 → 接受，什么都不用记。
+            Ok(crate::agent::update_apply::RollbackIdentity::Preserved) => {}
             Ok(verdict) => {
                 tracing::warn!(
                     expected = %r.restore.session_id,
@@ -1420,7 +1425,6 @@ async fn run_session(
                     "the original session id was preserved but the relay re-issued its tokens; \
                      browsers holding the old tokens are logged out"
                 );
-                accepted = true;
             }
             Err(e) => {
                 tracing::error!(
@@ -1434,13 +1438,15 @@ async fn run_session(
                 anyhow::bail!("upgrade identity not restored: {e}");
             }
         }
-        if accepted {
-            r.complete();
-            // 不再需要"识别/收掉 systemd 补起的重复实例"（MYS-2425-D 评审）：
-            // `Restart=always` 的托管场景要么走 Coordinated（助手先 stop，补起
-            // 被取消，只有一个受管 MainPID），要么在换机前就 fail-closed 失败。
-            // 那条观察路径已无可达场景，故一并移除，缩小 diff。
-        }
+        // 走到这里等价于"relay 已接受本次交接身份"：Err 分支上面已经 bail
+        // 出去，剩下两个 Ok 分支都表示接受（第二个只是 Token 被重签，已记
+        // warn）。原先那个 `accepted` 标志在三个分支里恒为 true，没有任何
+        // 判定作用，只是让 `if accepted` 看起来像有条件——去掉标志、语义不变。
+        r.complete();
+        // 不再需要"识别/收掉 systemd 补起的重复实例"（MYS-2425-D 评审）：
+        // `Restart=always` 的托管场景要么走 Coordinated（助手先 stop，补起
+        // 被取消，只有一个受管 MainPID），要么在换机前就 fail-closed 失败。
+        // 那条观察路径已无可达场景，故一并移除，缩小 diff。
     }
 
     // 把实际 session id 与 token 写入共享状态（TUI 展示；token 刷新后在此更新）。
@@ -3493,7 +3499,7 @@ mod tests {
         assert!(rss > 0, "self_rss_kb must be >0 on Linux, got {rss}");
     }
 
-    #[cfg(feature = "desktop")]
+    #[cfg(all(feature = "desktop", target_os = "linux"))]
     #[test]
     fn test_cpu_ms_from_stat_parses_ticks() {
         // R5#136-146 功耗采样：构造 stat（comm 含空格/括号，utime 字段14=100、

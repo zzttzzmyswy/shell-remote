@@ -368,7 +368,9 @@ mod tests {
     }
 
     /// 构造确定性混合 BGRA 帧（伪随机但可复现，覆盖全值域 + 尾部对齐余量）。
-    fn make_bgra(w: usize, h: usize, stride: usize, seed: u64) -> Vec<u8> {
+    ///
+    /// 尺寸只由 `h × stride` 决定（`stride` 已含行宽），不再需要单独的 `w`。
+    fn make_bgra(h: usize, stride: usize, seed: u64) -> Vec<u8> {
         let mut buf = vec![0u8; h * stride];
         let mut x = seed;
         for i in 0..buf.len() {
@@ -380,7 +382,7 @@ mod tests {
 
     /// SIMD dispatch 输出与标量参考逐字节一致（R5 #127-128 SIMD 子集正确性）。
     fn assert_simd_matches_scalar(w: usize, h: usize, stride: usize, matrix: ColorMatrix, seed: u64) {
-        let bgra = make_bgra(w, h, stride, seed);
+        let bgra = make_bgra(h, stride, seed);
         let yuv = bgra_to_i420_with_matrix(&bgra, w, h, stride, matrix);
         // 标量参考：手工按原算法重算（不经 SIMD dispatch）。
         let (kyr, kyg, kyb, kur, kug, kub, kvr, kvg, kvb) = matrix_coeffs(matrix);
@@ -442,7 +444,7 @@ mod tests {
         let w = 1920usize;
         let h = 1080usize;
         let stride = w * 4;
-        let bgra = make_bgra(w, h, stride, 0xbe);
+        let bgra = make_bgra(h, stride, 0xbe);
         let n = 30;
         // SIMD dispatch 路径。
         let t0 = std::time::Instant::now();

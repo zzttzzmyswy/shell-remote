@@ -174,8 +174,6 @@ mod x11clip {
         conn: Arc<x11rb::rust_connection::RustConnection>,
         win: x11rb::protocol::xproto::Window,
         clipboard_atom: Atom,
-        utf8_atom: Atom,
-        string_atom: Atom,
         pub content: Arc<Mutex<String>>,
     }
 
@@ -214,7 +212,7 @@ mod x11clip {
             .ok()?;
             let clipboard_atom = intern(&conn, "CLIPBOARD")?;
             let utf8_atom = intern(&conn, "UTF8_STRING")?;
-            let string_atom = x11rb::protocol::xproto::AtomEnum::STRING.into();
+            let string_atom: Atom = x11rb::protocol::xproto::AtomEnum::STRING.into();
             let content: Arc<Mutex<String>> = Arc::new(String::new().into());
             let c2 = conn.clone();
             let content2 = content.clone();
@@ -265,12 +263,12 @@ mod x11clip {
                     }
                 })
                 .ok()?;
+            // utf8_atom / string_atom 只被上面的事件线程用来判定可转换的
+            // target（Atom 是 Copy，已 move 进闭包），不必再存一份到结构体。
             Some(Self {
                 conn,
                 win,
                 clipboard_atom,
-                utf8_atom,
-                string_atom,
                 content,
             })
         }

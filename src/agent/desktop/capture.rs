@@ -167,11 +167,9 @@ fn open_auto(display: Option<&str>) -> Result<(Box<dyn FrameSource>, String), St
     }
 }
 
-#[cfg(windows)]
-fn open_gdi() -> Result<Box<dyn FrameSource>, String> {
-    gdi::GdiSource::open().map(|s| Box::new(s) as Box<dyn FrameSource>)
-}
-
+// 非 Windows 上 `"gdi"` 走这条兜底（返回明确的"仅 Windows"错误）；Windows
+// 的 `"gdi"` 分支直接调 `gdi::GdiSource::open_at`，不需要这里的 windows 版本
+// ——那个版本从来没被调用过，会编译但在 Windows 构建里报 dead_code。
 #[cfg(not(windows))]
 fn open_gdi() -> Result<Box<dyn FrameSource>, String> {
     Err("GDI capture is Windows-only".to_string())
@@ -199,7 +197,7 @@ pub struct ThreadedFrameSource {
 
 impl ThreadedFrameSource {
     /// 启动抓帧线程，不限速（等价 `spawn_with_max_fps(inner, 0)`）。
-    pub fn spawn(mut inner: Box<dyn FrameSource>) -> Result<Self, String> {
+    pub fn spawn(inner: Box<dyn FrameSource>) -> Result<Self, String> {
         Self::spawn_with_max_fps(inner, 0.0, None)
     }
 
@@ -211,7 +209,6 @@ impl ThreadedFrameSource {
         max_fps: f64,
         pool: Option<std::sync::Arc<FramePool>>,
     ) -> Result<Self, String> {
-        use std::sync::atomic::Ordering as O;
         let (width, height) = inner.resolution();
         // R5 #127 捕获侧池：注入线程内 capture（next_frame 从池借出）。
         if let Some(p) = &pool {
@@ -244,7 +241,7 @@ impl ThreadedFrameSource {
                             e1.store(0, O::Relaxed);
                             same = match &last_raw {
                                 Some((lw, lh, buf)) => {
-                                    (*lw == f.width && *lh == f.height && buf.as_slice() == f.bgra.as_slice())
+                                    *lw == f.width && *lh == f.height && buf.as_slice() == f.bgra.as_slice()
                                 }
                                 None => false,
                             };
@@ -357,7 +354,6 @@ impl Drop for ThreadedFrameSource {
 #[cfg(not(windows))]
 pub struct X11Source {
     conn: x11rb::rust_connection::RustConnection,
-    screen_num: usize,
     root: x11rb::protocol::xproto::Drawable,
     width: u16,
     height: u16,
@@ -396,6 +392,7 @@ pub struct X11Source {
 /// struct lives (dropped via `shmdt`); X writes into it on `ShmGetImage`.
 /// Access is guarded: capture reads it only after the `ShmGetImage` reply
 /// has been waited on, so no explicit sync fence is needed between X and us.
+#[cfg(not(windows))]
 struct ShmState {
     shmid: i32,
     ptr: *mut u8,
@@ -408,6 +405,7 @@ struct ShmState {
 // SAFETY: the raw pointer is only ever dereferenced from the owning thread
 // (capture loop) after a `ShmGetImage` reply, so it is safe to consider the
 // struct Send within this single-threaded `ThreadedFrameSource` usage.
+#[cfg(not(windows))]
 unsafe impl Send for ShmState {}
 
 #[cfg(not(windows))]
@@ -433,7 +431,6 @@ impl X11Source {
         };
         let mut src = Self {
             conn,
-            screen_num,
             root,
             width,
             height,
@@ -946,11 +943,10 @@ mod gdi {
     use super::{Frame, FrameSource, MonitorInfo};
     use windows_sys::Win32::Foundation::{GetLastError, RECT};
     use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
-        BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, MONITORINFO, SRCCOPY,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+        EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject,
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, MONITORINFO, SRCCOPY,
     };
-    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, MONITORENUMPROC};
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
     pub struct GdiSource {
@@ -1015,10 +1011,6 @@ mod gdi {
     }
 
     impl GdiSource {
-        pub fn open() -> Result<Self, String> {
-            Self::open_at(0)
-        }
-
         /// Open capture for the `index`-th display monitor（EnumDisplayMonitors
         /// 枚举顺序，0 = 主屏）。抓帧时按该屏在虚拟桌面中的矩形 BitBlt。
         pub fn open_at(index: usize) -> Result<Self, String> {
@@ -1509,7 +1501,6 @@ mod tests {
     /// 静止源在 1.2s 窗口内产出的可取帧数应明显少于全速源。
     #[test]
     fn test_threaded_static_source_backs_off() {
-        use std::sync::atomic::Ordering as O;
         // 恒定画面源：每帧字节完全相同，would-block 判 `same` → 退避 sleep。
         struct StaticSource {
             w: usize,

@@ -1456,7 +1456,7 @@ mod tests {
             "data": B64.encode(b"second"),
         }))
         .await;
-        let (ty, p) = recv(&mut rx).await;
+        let (ty, _) = recv(&mut rx).await;
         assert_eq!(ty, "tcp:ack");
         let (ty, p) = recv(&mut rx).await;
         assert_eq!(ty, "tcp:data");
@@ -1493,7 +1493,7 @@ mod tests {
         assert_eq!(recv(&mut rx).await.0, "tcp:opened");
         tun.handle_data(&json!({"conn_id":"c2","seq":0,"data":B64.encode(b"a")}))
             .await;
-        let (ty, p) = recv(&mut rx).await;
+        let (ty, _) = recv(&mut rx).await;
         assert_eq!(ty, "tcp:ack");
         tun.handle_data(&json!({"conn_id":"c2","seq":0,"data":B64.encode(b"b")}))
             .await;

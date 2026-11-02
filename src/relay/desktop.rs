@@ -976,7 +976,9 @@ mod tests {
                 "/agent/desktop/ws",
                 axum::routing::get(
                     move |State(st): State<Arc<crate::relay::SharedState>>,
-                          Query(p): Query<HashMap<String, String>>,
+                          // 路由必须声明 Query 提取器才吃 `?token=` 之类的
+                          // 查询串（未知参数被忽略），这里不读它。
+                          Query(_): Query<HashMap<String, String>>,
                           ws: axum::extract::ws::WebSocketUpgrade| async move {
                         let stream = st.desktop_streams.read().await.get(&sid).cloned().unwrap();
                         ws.on_upgrade(move |socket| {

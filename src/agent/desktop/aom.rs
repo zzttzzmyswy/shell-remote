@@ -74,8 +74,6 @@ unsafe impl Send for AomEncoder {}
 
 /// Compressed frame packet kind (AOM_CODEC_CX_FRAME_PKT).
 const AOM_CODEC_CX_FRAME_PKT: c_int = 0;
-/// Raw I420 image format for `aom_img_alloc` (bindgen rustified enum).
-const AOM_IMG_FMT_I420: c_uint = 258; // AOM_IMG_FMT_I420
 /// Key-frame flag in `aom_codec_cx_pkt.frame.flags`.
 const AOM_FRAME_IS_KEY: c_uint = 0x1;
 
@@ -104,12 +102,21 @@ impl AomEncoder {
             if iface.is_null() {
                 return Err("aom_codec_av1_cx unavailable".into());
             }
-            let mut cfg: aom_sys::aom_codec_enc_cfg_t =
-                unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-            let rc = aom_sys::aom_codec_enc_config_default(iface, &mut cfg, aom_sys::AOM_USAGE_REALTIME);
+            // aom_codec_enc_cfg_t 含有非零有效位宽的字段（g_timebase 的
+            // num/den 等），`MaybeUninit::uninit().assume_init()` 是未定义
+            // 行为（rustc `invalid_value`）。改为交给 libaom 自己整份填默认值：
+            // `aom_codec_enc_config_default` 是纯输出参数，只在 rc==OK 之后
+            // 才 assume_init。
+            let mut cfg = std::mem::MaybeUninit::<aom_sys::aom_codec_enc_cfg_t>::uninit();
+            let rc = aom_sys::aom_codec_enc_config_default(
+                iface,
+                cfg.as_mut_ptr(),
+                aom_sys::AOM_USAGE_REALTIME,
+            );
             if rc != aom_sys::aom_codec_err_t_AOM_CODEC_OK {
                 return Err(format!("enc_config_default rc={rc:?}"));
             }
+            let mut cfg = cfg.assume_init();
             cfg.g_w = w;
             cfg.g_h = h;
             cfg.g_threads = crate::agent::desktop::encoder::codec_thread_num() as c_uint;
@@ -158,7 +165,8 @@ impl AomEncoder {
             // 65535 帧（30fps ≈ 36 分钟）远大于任何会话，等效"永不自动 KF"。
             cfg.kf_max_dist = 65535;
 
-            let mut ctx: aom_sys::aom_codec_ctx_t = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+            // 已在外层 unsafe 块内，无需再套一层。
+            let mut ctx: aom_sys::aom_codec_ctx_t = std::mem::MaybeUninit::zeroed().assume_init();
             let rc = aom_sys::aom_codec_enc_init_ver(
                 &mut ctx,
                 iface,
@@ -407,13 +415,11 @@ impl AomEncoder {
             level,
             super::BitrateGuard::MAX_LEVEL,
         );
-        unsafe {
-            set_ctl(
-                &mut self.ctx,
-                aom_sys::aome_enc_control_id_AV1E_SET_QUANTIZER_ONE_PASS as c_int,
-                qp as c_int,
-            );
-        }
+        set_ctl(
+            &mut self.ctx,
+            aom_sys::aome_enc_control_id_AV1E_SET_QUANTIZER_ONE_PASS as c_int,
+            qp as c_int,
+        );
     }
 
     /// Read back the current target bitrate (bps).
@@ -535,7 +541,6 @@ impl crate::agent::desktop::encoder::VideoEncoder for AomEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::desktop::encoder::VideoEncoder;
 
     /// cpu_used 固定 5（MYS-954 三轮定档：5=画质/码率最优、帧率交 QoS；
     /// 6 曾高熵掉帧花屏、8 画质糙）；superblock 仍按面积/线程分档（#81，
@@ -636,20 +641,25 @@ mod tests {
         // 每帧 = 混合高动态（模拟真实"大量移动画面"）：快速滚动的图文长页
         // （平移、可压缩）+ 右下角一块每帧全变的噪声"视频窗口"（不可压缩、
         // 运动估计追不上，是码率压力的真实来源）。
-        let mut page = Vec::new(); // 高细节"长页面"（内容静止，整体平移）
-        {
+        let page: Vec<u8> = {
+            // 高细节"长页面"（内容静止，整体平移）
             let pw = w * 2;
-            page = vec![0u8; pw * h * 2];
+            let mut p = vec![0u8; pw * h * 2];
             for yy in 0..h * 2 {
                 let seed = (yy as u64).wrapping_mul(0x9E3779B97F4A7C15);
                 for xx in 0..pw {
                     let c = ((seed >> (xx % 32)) ^ (xx as u64 * 2654435761)) as u8;
                     let on = (c & 0x3f) < 12;
-                    page[yy * pw + xx] = if on { (c & 0xf0).max(180) } else { (c & 0x1f).max(140).min(175) };
+                    p[yy * pw + xx] = if on {
+                        (c & 0xf0).max(180)
+                    } else {
+                        (c & 0x1f).max(140).min(175)
+                    };
                 }
             }
-        }
-        let mut frame = |buf: &mut [u8], t: u32| {
+            p
+        };
+        let frame = |buf: &mut [u8], t: u32| {
             let stride = w;
             let dy = (t as usize * 13) % (h * 2 - h); // 快速垂直滚动
             for y in 0..h {
@@ -713,7 +723,7 @@ mod tests {
             .expect("av1 init");
         // 每帧内容 = 平铺平移的伪随机块（相位随 t 全变）→ 帧间几乎无
         // 运动相关性，AV1 每帧都要真实编码 → 持续高熵（模拟拖动复杂窗口）。
-        let mut frame = |buf: &mut [u8], t: u32| {
+        let frame = |buf: &mut [u8], t: u32| {
             let (bw, bh) = (16usize, 16usize);
             let stride = w;
             for by in 0..(h / bh) {
@@ -737,7 +747,7 @@ mod tests {
                 }
             }
         };
-        let mut run_seg = |enc: &mut AomEncoder, t0: u32, tag: &str| {
+        let run_seg = |enc: &mut AomEncoder, t0: u32, tag: &str| {
             let (mut bytes, mut out) = (0usize, 0usize);
             for t in t0..t0 + 30 {
                 let mut buf = solid_i420(w, h, 90);
@@ -820,7 +830,6 @@ mod tests {
 #[cfg(test)]
 mod bench_encode_time {
     use super::*;
-    use crate::agent::desktop::encoder::VideoEncoder;
 
     fn noise_i420(w: usize, h: usize, t: u32) -> Vec<u8> {
         let mut buf = vec![90u8; w * h + w * h / 2];
@@ -851,9 +860,6 @@ mod bench_encode_time {
             let wy = ((t as usize * 23) % (h * 2)) as isize - h as isize / 2;
             for dy in 0..180isize {
                 for dx in 0..160isize {
-                    let px = wx + dx;
-                    let py = wy.saturating_mul(0) + dy;
-                    let _ = py;
                     let xx = wx + dx;
                     let yy = wy + dy;
                     if (0..w as isize).contains(&xx) && (0..h as isize).contains(&yy) {
@@ -971,7 +977,7 @@ mod bench_encode_time {
         // +细微光标扰动，测实际输出字节/秒。
         let mut enc = AomEncoder::new(1280, 800, 573_000, 30.0, 24, 45, false).expect("av1 init");
         let (w, h) = (1280usize, 800usize);
-        let mut base = vec![128u8; w*h + w*h/2];
+        let base = vec![128u8; w * h + w * h / 2];
         let mut total = 0u64; let mut frames = 0u64;
         let start = std::time::Instant::now();
         for t in 0..540u32 { // 18s @ 30fps
@@ -1000,7 +1006,7 @@ mod bench_encode_time {
     #[ignore]
     fn av1_dynamic_rc_reconfig_repro() {
         let mut enc = AomEncoder::new(1280, 800, 900_000, 1.0, 24, 45, false).expect("av1 init");
-        let mut qos = 1000u32; // 千分比
+        let mut qos: u32; // 千分比（每 3 帧由 QoS 节律赋值后才读）
         let mut phase = 0usize;
         // 模拟桌面内容：静态底 + 移动窗口块
         fn frame(t: u64, w: usize, h: usize) -> Vec<u8> {
@@ -1056,7 +1062,7 @@ mod bench_encode_time {
     fn test_av1_monochrome_saves_bytes_and_flags() {
         let (w, h) = (640usize, 360usize);
         // 内容：彩色噪声纹理（U/V 填充显著偏离 128 的值，模拟彩色桌面）
-        let mut frame = |t: u32| -> Vec<u8> {
+        let frame = |t: u32| -> Vec<u8> {
             let mut buf = vec![0u8; w * h + w * h / 2];
             let seed = t.wrapping_mul(2654435761).wrapping_add(7);
             for i in 0..buf.len() {
