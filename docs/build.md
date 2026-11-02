@@ -91,6 +91,15 @@ tools/release.sh
 
 发布：版本号以 `Cargo.toml` 为唯一源，脚本据此打 tag、重建 `dist/` 并创建 GitHub release。`--skip-build` 复用已有 `dist/`。CI 与人工发布都走这个入口，避免 tag 与二进制 `--version` 漂移。
 
+**发版前必须跑跨版本兼容矩阵，并保证全部 PASS/GAP（不允许 FAIL）**：
+
+```bash
+tools/compat_matrix.sh
+```
+
+它用真实的已发布旧二进制跑「新 relay + 旧 agent」与「旧 relay + 新 agent」两个方向，
+见 [compat-matrix.md](compat-matrix.md)。有 FAIL 时退出码非 0，不要发版。
+
 ```bash
 tools/build-libaom.sh
 ```
