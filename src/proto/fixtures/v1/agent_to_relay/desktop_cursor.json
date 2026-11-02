@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "shown": true,
+    "x": 640,
+    "y": 360
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:cursor"
+}

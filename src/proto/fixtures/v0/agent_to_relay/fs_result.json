@@ -1,0 +1,19 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-fs-1",
+    "entries": [
+      {
+        "is_symlink": false,
+        "mode": "-rw-r--r--",
+        "name": "note.txt",
+        "owner": "1000:1000",
+        "path": "/home/golden/note.txt",
+        "size": 1024,
+        "type": "file"
+      }
+    ],
+    "success": true
+  },
+  "session_id": "goldensession1",
+  "type": "fs:result"
+}

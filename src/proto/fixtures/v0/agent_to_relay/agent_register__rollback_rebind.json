@@ -1,0 +1,15 @@
+{
+  "agent_version": "0.59.11",
+  "session_id": "goldensession1",
+  "tokens": [
+    {
+      "permission": "rw",
+      "token": "golden-rw-token"
+    },
+    {
+      "permission": "ro",
+      "token": "golden-ro-token"
+    }
+  ],
+  "type": "agent:register"
+}

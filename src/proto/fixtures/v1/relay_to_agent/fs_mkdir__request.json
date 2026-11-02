@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "path": "/home/golden/newdir"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:mkdir"
+}

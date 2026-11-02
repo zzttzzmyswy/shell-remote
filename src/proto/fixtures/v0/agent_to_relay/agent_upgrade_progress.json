@@ -1,0 +1,10 @@
+{
+  "payload": {
+    "detail": "9.9MB/23.5MB 1.8MB/s",
+    "percent": 42,
+    "stage": "downloading",
+    "version": "0.59.12"
+  },
+  "session_id": "goldensession1",
+  "type": "agent:upgrade_progress"
+}

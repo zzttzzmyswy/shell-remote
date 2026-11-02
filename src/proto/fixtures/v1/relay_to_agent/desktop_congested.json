@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "dropped": 3
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:congested"
+}

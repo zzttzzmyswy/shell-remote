@@ -110,6 +110,37 @@ pub async fn sse_handler(
     response
 }
 
+/// 构造下发给 agent 的 `mcp:exec` 消息（relay → agent）。
+///
+/// 抽成独立函数（MYS-2553 兼容 2）：金样夹具与输出契约测试按真实构造路径
+/// 断言字段集。`cmd` / `timeout_ms` / `_mcp_request_id` 是存量 agent 必读的
+/// 三个键；`shell` / `cwd` 是后加的可选键，老 agent 忽略。
+pub fn build_mcp_exec_message(
+    session_id: &str,
+    cmd: &str,
+    timeout_ms: u64,
+    shell: Option<&str>,
+    cwd: Option<&str>,
+    mcp_request_id: &str,
+) -> ProtoMessage {
+    let mut payload = json!({
+        "cmd": cmd,
+        "timeout_ms": timeout_ms,
+        "_mcp_request_id": mcp_request_id
+    });
+    if let Some(shell) = shell {
+        payload["shell"] = json!(shell);
+    }
+    if let Some(cwd) = cwd {
+        payload["cwd"] = json!(cwd);
+    }
+    ProtoMessage {
+        msg_type: "mcp:exec".to_string(),
+        session_id: session_id.to_string(),
+        payload,
+    }
+}
+
 pub async fn messages_handler(
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
@@ -337,23 +368,14 @@ FILE TRANSFER (bytes bypass LLM context — use for files of any size):\n  uploa
             }
 
             let mcp_req_id = Uuid::new_v4().to_string();
-            let mut payload = json!({
-                "cmd": cmd,
-                "timeout_ms": timeout_ms_val,
-                "_mcp_request_id": mcp_req_id
-            });
-            if let Some(shell) = shell {
-                payload["shell"] = json!(shell);
-            }
-            if let Some(cwd) = cwd {
-                payload["cwd"] = json!(cwd);
-            }
-
-            let proto_msg = ProtoMessage {
-                msg_type: "mcp:exec".to_string(),
-                session_id: session_id.clone(),
-                payload,
-            };
+            let proto_msg = build_mcp_exec_message(
+                &session_id,
+                cmd,
+                timeout_ms_val,
+                shell,
+                cwd,
+                &mcp_req_id,
+            );
 
             let (tx, rx) = oneshot::channel();
             {

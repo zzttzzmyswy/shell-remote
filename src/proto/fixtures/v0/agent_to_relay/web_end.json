@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "request_id": "web-req-1"
+  },
+  "session_id": "goldensession1",
+  "type": "web:end"
+}

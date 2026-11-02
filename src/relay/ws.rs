@@ -403,6 +403,35 @@ fn stale_upgrade_reason(target: &str, stage: &str) -> String {
     )
 }
 
+/// 构造 `agent:registered` 响应（注册握手 relay → agent）。
+///
+/// 抽成独立函数（MYS-2553 兼容 2）：金样夹具与输出契约测试必须断言**真实
+/// 响应构造代码**产出的字段集，不能在测试里另抄一份 json——那样删掉
+/// `desktop_binary` 这类老兼容位时测试会跟着一起「通过」。
+pub fn build_register_response(
+    session_id: &str,
+    evicted: bool,
+    tokens_json: Vec<Value>,
+) -> Value {
+    json!({
+        "type": "agent:registered",
+        "session_id": session_id,
+        "evicted": evicted,
+        // R5 #41 binary 传输能力告知：新 relay 的 agent WS uplink 支持
+        // desktop:video 二进制帧（Message::Binary → route_bin_desktop_frame）。
+        // 老 relay 无此字段 → agent 保持 JSON+base64（兼容回退）。
+        "desktop_binary": true,
+        // MYS-2553：协议代次 + relay 版本 + relay 能力声明。三项都是
+        // **新增可选字段**——老 agent 只认 `desktop_binary` 就够，多余
+        // 字段被 serde 忽略；新 agent 优先看 `relay_capabilities`，
+        // 缺字段时回退到 `desktop_binary`。
+        "protocol_version": crate::proto::PROTOCOL_VERSION,
+        "relay_version": env!("CARGO_PKG_VERSION"),
+        "relay_capabilities": crate::proto::RELAY_CAPABILITIES,
+        "payload": { "tokens": tokens_json }
+    })
+}
+
 pub async fn route_agent_message(state: &Arc<SharedState>, session_id: &str, text_str: &str) {
     // 未注册的 sid 直接丢弃：下面各分支都会 `entry(sid).or_default()` 写
     // `kpi_history` / `desktop_proto` / `desktop_streams` 等按 sid 索引的表，
@@ -1458,7 +1487,6 @@ pub async fn agent_send_handler(
                 json!({"token": token, "permission": perm_str})
             })
             .collect();
-
         let key_info = if body.get("tokens").map(|v| v.is_array()).unwrap_or(false) {
             "reconnect".to_string()
         } else {
@@ -1574,24 +1602,7 @@ pub async fn agent_send_handler(
             }
         }
 
-        return Json(json!({
-            "type": "agent:registered",
-            "session_id": session_id,
-            "evicted": evicted,
-            // R5 #41 binary 传输能力告知：新 relay 的 agent WS uplink 支持
-            // desktop:video 二进制帧（Message::Binary → route_bin_desktop_frame）。
-            // 老 relay 无此字段 → agent 保持 JSON+base64（兼容回退）。
-            "desktop_binary": true,
-            // MYS-2553：协议代次 + relay 版本 + relay 能力声明。三项都是
-            // **新增可选字段**——老 agent 只认 `desktop_binary` 就够，多余
-            // 字段被 serde 忽略；新 agent 优先看 `relay_capabilities`，
-            // 缺字段时回退到 `desktop_binary`。
-            "protocol_version": crate::proto::PROTOCOL_VERSION,
-            "relay_version": env!("CARGO_PKG_VERSION"),
-            "relay_capabilities": crate::proto::RELAY_CAPABILITIES,
-            "payload": { "tokens": tokens_json }
-        }))
-        .into_response();
+        return Json(build_register_response(&session_id, evicted, tokens_json)).into_response();
     }
 
     // All other message types require server auth, unless they carry a valid session_id

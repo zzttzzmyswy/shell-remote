@@ -1,0 +1,18 @@
+{
+  "payload": {
+    "tabs": [
+      {
+        "active": true,
+        "tab_id": "tab-1",
+        "title": "bash"
+      },
+      {
+        "active": false,
+        "tab_id": "tab-2",
+        "title": "logs"
+      }
+    ]
+  },
+  "session_id": "goldensession1",
+  "type": "session:tab_list"
+}

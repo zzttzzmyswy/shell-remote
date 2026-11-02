@@ -1,0 +1,12 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-mcp-2",
+    "exec_id": "exec-1",
+    "exit_code": 0,
+    "status": "exited",
+    "stderr": "",
+    "stdout": "done\n"
+  },
+  "session_id": "goldensession1",
+  "type": "mcp:exec_result"
+}

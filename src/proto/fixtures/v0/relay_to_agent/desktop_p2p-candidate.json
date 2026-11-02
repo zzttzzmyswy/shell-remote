@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "candidate": "candidate:1 1 udp 2130706431 192.168.1.9 54322 typ host"
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:p2p-candidate"
+}

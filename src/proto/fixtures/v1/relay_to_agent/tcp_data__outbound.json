@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "conn_id": "conn-1",
+    "data": "R0VUIC8gSFRUUC8xLjENCkhvc3Q6IHgNCg0K",
+    "seq": 0
+  },
+  "session_id": "goldensession1",
+  "type": "tcp:data"
+}

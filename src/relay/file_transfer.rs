@@ -185,6 +185,32 @@ fn header_value_or_static(value: &str, fallback: &'static str) -> axum::http::He
         .unwrap_or_else(|_| axum::http::HeaderValue::from_static(fallback))
 }
 
+/// 构造下发给 agent 的 `fs:read` 消息（relay → agent）。
+///
+/// 抽成独立函数（MYS-2553 兼容 2）：金样夹具与输出契约测试按真实构造路径
+/// 断言字段集。`path` / `_mcp_request_id` 是存量 agent 必读的两个键；
+/// `offset` / `limit` 是 Range 请求才带的**可选**键，老 agent 忽略它们 →
+/// 整文件返回（relay 侧再按 `file_size` 收敛，见 `test_get_range_*`）。
+pub fn build_fs_read_message(
+    session_id: &str,
+    path: &str,
+    correlation_id: &str,
+    range: Option<(u64, Option<u64>)>,
+) -> serde_json::Value {
+    let mut read_payload = json!({
+        "path": path, "_mcp_request_id": correlation_id
+    });
+    if let Some((start, end)) = range {
+        read_payload["offset"] = json!(start);
+        // `end` is clamped by the relay once the agent reports the file size;
+        // before that, saturate rather than overflow on `bytes=0-18446744073709551615`.
+        if let Some(e) = end {
+            read_payload["limit"] = json!(e.saturating_sub(start).saturating_add(1));
+        }
+    }
+    json!({"type":"fs:read","session_id":session_id, "payload": read_payload})
+}
+
 pub async fn get_handler(
     State(state): State<Arc<crate::relay::SharedState>>,
     headers: axum::http::HeaderMap,
@@ -242,18 +268,7 @@ pub async fn get_handler(
     }
     // Send fs:read to agent on bulk channel. For a range request the offset and
     // limit ride optional payload fields; an old agent ignores them → full file.
-    let mut read_payload = json!({
-        "path": &path, "_mcp_request_id": &correlation_id
-    });
-    if let Some((start, end)) = range {
-        read_payload["offset"] = json!(start);
-        // `end` is clamped by the relay once the agent reports the file size;
-        // before that, saturate rather than overflow on `bytes=0-18446744073709551615`.
-        if let Some(e) = end {
-            read_payload["limit"] = json!(e.saturating_sub(start).saturating_add(1));
-        }
-    }
-    let proto = json!({"type":"fs:read","session_id":&session_id, "payload": read_payload});
+    let proto = build_fs_read_message(&session_id, &path, &correlation_id, range);
     let _ = deliver_bulk(&bulk_tx, proto.to_string()).await;
 
     // Wait for chunk 0 to decide 200 vs 206 vs error status.

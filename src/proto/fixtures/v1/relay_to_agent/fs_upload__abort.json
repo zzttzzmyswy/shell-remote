@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "aborted": true,
+    "upload_id": "up-1"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:upload"
+}

@@ -1,0 +1,10 @@
+{
+  "payload": {
+    "_mcp_request_id": "c-2",
+    "limit": 1024,
+    "offset": 1024,
+    "path": "/home/golden/big.log"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:read"
+}

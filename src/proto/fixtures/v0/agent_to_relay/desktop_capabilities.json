@@ -1,0 +1,13 @@
+{
+  "payload": {
+    "available": true,
+    "capture": "auto",
+    "codecs": [
+      "h264"
+    ],
+    "lan_addrs": [],
+    "running": false
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:capabilities"
+}

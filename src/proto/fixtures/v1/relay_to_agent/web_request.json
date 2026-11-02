@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "method": "GET",
+    "request_id": "web-req-1",
+    "url": "http://intranet.golden/"
+  },
+  "session_id": "goldensession1",
+  "type": "web:request"
+}

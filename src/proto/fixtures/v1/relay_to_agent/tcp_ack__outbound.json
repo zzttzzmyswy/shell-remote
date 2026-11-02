@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "bytes": 27,
+    "conn_id": "conn-1"
+  },
+  "session_id": "goldensession1",
+  "type": "tcp:ack"
+}

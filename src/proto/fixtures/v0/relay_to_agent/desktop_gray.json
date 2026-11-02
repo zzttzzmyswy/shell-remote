@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "enabled": true,
+    "seq": 5
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:gray"
+}

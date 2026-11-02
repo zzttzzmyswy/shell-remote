@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "path": "/home/golden"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:list"
+}

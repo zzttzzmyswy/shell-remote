@@ -1,0 +1,18 @@
+{
+  "desktop_binary": true,
+  "evicted": false,
+  "payload": {
+    "tokens": [
+      {
+        "permission": "rw",
+        "token": "golden-rw-token"
+      },
+      {
+        "permission": "ro",
+        "token": "golden-ro-token"
+      }
+    ]
+  },
+  "session_id": "goldensession1",
+  "type": "agent:registered"
+}

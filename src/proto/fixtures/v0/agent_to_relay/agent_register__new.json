@@ -1,0 +1,28 @@
+{
+  "agent_version": "0.59.11",
+  "capabilities": [
+    "web:proxy-v1",
+    "net:tcp-v1",
+    "upgrade:v2",
+    "codec:h264",
+    "codec:av1",
+    "backend:x11",
+    "desktop:gray",
+    "desktop:quality",
+    "desktop:clipboard",
+    "desktop:cursor",
+    "desktop:test-delay"
+  ],
+  "device": {
+    "arch": "x86_64",
+    "cpu_model": "Golden CPU @ 2.00GHz",
+    "hostname": "golden-host",
+    "kernel": "5.15.0-golden",
+    "os": "Linux",
+    "platform": "linux"
+  },
+  "key": "golden-fixed-key",
+  "session_id": "goldensession1",
+  "token_type": "rw",
+  "type": "agent:register"
+}
