@@ -36,7 +36,7 @@ shell-remote.exe agent --relay-url http://your-relay:3000 --key YourFixedKey --s
 
 - 建议以管理员身份运行以完整访问文件系统（`tools/build-dist.sh` 给 UI 二进制嵌入 `requireAdministrator` manifest，让键鼠注入能操作提权窗口）
 - 交互式程序（ssh / vim）在 MCP exec 路径不支持；文件下载（read）正常
-- 终端输出与 MCP 命令结果会自动把 Windows 控制台的非常见编码（如 GBK / cp936）统一转换为 UTF-8 后回传，浏览器与 AI Agent 侧无需关心目标机编码
+- 终端输出与 MCP 命令结果**按行**逐行判定编码后统一转换为 UTF-8 回传：合法 UTF-8 的行原样保留，其余行按系统 ANSI 代码页（中文 Windows 为 GBK / cp936）解码——同一条命令里 PowerShell 输出的 UTF-8 与原生程序的 GBK 可以共存。跨块被切开的多字节字符由流式解码器拼接，不会出现半个汉字。浏览器与 AI Agent 侧无需关心目标机编码
 - **命令日志会记录全部终端输入**：Windows 的 ConPTY 拿不到 Unix 那样的 termios 与前台进程组信息，无法判断"是否在密码提示下"，因此 Windows agent 不区分密码输入。在 Windows 上处理敏感操作时请加 `--no-cmd-log`。详见 [mcp.md](mcp.md)
 
 ## 交叉编译（从 Linux）

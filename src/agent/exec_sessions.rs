@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use uuid::Uuid;
 
+use crate::agent::encoding::StreamDecoder;
 use crate::agent::fs;
 use crate::proto::{ExecResultPayload, ExecSessionInfo};
 
@@ -74,53 +75,6 @@ fn trim_front(buf: &mut String, max: usize) {
         keep_start += 1;
     }
     buf.drain(..keep_start);
-}
-
-/// Decode one raw output chunk as UTF-8, never splitting a multi-byte character
-/// across chunk boundaries.
-///
-/// A 4096-byte read can land in the middle of a CJK character or an emoji, so
-/// decoding each chunk on its own (`decode_bytes`) yields U+FFFD for both
-/// halves. Instead, when the bytes end inside an incomplete UTF-8 sequence
-/// (`error_len() == None`), the trailing partial character is held in `tail`
-/// and prepended to the next chunk.
-///
-/// Genuinely invalid bytes (`error_len() == Some(_)`, e.g. GBK console output)
-/// are not held back — they go through the platform decoder immediately.
-fn decode_utf8_stream(tail: &mut Vec<u8>, chunk: &[u8]) -> String {
-    tail.extend_from_slice(chunk);
-    match std::str::from_utf8(tail) {
-        Ok(_) => {
-            let s = String::from_utf8_lossy(tail).into_owned();
-            tail.clear();
-            s
-        }
-        Err(e) if e.error_len().is_none() => {
-            // Incomplete sequence at the end: emit everything before it and
-            // keep the partial character for the next read.
-            let cut = e.valid_up_to();
-            let s = String::from_utf8_lossy(&tail[..cut]).into_owned();
-            tail.drain(..cut);
-            s
-        }
-        Err(_) => {
-            // Not a split character — real legacy-encoded bytes. Use the
-            // platform decoder (GBK on Windows), as before.
-            let s = crate::agent::encoding::decode_bytes(tail);
-            tail.clear();
-            s
-        }
-    }
-}
-
-/// Flush whatever an incomplete multi-byte character left in `tail` at EOF.
-fn flush_utf8_tail(tail: &mut Vec<u8>) -> String {
-    if tail.is_empty() {
-        return String::new();
-    }
-    let s = crate::agent::encoding::decode_bytes(tail);
-    tail.clear();
-    s
 }
 
 pub struct ExecSessionManager {
@@ -247,10 +201,10 @@ impl ExecSessionManager {
         tokio::spawn(async move {
             let mut stdout_buf = vec![0u8; 4096];
             let mut stderr_buf = vec![0u8; 4096];
-            // 跨块 UTF-8 尾部：一个 4096 字节读可能正好切在多字节字符中间，
-            // 各自独立 decode 会把两半都变成 U+FFFD。
-            let mut stdout_tail: Vec<u8> = Vec::new();
-            let mut stderr_tail: Vec<u8> = Vec::new();
+            // 跨块解码器：一个 4096 字节读可能正好切在多字节字符（UTF-8 或
+            // GBK）中间，由 StreamDecoder 扣住残缺尾部、按行选择编码。
+            let mut stdout_dec = StreamDecoder::new();
+            let mut stderr_dec = StreamDecoder::new();
             let check_interval = Duration::from_secs(30);
             let mut last_activity = Instant::now();
             // stdout/stderr 分别记 EOF：两者都关闭才说明进程不再产出，
@@ -266,7 +220,7 @@ impl ExecSessionManager {
                         match n {
                             Ok(0) => {
                                 stdout_eof = true;
-                                let s = flush_utf8_tail(&mut stdout_tail);
+                                let s = stdout_dec.finish();
                                 if !s.is_empty() {
                                     let mut buf = output_buf_clone.lock().await;
                                     buf.push_str(&s);
@@ -274,7 +228,7 @@ impl ExecSessionManager {
                                 }
                             }
                             Ok(n) => {
-                                let s = decode_utf8_stream(&mut stdout_tail, &stdout_buf[..n]);
+                                let s = stdout_dec.push(&stdout_buf[..n]);
                                 if !s.is_empty() {
                                     let mut buf = output_buf_clone.lock().await;
                                     buf.push_str(&s);
@@ -284,7 +238,7 @@ impl ExecSessionManager {
                             }
                             Err(_) => {
                                 stdout_eof = true;
-                                let s = flush_utf8_tail(&mut stdout_tail);
+                                let s = stdout_dec.finish();
                                 if !s.is_empty() {
                                     let mut buf = output_buf_clone.lock().await;
                                     buf.push_str(&s);
@@ -297,7 +251,7 @@ impl ExecSessionManager {
                         match n {
                             Ok(0) => {
                                 stderr_eof = true;
-                                let s = flush_utf8_tail(&mut stderr_tail);
+                                let s = stderr_dec.finish();
                                 if !s.is_empty() {
                                     let mut buf = output_buf_clone.lock().await;
                                     buf.push_str(&s);
@@ -305,7 +259,7 @@ impl ExecSessionManager {
                                 }
                             }
                             Ok(n) => {
-                                let s = decode_utf8_stream(&mut stderr_tail, &stderr_buf[..n]);
+                                let s = stderr_dec.push(&stderr_buf[..n]);
                                 if !s.is_empty() {
                                     let mut buf = output_buf_clone.lock().await;
                                     buf.push_str(&s);
@@ -315,7 +269,7 @@ impl ExecSessionManager {
                             }
                             Err(_) => {
                                 stderr_eof = true;
-                                let s = flush_utf8_tail(&mut stderr_tail);
+                                let s = stderr_dec.finish();
                                 if !s.is_empty() {
                                     let mut buf = output_buf_clone.lock().await;
                                     buf.push_str(&s);
@@ -861,51 +815,44 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_utf8_stream_across_chunk_boundary() {
+    fn test_stream_decoder_across_chunk_boundary() {
         // C3：「你好」6 字节，在中间拆成两块——各自独立解码会得到两个 U+FFFD。
         let bytes = "你好".as_bytes();
-        let mut tail = Vec::new();
-        let first = decode_utf8_stream(&mut tail, &bytes[..3]);
-        assert_eq!(first, "你", "first chunk should decode its complete char");
-        assert_eq!(tail.len(), 0, "no partial char is pending here");
+        let mut d = StreamDecoder::new();
+        assert_eq!(d.push(&bytes[..3]), "你", "complete chars emit at once");
+        assert_eq!(d.finish(), "");
 
         // 真正切在多字节字符中间：前 4 字节 = "你" + "好" 的首字节。
-        let mut tail = Vec::new();
-        let first = decode_utf8_stream(&mut tail, &bytes[..4]);
-        assert_eq!(first, "你");
-        assert_eq!(tail, &bytes[3..4], "the split byte stays buffered");
-        let second = decode_utf8_stream(&mut tail, &bytes[4..]);
-        assert_eq!(second, "好");
-        assert!(tail.is_empty());
+        let mut d = StreamDecoder::new();
+        assert_eq!(d.push(&bytes[..4]), "你");
+        assert_eq!(d.push(&bytes[4..]), "好");
+        assert_eq!(d.finish(), "");
     }
 
     #[test]
-    fn test_decode_utf8_stream_three_byte_split_and_eof_flush() {
+    fn test_stream_decoder_three_byte_split_and_eof_flush() {
         // 3 字节字符被切成 1+2，且最后一块不完整时 EOF flush 用 lossy。
         let bytes = "好".as_bytes(); // 3 bytes
-        let mut tail = Vec::new();
-        assert_eq!(decode_utf8_stream(&mut tail, &bytes[..1]), "");
-        assert_eq!(tail.len(), 1);
-        assert_eq!(decode_utf8_stream(&mut tail, &bytes[1..]), "好");
-        assert!(tail.is_empty());
+        let mut d = StreamDecoder::new();
+        assert_eq!(d.push(&bytes[..1]), "");
+        assert_eq!(d.push(&bytes[1..]), "好");
+        assert_eq!(d.finish(), "");
 
         // 进程在字符中途退出：剩余字节在 EOF 时 lossy 输出，不吞掉。
-        let mut tail = Vec::new();
-        assert_eq!(decode_utf8_stream(&mut tail, &bytes[..1]), "");
-        let flushed = flush_utf8_tail(&mut tail);
-        assert_eq!(flushed, "\u{FFFD}");
-        assert!(tail.is_empty());
-        assert_eq!(flush_utf8_tail(&mut tail), "");
+        let mut d = StreamDecoder::new();
+        assert_eq!(d.push(&bytes[..1]), "");
+        assert_eq!(d.finish(), "\u{FFFD}");
+        assert_eq!(d.finish(), "");
     }
 
     #[test]
-    fn test_decode_utf8_stream_passes_invalid_bytes_to_platform_decoder() {
+    fn test_stream_decoder_passes_invalid_bytes_to_platform_decoder() {
         // 非 UTF-8 的遗留编码字节（error_len == Some）不能被当成"跨块字符"
         // 无限缓存，必须立刻交给平台解码器。
-        let mut tail = Vec::new();
-        let out = decode_utf8_stream(&mut tail, b"AB\xFFCD");
-        assert!(tail.is_empty(), "invalid bytes must not be buffered");
+        let mut d = StreamDecoder::new();
+        let out = d.push(b"AB\xFFCD");
         assert!(out.starts_with("AB"));
         assert!(out.ends_with("CD"));
+        assert_eq!(d.finish(), "", "invalid bytes must not be buffered");
     }
 }

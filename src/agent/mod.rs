@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::client::RelayClient;
+use crate::agent::encoding::StreamDecoder;
 use crate::agent::shell::Shell;
 use crate::proto::{McpResultPayload, Message};
 #[cfg(feature = "tui")]
@@ -136,6 +137,33 @@ fn reap_exited_tab(
     true
 }
 
+/// Append PTY output to `buf`, then trim it back to [`TAB_REPLAY_BYTES`].
+///
+/// `drain` cuts at an arbitrary byte, which can leave the buffer starting with
+/// the continuation bytes of a character whose head was just dropped — replay
+/// then decodes that fragment as garbage. Skipping the leading continuation
+/// bytes (`0x80..=0xBF`, at most three for UTF-8) moves the start to a
+/// character boundary.
+///
+/// PTY output is UTF-8 on both Unix and Windows (ConPTY), which is what makes
+/// this a boundary rather than a guess. This holds for the replay buffer only;
+/// legacy-encoded bytes still reach the terminal through `decode_bytes`, which
+/// handles them per line.
+fn append_replay(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(data);
+    if buf.len() <= TAB_REPLAY_BYTES {
+        return;
+    }
+    let excess = buf.len() - TAB_REPLAY_BYTES;
+    buf.drain(..excess);
+    let skip = buf
+        .iter()
+        .take(3)
+        .take_while(|b| (0x80..=0xBFu8).contains(b))
+        .count();
+    buf.drain(..skip);
+}
+
 impl Terminals {
     fn new() -> Self {
         let (shell_tx, shell_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -164,11 +192,7 @@ impl Terminals {
         let Some(ts) = self.tabs.get_mut(tab_id) else {
             return false;
         };
-        ts.output_buf.extend_from_slice(data);
-        if ts.output_buf.len() > TAB_REPLAY_BYTES {
-            let excess = ts.output_buf.len() - TAB_REPLAY_BYTES;
-            ts.output_buf.drain(..excess);
-        }
+        append_replay(&mut ts.output_buf, data);
         true
     }
 
@@ -275,6 +299,9 @@ async fn sender_loop(
     status: Option<AgentStatus>,
 ) {
     let mut pending: HashMap<String, Vec<u8>> = HashMap::new();
+    // Per-tab streaming decoder: holds a character split across flushes so the
+    // browser never receives half of one.
+    let mut decoders: HashMap<String, StreamDecoder> = HashMap::new();
     let mut timer = tokio::time::interval(Duration::from_millis(16));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_tick = tokio::time::interval(heartbeat);
@@ -285,7 +312,10 @@ async fn sender_loop(
             biased;
             ctrl = control_rx.recv() => match ctrl {
                 Some(s) => {
-                    flush_output(&client, &send_url, &agent_token, &session_id, &mut pending).await;
+                    flush_output(
+                        &client, &send_url, &agent_token, &session_id, &mut pending, &mut decoders,
+                    )
+                    .await;
                     post_raw(&client, &send_url, &agent_token, &s).await;
                 }
                 None => break,
@@ -295,7 +325,9 @@ async fn sender_loop(
                 None => break,
             },
             _ = timer.tick() => {
-                flush_output(&client, &send_url, &agent_token, &session_id, &mut pending).await;
+                flush_output(
+                    &client, &send_url, &agent_token, &session_id, &mut pending, &mut decoders,
+                ).await;
             }
             _ = heartbeat_tick.tick() => {
                 // 心跳扩展（R5#150）：桌面启用时附带运行态 KPI，relay/admin
@@ -347,7 +379,31 @@ async fn sender_loop(
             }
         }
     }
-    flush_output(&client, &send_url, &agent_token, &session_id, &mut pending).await;
+    // Final flush, then release whatever each decoder still withholds (a
+    // character cut off by the session ending) so no output is swallowed.
+    flush_output(
+        &client,
+        &send_url,
+        &agent_token,
+        &session_id,
+        &mut pending,
+        &mut decoders,
+    )
+    .await;
+    for (tab_id, dec) in decoders.iter_mut() {
+        let text = dec.finish();
+        if text.is_empty() {
+            continue;
+        }
+        let msg = Message {
+            msg_type: "terminal:output".to_string(),
+            session_id: session_id.clone(),
+            payload: serde_json::json!({ "data": fs::encode_b64(text.as_bytes()), "tab_id": tab_id }),
+        };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            post_raw(&client, &send_url, &agent_token, &s).await;
+        }
+    }
 }
 
 /// 当前进程 RSS（KB）。读 `/proc/self/statm` 第 2 字段（resident pages）
@@ -434,6 +490,7 @@ async fn flush_output(
     agent_token: &str,
     session_id: &str,
     pending: &mut HashMap<String, Vec<u8>>,
+    decoders: &mut HashMap<String, StreamDecoder>,
 ) {
     for (tab_id, data) in pending.drain() {
         if data.is_empty() {
@@ -443,7 +500,14 @@ async fn flush_output(
         // (which TextDecoder UTF-8 by default) render correctly even when the
         // agent's console emits a legacy encoding (e.g. GBK on Windows). On
         // POSIX this is a no-op (already UTF-8).
-        let text = crate::agent::encoding::decode_bytes(&data);
+        //
+        // The tab keeps a decoder across flushes: 16ms coalescing and 4096-byte
+        // PTY reads can both land mid-character, so decoding each flush on its
+        // own would tear multi-byte text apart.
+        let text = decoders.entry(tab_id.clone()).or_default().push(&data);
+        if text.is_empty() {
+            continue; // everything pending was an incomplete character
+        }
         let encoded = fs::encode_b64(text.as_bytes());
         let msg = Message {
             msg_type: "terminal:output".to_string(),
@@ -2005,11 +2069,7 @@ async fn run_session(
                         }
                         Some((tab_id, data)) => {
                             if let Some(ts) = tabs.get_mut(&tab_id) {
-                                ts.output_buf.extend_from_slice(&data);
-                                if ts.output_buf.len() > TAB_REPLAY_BYTES {
-                                    let excess = ts.output_buf.len() - TAB_REPLAY_BYTES;
-                                    ts.output_buf.drain(..excess);
-                                }
+                                append_replay(&mut ts.output_buf, &data);
                             }
                             // Non-blocking push to the coalescing sender. Never
                             // stalls the loop — disconnect is detected via the
@@ -4351,6 +4411,35 @@ mod tests {
                 "unrecognised {v:?} must fall back to cmd without PowerShell"
             );
         }
+    }
+
+    #[test]
+    fn test_append_replay_keeps_the_buffer_bounded() {
+        let mut buf = Vec::new();
+        append_replay(&mut buf, b"hello");
+        assert_eq!(buf, b"hello");
+        append_replay(&mut buf, &vec![b'a'; TAB_REPLAY_BYTES]);
+        assert!(buf.len() <= TAB_REPLAY_BYTES, "len={}", buf.len());
+        assert_eq!(buf.last(), Some(&b'a'));
+    }
+
+    #[test]
+    fn test_append_replay_starts_on_a_character_boundary() {
+        // 「你」= E4 BD A0、 「好」= E5 A5 BD。只留 2 字节时截断点落在字符中间，
+        // 缓冲不能以续字节开头，否则回放会把它解成 U+FFFD。
+        let mut buf = Vec::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&vec![b'x'; TAB_REPLAY_BYTES - 2]);
+        data.extend_from_slice("你好".as_bytes());
+        append_replay(&mut buf, &data);
+        assert!(buf.len() <= TAB_REPLAY_BYTES + 3, "len={}", buf.len());
+        assert!(
+            !(0x80..=0xBF).contains(&buf[0]),
+            "buffer must not start with a continuation byte: {:?}",
+            &buf[..4]
+        );
+        // 至少能整段解码，且尾部是完整的「好」。
+        String::from_utf8(buf.clone()).expect("replay buffer must be valid UTF-8");
     }
 
     #[test]
