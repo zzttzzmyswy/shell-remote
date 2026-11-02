@@ -2,11 +2,188 @@
 
 use serde::{Deserialize, Serialize};
 
+// ── 协议版本（MYS-2553 兼容 1a）────────────────────────────────────
+//
+// 线协议上的**粗粒度**版本号。它不是功能开关：某个功能是否可用仍然只看
+// 能力字符串（`web:proxy-v1` / `upgrade:v2` / `desktop:binary-uplink` 等）。
+// 版本号只承担三件事：
+//   1. 粗粒度判定——快速区分「带协议标记的一侧」与「标记出现前的老侧」；
+//   2. 诊断——注册日志/管理后台能一眼看出对端协议代次；
+//   3. 界定支持窗口——与 [`MIN_PEER_PROTOCOL_VERSION`] 一起说明还愿意兼容
+//      到哪一代。
+//
+// 升版本号的**唯一**理由：线协议出现不兼容变化，或需要一次性声明一批新语义
+// （例如某类消息的语义整体改变）。只做加法的兼容改动（新可选字段、新消息
+// 类型、新能力字符串）**不升**版本号——老 peer 忽略未知字段/类型即可。
+//
+// 版本约定：
+//   - `0`：标记出现之前的旧版本（≤ v0.59.11），注册消息里没有
+//     `protocol_version` 字段；
+//   - `1`：本次引入协议标记后的线协议（注册握手带 `protocol_version`，
+//     relay 注册响应带 `protocol_version` / `relay_version` /
+//     `relay_capabilities`）。
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// 本端仍愿意与之为伍的**最老**对端协议版本。低于它的对端可以直接拒绝
+/// （或在文档里声明「不再保证兼容」）。提高它属于破坏性变更，必须写进
+/// release note。当前 `0` = 仍兼容「标记出现之前」的所有旧版本。
+pub const MIN_PEER_PROTOCOL_VERSION: u32 = 0;
+
+/// relay 能力字符串：agent→relay 的 desktop:video 支持二进制 WS 帧上行
+/// （[`encode_bin_frame`] 格式）。新 relay 在注册响应的 `relay_capabilities`
+/// 里声明；老 relay 只能靠 `desktop_binary: true` 这个布尔字段告知。
+pub const CAP_DESKTOP_BINARY_UPLINK: &str = "desktop:binary-uplink";
+
+/// 当前 relay 声明的全部能力（注册响应 `relay_capabilities` 的内容）。
+/// agent 判定某个 relay 能力时**必须**看这个列表，而不是看 relay 版本号。
+pub const RELAY_CAPABILITIES: &[&str] = &[CAP_DESKTOP_BINARY_UPLINK];
+
+/// 解析对端在注册握手/响应里声明的 `protocol_version`：缺失、非整数、
+/// 负数一律记为 [`MIN_PEER_PROTOCOL_VERSION`]（= 旧版本），绝不因为一个
+/// 可疑的版本字段让注册失败。
+pub fn parse_protocol_version(value: Option<&serde_json::Value>) -> u32 {
+    match value.and_then(|v| v.as_u64()) {
+        Some(n) => n.min(u32::MAX as u64) as u32,
+        None => MIN_PEER_PROTOCOL_VERSION,
+    }
+}
+
+// ── 消息类型注册表（MYS-2553 兼容 1a）──────────────────────────────
+//
+// 全部线上消息类型的**唯一**登记处。新增消息类型必须同时加进对应方向的
+// 常量，否则 relay 会把它当成未知类型丢弃（并在日志里报 unknown），
+// `docs/protocol.md` 的清单也会失真。
+//
+// 方向的判定口径：消息由谁**首次发出**。因此 `desktop:p2p-answer` /
+// `desktop:p2p-state` 是 agent→relay（agent 应答/上报状态后由 relay 广播
+// 给浏览器），而 `desktop:p2p-offer` / `desktop:p2p-candidate` 是
+// relay→agent（浏览器发起，relay 转发）。
+
+/// agent → relay 方向的全部消息类型。
+pub const AGENT_TO_RELAY_TYPES: &[&str] = &[
+    // 生命周期 / 保活（`ping` 无 payload，路由前按宽松 JSON 单独拦截）
+    "ping",
+    "agent:upgrade_progress",
+    // 终端 / 文件 / MCP 回包
+    "terminal:output",
+    "fs:result",
+    "fs:mkdir",
+    "mcp:result",
+    "mcp:exec_result",
+    // 会话状态
+    "session:users",
+    "session:tab_list",
+    "session:tab_switched",
+    // 桌面
+    "desktop:video",
+    "desktop:started",
+    "desktop:stopped",
+    "desktop:error",
+    "desktop:capabilities",
+    "desktop:uplink",
+    "desktop:clipboard",
+    "desktop:qos-ack",
+    "desktop:cmd-ack",
+    "desktop:cursor",
+    "test-delay-ack",
+    // Task 2 P2P 信令（agent 应答 / 状态上报，relay 广播给浏览器）
+    "desktop:p2p-answer",
+    "desktop:p2p-state",
+    // 网页代理回包（MYS-2383）
+    "web:head",
+    "web:chunk",
+    "web:end",
+    "web:error",
+    // 纯 TCP 管道回包（MYS-2383 阶段6）
+    "tcp:opened",
+    "tcp:data",
+    "tcp:ack",
+    "tcp:eof",
+    "tcp:closed",
+    "tcp:error",
+    // 通用错误回包（只读会话拒绝写操作等）
+    "error",
+];
+
+/// relay → agent 方向的全部消息类型。
+pub const RELAY_TO_AGENT_TYPES: &[&str] = &[
+    // 终端
+    "terminal:input",
+    "terminal:resize",
+    // 会话
+    "session:join",
+    "session:leave",
+    "session:tab_switch",
+    "session:tab_create",
+    "session:tab_close",
+    // 文件
+    "fs:list",
+    "fs:read",
+    "fs:read_cancel",
+    "fs:write",
+    "fs:upload",
+    "fs:delete",
+    "fs:rename",
+    "fs:mkdir",
+    // MCP
+    "mcp:exec",
+    "mcp:exec_start",
+    "mcp:exec_input",
+    "mcp:exec_close",
+    "mcp:exec_list",
+    // 桌面控制
+    "desktop:start",
+    "desktop:stop",
+    "desktop:codec",
+    "desktop:quality",
+    "desktop:bitrate",
+    "desktop:gray",
+    "desktop:reqkey",
+    "desktop:test-delay",
+    "desktop:mouse",
+    "desktop:key",
+    "desktop:clipboard:get",
+    "desktop:clipboard:set",
+    "desktop:select-display",
+    "desktop:qos",
+    "desktop:congested",
+    // Task 2 P2P 信令（浏览器发起，relay 转发给 agent）
+    "desktop:p2p-offer",
+    "desktop:p2p-candidate",
+    // 网页代理 / 纯 TCP 管道请求
+    "web:request",
+    "web:cancel",
+    "tcp:open",
+    "tcp:data",
+    "tcp:ack",
+    "tcp:eof",
+    "tcp:close",
+    // 自升级
+    "agent:upgrade",
+];
+
+/// 该类型是否是已登记的 agent → relay 消息（relay 侧「已知类型」判据）。
+pub fn is_known_agent_type(msg_type: &str) -> bool {
+    AGENT_TO_RELAY_TYPES.contains(&msg_type)
+}
+
+/// 该类型是否是已登记的 relay → agent 消息。
+pub fn is_known_relay_type(msg_type: &str) -> bool {
+    RELAY_TO_AGENT_TYPES.contains(&msg_type)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     #[serde(rename = "type")]
     pub msg_type: String,
+    /// 缺失 → 空串。老 agent 的心跳（`ping`）不带 payload，部分控制消息也
+    /// 省略 session_id；让它们能解析，比因为一个可选字段整条丢弃更安全
+    /// （消息类型本身仍然必填）。
+    #[serde(default)]
     pub session_id: String,
+    /// 缺失 → `Value::Null`。所有消费方都用 `payload["k"].as_str()` 之类的
+    /// 取值方式，`Null` 上取键得 `None`、带默认值，行为与空对象一致。
+    #[serde(default)]
     pub payload: serde_json::Value,
 }
 
@@ -339,6 +516,123 @@ mod tests {
         assert_eq!(decoded.msg_type, "terminal:input");
         assert_eq!(decoded.session_id, "abc-123");
         assert_eq!(decoded.payload["data"].as_str().unwrap(), "aGVsbG8=");
+    }
+
+    /// MYS-2553 兼容隐患 a：`session_id` / `payload` 是可选字段。agent 心跳
+    /// `{"type":"ping", ...}` 这类消息没有 payload，旧版严格解析会整条失败。
+    /// 缺字段时分别取空串 / `Null`，`type` 仍然必填。
+    #[test]
+    fn test_message_parses_without_payload_or_session_id() {
+        // 缺 payload → payload == Null，session_id == ""。
+        let decoded: Message = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
+        assert_eq!(decoded.msg_type, "ping");
+        assert_eq!(decoded.session_id, "");
+        assert!(decoded.payload.is_null(), "缺失的 payload 必须是 Null");
+        // 在 Null 上按 key 取值不会 panic，行为与空对象一致。
+        assert!(decoded.payload["data"].as_str().is_none());
+        assert_eq!(decoded.payload.get("data").and_then(|v| v.as_str()), None);
+
+        // 缺 session_id 但带 payload。
+        let decoded: Message =
+            serde_json::from_str(r#"{"type":"desktop:state","payload":{"running":true}}"#)
+                .unwrap();
+        assert_eq!(decoded.session_id, "");
+        assert_eq!(decoded.payload["running"].as_bool(), Some(true));
+
+        // `type` 仍然必填——没有它就不知道该消息是什么。
+        assert!(serde_json::from_str::<Message>(r#"{"session_id":"s1","payload":{}}"#).is_err());
+    }
+
+    /// MYS-2553：协议版本解析对非法值一律回落到 0（旧版本），绝不报错。
+    #[test]
+    fn test_parse_protocol_version() {
+        assert_eq!(parse_protocol_version(None), 0);
+        assert_eq!(parse_protocol_version(Some(&serde_json::json!(1))), 1);
+        assert_eq!(parse_protocol_version(Some(&serde_json::json!(0))), 0);
+        // 非法：负数 / 字符串 / 浮点 / null / 对象 → 0
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!("1"),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+            serde_json::json!({"v": 1}),
+        ] {
+            assert_eq!(parse_protocol_version(Some(&bad)), 0, "{bad} 必须回落为 0");
+        }
+    }
+
+    /// MYS-2553 设计 3d：消息类型注册表是**唯一**登记处。这里守住两条：
+    /// 1. 漏登记过的 P2P 回包必须在表里（它们本就被广播，此前每次都被当成
+    ///    unknown 打日志）；
+    /// 2. 两个方向不重复、无空项，且同一类型不会同时出现在两个方向
+    ///    （唯一例外 `tcp:data`/`tcp:ack`/`tcp:eof` 是真正的双向消息）。
+    #[test]
+    fn test_message_type_registry() {
+        assert!(
+            is_known_agent_type("desktop:p2p-answer"),
+            "desktop:p2p-answer 必须登记为 agent→relay（此前漏登记，每条白打 unknown 日志）"
+        );
+        assert!(
+            is_known_agent_type("desktop:p2p-state"),
+            "desktop:p2p-state 必须登记为 agent→relay"
+        );
+        assert!(is_known_relay_type("desktop:p2p-offer"));
+        assert!(is_known_relay_type("desktop:p2p-candidate"));
+        // agent 侧应答类消息不得被误登记成 relay→agent。
+        assert!(!is_known_relay_type("desktop:p2p-answer"));
+        assert!(!is_known_relay_type("desktop:p2p-state"));
+
+        // 无重复、无空项。
+        for (name, list) in [
+            ("AGENT_TO_RELAY_TYPES", AGENT_TO_RELAY_TYPES),
+            ("RELAY_TO_AGENT_TYPES", RELAY_TO_AGENT_TYPES),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for t in list {
+                assert!(!t.is_empty(), "{name} 含空项");
+                assert!(seen.insert(*t), "{name} 重复登记 {t}");
+            }
+        }
+
+        // 两个方向的交集只能是真正的双向消息：请求与回包/广播共用同一个
+        // 类型名（`tcp:*` 是管道两个方向共用；`fs:mkdir` 既是浏览器→agent
+        // 的建目录请求，也是 agent→浏览器广播的「目录已建」事件）。
+        let bidir = ["tcp:data", "tcp:ack", "tcp:eof", "fs:mkdir"];
+        for t in AGENT_TO_RELAY_TYPES {
+            if RELAY_TO_AGENT_TYPES.contains(t) {
+                assert!(bidir.contains(t), "{t} 同时出现在两个方向，但没有登记为双向消息");
+            }
+        }
+
+        // 未知类型不命中任何一个方向（relay 据此打 unknown 日志）。
+        assert!(!is_known_agent_type("agent:registered"));
+        assert!(!is_known_agent_type("browser:connected"));
+        assert!(!is_known_relay_type("agent:registered"));
+    }
+
+    /// `requires_write` 的只读白名单全是浏览器可发的类型，必须都能在
+    /// relay→agent 注册表里找到（防止新增只读类型时忘了登记方向）。
+    #[test]
+    fn test_read_only_types_are_registered() {
+        for t in [
+            "session:users",
+            "session:tab_list",
+            "fs:list",
+            "fs:read",
+            "mcp:exec_list",
+            "desktop:reqkey",
+            "desktop:test-delay",
+            "desktop:clipboard:get",
+            "desktop:p2p-offer",
+            "desktop:p2p-answer",
+            "desktop:p2p-candidate",
+            "desktop:p2p-state",
+        ] {
+            assert!(
+                is_known_relay_type(t) || is_known_agent_type(t),
+                "{t} 未登记进任一方向的类型表"
+            );
+        }
     }
 
     #[test]

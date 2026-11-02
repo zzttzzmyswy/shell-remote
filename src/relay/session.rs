@@ -24,6 +24,10 @@ pub struct SessionInfo {
     /// 浏览器经 agent 的 `desktop:capabilities.lan_addrs` 拿到做同网段探测
     /// 直连（不经过 relay）。老版本 / 未开启 `--desktop-lan-port` → None。
     pub lan_addr: Option<String>,
+    /// Agent 注册时声明的线协议版本（MYS-2553）。缺失/非法按 `0` 存，
+    /// `0` = 协议标记出现之前的旧版本（≤ v0.59.11）。只用于粗粒度判定、
+    /// 诊断与支持窗口，功能可用性仍看 [`SessionInfo::capabilities`]。
+    pub agent_protocol_version: u32,
 }
 
 pub struct SessionRegistry {
@@ -135,6 +139,7 @@ impl SessionRegistry {
                     agent_version: None,
                     capabilities: Vec::new(),
                     lan_addr: None,
+                    agent_protocol_version: crate::proto::MIN_PEER_PROTOCOL_VERSION,
                 },
             );
             for (token, perm) in &tokens {
@@ -215,6 +220,7 @@ impl SessionRegistry {
                     agent_version: None,
                     capabilities: Vec::new(),
                     lan_addr: None,
+                    agent_protocol_version: crate::proto::MIN_PEER_PROTOCOL_VERSION,
                 },
             );
             for (token, perm) in &tokens {
@@ -291,6 +297,14 @@ impl SessionRegistry {
     pub async fn set_lan_addr(&self, session_id: &str, lan_addr: Option<String>) {
         if let Some(info) = self.sessions.write().await.get_mut(session_id) {
             info.lan_addr = lan_addr;
+        }
+    }
+
+    /// 存/换 agent 注册时声明的线协议版本（MYS-2553）。缺失/非法时调用方
+    /// 传入 `0`（= 旧版本）。会话不存在时静默。
+    pub async fn set_agent_protocol_version(&self, session_id: &str, version: u32) {
+        if let Some(info) = self.sessions.write().await.get_mut(session_id) {
+            info.agent_protocol_version = version;
         }
     }
 

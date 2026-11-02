@@ -187,6 +187,9 @@ pub async fn overview_handler(
             "fixed_key": info.fixed_key,
             "device": info.device,
             "agent_version": info.agent_version,
+            // 协议代次（MYS-2553）：0 = 协议标记出现之前的旧版本。与
+            // agent_version 一起展示，排障时能直接看出对端是哪一代线协议。
+            "agent_protocol_version": info.agent_protocol_version,
             "capabilities": info.capabilities,
             "lan_addr": info.lan_addr,
             "desktop_proto": state
@@ -1008,6 +1011,7 @@ async fn trigger_upgrade(
                 "error": format!("no upgrade needed: {}", decision.reason()),
                 "relay_version": relay_version,
                 "agent_version": info.agent_version,
+                "agent_protocol_version": info.agent_protocol_version,
                 "decision": format!("{decision:?}"),
             })),
         )
@@ -1368,6 +1372,7 @@ pub async fn agent_upgrade_plan_handler(
         "session_id": sid,
         "relay_version": relay_version,
         "agent_version": info.agent_version,
+        "agent_protocol_version": info.agent_protocol_version,
         "decision": format!("{decision:?}"),
         "needs_upgrade": decision.needs_upgrade(),
         "reason": decision.reason(),

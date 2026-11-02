@@ -248,10 +248,16 @@ pub struct RelayClient {
     pub tokens: Vec<(String, String)>,
     /// 自签 https relay 模式：上行(register/SSE/桌面WS)跳过证书校验。
     pub insecure_tls: bool,
-    /// relay 是否支持 desktop:video 二进制上行（R5 #41 能力告知）。register
-    /// 响应带 `desktop_binary: true` 才为 true；老 relay 无该字段 → false，
-    /// agent 保持 JSON+base64（兼容回退）。
+    /// relay 是否支持 desktop:video 二进制上行（R5 #41 能力告知）。优先看
+    /// 注册响应的 `relay_capabilities`，缺该字段时回退到 `desktop_binary`。
+    /// 老 relay 两者皆无 → false，agent 保持 JSON+base64（兼容回退）。
     pub desktop_binary: bool,
+    /// relay 声明的线协议版本（MYS-2553）。缺失/非法 → 0（旧 relay）。
+    /// 只用于日志与粗粒度判定，功能可用性看 [`RelayClient::desktop_binary`]
+    /// 这类能力标志。
+    pub relay_protocol_version: u32,
+    /// relay 自报的版本号（新 relay 才有；老 relay → None）。
+    pub relay_version: Option<String>,
 }
 
 /// 429（relay 对每 IP `agent:register` 限流，见 relay/ws.rs）时用固定
@@ -282,10 +288,23 @@ pub(crate) fn jittered(base: Duration) -> Duration {
     Duration::from_secs_f64((base.as_secs_f64() * factor).max(1.0))
 }
 
-/// 解析 register 响应中的 `desktop_binary` 能力告知（R5 #41）：新 relay 带
-/// `desktop_binary: true` → agent WS 上行改发 binary desktop:video 帧；
-/// 缺省/非 bool → false（JSON+base64 兼容回退）。
+/// 解析 register 响应里的「relay 是否支持 desktop:video 二进制上行」
+/// （R5 #41 / MYS-2553 能力声明）。
+///
+/// 判定顺序：
+/// 1. 响应带 `relay_capabilities` 数组 → **只看**里面有没有
+///    [`crate::proto::CAP_DESKTOP_BINARY_UPLINK`]。数组存在即视为新 relay 的
+///    权威声明：它没列这个能力，就不是能力误判，而是 relay 明确不支持。
+/// 2. 该字段不存在（旧 relay）→ 回退到 `desktop_binary: true`。
+///
+/// 两条路径都是「缺省 = 不支持」，老 relay 的行为完全不变。
 fn parse_desktop_binary(response: &serde_json::Value) -> bool {
+    if let Some(caps) = response.get("relay_capabilities").and_then(|v| v.as_array()) {
+        return caps
+            .iter()
+            .filter_map(|c| c.as_str())
+            .any(|c| c == crate::proto::CAP_DESKTOP_BINARY_UPLINK);
+    }
     response
         .get("desktop_binary")
         .and_then(|v| v.as_bool())
@@ -293,19 +312,89 @@ fn parse_desktop_binary(response: &serde_json::Value) -> bool {
 }
 
 /// 从注册响应里解析 `payload.tokens` 为 `(token, permission)` 列表。
-/// 解析失败/缺失 → 空列表（老 relay 兼容）。
-pub(crate) fn parse_tokens(response: &serde_json::Value) -> Vec<(String, String)> {
+///
+/// 宽松口径（MYS-2553）：单条缺 `token`/`permission` 的条目**跳过**（`warn`
+/// 为真时记一条 warn），不让一条坏条目把整个注册打失败——此前这里是
+/// `.context(...)?`，一条坏 token 就让整次注册失败。全部条目都无效 → 空列表，
+/// 等同「relay 没给 tokens」，走旧 relay 的回退路径（上行不带身份头）。
+pub(crate) fn parse_tokens_lenient(
+    response: &serde_json::Value,
+    warn: bool,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if let Some(arr) = response["payload"]["tokens"].as_array() {
-        for t in arr {
-            if let (Some(tok), Some(perm)) =
-                (t["token"].as_str(), t["permission"].as_str())
-            {
-                out.push((tok.to_string(), perm.to_string()));
+    let Some(arr) = response["payload"]["tokens"].as_array() else {
+        return out;
+    };
+    for (idx, t) in arr.iter().enumerate() {
+        match (t["token"].as_str(), t["permission"].as_str()) {
+            (Some(tok), Some(perm)) => out.push((tok.to_string(), perm.to_string())),
+            _ => {
+                if warn {
+                    tracing::warn!(
+                        index = idx,
+                        "register response token entry is missing token/permission — skipped"
+                    );
+                }
             }
         }
     }
     out
+}
+
+/// 从注册响应里解析 `payload.tokens` 为 `(token, permission)` 列表。
+/// 解析失败/缺失 → 空列表（老 relay 兼容）。
+pub(crate) fn parse_tokens(response: &serde_json::Value) -> Vec<(String, String)> {
+    parse_tokens_lenient(response, false)
+}
+
+/// 注册响应里 agent 关心的全部内容（MYS-2553 抽出为纯函数以便单测两个方向
+/// 的兼容性：旧 relay 格式 / 新 relay 格式）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RegisterHandshake {
+    pub session_id: String,
+    /// `(token, permission)`，从 `payload.tokens` 宽松解析（坏条目跳过）。
+    pub tokens: Vec<(String, String)>,
+    /// relay 是否支持 desktop:video 二进制上行（见 [`parse_desktop_binary`]）。
+    pub desktop_binary: bool,
+    /// relay 声明的线协议版本，缺失/非法 → 0。
+    pub relay_protocol_version: u32,
+    /// relay 自报版本号，老 relay → None。
+    pub relay_version: Option<String>,
+    pub evicted: bool,
+}
+
+/// 解析 `agent:registered` 响应。跨版本规则（MYS-2553）：
+/// - 只有 `type` 与 `session_id` 是必需的（老 relay 一直都给）；
+/// - `payload.tokens` 逐条宽松解析，单条坏不影响注册；
+/// - `protocol_version` / `relay_version` / `relay_capabilities` 全是新增
+///   可选字段，缺失时按「旧 relay」语义取值。
+pub(crate) fn parse_register_handshake(
+    response: &serde_json::Value,
+) -> anyhow::Result<RegisterHandshake> {
+    let msg_type = response["type"].as_str().unwrap_or("");
+    if msg_type != "agent:registered" {
+        bail!("Unexpected register response type: {}", msg_type);
+    }
+    Ok(RegisterHandshake {
+        session_id: response["session_id"]
+            .as_str()
+            .context("Missing session_id")?
+            .to_string(),
+        tokens: parse_tokens_lenient(response, true),
+        desktop_binary: parse_desktop_binary(response),
+        relay_protocol_version: crate::proto::parse_protocol_version(
+            response.get("protocol_version"),
+        ),
+        relay_version: response
+            .get("relay_version")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        evicted: response
+            .get("evicted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
 }
 
 impl RelayClient {
@@ -372,6 +461,9 @@ impl RelayClient {
             register_msg["session_id"] = json!(sid);
         }
         register_msg["agent_version"] = json!(env!("CARGO_PKG_VERSION"));
+        // 协议版本标记（MYS-2553）：让新 relay 知道对端带协议标记，老 relay
+        // 忽略这个未知字段（serde 宽松解析，无 deny_unknown_fields）。
+        register_msg["protocol_version"] = json!(crate::proto::PROTOCOL_VERSION);
         // R5#44 capability 协商最小子集：注册时声明能力集（codec/后端/
         // 桌面功能），relay 存储并在 admin overview 展示，浏览器可据此协商。
         // 后端按**平台 + 运行时探测**真实声明（Linux 不声明 Windows 专属
@@ -483,6 +575,8 @@ impl RelayClient {
             tokens: Vec::new(),
             insecure_tls,
             desktop_binary: false,
+            relay_protocol_version: crate::proto::MIN_PEER_PROTOCOL_VERSION,
+            relay_version: None,
         };
 
         Self::handle_register_response(&mut client, &response)?;
@@ -493,46 +587,42 @@ impl RelayClient {
         client: &mut Self,
         response: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        let msg_type = response["type"].as_str().unwrap_or("");
-        if msg_type != "agent:registered" {
-            bail!("Unexpected register response type: {}", msg_type);
-        }
+        let hs = parse_register_handshake(response)?;
 
-        client.session_id = response["session_id"]
-            .as_str()
-            .context("Missing session_id")?
-            .to_string();
+        client.session_id = hs.session_id;
+        if !hs.tokens.is_empty() {
+            client.tokens = hs.tokens;
+        }
+        // 一个合法条目都没有 = 「relay 没给 tokens」（含全部条目无效的极端
+        // 情况）→ 保持空，走旧 relay 的回退路径（上行不带身份头）。
+        client.desktop_binary = hs.desktop_binary;
+        client.relay_protocol_version = hs.relay_protocol_version;
+        client.relay_version = hs.relay_version;
 
         // The relay marks the registration with `evicted: true` when this
         // agent took over a session_id / token that a previous incarnation
         // still held — the old session was displaced. Surface it prominently
         // so operators notice a duplicate/restart immediately.
-        if response.get("evicted").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if hs.evicted {
             tracing::warn!(
                 session = %client.session_id,
                 "registration evicted a previous session with the same session_id/token — duplicate agent detected"
             );
         }
 
-        let payload = &response["payload"];
-        if let Some(tokens_array) = payload["tokens"].as_array() {
-            for t in tokens_array {
-                let token = t["token"]
-                    .as_str()
-                    .context("Missing token in tokens array")?
-                    .to_string();
-                let permission = t["permission"]
-                    .as_str()
-                    .context("Missing permission in tokens array")?
-                    .to_string();
-                client.tokens.push((token, permission));
-            }
+        match client.relay_version.as_deref() {
+            Some(v) => tracing::info!(
+                session = %client.session_id,
+                "registered with relay v{} (protocol {})",
+                v,
+                client.relay_protocol_version
+            ),
+            None => tracing::info!(
+                session = %client.session_id,
+                "registered with relay (protocol {}) — relay reports no version",
+                client.relay_protocol_version
+            ),
         }
-
-        // R5 #41：relay 能力告知——新 relay 在 register 响应带
-        // `desktop_binary: true`（agent WS uplink 支持 binary desktop:video
-        // 帧）。老 relay 无此字段 → false（JSON+base64 兼容回退）。
-        client.desktop_binary = parse_desktop_binary(response);
 
         Ok(())
     }
@@ -728,6 +818,145 @@ mod tests {
         assert!(parse_desktop_binary(&serde_json::json!({"desktop_binary": true})));
         // 非 bool 值容错为 false。
         assert!(!parse_desktop_binary(&serde_json::json!({"desktop_binary": "yes"})));
+    }
+
+    /// MYS-2553：`relay_capabilities` 存在时它是**权威**声明——它没列
+    /// `desktop:binary-uplink`，即使 `desktop_binary: true` 也不走二进制上行。
+    /// 字段不存在才回退到旧的布尔位。
+    #[test]
+    fn test_desktop_binary_prefers_relay_capabilities() {
+        let cap = crate::proto::CAP_DESKTOP_BINARY_UPLINK;
+        // 有 capabilities 且含该能力 → true
+        assert!(parse_desktop_binary(&serde_json::json!({
+            "desktop_binary": false,
+            "relay_capabilities": [cap],
+        })));
+        // 有 capabilities 但不含该能力 → false（即使 desktop_binary: true）
+        assert!(!parse_desktop_binary(&serde_json::json!({
+            "desktop_binary": true,
+            "relay_capabilities": ["something:else"],
+        })));
+        // 有 capabilities 但是空数组 → 明确「不支持」
+        assert!(!parse_desktop_binary(&serde_json::json!({
+            "desktop_binary": true,
+            "relay_capabilities": [],
+        })));
+        // 无 capabilities 字段 → 回退到 desktop_binary
+        assert!(parse_desktop_binary(&serde_json::json!({"desktop_binary": true})));
+        assert!(!parse_desktop_binary(&serde_json::json!({"desktop_binary": false})));
+        // capabilities 不是数组（畸形）→ 也回退到 desktop_binary，不 panic。
+        assert!(parse_desktop_binary(&serde_json::json!({
+            "desktop_binary": true,
+            "relay_capabilities": "desktop:binary-uplink",
+        })));
+    }
+
+    /// MYS-2553 验收 3：agent 解析**旧 relay 格式**的注册响应（只有
+    /// `desktop_binary`，没有三个新字段）→ 协议版本记 0，二进制上行按
+    /// `desktop_binary` 判定，relay_version 为 None。
+    #[test]
+    fn test_parse_register_handshake_from_old_relay() {
+        let resp = serde_json::json!({
+            "type": "agent:registered",
+            "session_id": "old-relay-1",
+            "desktop_binary": true,
+            "payload": { "tokens": [{"token": "a", "permission": "rw"}] }
+        });
+        let hs = parse_register_handshake(&resp).unwrap();
+        assert_eq!(hs.session_id, "old-relay-1");
+        assert_eq!(hs.tokens, vec![("a".to_string(), "rw".to_string())]);
+        assert_eq!(
+            hs.relay_protocol_version, 0,
+            "旧 relay 没有 protocol_version → 必须记为 0"
+        );
+        assert_eq!(hs.relay_version, None, "旧 relay 不报版本号");
+        assert!(hs.desktop_binary, "旧 relay 靠 desktop_binary 声明二进制上行");
+
+        // 更老的 relay：连 desktop_binary 都没有 → 二进制上行关闭。
+        let resp = serde_json::json!({"type": "agent:registered", "session_id": "s"});
+        let hs = parse_register_handshake(&resp).unwrap();
+        assert_eq!(hs.relay_protocol_version, 0);
+        assert!(!hs.desktop_binary);
+        assert!(hs.tokens.is_empty());
+    }
+
+    /// MYS-2553：agent 解析**新格式**响应——协议版本 / relay 版本都取到，
+    /// 二进制上行由 `relay_capabilities` 决定。
+    #[test]
+    fn test_parse_register_handshake_from_new_relay() {
+        let resp = serde_json::json!({
+            "type": "agent:registered",
+            "session_id": "new-relay-1",
+            "desktop_binary": true,
+            "protocol_version": crate::proto::PROTOCOL_VERSION,
+            "relay_version": "0.60.0",
+            "relay_capabilities": crate::proto::RELAY_CAPABILITIES,
+            "payload": { "tokens": [{"token": "a", "permission": "rw"}] }
+        });
+        let hs = parse_register_handshake(&resp).unwrap();
+        assert_eq!(hs.relay_protocol_version, crate::proto::PROTOCOL_VERSION);
+        assert_eq!(hs.relay_version.as_deref(), Some("0.60.0"));
+        assert!(hs.desktop_binary);
+
+        // 新格式但明确不声明二进制上行 → 即使 desktop_binary: true 也关闭。
+        let resp = serde_json::json!({
+            "type": "agent:registered",
+            "session_id": "new-relay-2",
+            "desktop_binary": true,
+            "protocol_version": 1,
+            "relay_version": "0.60.0",
+            "relay_capabilities": [],
+        });
+        let hs = parse_register_handshake(&resp).unwrap();
+        assert!(
+            !hs.desktop_binary,
+            "relay_capabilities 不含 desktop:binary-uplink 时不得走二进制上行"
+        );
+    }
+
+    /// MYS-2553 验收 3：tokens 里一条非法、一条合法 → 注册成功，只保留合法的
+    /// 那条；全部非法 → 视同「relay 没给 tokens」（空列表，走旧 relay 回退）。
+    #[test]
+    fn test_parse_register_handshake_lenient_tokens() {
+        let resp = serde_json::json!({
+            "type": "agent:registered",
+            "session_id": "s1",
+            "payload": { "tokens": [
+                {"token": "good", "permission": "rw"},
+                {"permission": "ro"},                 // 缺 token → 跳过
+                {"token": "no-perm"},                 // 缺 permission → 跳过
+                "not-an-object",                      // 根本不是对象 → 跳过
+                {"token": "also-good", "permission": "ro"}
+            ]}
+        });
+        let hs = parse_register_handshake(&resp).expect("坏 tokens 不得让注册失败");
+        assert_eq!(
+            hs.tokens,
+            vec![
+                ("good".to_string(), "rw".to_string()),
+                ("also-good".to_string(), "ro".to_string()),
+            ]
+        );
+
+        // 全部无效 → 空列表（= relay 没给 tokens）。
+        let resp = serde_json::json!({
+            "type": "agent:registered",
+            "session_id": "s2",
+            "payload": { "tokens": [{"token": 1}, {}, null] }
+        });
+        let hs = parse_register_handshake(&resp).unwrap();
+        assert!(hs.tokens.is_empty(), "全部无效条目应视同未给 tokens");
+    }
+
+    /// 响应类型不对 / 缺 session_id 仍然是硬错误（这两项老 relay 一直都给，
+    /// 不是新增可选字段）。
+    #[test]
+    fn test_parse_register_handshake_rejects_bad_response() {
+        assert!(parse_register_handshake(&serde_json::json!({"type": "error"})).is_err());
+        assert!(parse_register_handshake(
+            &serde_json::json!({"type": "agent:registered"})
+        )
+        .is_err());
     }
 
     #[tokio::test]

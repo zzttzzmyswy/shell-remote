@@ -2706,6 +2706,11 @@ fn bind_identity(
             .map(|(t, p)| serde_json::json!({"token": t, "permission": p}))
             .collect::<Vec<_>>(),
         "agent_version": env!("CARGO_PKG_VERSION"),
+        // 协议版本标记（MYS-2553）：这等价于旧版普通断线重连，新 relay 要
+        // 能从回滚路径也看到协议代次。老 relay 忽略未知字段。
+        // 注意本消息**故意不带** capabilities/device/lan_addr：relay 侧对这些
+        // 字段是「带了才覆盖」，缺省即保留会话上已有的值（回滚不该抹掉能力）。
+        "protocol_version": crate::proto::PROTOCOL_VERSION,
     });
     match http_register(base, &body, ctx.relay_insecure) {
         Ok(confirmed) => {
