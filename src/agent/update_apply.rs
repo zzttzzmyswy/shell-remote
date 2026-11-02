@@ -3007,11 +3007,6 @@ fn spawn_agent(
     cmd.spawn()
 }
 
-// （这里曾有一对 `spawn_with_etxtbsy_retry` / `libc_etxtbsy`：先 spawn 失败
-// 再按 ETXTBSY 退避重试。现在覆盖旧二进制的做法改成"写临时文件 + rename"
-// （见 tests.rs 的同款手法），不存在 ETXTBSY 窗口，重试路径没有调用点，
-// 故删除——不是"暂时留着以后用"。）
-
 /// 读新进程的 stderr，直到看到注册标记、进程退出或超时。
 ///
 /// 返回 `Ok(version)` 只在真的收到 `registered` 时——"进程起来了"不等于
