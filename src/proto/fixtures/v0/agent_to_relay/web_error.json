@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "kind": "timeout",
+    "message": "response body idle timeout",
+    "request_id": "web-req-2"
+  },
+  "session_id": "goldensession1",
+  "type": "web:error"
+}

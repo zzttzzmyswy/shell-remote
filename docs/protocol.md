@@ -292,6 +292,8 @@ agent 侧解析在 `src/agent/client.rs:371` `parse_register_handshake`：
 - [ ] **登记消息类型。** 新增的消息类型加进 `AGENT_TO_RELAY_TYPES` /
       `RELAY_TO_AGENT_TYPES`（`src/proto/mod.rs`），否则 relay 会把它当未知类型
       丢弃，本文 §2.4 的清单也会失真。
+- [ ] **补夹具。** 新增类型必须在 `src/proto/fixtures/v<当前版本>/` 的对应方向
+      目录下留一条样本，否则覆盖率测试（§7.4）会失败。
 - [ ] **补新旧双向单测。** 至少两条：一条「新对端 + 新字段」、一条「旧对端 +
       缺字段」。参考现有用例：
       - `src/agent/client.rs` — `test_parse_register_handshake_from_old_relay`、
@@ -303,11 +305,202 @@ agent 侧解析在 `src/agent/client.rs:371` `parse_register_handshake`：
         `test_rebind_without_capabilities_keeps_them`；
       - `src/proto/mod.rs` — `test_message_parses_without_payload_or_session_id`、
         `test_message_type_registry`、`test_parse_protocol_version`。
-- [ ] **跑跨版本矩阵。** `tools/compat_matrix.sh`（由并行任务 MYS-2553 1b 提供）
-      在真机上跑「新 agent × 旧 relay」「旧 agent × 新 relay」两组组合。
+- [ ] **跑金样与契约测试。** `cargo test --lib proto::fixtures` —— 冻结、回放、
+      输出契约、覆盖率四组都要绿（§7）。
+- [ ] **跑跨版本矩阵。** `tools/compat_matrix.sh`（见
+      [`docs/compat-matrix.md`](compat-matrix.md)）在真机上跑「新 agent × 旧
+      relay」「旧 agent × 新 relay」两组组合。
 - [ ] **确认新字段的可缺省性。** 手工构造一个删掉新字段的响应/请求，确认代码
       走的是「旧版本行为」分支，而不是报错。
-- [ ] **确认没动 `desktop_binary` 这类老兼容位。**
-- [ ] **同步本文。** §2 的清单与 §1.3 的能力表必须与代码一致。
+- [ ] **确认没动 `desktop_binary` 这类老兼容位。** §6 的字段清单由测试逐条断言，
+      删任何一个都会红。
+- [ ] **同步本文。** §2 的清单、§1.3 的能力表、§6 的输出契约字段清单必须与代码
+      一致（§6 的清单有测试核对文档与常量的一致性）。
 - [ ] **如果要提高 `MIN_PEER_PROTOCOL_VERSION`**：确认线上已无更低版本设备，
       并写进 release note。
+
+---
+
+## 6. 输出契约：旧版本对端依赖的字段（不许删）
+
+下面五份清单是**删除红线**。它们只列「旧版本对端会读」的字段：新增字段不受
+限制（老 peer 忽略未知字段），但删掉任何一个，老设备就会静默坏掉——没有报错，
+只是注册丢了能力、升级下不动、命令回包对不上。
+
+清单在代码里的常量位置：`src/proto/fixtures.rs` 的 `CONTRACT_*`。测试
+`test_contract_*` 断言**当前代码真实构造出的消息**包含这些字段；
+`test_contract_field_lists_match_protocol_doc` 断言本节与那些常量逐条一致
+（文档漏写也会红）。
+
+### 6.1 relay → agent：`agent:registered`
+
+顶层必须包含：`type`、`session_id`、`evicted`、`desktop_binary`、
+`protocol_version`、`relay_version`、`relay_capabilities`、`payload`。
+
+`payload` 必须包含：`tokens`（数组，每项含 `token` 与 `permission`）。
+
+要点：
+
+- `desktop_binary` **必须仍为 `true`**。它是 v0 旧 agent 判断「relay 支持
+  `desktop:video` 二进制上行」的唯一依据；`relay_capabilities` 只是新增的替代
+  通道，老 agent 完全不认识它。
+- `payload.tokens` 是旧 agent 拿身份令牌的唯一来源，格式不能变。
+
+### 6.2 relay → agent：`agent:upgrade.payload`
+
+必须包含：`target_version`、`version`、`filename`、`size`、`sha256`、
+`relay_url`、`url`、`relay_fallback`、`source`。
+
+- `version` 是 `target_version` 的**别名**，`url` 是 `relay_url` 的**别名**；
+  旧 agent 只读别名，新 agent 优先读主名。两者必须同值
+  （`UpgradeTask::wire_payload()` 负责插入别名，测试断言同值）。
+- 旧 agent 还硬性要求 `url` 存在，所以没有 relay 副本的任务不能发给它
+  （`legacy_compatible()` 判据）。
+
+### 6.3 relay → agent：`mcp:exec.payload`
+
+必须包含：`cmd`、`timeout_ms`、`_mcp_request_id`。
+
+`shell` / `cwd` 是后加的可选键，旧 agent 忽略；`_mcp_request_id` 是回包
+关联的唯一凭据，删了命令就永远等不到结果。
+
+### 6.4 relay → agent：`fs:read.payload`
+
+必须包含：`path`、`_mcp_request_id`。
+
+`offset` / `limit` 只在 Range 请求时出现，旧 agent 忽略它们 → 返回整文件
+（relay 侧再按 `file_size` 收敛）。
+
+### 6.5 agent → relay：`agent:register`
+
+必须包含：`type`、`agent_version`、`capabilities`、`device`、`protocol_version`。
+
+身份字段二选一：新注册带 `key` + `token_type`，缓存重连带 `tokens`。
+`session_id` / `lan_addr` 可选。
+
+**回滚重绑变体**（`update_apply.rs::bind_identity`）同样必须带
+`protocol_version`，但**故意不带** `capabilities` / `device` / `lan_addr` ——
+relay 侧对这三项是「带了才覆盖」，缺省即保留（§2.3），回滚不该抹掉能力。
+
+---
+
+## 7. 金样夹具与冻结规则
+
+已发布的协议行为用**冻结的 JSON 夹具**钉住，`cargo test` 就是兼容性的守门人。
+
+### 7.1 目录与命名
+
+```
+src/proto/fixtures/
+  FROZEN.sha256              # 冻结清单：<sha256>  <相对路径>
+  v0/                        # 协议标记出现之前的线协议（≤ v0.59.11）
+    agent_to_relay/*.json
+    relay_to_agent/*.json
+  v1/                        # 当前线协议（PROTOCOL_VERSION = 1）
+    agent_to_relay/*.json
+    relay_to_agent/*.json
+```
+
+- 一个消息一个文件，内容是一条**完整信封**（`{type, session_id, payload}` 加上
+  该版本特有的顶层字段），因此可以直接喂给真实的路由/解析代码。
+- 文件名：`<类型里的冒号换成下划线>[__<变体>].json`。例如
+  `terminal_output.json`、`agent_register__reconnect_tokens.json`。
+- `desktop:video` 的 9 字节头二进制帧存成 `.bin`
+  （`desktop_video__bin_frag.bin`）。
+- 必录的变体：注册请求的三种形态（新注册 / 带 tokens 重连 / 回滚重绑）、
+  注册响应的 v0 与 v1 两代格式、无 payload 的 `ping`、`agent:upgrade` 的旧别名
+  字段格式。
+
+### 7.2 夹具怎么来的
+
+**从真实代码路径产出，不手写。** 生成器 `src/proto/fixtures_gen.rs` 调用生产
+构造函数（`agent::client::build_register_message`、
+`relay::ws::build_register_response`、`relay::admin::build_upgrade_message`、
+`relay::mcp::build_mcp_exec_message`、
+`relay::file_transfer::build_fs_read_message`），其余类型复刻各模块
+`json!({...})` 里逐字相同的字段集，并在注释里标出源位置。
+
+这些构造函数就是为了让测试断言「真实构造路径」而抽出来的（见 §8 的清单）。
+
+重新生成 `v1/` 并重写冻结清单：
+
+```bash
+REGEN_FIXTURES=1 cargo test --lib proto::fixtures::tests::regen_fixtures -- --ignored --nocapture
+```
+
+`v0/` **永远不重新生成**——那是已发布的线协议，改动等于伪造历史。
+
+### 7.3 冻结规则
+
+红线：**已发布版本的夹具不允许修改**，也不允许删除。
+
+- `FROZEN.sha256` 记下每个夹具的 sha256，`test_frozen_fixtures_are_unmodified`
+  逐条校验。内容一变就失败，提示信息写明：
+
+  > 已发布协议版本的夹具不可修改：要变更协议，请新增 `fixtures/v<N+1>/`，
+  > 并保持旧版本夹具继续通过。
+
+- 每个夹具都必须在清单里（`test_every_fixture_is_frozen`），清单也不能有指向
+  已删文件的僵尸条目（`test_frozen_manifest_has_no_stale_entries`）。
+- 当前开发中、还没发布的最高版本（现在 `v1`）**也一起冻结**。理由：它是
+  「当前必须始终通过的基线」，允许随手改就等于允许无痕改协议。真要改线协议，
+  走下面的升级流程。
+
+### 7.4 四组测试
+
+跑法：`cargo test --lib proto::fixtures`
+
+| 组 | 测什么 | 关键用例 |
+| --- | --- | --- |
+| **冻结** | 夹具逐字节未变、清单完整、无僵尸条目 | `test_frozen_*`、`test_every_fixture_is_frozen` |
+| **回放（relay 侧）** | 所有版本 `agent_to_relay` 夹具送进 `/agent/send`：注册类得到 `agent:registered`、会话记下正确的协议版本（v0 → 0）；普通消息全被接受、不被判成未知类型；需要广播的类型确实转发出去了 | `test_replay_agent_to_relay_*`、`test_v0_register_without_protocol_version_is_accepted_as_zero`、`test_replay_broadcast_types_reach_browser` |
+| **回放（agent 侧）** | 所有版本 `relay_to_agent` 夹具喂给 agent 的信封解析与分发判据：不 panic；v0 注册响应 → relay 协议版本 0、按 `desktop_binary` 回退；`agent:upgrade` 两种格式解析成同一个任务；未知类型/未知字段被忽略 | `test_replay_relay_to_agent_*`、`test_replay_v0_register_response_falls_back_to_desktop_binary`、`test_replay_agent_upgrade_two_formats_yield_same_task` |
+| **输出契约** | §6 的字段清单：当前代码发出的五条关键消息都含旧对端要求的全部字段 | `test_contract_*` |
+| **覆盖率** | 注册表每个类型在当前版本夹具目录下至少一条（按信封 `type` 判定，不按文件名） | `test_fixture_covers_every_*` |
+
+### 7.5 版本升级时的冻结流程
+
+只有**线协议出现不兼容变化**或**需要一次性声明一批新语义**时才升协议版本号
+（§1.2）。走法：
+
+1. 把 `src/proto/mod.rs` 的 `PROTOCOL_VERSION` 加一（如 `1` → `2`）。
+2. 新建 `src/proto/fixtures/v2/`，把 `v1/` 的内容拷过去作为起点。
+3. 在生成器里按新协议改 `v2` 的夹具（新增字段/类型/变体），
+   在 `src/proto/fixtures.rs` 的 `ALL_VERSIONS` 加上 `"v2"`、
+   把 `CURRENT_VERSION_DIR` 改成 `"v2"`。
+4. 重新生成并重写冻结清单（`regen_fixtures`，见 §7.2）。
+5. **`v0/` 与 `v1/` 一个字节都不许动**——它们的 sha256 已经在
+   `FROZEN.sha256` 里，改了测试立刻红。
+6. 确认 `cargo test --lib proto::fixtures` 全绿：这意味着当前代码能处理
+   v0、v1、v2 三代的全部夹具，即「新代码仍然兼容所有历史版本」。
+7. 同步本文 §1、§2、§6 与 `docs/compat-matrix.md` 的版本表，写 release note。
+
+> 只做加法的改动（新可选字段、新消息类型、新能力字符串）**不升**版本号，
+> 但也必须补夹具——覆盖率测试会拦住「新增类型但没留样本」。
+
+### 7.6 相关文档
+
+- [`docs/compat-matrix.md`](compat-matrix.md)：跨版本兼容矩阵（真实旧二进制
+  双向实测）。夹具是「消息级」的单元回归，矩阵是「进程级」的端到端验证，
+  两者互补。
+
+---
+
+## 8. 为测试暴露的内部函数
+
+兼容 2 任务为了让夹具和契约测试断言**真实构造路径**（而不是在测试里另抄一份
+JSON），把四处内联的 `json!({...})` 抽成了函数。行为零变化，只是把「同一段
+构造代码」变成可调用的：
+
+| 函数 | 位置 | 原来在哪 |
+| --- | --- | --- |
+| `build_register_message` | `src/agent/client.rs` | `RelayClient::connect_http` 里的内联构造 |
+| `build_register_response` | `src/relay/ws.rs` | `agent_send_handler` 注册分支的 `Json(json!({...}))` |
+| `build_upgrade_message` | `src/relay/admin.rs` | `agent_upgrade_handler` 里的内联构造 |
+| `build_mcp_exec_message` | `src/relay/mcp.rs` | `messages_handler` 的 `mcp:exec` 分支 |
+| `build_fs_read_message` | `src/relay/file_transfer.rs` | `get_handler` 里的内联构造 |
+
+`build_register_message` 是 `pub(crate)`（agent 内部）；其余四个是 `pub`，
+因为夹具生成器与契约测试在 `proto::fixtures` 里跨模块调用它们，而 relay/agent
+两个模块之间也需要 `pub` 的实现内可见性。它们都只做「构造一个 JSON 值」，
+没有副作用，不暴露任何内部状态。

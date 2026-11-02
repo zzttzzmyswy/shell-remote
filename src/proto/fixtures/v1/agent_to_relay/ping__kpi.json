@@ -1,0 +1,17 @@
+{
+  "kpi": {
+    "active": true,
+    "bitrate_kbps": 1388,
+    "bp_count": 0,
+    "codec": "h264",
+    "cpu_ms": 12345,
+    "cpu_temp": 45.5,
+    "encode_ms": 11,
+    "fps": 30,
+    "quality_permille": 670,
+    "rss_kb": 20480,
+    "running": true
+  },
+  "session_id": "goldensession1",
+  "type": "ping"
+}

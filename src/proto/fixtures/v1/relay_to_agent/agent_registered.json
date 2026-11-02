@@ -1,0 +1,23 @@
+{
+  "desktop_binary": true,
+  "evicted": false,
+  "payload": {
+    "tokens": [
+      {
+        "permission": "rw",
+        "token": "golden-rw-token"
+      },
+      {
+        "permission": "ro",
+        "token": "golden-ro-token"
+      }
+    ]
+  },
+  "protocol_version": 1,
+  "relay_capabilities": [
+    "desktop:binary-uplink"
+  ],
+  "relay_version": "0.59.11",
+  "session_id": "goldensession1",
+  "type": "agent:registered"
+}

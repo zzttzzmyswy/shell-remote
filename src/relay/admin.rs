@@ -915,6 +915,20 @@ pub async fn load_manifest(
     Some(manifest)
 }
 
+/// 构造下发给 agent 的 `agent:upgrade` 消息（relay → agent）。
+///
+/// 抽成独立函数（MYS-2553 兼容 2）：金样夹具与输出契约测试必须断言真实
+/// 构造路径产出的字段集，包括 `wire_payload()` 为存量 agent 补的两个别名字段
+/// （`version` / `url`）——那是老 agent 唯一认识的键，删掉它们旧设备就再也
+/// 升不了级。
+pub fn build_upgrade_message(session_id: &str, task: &crate::relay::artifact_store::UpgradeTask) -> Value {
+    json!({
+        "type": "agent:upgrade",
+        "session_id": session_id,
+        "payload": task.wire_payload(),
+    })
+}
+
 /// 触发一台设备的自升级（MYS-2425：版本决策 + 可信任务）。
 ///
 /// 流程：
@@ -1132,12 +1146,7 @@ async fn trigger_upgrade(
             .into_response()));
     }
 
-    let text = serde_json::to_string(&json!({
-        "type": "agent:upgrade",
-        "session_id": sid,
-        "payload": task.wire_payload(),
-    }))
-    .unwrap_or_default();
+    let text = serde_json::to_string(&build_upgrade_message(&sid, &task)).unwrap_or_default();
     {
         let broadcast = state.agent_broadcast.read().await;
         match broadcast.get(&sid).and_then(|cm| cm.agent.as_ref()) {

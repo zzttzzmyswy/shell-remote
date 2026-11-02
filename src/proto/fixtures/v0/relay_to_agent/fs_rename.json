@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "from": "/home/golden/a.txt",
+    "to": "/home/golden/b.txt"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:rename"
+}

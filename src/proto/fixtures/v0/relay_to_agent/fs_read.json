@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "_mcp_request_id": "c-1",
+    "path": "/home/golden/big.log"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:read"
+}

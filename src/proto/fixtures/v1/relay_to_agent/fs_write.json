@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-fs-2",
+    "content": "aGVsbG8K",
+    "path": "/home/golden/note.txt"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:write"
+}

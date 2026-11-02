@@ -1,0 +1,25 @@
+{
+  "payload": {
+    "arch": "x86_64",
+    "cdn_base_urls": [
+      "https://github.com",
+      "https://gh-proxy.com/https://github.com"
+    ],
+    "filename": "shell-remote-x86_64",
+    "official_path": "/zzttzzmyswy/shell-remote/releases/download/v0.59.12/shell-remote-x86_64",
+    "official_release": true,
+    "relay_fallback": true,
+    "relay_url": "/agent/upgrade/blob/shell-remote-x86_64",
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "size": 12345678,
+    "source": "local",
+    "target_version": "0.59.12",
+    "upgrade_id": "up-golden-0001",
+    "url": "/agent/upgrade/blob/shell-remote-x86_64",
+    "variant": "cli",
+    "version": "0.59.12",
+    "windows": false
+  },
+  "session_id": "goldensession1",
+  "type": "agent:upgrade"
+}

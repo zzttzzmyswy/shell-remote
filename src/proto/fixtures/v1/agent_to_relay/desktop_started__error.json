@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "codec": "h264",
+    "error": "capture unavailable: no display"
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:started"
+}

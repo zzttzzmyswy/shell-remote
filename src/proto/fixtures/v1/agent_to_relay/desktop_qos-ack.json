@@ -1,0 +1,12 @@
+{
+  "payload": {
+    "active": true,
+    "bitrate_kbps": 1388,
+    "bp_count": 0,
+    "fps": 30,
+    "qos_scale": 2,
+    "qos_state": "Good"
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:qos-ack"
+}

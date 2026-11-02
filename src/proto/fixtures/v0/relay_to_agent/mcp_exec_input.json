@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-exec-2",
+    "data_b64": "eQo=",
+    "exec_id": "exec-1"
+  },
+  "session_id": "goldensession1",
+  "type": "mcp:exec_input"
+}

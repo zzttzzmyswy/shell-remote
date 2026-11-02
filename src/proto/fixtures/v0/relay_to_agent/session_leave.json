@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "permission": "rw",
+    "user_id": "user-golden"
+  },
+  "session_id": "goldensession1",
+  "type": "session:leave"
+}

@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "conn_id": "conn-1",
+    "kind": "connect",
+    "message": "connect to 10.0.0.9:8080 failed: connection refused"
+  },
+  "session_id": "goldensession1",
+  "type": "tcp:error"
+}

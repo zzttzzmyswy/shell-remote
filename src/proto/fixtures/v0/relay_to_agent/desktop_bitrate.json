@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "kbps": 2200
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:bitrate"
+}

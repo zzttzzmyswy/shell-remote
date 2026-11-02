@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "conn_id": "conn-1",
+    "host": "10.0.0.9",
+    "port": 8080
+  },
+  "session_id": "goldensession1",
+  "type": "tcp:open"
+}

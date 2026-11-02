@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "uplink": "ws"
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:uplink"
+}

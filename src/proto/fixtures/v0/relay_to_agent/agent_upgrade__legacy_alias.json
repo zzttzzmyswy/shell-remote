@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "url": "/agent/upgrade/blob/shell-remote-x86_64",
+    "version": "0.59.12"
+  },
+  "session_id": "goldensession1",
+  "type": "agent:upgrade"
+}

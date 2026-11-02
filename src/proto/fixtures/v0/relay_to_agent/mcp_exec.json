@@ -1,0 +1,11 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-mcp-1",
+    "cmd": "uname -a",
+    "cwd": "/home/golden",
+    "shell": "auto",
+    "timeout_ms": 30000
+  },
+  "session_id": "goldensession1",
+  "type": "mcp:exec"
+}

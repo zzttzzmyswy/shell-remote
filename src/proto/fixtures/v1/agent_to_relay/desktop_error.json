@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "error": "capture error, retrying: BadMatch (invalid parameter attributes)"
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:error"
+}

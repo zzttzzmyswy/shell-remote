@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-exec-1",
+    "cmd": "tail -f /var/log/syslog"
+  },
+  "session_id": "goldensession1",
+  "type": "mcp:exec_start"
+}

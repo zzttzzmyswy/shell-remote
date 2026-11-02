@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-mcp-legacy",
+    "cmd": "df -h",
+    "timeout_ms": 30000
+  },
+  "session_id": "goldensession1",
+  "type": "mcp:exec"
+}

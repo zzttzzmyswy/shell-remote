@@ -1,0 +1,11 @@
+{
+  "payload": {
+    "data": "AAAAGGZ0eXBpc281AAAAAWlzbzVpc282bXA0MQAAAAxtb29mAAAAAA==",
+    "flags": "key",
+    "key": true,
+    "kind": "frag",
+    "seq": 1
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:video"
+}

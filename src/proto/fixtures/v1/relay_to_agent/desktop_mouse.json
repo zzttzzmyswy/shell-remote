@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "type": "move",
+    "x": 640,
+    "y": 360
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:mouse"
+}

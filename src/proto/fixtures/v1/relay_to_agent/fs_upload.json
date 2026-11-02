@@ -1,0 +1,11 @@
+{
+  "payload": {
+    "chunk_index": 0,
+    "content": "Y2h1bmstMA==",
+    "final_path": "/home/golden/up.bin",
+    "total_chunks": 2,
+    "upload_id": "up-1"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:upload"
+}

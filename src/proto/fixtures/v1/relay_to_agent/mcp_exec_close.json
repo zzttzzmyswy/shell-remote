@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-exec-3",
+    "exec_id": "exec-1"
+  },
+  "session_id": "goldensession1",
+  "type": "mcp:exec_close"
+}

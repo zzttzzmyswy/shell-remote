@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "error": "codec av1 unavailable on this backend",
+    "ok": false,
+    "seq": 4
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:cmd-ack"
+}

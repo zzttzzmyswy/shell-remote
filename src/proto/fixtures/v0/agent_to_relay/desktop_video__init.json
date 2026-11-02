@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "codec": "h264",
+    "data": "AAAAGGZ0eXBpc281AAAAAWlzbzVpc282bXA0MQAAAAxtb29mAAAAAA==",
+    "kind": "init"
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:video"
+}

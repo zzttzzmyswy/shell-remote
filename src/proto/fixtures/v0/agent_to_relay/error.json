@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "code": "UPGRADE_BAD_PAYLOAD",
+    "message": "agent:upgrade missing target_version/version, filename (or url) and a 64-hex sha256"
+  },
+  "session_id": "goldensession1",
+  "type": "error"
+}

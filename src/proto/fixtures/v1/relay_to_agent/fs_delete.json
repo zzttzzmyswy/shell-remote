@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "path": "/home/golden/old.txt"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:delete"
+}

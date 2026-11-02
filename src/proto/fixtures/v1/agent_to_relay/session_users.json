@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "count": 2
+  },
+  "session_id": "goldensession1",
+  "type": "session:users"
+}

@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "cols": 120,
+    "rows": 40,
+    "tab_id": "tab-1"
+  },
+  "session_id": "goldensession1",
+  "type": "terminal:resize"
+}

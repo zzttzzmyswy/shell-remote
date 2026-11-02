@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "ok": true,
+    "seq": 3
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:cmd-ack"
+}

@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "bitrate_kbps": 1500,
+    "quality": "balanced",
+    "seq": 4
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:quality"
+}

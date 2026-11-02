@@ -1,0 +1,11 @@
+{
+  "payload": {
+    "delay_ms": 42,
+    "dfps": 30,
+    "dq": 0,
+    "lseq": 128,
+    "probe_ms": 18
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:qos"
+}

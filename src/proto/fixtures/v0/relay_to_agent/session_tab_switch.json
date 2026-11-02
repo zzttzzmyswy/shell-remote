@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "_user_id": "user-golden",
+    "tab_id": "tab-2"
+  },
+  "session_id": "goldensession1",
+  "type": "session:tab_switch"
+}

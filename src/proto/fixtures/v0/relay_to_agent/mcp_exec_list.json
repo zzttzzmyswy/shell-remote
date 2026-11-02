@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "_mcp_request_id": "req-exec-4"
+  },
+  "session_id": "goldensession1",
+  "type": "mcp:exec_list"
+}

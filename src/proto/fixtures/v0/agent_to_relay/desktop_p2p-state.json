@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "state": "connected"
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:p2p-state"
+}

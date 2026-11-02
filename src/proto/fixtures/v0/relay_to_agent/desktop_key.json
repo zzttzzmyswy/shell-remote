@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "code": "KeyA",
+    "down": true
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:key"
+}

@@ -1,0 +1,15 @@
+{
+  "payload": {
+    "final_url": "http://intranet.golden/",
+    "headers": [
+      [
+        "content-type",
+        "text/html; charset=utf-8"
+      ]
+    ],
+    "request_id": "web-req-1",
+    "status": 200
+  },
+  "session_id": "goldensession1",
+  "type": "web:head"
+}

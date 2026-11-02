@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "codec": "h264",
+    "seq": 3
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:codec"
+}

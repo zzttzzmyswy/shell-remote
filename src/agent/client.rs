@@ -397,6 +397,69 @@ pub(crate) fn parse_register_handshake(
     })
 }
 
+/// 构造 `agent:register` 请求体（注册握手 agent → relay）。
+///
+/// 抽成独立函数（MYS-2553 兼容 2）：金样夹具与输出契约测试必须断言**真实
+/// 注册路径**产出的字段，而不是测试里另抄一份 json。`device` 由调用方探测后
+/// 传入（`device::probe()` 是异步且依赖运行环境的，夹具侧传入固定值）。
+///
+/// 三种形态对应夹具里的三个变体：
+/// - 新注册：带 `key` / `token_type`；
+/// - 缓存 tokens 重连：带 `tokens`（relay 复用这批 token 而不是新铸）；
+/// - 回滚重绑：见 `update_apply.rs::bind_identity`（另一条独立构造路径，
+///   只带身份，故意不带 capabilities/device/lan_addr）。
+pub(crate) fn build_register_message(
+    fixed_key: Option<String>,
+    token_type: &str,
+    desired_session_id: Option<&str>,
+    cached_tokens: Option<&[(String, String)]>,
+    lan_addr: Option<String>,
+    device: &crate::proto::DeviceInfo,
+) -> serde_json::Value {
+    let mut register_msg = if let Some(ct) = cached_tokens {
+        let arr: Vec<serde_json::Value> = ct
+            .iter()
+            .map(|(tok, perm)| json!({"token": tok, "permission": perm}))
+            .collect();
+        json!({
+            "type": "agent:register",
+            "tokens": arr,
+            "device": device,
+        })
+    } else {
+        json!({
+            "type": "agent:register",
+            "key": fixed_key,
+            "token_type": token_type,
+            "device": device,
+        })
+    };
+    if let Some(sid) = desired_session_id {
+        register_msg["session_id"] = json!(sid);
+    }
+    register_msg["agent_version"] = json!(env!("CARGO_PKG_VERSION"));
+    // 协议版本标记（MYS-2553）：让新 relay 知道对端带协议标记，老 relay
+    // 忽略这个未知字段（serde 宽松解析，无 deny_unknown_fields）。
+    register_msg["protocol_version"] = json!(crate::proto::PROTOCOL_VERSION);
+    // R5#44 capability 协商最小子集：注册时声明能力集（codec/后端/
+    // 桌面功能），relay 存储并在 admin overview 展示，浏览器可据此协商。
+    // 后端按**平台 + 运行时探测**真实声明（Linux 不声明 Windows 专属
+    // GDI/DXGI；Wayland 需编译 feature 且 WAYLAND_DISPLAY 可达）——
+    // 避免 capability 声明不实误导浏览器/admin。
+    register_msg["capabilities"] = json!(build_capabilities());
+
+    // 阶段2 LAN 直连：agent 本地桌面流 HTTP 端点地址（"ip:port"），relay
+    // 存进 session 表、admin 展示；浏览器经 desktop:capabilities.lan_addrs
+    // 拿到后同网段探测直连（绕开 relay）。老版本 / 未开启
+    // --desktop-lan-port 时无此字段（兼容）。
+    if let Some(addr) = lan_addr {
+        if !addr.is_empty() {
+            register_msg["lan_addr"] = json!(addr);
+        }
+    }
+    register_msg
+}
+
 impl RelayClient {
     async fn connect_http(
         relay_url: &str,
@@ -439,47 +502,14 @@ impl RelayClient {
 
         // On reconnect, replay the cached tokens so the relay reuses them
         // instead of minting new random ones (keeps shared tokens stable).
-        let mut register_msg = if let Some(ct) = cached_tokens {
-            let arr: Vec<serde_json::Value> = ct
-                .iter()
-                .map(|(tok, perm)| json!({"token": tok, "permission": perm}))
-                .collect();
-            json!({
-                "type": "agent:register",
-                "tokens": arr,
-                "device": device,
-            })
-        } else {
-            json!({
-                "type": "agent:register",
-                "key": fixed_key,
-                "token_type": token_type,
-                "device": device,
-            })
-        };
-        if let Some(sid) = desired_session_id {
-            register_msg["session_id"] = json!(sid);
-        }
-        register_msg["agent_version"] = json!(env!("CARGO_PKG_VERSION"));
-        // 协议版本标记（MYS-2553）：让新 relay 知道对端带协议标记，老 relay
-        // 忽略这个未知字段（serde 宽松解析，无 deny_unknown_fields）。
-        register_msg["protocol_version"] = json!(crate::proto::PROTOCOL_VERSION);
-        // R5#44 capability 协商最小子集：注册时声明能力集（codec/后端/
-        // 桌面功能），relay 存储并在 admin overview 展示，浏览器可据此协商。
-        // 后端按**平台 + 运行时探测**真实声明（Linux 不声明 Windows 专属
-        // GDI/DXGI；Wayland 需编译 feature 且 WAYLAND_DISPLAY 可达）——
-        // 避免 capability 声明不实误导浏览器/admin。
-        register_msg["capabilities"] = json!(build_capabilities());
-
-        // 阶段2 LAN 直连：agent 本地桌面流 HTTP 端点地址（"ip:port"），relay
-        // 存进 session 表、admin 展示；浏览器经 desktop:capabilities.lan_addrs
-        // 拿到后同网段探测直连（绕开 relay）。老版本 / 未开启
-        // --desktop-lan-port 时无此字段（兼容）。
-        if let Some(addr) = lan_addr {
-            if !addr.is_empty() {
-                register_msg["lan_addr"] = json!(addr);
-            }
-        }
+        let register_msg = build_register_message(
+            fixed_key.clone(),
+            token_type,
+            desired_session_id,
+            cached_tokens,
+            lan_addr,
+            &device,
+        );
 
         let resp = http_client
             .post(&send_url)

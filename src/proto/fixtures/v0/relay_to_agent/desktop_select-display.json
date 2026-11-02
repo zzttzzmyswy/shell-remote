@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "display": ":0.1",
+    "seq": 6
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:select-display"
+}

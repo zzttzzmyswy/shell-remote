@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "_mcp_request_id": "c-1"
+  },
+  "session_id": "goldensession1",
+  "type": "fs:read_cancel"
+}

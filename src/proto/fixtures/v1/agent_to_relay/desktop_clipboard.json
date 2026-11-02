@@ -1,0 +1,7 @@
+{
+  "payload": {
+    "text": "golden clipboard"
+  },
+  "session_id": "goldensession1",
+  "type": "desktop:clipboard"
+}
