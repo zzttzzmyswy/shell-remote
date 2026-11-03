@@ -83,7 +83,77 @@ https://ghproxy.net/https://github.com
 
 任务里含裸 `github.com` origin 时，agent 的重定向白名单与 `/agent/resolve` 还会额外放行官方 release 资产的跳转目标 `release-assets.githubusercontent.com`、`objects.githubusercontent.com`——`https://github.com/.../releases/download/...` 会 302 到前者，不放行这个源就永远失败。这两个主机只提供 GitHub 官方资产，字节仍由任务里的 SHA-256 钉死，不构成可下载内容的扩张。
 
-已部署的旧 agent（< v0.59.8）会把带路径的条目当畸形输入跳过（只打 warn）并继续用其余源与 relay 兜底，不会崩溃——所以改动上线后老版本仍能升级，只是拿不到前缀镜像带来的可达性改善。
+### 按 agent 版本裁剪 CDN 列表
+
+上面那条"放行 302 跳转目标"的能力是 **v0.59.8**（commit `e4e8743`）才加到 agent 侧的。更早的 agent 只认任务里列出的 CDN base 主机，遇到 `github.com → release-assets.githubusercontent.com` 的跨主机 302 会直接拒绝：
+
+```text
+refusing redirect to https://release-assets.githubusercontent.com/... —
+host is not one of this upgrade task's CDN hosts
+```
+
+因此 relay 构造升级任务时会按设备上报的 `agent_version` 裁剪 `cdn_base_urls`：
+
+| agent 版本 | 任务里的 `cdn_base_urls` |
+|---|---|
+| ≥ 0.59.8（或 `0.59.8-beta.1` 之类预发布，按 semver 比较） | 全部条目，含裸 `https://github.com` |
+| < 0.59.8 | **去掉裸 `https://github.com`**，前缀镜像全部保留 |
+| 未上报 / 非法 | 不裁剪（维持原样） |
+
+只去掉**裸** `https://github.com` 这一条：前缀镜像（`https://gh-proxy.com/https://github.com`）由镜像主机直接回 200，不产生跨主机跳转，旧 agent 用得了；relay 镜像走任务里的 `relay_url`，本来就不在这份列表里，不受影响。版本未知时不裁剪——宁可让它在官方 origin 上失败一次（它会明确报错并继续试其它源），也不要因为缺一个字段削掉一个可能可用的源。
+
+阈值是 `artifact_store::BARE_GITHUB_MIN_AGENT_VERSION`。`GET /api/agent/upgrade/plan` 返回的 `cdn_base_urls` 已经是**这台设备实际会收到的**裁剪结果，不是 relay 配置原样。
+
+已部署的旧 agent（< v0.59.8）同样会把带路径的条目当畸形输入跳过（只打 warn）并继续用其余源与 relay 兜底，不会崩溃——所以改动上线后老版本仍能升级，只是拿不到前缀镜像带来的可达性改善。
+
+## 升级失败的目标不可写（`target_not_writable`）
+
+### 现象与根因
+
+agent 被 systemd 以**普通用户**拉起，而二进制所在的 `/usr/local/bin` 归 root 时，原地替换必然失败：
+
+```text
+cannot move the current binary to /usr/local/bin/shell-remote.sr-old-…: Permission denied (os error 13)
+```
+
+只读分区上是 `Read-only file system (os error 30)`。两种都是**权限/文件系统**问题，重试一万次结果一样。
+
+### relay 怎么记
+
+relay 收到 `agent:upgrade_progress` 的失败帧（`stage` 为 `failed` 或 `rolled_back`）时，把 `error` / `detail` 里的文本归类，写进该设备的升级状态：
+
+| 字段 | 含义 |
+|---|---|
+| `last_failure_kind` | `target_not_writable` 或 `other` |
+| `last_failure_at_unix_s` | 归类时刻（Unix 秒） |
+
+判据是 `Permission denied` / `os error 13` / `Read-only file system` / `os error 30` 任一出现。按 `os error <n>` 匹配是因为这段说明由 Rust 标准库自己拼接，与该平台的 strerror 语言无关。新一轮升级开始或成功回执到达时，这两个字段会被清掉。
+
+### 谁会被阻断
+
+`GET /api/agent/upgrade/plan` 与全量升级入口在**同时满足**下面两条时把设备判为阻断：
+
+1. 最近一次失败归类是 `target_not_writable`；
+2. 设备**没有** `upgrade:overlay-v1` 能力。
+
+具备 overlay 能力的 agent 不再改写目标二进制，而是把新字节铺到自己有写权限的 overlay 上再从那里启动——目录权限对它不是问题，因此不阻断。
+
+plan 响应里对应两个字段：
+
+```json
+{
+  "blocked_reason": "target_not_writable",
+  "hint": "该设备二进制所在目录对 agent 用户不可写；请人工替换一次 base 二进制为 ≥0.59.13，之后可无权限自升级",
+  "last_failure_kind": "target_not_writable",
+  "supports_overlay_upgrade": false
+}
+```
+
+不阻断时 `blocked_reason` 与 `hint` 都是 `null`（`last_failure_kind` 仍如实展示）。
+
+### 处理办法
+
+人工把该设备的 base 二进制替换成 ≥ 0.59.13 一次（`sudo install -m755 shell-remote-<arch> /usr/local/bin/shell-remote`，再重启服务）。之后的升级由 overlay 能力接管，不再需要权限。阻断不是永久标记——设备上报新版本并重新声明能力后，判据自然失效。
 
 ## 下发字段
 
@@ -112,6 +182,8 @@ https://ghproxy.net/https://github.com
 
 `version` / `url` 是给存量 agent（≤ v0.59.2，只认这三个键加 `sha256`）的兼容别名。没有 relay 副本时不给 `url`，admin 响应里的 `legacy_compatible: false` 会提示老 agent 无法完成这次升级。
 
+`cdn_base_urls` 是按**这台设备的 `agent_version`** 裁剪后的实际值：上面的例子是 ≥ v0.59.8 的设备；对更早的 agent，`https://github.com` 这一项不会出现（见上文「按 agent 版本裁剪 CDN 列表」）。这条裁剪只改变已有字段的内容，不新增字段，因此不涉及线协议兼容——老的 relay / agent 都按原样解析。
+
 ## 代解析端点
 
 `GET /agent/resolve?host=<CDN 主机>`（rw Token 鉴权）供系统 DNS 与 DoH 都不可用时使用。它**不是**通用 DNS 代理：只解析 `--upgrade-cdn` 列出的主机的 host 部分（外加官方 `github.com` 与两个官方资产跳转主机），裸主机名形态，其他一律 `403`（响应不回显允许列表，不给探测者提供枚举素材）。
@@ -133,6 +205,20 @@ TTL 上限 300s，解析失败有 15s 负缓存（仍带 `expires_at`，让 agen
 5. 启动一个短命的换机助手进程（`shell-remote update-apply <handoff>`，隐藏子命令，`shell-remote-ui` 里同样存在）。它在 stdout 上只报一行 `ready`，**只有收到这一行之后**旧 agent 才退出
 
 `GET <admin>/api/agent/upgrade/plan?session_id=…` 只做版本决策与制品定位，**不**下发指令、不退出任何进程，供设备列表显示"是否需要升级 / 能否升级"。
+
+### 全量升级入口必须带 `confirm`
+
+`POST <admin>/api/agent/upgrade/fleet` 一次对**全部在线设备**下发升级。请求体必须显式带 `"confirm": true`，否则返回 `400` + `code: "confirm_required"`，并在错误信息里指向只读的 `/api/agent/upgrade/plan`：
+
+```bash
+curl -X POST https://<relay><admin>/api/agent/upgrade/fleet \
+  -H 'Content-Type: application/json' -b '<admin cookie>' \
+  -d '{"confirm": true}'
+```
+
+`confirm` 必须是布尔 `true`；缺省、`false`、字符串 `"true"`、数字 `1` 都不算。可选 `session_ids: ["…"]` 做灰度，`force: true` 重装同版本。
+
+这个闸门来自 2026-11-03 的事故：一条打错路径的调用让 14 台设备全量升级，其中 12 台回滚。返回体按 `triggered` / `skipped` / `failed` / `blocked` 四组列出每台设备与原因；`blocked` 里是 `target_not_writable` 且无 overlay 能力的设备（**不下发**），逐条带 `hint`。管理后台的"全部升级"按钮已同步传 `confirm: true`（它在弹确认框之后才发请求）。
 
 ### 换机助手
 

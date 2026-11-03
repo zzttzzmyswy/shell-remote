@@ -73,6 +73,85 @@ pub const DEFAULT_CDN_BASE_URLS: &[&str] = &[
     "https://ghproxy.net/https://github.com",
 ];
 
+/// 能跟随 `https://github.com` 的 302 跳到官方资产的**最老** agent 版本。
+///
+/// 依据：放行 `release-assets.githubusercontent.com` / `objects.githubusercontent.com`
+/// 这两个跳转目标的逻辑是 **v0.59.8**（commit `e4e8743`，MYS-2425-G）才加到
+/// agent 侧的。更早的 agent 只认任务里列出的 CDN base 主机，遇到跨主机 302 会
+/// 直接拒绝：
+///
+/// ```text
+/// refusing redirect to https://release-assets.githubusercontent.com/... —
+/// host is not one of this upgrade task's CDN hosts
+/// ```
+///
+/// 因此给这些旧 agent 下发裸 `https://github.com` 只会白浪费一次尝试，还会让
+/// 排查以为"GitHub 挂了"（2026-11-03 全量升级事故，MYS-2569）。见
+/// [`cdn_base_urls_for_agent`]。
+pub const BARE_GITHUB_MIN_AGENT_VERSION: &str = "0.59.8";
+
+/// 按 agent 版本裁剪 CDN 入口列表。
+///
+/// 只去掉**裸 `https://github.com`**（官方 origin 本身）：前缀镜像
+/// （`https://gh-proxy.com/https://github.com`）由镜像主机直接回 200，不涉及
+/// 跨主机跳转，旧 agent 用得了；relay 镜像（任务里的 `relay_url`）根本不在这个
+/// 列表里，保持原样。
+///
+/// 版本未知/非法时**不裁剪**：宁可让一台版本读不到的 agent 在官方 origin 上失败
+/// 一次（它会明确报错并继续试其它源），也不要因为缺一个字段就削掉一个可能可用
+/// 的源。
+pub fn cdn_base_urls_for_agent(
+    agent_version: Option<&str>,
+    cdn_base_urls: &[String],
+) -> Vec<String> {
+    if !lacks_bare_github_redirect_support(agent_version) {
+        return cdn_base_urls.to_vec();
+    }
+    cdn_base_urls
+        .iter()
+        .filter(|base| !is_bare_github_origin(base))
+        .cloned()
+        .collect()
+}
+
+/// 该 agent 版本是否跟不了 `github.com` → `release-assets…` 的 302。
+///
+/// 版本缺失、空串或非法一律 `false`（未知即不裁剪）。
+fn lacks_bare_github_redirect_support(agent_version: Option<&str>) -> bool {
+    let Some(raw) = agent_version.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    // 允许 `v0.59.4` 这种 `--version` 输出风格（与 [`version_decision`] 同规则）。
+    let Ok(agent) = semver::Version::parse(raw.strip_prefix('v').unwrap_or(raw)) else {
+        return false;
+    };
+    let Ok(min) = semver::Version::parse(BARE_GITHUB_MIN_AGENT_VERSION) else {
+        return false;
+    };
+    agent < min
+}
+
+/// 是否为**裸**官方 origin（`https://github.com`，允许结尾斜杠）。
+///
+/// 带路径前缀的镜像条目（`https://gh-proxy.com/https://github.com`）一律不是——
+/// 它们的主机是镜像自己，不会产生跨主机跳转。
+pub fn is_bare_github_origin(base: &str) -> bool {
+    let Some(host) = cdn_host(base) else {
+        return false;
+    };
+    if Some(host.as_str()) != cdn_host(OFFICIAL_DOWNLOAD_BASE).as_deref() {
+        return false;
+    }
+    let Some((_, after_scheme)) = base.trim().split_once("://") else {
+        return false;
+    };
+    // authority 之后不允许再有任何路径段。
+    match after_scheme.split_once('/') {
+        None => true,
+        Some((_, path)) => path.is_empty(),
+    }
+}
+
 /// 制品形态：CLI（lean，仅终端转发）或 UI（桌面 agent + 窗口面板）。
 ///
 /// 两者是同一次 release 的不同产物，**升级时必须按当前运行的可执行文件选**，
@@ -925,6 +1004,11 @@ impl TaskRefusal {
 /// CARGO_PKG_VERSION)` 提供）。没有官方清单时任务也要带非空版本——custom 分支
 /// 曾经回落到 `""`，agent 侧日志/上报会显示空版本，且"升级到哪个版本"这件事
 /// 本身仍然成立：目标就是与 agent 版本比较过的那个 relay 版本。
+///
+/// `agent_version` 是这台设备**当前**跑的版本，只用于按能力裁剪 CDN 列表
+/// （见 [`cdn_base_urls_for_agent`]）：< v0.59.8 的 agent 跟不了官方 origin 的
+/// 302，给它下发裸 `https://github.com` 只会白失败一次。`None`（老 agent 未
+/// 上报）不裁剪。
 pub fn build_task(
     upgrade_id: String,
     target_version: &str,
@@ -932,6 +1016,7 @@ pub fn build_task(
     manifest: Option<&OfficialManifest>,
     local: Option<&LocalArtifact>,
     cdn_base_urls: &[String],
+    agent_version: Option<&str>,
     allow_custom: bool,
 ) -> Result<UpgradeTask, TaskRefusal> {
     let asset = manifest.and_then(|m| m.asset(artifact));
@@ -983,10 +1068,11 @@ pub fn build_task(
     };
 
     // custom 制品不在官方 CDN 上——给出去只会让 agent 下载到同版本的另一个文件。
+    // 其余情况再按 agent 版本裁剪掉它跟不了的重定向源。
     let cdn = if source == ArtifactSource::Custom {
         Vec::new()
     } else {
-        cdn_base_urls.to_vec()
+        cdn_base_urls_for_agent(agent_version, cdn_base_urls)
     };
     let relay_url = local.map(|_| format!("/agent/upgrade/blob/{}", artifact.filename()));
 
@@ -1579,11 +1665,116 @@ mod tests {
             .collect()
     }
 
+    // ── 按 agent 版本裁剪 CDN（MYS-2575，2026-11-03 事故）───────────
+    //
+    // 放行 `github.com → release-assets.githubusercontent.com` 的重定向是
+    // v0.59.8（e4e8743）才有的能力。更早的 agent 拿裸 `https://github.com`
+    // 必然报 "refusing redirect … host is not one of this upgrade task's CDN
+    // hosts"，白白浪费一次尝试。前缀镜像不受影响（镜像主机直接回 200）。
+
+    #[test]
+    fn test_legacy_agent_drops_bare_github_but_keeps_prefix_mirrors() {
+        // 事故现场的版本：0.59.4。
+        let out = cdn_base_urls_for_agent(Some("0.59.4"), &cdns());
+        assert!(
+            !out.iter().any(|u| u == OFFICIAL_DOWNLOAD_BASE),
+            "≤0.59.7 的 agent 不能拿到裸 github.com: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|u| u == "https://gh-proxy.com/https://github.com"),
+            "前缀镜像必须保留（它们不走跨主机跳转）: {out:?}"
+        );
+        assert_eq!(
+            out.len(),
+            DEFAULT_CDN_BASE_URLS.len() - 1,
+            "只去掉裸 origin 这一条: {out:?}"
+        );
+        // relay 镜像不在这份列表里，另行由 relay_url 表达——确认没有被牵连。
+        assert!(out.iter().all(|u| !u.contains("/agent/upgrade/blob/")));
+    }
+
+    #[test]
+    fn test_threshold_agent_version_keeps_bare_github() {
+        // 0.59.8 正是放行重定向的那个版本（含）。
+        let out = cdn_base_urls_for_agent(Some(BARE_GITHUB_MIN_AGENT_VERSION), &cdns());
+        assert!(out.iter().any(|u| u == OFFICIAL_DOWNLOAD_BASE), "{out:?}");
+        assert_eq!(out, cdns(), "阈值版本上不裁剪任何源");
+
+        // 更新的版本同样保留。
+        let newer = cdn_base_urls_for_agent(Some("0.59.13"), &cdns());
+        assert_eq!(newer, cdns());
+
+        // `v` 前缀与预发布也要按 semver 比较，而不是字符串比较。
+        let vprefixed = cdn_base_urls_for_agent(Some("v0.59.4"), &cdns());
+        assert!(!vprefixed.iter().any(|u| u == OFFICIAL_DOWNLOAD_BASE));
+        let prerelease = cdn_base_urls_for_agent(Some("0.59.8-beta.1"), &cdns());
+        assert!(
+            !prerelease.iter().any(|u| u == OFFICIAL_DOWNLOAD_BASE),
+            "0.59.8-beta.1 < 0.59.8，仍跟不了重定向"
+        );
+    }
+
+    #[test]
+    fn test_unknown_agent_version_keeps_every_cdn() {
+        // 版本未知/非法一律不裁剪：宁可让它在官方 origin 上失败一次（它会明确
+        // 报错并继续试其它源），也不要因为缺一个字段削掉一个可能可用的源。
+        for agent in [None, Some(""), Some("   "), Some("not-a-version")] {
+            assert_eq!(
+                cdn_base_urls_for_agent(agent, &cdns()),
+                cdns(),
+                "版本 {agent:?} 不该裁剪 CDN"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_bare_github_origin_matches_only_the_bare_origin() {
+        assert!(is_bare_github_origin("https://github.com"));
+        assert!(is_bare_github_origin("https://github.com/"));
+        assert!(!is_bare_github_origin(
+            "https://gh-proxy.com/https://github.com"
+        ));
+        assert!(!is_bare_github_origin(
+            "https://ghproxy.net/https://github.com"
+        ));
+        assert!(!is_bare_github_origin("https://github.com/zzttzzmyswy"));
+        assert!(!is_bare_github_origin("https://example.com"));
+        assert!(!is_bare_github_origin("not a url"));
+        // 主机名相似但不同的条目不能误判。
+        assert!(!is_bare_github_origin("https://github.com.evil.test"));
+    }
+
+    #[test]
+    fn test_build_task_trims_cdn_for_legacy_agent() {
+        // 端到端：任务构造路径必须用得上裁剪（而不是只有独立函数被调用）。
+        let m = sample_manifest("0.59.2");
+        let art = ArtifactRef::new(Variant::Cli, "aarch64", false).unwrap();
+        let t = build_task(
+            "u-old".into(),
+            "0.59.2",
+            &art,
+            Some(&m),
+            None,
+            &cdns(),
+            Some("0.59.4"),
+            false,
+        )
+        .unwrap();
+        assert!(!t.cdn_base_urls.iter().any(|u| u == OFFICIAL_DOWNLOAD_BASE));
+        // 序列化后的线载荷同样不含裸 origin（agent 读的是它）。
+        let wire = t.wire_payload();
+        let arr = wire["cdn_base_urls"].as_array().unwrap();
+        assert!(!arr.iter().any(|v| v == OFFICIAL_DOWNLOAD_BASE));
+    }
+
     #[test]
     fn test_build_task_official_only_has_cdn_and_no_relay_url() {
         let m = sample_manifest("0.59.2");
         let art = ArtifactRef::new(Variant::Cli, "aarch64", false).unwrap();
-        let t = build_task("u1".into(), "0.59.2", &art, Some(&m), None, &cdns(), false).unwrap();
+        let t =
+            build_task("u1".into(), "0.59.2", &art, Some(&m), None, &cdns(), None, false)
+                .unwrap();
         assert_eq!(t.source, ArtifactSource::Official);
         assert_eq!(t.target_version, "0.59.2");
         assert_eq!(t.filename, "shell-remote-aarch64");
@@ -1632,6 +1823,7 @@ mod tests {
             Some(&m),
             Some(&local),
             &cdns(),
+            None,
             false,
         )
         .unwrap();
@@ -1667,6 +1859,7 @@ mod tests {
             Some(&m),
             Some(&local),
             &cdns(),
+            None,
             false,
         )
         .unwrap_err();
@@ -1697,6 +1890,7 @@ mod tests {
             None,
             Some(&local),
             &cdns(),
+            None,
             false,
         )
         .unwrap_err();
@@ -1711,6 +1905,7 @@ mod tests {
             None,
             Some(&local),
             &cdns(),
+            None,
             true,
         )
         .unwrap();
@@ -1741,7 +1936,9 @@ mod tests {
     #[test]
     fn test_build_task_refuses_when_nothing_available() {
         let art = ArtifactRef::new(Variant::Ui, "armv7", false).unwrap();
-        let err = build_task("u5".into(), "0.59.2", &art, None, None, &cdns(), true).unwrap_err();
+        let err =
+            build_task("u5".into(), "0.59.2", &art, None, None, &cdns(), None, true)
+                .unwrap_err();
         assert_eq!(err, TaskRefusal::NoArtifact);
     }
 
@@ -1751,7 +1948,8 @@ mod tests {
         let m = sample_manifest("0.59.2");
         let art = ArtifactRef::new(Variant::Ui, "x86_64", false).unwrap();
         let err =
-            build_task("u6".into(), "0.59.2", &art, Some(&m), None, &cdns(), false).unwrap_err();
+            build_task("u6".into(), "0.59.2", &art, Some(&m), None, &cdns(), None, false)
+                .unwrap_err();
         assert_eq!(err, TaskRefusal::NoArtifact);
     }
 
@@ -1759,7 +1957,9 @@ mod tests {
     fn test_upgrade_task_serializes_expected_wire_fields() {
         let m = sample_manifest("0.59.2");
         let art = ArtifactRef::new(Variant::Cli, "aarch64", false).unwrap();
-        let t = build_task("u7".into(), "0.59.2", &art, Some(&m), None, &cdns(), false).unwrap();
+        let t =
+            build_task("u7".into(), "0.59.2", &art, Some(&m), None, &cdns(), None, false)
+                .unwrap();
         let v = serde_json::to_value(&t).unwrap();
         for k in [
             "upgrade_id",
@@ -1793,7 +1993,8 @@ mod tests {
             size: 7,
             sha256: Some("9".repeat(64)),
         };
-        let t = build_task("u8".into(), "0.59.2", &art, None, Some(&local), &[], true).unwrap();
+        let t = build_task("u8".into(), "0.59.2", &art, None, Some(&local), &[], None, true)
+            .unwrap();
         let p = t.wire_payload();
         assert_eq!(p["version"], t.target_version);
         assert_eq!(p["url"], "/agent/upgrade/blob/shell-remote-aarch64");
@@ -1817,7 +2018,9 @@ mod tests {
 
         // 只有 CDN、没有 relay 副本 → 不给 `url`，并标记老 agent 不兼容。
         let m = sample_manifest("0.59.2");
-        let t2 = build_task("u9".into(), "0.59.2", &art, Some(&m), None, &cdns(), false).unwrap();
+        let t2 =
+            build_task("u9".into(), "0.59.2", &art, Some(&m), None, &cdns(), None, false)
+                .unwrap();
         let p2 = t2.wire_payload();
         assert!(p2.get("url").is_none(), "没有 relay 副本就不该给 url");
         assert_eq!(p2["version"], t2.target_version, "version 仍然给");

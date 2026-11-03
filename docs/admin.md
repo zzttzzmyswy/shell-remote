@@ -129,9 +129,23 @@ Relay 可选启用一个 web 管理后台。默认禁用，需命令行显式开
 | `<admin>/api/recordings` | GET | 录像文件列表 |
 | `<admin>/api/recordings/content` | GET | 录像内容 |
 | `<admin>/api/recordings/delete` | DELETE | 删除录像 |
-| `<admin>/api/agent/upgrade` | POST | 触发 agent 升级（`{"session_id":…,"force":false}`） |
-| `<admin>/api/agent/upgrade/plan` | GET | 只做版本决策与制品定位，不下发指令 |
+| `<admin>/api/agent/upgrade` | POST | 触发单台 agent 升级（`{"session_id":…,"force":false}`） |
+| `<admin>/api/agent/upgrade/plan` | GET | 只做版本决策与制品定位，不下发指令；含 `blocked_reason` / `hint` |
+| `<admin>/api/agent/upgrade/fleet` | POST | 全量升级，**必须带 `{"confirm": true}`**，否则 400 `confirm_required` |
 | `<admin>/api/agent/upgrade/artifacts` | GET | 制品库现状 |
+
+### 升级相关的两个运维语义
+
+**旧 agent 的下载源会被裁剪。** relay 按设备上报的 `agent_version` 决定 `cdn_base_urls`：低于 v0.59.8 的 agent 跟不了 `github.com → release-assets.githubusercontent.com` 的 302，因此任务里去掉裸 `https://github.com`，前缀镜像全部保留；版本未知时不裁剪。plan 返回的 `cdn_base_urls` 已是裁剪后的实际值。
+
+**`target_not_writable` 表示"点多少次都不会成功"。** agent 二进制所在目录对运行 agent 的用户不可写（systemd `User=` 是普通用户 + `/usr/local/bin` 归 root 是典型形状），失败帧里的 `Permission denied (os error 13)` / `Read-only file system (os error 30)` 会被 relay 归类为 `last_failure_kind: "target_not_writable"`。当设备**没有** `upgrade:overlay-v1` 能力时：
+
+- `plan` 返回 `blocked_reason: "target_not_writable"` 与对应的 `hint`；
+- 全量入口跳过该设备，列进返回体的 `blocked` 数组（带 `hint`），不下发必然失败的任务。
+
+处理办法是把该设备的 base 二进制人工替换一次为 ≥ 0.59.13；之后 agent 声明 overlay 能力，升级不再需要目录写权限，阻断自动失效。详见 [upgrade.md](upgrade.md)。
+
+**全量入口是危险操作。** `POST /api/agent/upgrade/fleet` 会对所有在线设备下发升级，必须显式带 `{"confirm": true}`（缺省、`false`、字符串 `"true"`、数字 `1` 都返回 400）。只想看"谁能升、谁不能升"时用只读的 `GET /api/agent/upgrade/plan?session_id=…`。
 
 ## 带宽限制
 
