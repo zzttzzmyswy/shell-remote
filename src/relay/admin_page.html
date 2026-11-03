@@ -1671,6 +1671,10 @@
   async function onUpgradeAll() {
     // 全量入口：一次命令所有落后设备升级。确认框必须说清"会影响多少台"——
     // 这个按钮会重启一批设备，不能点完才发现范围不对。
+    //
+    // MYS-2575：后端现在**强制要求** body 带 `confirm: true`（这个接口一次
+    // 重启整片设备，2026-11-03 误触过一次全量升级）。上面这个确认框问过用户
+    // 之后才带，因此"点确定"与"服务端确认"是同一件事。
     const sessions = (lastOverview && lastOverview.sessions) || [];
     const eligible = sessions.filter(s => upgradeEligible(s).ok);
     if (!eligible.length) { failDialog(t('upg_all_none')); return; }
@@ -1680,7 +1684,7 @@
     });
     if (!ok) return;
     try {
-      const r = await api('/api/agent/upgrade/fleet', { method: 'POST', body: {} });
+      const r = await api('/api/agent/upgrade/fleet', { method: 'POST', body: { confirm: true } });
       if (!r.ok) throw new Error(r.error || 'failed');
       const c = r.counts || {};
       UI.alert(t('upg_all_done', {

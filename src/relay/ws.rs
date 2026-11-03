@@ -168,6 +168,57 @@ fn upgrade_stage_is_final(stage: &str) -> bool {
     matches!(stage, "registered" | "rolled_back" | "failed")
 }
 
+/// 失败归类：`target_not_writable` = 目标二进制所在目录对 agent 用户不可写。
+///
+/// 2026-11-03 全量升级事故（MYS-2569）的主因之一：systemd 以普通用户跑 agent，
+/// 而 `/usr/local/bin` 归 root，`rename` 直接 `Permission denied (os error 13)`。
+/// 这不是"这次网络不好、再点一次"能解决的失败——重试一万次还是同样的 EACCES，
+/// 必须人工替换一次 base 二进制。把它结构化下来，管理后台才能明确标出"别点了，
+/// 去人工换"而不是每次都让人重新读一遍错误串。
+///
+/// 判据是错误文本，因为 agent 上报的 `error` / `detail` 是 `std::io::Error`
+/// 的 Display（`Permission denied (os error 13)` / `Read-only file system
+/// (os error 30)`）。按 `os error <n>` 匹配的理由：`os error 13` 在中文/其它
+/// locale 的 Display 里措辞会变，但 `(os error 13)` 这段是 Rust 标准库自己拼的，
+/// 与该平台的 strerror 文案无关。
+pub const FAILURE_KIND_TARGET_NOT_WRITABLE: &str = "target_not_writable";
+/// 其它失败（含下载失败、hash 不符、助手未完成等）的兜底归类。
+pub const FAILURE_KIND_OTHER: &str = "other";
+
+/// 把一条失败上报归类成结构化的 `last_failure_kind`。
+///
+/// 只在 `stage` 是 `failed` / `rolled_back` 时调用——非终结阶段没有"失败原因"
+/// 可言，给它们打标记只会让界面显示一条不存在的错误。
+pub fn classify_upgrade_failure(stage: &str, payload: &serde_json::Value) -> Option<&'static str> {
+    if !upgrade_stage_is_final(stage) || stage == "registered" {
+        return None;
+    }
+    let mut text = String::new();
+    for key in ["error", "detail"] {
+        if let Some(s) = payload.get(key).and_then(|v| v.as_str()) {
+            text.push_str(s);
+            text.push('\n');
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    // 文本判据（任一命中即算"目标不可写"）：
+    // - `Permission denied` / `os error 13`（EACCES）：目录归 root 或权限位不对；
+    // - `Read-only file system` / `os error 30`（EROFS）：只读分区。
+    // 另外接受 `cannot move the current binary` / `cannot install the new
+    // binary` 与上述之一同时出现的组合——那两句是助手在 `rename` 失败时的固定
+    // 措辞，出现时原因几乎必然是写权限，但**单凭它们不够**，仍要求带 errno。
+    let not_writable = lower.contains("permission denied")
+        || lower.contains("os error 13")
+        || lower.contains("read-only file system")
+        || lower.contains("readonly file system")
+        || lower.contains("os error 30");
+    Some(if not_writable {
+        FAILURE_KIND_TARGET_NOT_WRITABLE
+    } else {
+        FAILURE_KIND_OTHER
+    })
+}
+
 /// 换机的"最后一公里"阶段：磁盘已经被动过（或正准备动），结论只能来自
 /// 接手的新进程/助手。
 ///
@@ -293,6 +344,25 @@ async fn absorb_upgrade_progress(
         .unwrap_or(0);
     if let Some(obj) = value.as_object_mut() {
         obj.insert("at_unix_s".to_string(), serde_json::json!(at));
+        // 失败归类（MYS-2575）：终态失败帧额外记一个结构化的原因码，让
+        // `/api/agent/upgrade/plan` 与 fleet 入口能判断"这台设备重试一万次也
+        // 没用，得人工换一次二进制"，而不是每次让运维重读一遍错误串。
+        // 与 `at_unix_s` 一起存放——升级状态本身就是 relay 手上唯一一份
+        // per-session 升级状态，不另起一套存储。
+        let stage = obj
+            .get("stage")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(kind) = classify_upgrade_failure(&stage, payload) {
+            obj.insert("last_failure_kind".to_string(), serde_json::json!(kind));
+            obj.insert("last_failure_at_unix_s".to_string(), serde_json::json!(at));
+        } else {
+            // 新一轮升级开始了：上一轮的失败归类不再代表现状，必须清掉，
+            // 否则一台设备会被永远钉在 `target_not_writable` 上。
+            obj.remove("last_failure_kind");
+            obj.remove("last_failure_at_unix_s");
+        }
     }
     upgrades.insert(session_id.to_string(), value);
 }
@@ -5651,6 +5721,111 @@ mod tests {
             "registered",
             "终点状态一旦写入就不能被同轮的迟到帧覆盖"
         );
+    }
+
+    // ── 失败归类（MYS-2575）──────────────────────────────────────────
+
+    /// 事故现场的错误串：`Permission denied (os error 13)` —— 目标目录归 root，
+    /// systemd 以普通用户跑 agent。必须归类为 `target_not_writable`。
+    #[test]
+    fn test_classify_target_not_writable_forms() {
+        for err in [
+            "cannot install the new binary: Permission denied (os error 13)",
+            "os error 13",
+            "Permission denied",
+            "Read-only file system (os error 30)",
+            "os error 30",
+        ] {
+            assert_eq!(
+                classify_upgrade_failure("failed", &json!({"error": err})),
+                Some(FAILURE_KIND_TARGET_NOT_WRITABLE),
+                "应归为 target_not_writable: {err}"
+            );
+        }
+        // 原因只写在 `detail` 里也要认。
+        assert_eq!(
+            classify_upgrade_failure(
+                "rolled_back",
+                &json!({"detail": "permission denied (os error 13)"})
+            ),
+            Some(FAILURE_KIND_TARGET_NOT_WRITABLE),
+            "大小写不敏感"
+        );
+    }
+
+    #[test]
+    fn test_classify_other_failures() {
+        for payload in [
+            json!({"error": "sha256 mismatch: expected aa, got bb"}),
+            json!({"error": "download failed: connection reset"}),
+            json!({"error": "the update helper did not finish"}),
+            json!({}), // 没有任何原因文本
+        ] {
+            assert_eq!(
+                classify_upgrade_failure("failed", &payload),
+                Some(FAILURE_KIND_OTHER),
+                "{payload}"
+            );
+        }
+    }
+
+    /// 非终态帧没有"失败原因"，不该被打上失败标记。
+    #[test]
+    fn test_classify_ignores_non_final_and_success_stages() {
+        let p = json!({"error": "Permission denied (os error 13)"});
+        assert_eq!(classify_upgrade_failure("downloading", &p), None);
+        assert_eq!(classify_upgrade_failure("swapping", &p), None);
+        assert_eq!(classify_upgrade_failure("started", &p), None);
+        // 成功回执即便带着奇怪的 error 字段也不是失败。
+        assert_eq!(classify_upgrade_failure("registered", &p), None);
+    }
+
+    /// 落库：失败帧带 `last_failure_kind` + 时间戳；新一轮升级开始必须清掉旧归类。
+    #[tokio::test]
+    async fn test_absorb_records_and_clears_last_failure_kind() {
+        let state = make_state("");
+        let sid = "upgfail1";
+        absorb_upgrade_progress(
+            &state,
+            sid,
+            &json!({
+                "stage": "failed", "upgrade_id": "u1", "version": "0.59.13",
+                "error": "cannot move the current binary to /usr/local/bin/…: \
+                          Permission denied (os error 13)"
+            }),
+        )
+        .await;
+        let v = state.agent_upgrades.read().await.get(sid).cloned().unwrap();
+        assert_eq!(v["last_failure_kind"], FAILURE_KIND_TARGET_NOT_WRITABLE);
+        assert!(
+            v["last_failure_at_unix_s"].as_u64().unwrap_or(0) > 0,
+            "必须记时间戳"
+        );
+
+        // 新一轮升级（新 upgrade_id）开始 → 上一轮的结论不再代表现状。
+        absorb_upgrade_progress(
+            &state,
+            sid,
+            &json!({"stage": "downloading", "upgrade_id": "u2", "percent": 5}),
+        )
+        .await;
+        let v = state.agent_upgrades.read().await.get(sid).cloned().unwrap();
+        assert_eq!(v["stage"], "downloading");
+        assert!(
+            v.get("last_failure_kind").is_none(),
+            "新任务开始时必须清掉上一轮的失败归类: {v}"
+        );
+        assert!(v.get("last_failure_at_unix_s").is_none());
+
+        // 成功回执同样不该留下失败标记。
+        absorb_upgrade_progress(
+            &state,
+            sid,
+            &json!({"stage": "registered", "upgrade_id": "u2"}),
+        )
+        .await;
+        let v = state.agent_upgrades.read().await.get(sid).cloned().unwrap();
+        assert!(v.get("last_failure_kind").is_none(), "{v}");
     }
 
     // ── 重连收敛：换机中途被打断必须给出可读结论（MYS-2425-D）─────────

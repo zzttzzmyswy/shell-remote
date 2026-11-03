@@ -814,6 +814,55 @@ pub fn supports_upgrade_v2(caps: &[String]) -> bool {
     caps.iter().any(|c| c == "upgrade:v2")
 }
 
+/// 能力字符串：agent 能走 overlay 无权限自升级（MYS-2574）。
+///
+/// 有它的 agent 不再需要改写 `target` 本身——它把新字节铺到一个自己有写权限的
+/// overlay 里再从那里启动，因此"目标目录不可写"对它是**伪问题**。relay 因此
+/// 只在设备**没有**这个能力时才把 `target_not_writable` 当阻断原因。
+///
+/// 目前只有 agent 侧（并行任务）会声明；未知能力字符串无害（按没有处理）。
+pub const CAP_UPGRADE_OVERLAY_V1: &str = "upgrade:overlay-v1";
+
+/// 设备是否具备 overlay 无权限自升级能力。
+pub fn supports_overlay_upgrade(caps: &[String]) -> bool {
+    caps.iter().any(|c| c == CAP_UPGRADE_OVERLAY_V1)
+}
+
+/// `target_not_writable` 的运维提示（给 plan 的 `hint`，也是 fleet 跳过原因）。
+pub const HINT_TARGET_NOT_WRITABLE: &str =
+    "该设备二进制所在目录对 agent 用户不可写；请人工替换一次 base 二进制为 ≥0.59.13，之后可无权限自升级";
+
+/// 读某台设备最近一次升级失败的结构化归类。
+///
+/// 存储就是 `state.agent_upgrades`（relay 手上唯一一份 per-session 升级状态），
+/// 不另起一套。返回 `None` 表示没有失败记录、或最近一轮已经从失败里走出来。
+async fn last_failure_kind(state: &Arc<SharedState>, sid: &str) -> Option<String> {
+    state
+        .agent_upgrades
+        .read()
+        .await
+        .get(sid)
+        .and_then(|v| v.get("last_failure_kind"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// 这台设备是否应当被 `target_not_writable` 阻断升级。
+///
+/// 两个条件同时成立才阻断：最近一次失败的目标不可写，且设备**没有**
+/// `upgrade:overlay-v1` 能力（有 overlay 的 agent 根本不受目录权限影响）。
+async fn blocked_by_target_not_writable(
+    state: &Arc<SharedState>,
+    sid: &str,
+    caps: &[String],
+) -> bool {
+    if supports_overlay_upgrade(caps) {
+        return false;
+    }
+    last_failure_kind(state, sid).await.as_deref()
+        == Some(crate::relay::ws::FAILURE_KIND_TARGET_NOT_WRITABLE)
+}
+
 /// List the staged agent upgrade artifacts. Purely file-metadata based (no
 /// hashing) so it is cheap enough for the admin page's periodic refresh.
 pub async fn upgrade_artifacts_handler(
@@ -1103,6 +1152,7 @@ async fn trigger_upgrade(
         manifest.as_ref(),
         local.as_ref(),
         &state.upgrade_cdn_base_urls,
+        info.agent_version.as_deref(),
         state.allow_custom_upgrade,
     ) {
         Ok(t) => t,
@@ -1214,6 +1264,10 @@ async fn trigger_upgrade(
 /// 逐台点、逐台看结果，容易漏。本入口把同一套决策规则（版本 → 形态 → 制品 →
 /// 能力校验）复用到整个会话集合上，并为每台设备返回独立结果：
 ///
+/// - **必须显式 `confirm: true`**（MYS-2575）。这个接口一次重启整片设备，误触
+///   的代价在 2026-11-03 已经付过一次（MYS-2569：一条 curl 打错路径，14 台设备
+///   全量升级、12 台回滚）。缺 `confirm` 直接 400，并在错误里指向只读的
+///   `/api/agent/upgrade/plan`。空 body `{}` 不再被当成"确认"。
 /// - 每台设备**独立决策**：已达目标版本的跳过（`up_to_date`），形态/制品/
 ///   能力不满足的各自失败，一台失败不影响其他设备。
 /// - 默认**只升级确实需要升级的**（`semver(relay) > semver(agent)`），与单台
@@ -1221,6 +1275,9 @@ async fn trigger_upgrade(
 /// - 幂等：同一 `session_id` 已有在途升级（`agent_upgrades` 处于非终态）时跳过，
 ///   避免一次误触把整片设备重复重启。
 /// - `session_ids` 可选：给了就只处理这些会话，便于灰度；不给就是全部在线设备。
+/// - **跳过 `target_not_writable` 且无 overlay 能力的设备**：它们的目录对 agent
+///   用户不可写，下发只会白失败一次。这些设备进 `skipped` 并带 `hint`，与
+///   真正"升不了级"的设备区分开。
 ///
 /// 返回按设备分组的汇总，调用方据此判断哪些成功、哪些为什么没升。
 pub async fn agent_upgrade_fleet_handler(
@@ -1230,6 +1287,22 @@ pub async fn agent_upgrade_fleet_handler(
 ) -> Response {
     if !check_admin(&state, &headers).await {
         return unauthorized();
+    }
+    // 确认闸门放在鉴权之后、任何副作用之前。`confirm` 必须是布尔 `true`：
+    // 字符串 "true" / 1 / 缺省都不算，避免"顺手加个字段"就绕过。
+    if body["confirm"].as_bool() != Some(true) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "confirm_required",
+                "error": "this endpoint pushes an upgrade to every online device; \
+                          resend with {\"confirm\": true}. Use \
+                          GET /api/agent/upgrade/plan?session_id=… for a read-only decision \
+                          per device, or POST /api/agent/upgrade for a single device.",
+            })),
+        )
+            .into_response();
     }
     let force = body["force"].as_bool().unwrap_or(false);
     // 可选的显式名单（灰度用）。空/缺省 = 全部在线设备。
@@ -1253,6 +1326,9 @@ pub async fn agent_upgrade_fleet_handler(
     let mut triggered: Vec<Value> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
+    // 目标目录不可写、又没有 overlay 能力的设备（MYS-2575）。单独一列，因为
+    // 它们不是"这次不满足条件"，而是"点多少次都不会成功"——运营上要人工处理。
+    let mut blocked: Vec<Value> = Vec::new();
 
     for sid in candidates {
         // 幂等闸门必须先于触发：`trigger_upgrade` 里没有"已在升级中"的判断，
@@ -1268,6 +1344,17 @@ pub async fn agent_upgrade_fleet_handler(
                 continue;
             }
         }
+        // 不可写目录：查一次设备能力，命中就跳过并解释，绝不下发。
+        let caps = state.sessions.get_capabilities(&sid).await;
+        if blocked_by_target_not_writable(&state, &sid, &caps).await {
+            blocked.push(json!({
+                "session_id": sid,
+                "reason": "target_not_writable",
+                "last_failure_kind": crate::relay::ws::FAILURE_KIND_TARGET_NOT_WRITABLE,
+                "hint": HINT_TARGET_NOT_WRITABLE,
+            }));
+            continue;
+        }
         match trigger_upgrade(&state, &sid, force).await {
             Ok(v) => triggered.push(json!({
                 "session_id": sid,
@@ -1281,8 +1368,14 @@ pub async fn agent_upgrade_fleet_handler(
                 let status = resp.status();
                 let code = status.as_u16();
                 let body = response_json_body(*resp).await;
-                let error = body["error"].as_str().unwrap_or("unknown error").to_string();
-                let detail = body.get("code").and_then(|c| c.as_str()).map(str::to_string);
+                let error = body["error"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                let detail = body
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string);
                 if code == StatusCode::CONFLICT.as_u16() {
                     skipped.push(json!({
                         "session_id": sid,
@@ -1310,10 +1403,15 @@ pub async fn agent_upgrade_fleet_handler(
             "triggered": triggered.len(),
             "skipped": skipped.len(),
             "failed": failed.len(),
+            // 被 `target_not_writable` 挡下的设备数（已含在 `skipped` 里，
+            // 这里单独给一个可对账的数）。
+            "blocked": blocked.len(),
         },
         "triggered": triggered,
         "skipped": skipped,
         "failed": failed,
+        // 被跳过的设备与原因（MYS-2575）：运维据此挑出需要人工替换二进制的机器。
+        "blocked": blocked,
     }))
     .into_response()
 }
@@ -1358,17 +1456,26 @@ pub async fn agent_upgrade_plan_handler(
     };
     let variant_res = variant_for_device(&info.capabilities, state.upgrade_variant_override);
     let variant = variant_res.variant();
-    let target = variant.and_then(|v| {
-        ArtifactRef::new(v, &arch, platform.as_deref() == Some("windows"))
-    });
+    let target =
+        variant.and_then(|v| ArtifactRef::new(v, &arch, platform.as_deref() == Some("windows")));
     let local_present = target
         .as_ref()
-        .and_then(|t| state.artifact_store.as_ref()?.locate(relay_version, &t.filename()))
+        .and_then(|t| {
+            state
+                .artifact_store
+                .as_ref()?
+                .locate(relay_version, &t.filename())
+        })
         .is_some();
     // 没有本地镜像 → 任务会是 CDN-only；旧 agent 消费不了（它的
     // `from_payload` 需要 `url`）。这里提前把结论给 UI，别让管理员点了才 409。
     let upgrade_v2 = supports_upgrade_v2(&info.capabilities);
-    let blocked_reason = if variant.is_none() {
+    // 目标目录不可写（MYS-2575）：上一轮已经用 `Permission denied (os error 13)`
+    // 失败过，而这台设备又没有 overlay 能力 —— 再点一次只会得到同样的失败。
+    let not_writable = blocked_by_target_not_writable(&state, &sid, &info.capabilities).await;
+    let blocked_reason = if not_writable {
+        Some("target_not_writable")
+    } else if variant.is_none() {
         Some("variant_unknown")
     } else if !local_present && !upgrade_v2 {
         Some("legacy_agent_needs_relay_mirror")
@@ -1389,16 +1496,49 @@ pub async fn agent_upgrade_plan_handler(
         "variant_source": variant_res.source(),
         "variant_unknown": variant.is_none(),
         "supports_upgrade_v2": upgrade_v2,
+        // overlay 能力：有它的 agent 不受目标目录权限限制，"目标不可写"对它
+        // 不是阻断项。UI 与 fleet 都用同一个判据。
+        "supports_overlay_upgrade": supports_overlay_upgrade(&info.capabilities),
         // `None` = 可下发；否则是 admin 会返回的错误码，UI 据此禁用并解释。
         "blocked_reason": blocked_reason,
+        // 与 `blocked_reason` 配套的可执行提示；不阻断时为 null。
+        "hint": blocked_reason.map(blocked_hint),
+        "last_failure_kind": last_failure_kind(&state, &sid).await,
         "arch": arch,
         "target_filename": target.as_ref().map(|t| t.filename()),
         "local_artifact_present": local_present,
         "allow_custom_upgrade": state.allow_custom_upgrade,
-        "cdn_base_urls": state.upgrade_cdn_base_urls,
+        // 实际会下发给这台设备的 CDN 列表（已按 agent 版本裁剪），不是 relay
+        // 配置原样——两者对 ≤ v0.59.7 的设备并不相同。
+        "cdn_base_urls": crate::relay::artifact_store::cdn_base_urls_for_agent(
+            info.agent_version.as_deref(),
+            &state.upgrade_cdn_base_urls,
+        ),
         "manifest": state.manifest_status.read().await.get(relay_version),
     }))
     .into_response()
+}
+
+/// `blocked_reason` → 给运维看的可执行建议。
+///
+/// 只有 `target_not_writable` 有专门文案（事故复盘里最贵的一条：重试无用，
+/// 必须人工换一次二进制）。其余原因的说明放在各自的错误响应里，这里给 `None`
+/// 之外的稳定短文案，避免 UI 出现"有原因没解释"的空格子。
+fn blocked_hint(reason: &str) -> String {
+    match reason {
+        "target_not_writable" => HINT_TARGET_NOT_WRITABLE.to_string(),
+        "variant_unknown" => {
+            "该设备未声明 `variant:cli`/`variant:ui`，relay 无法判断该换哪份制品；\
+             请配 --upgrade-variant 或先人工升级一次"
+                .to_string()
+        }
+        "legacy_agent_needs_relay_mirror" => {
+            "该 agent 不认 CDN 优先协议，且 relay 没有对应制品的本地镜像；\
+             请把制品放进 relay 的 --download-dir 后重试"
+                .to_string()
+        }
+        other => format!("升级被阻断：{other}"),
+    }
 }
 
 #[cfg(test)]
@@ -2469,7 +2609,9 @@ mod tests {
         .await;
         let mut rx_current = attach_agent_channel(&state, &up_to_date).await;
 
-        let r = agent_upgrade_fleet_handler(State(state.clone()), h, Json(json!({}))).await;
+        let r =
+            agent_upgrade_fleet_handler(State(state.clone()), h, Json(json!({"confirm": true})))
+                .await;
         assert_eq!(r.status(), 200);
         let body = body_json(r).await;
         assert_eq!(body["counts"]["triggered"], 3, "{body}");
@@ -2522,7 +2664,12 @@ mod tests {
             .await
             .insert(sid.clone(), json!({"stage": "downloading"}));
 
-        let r = agent_upgrade_fleet_handler(State(state.clone()), h.clone(), Json(json!({}))).await;
+        let r = agent_upgrade_fleet_handler(
+            State(state.clone()),
+            h.clone(),
+            Json(json!({"confirm": true})),
+        )
+        .await;
         let body = body_json(r).await;
         assert_eq!(body["counts"]["triggered"], 0, "{body}");
         assert_eq!(body["counts"]["skipped"], 1, "{body}");
@@ -2536,7 +2683,9 @@ mod tests {
             .write()
             .await
             .insert(sid.clone(), json!({"stage": "done"}));
-        let r = agent_upgrade_fleet_handler(State(state.clone()), h, Json(json!({}))).await;
+        let r =
+            agent_upgrade_fleet_handler(State(state.clone()), h, Json(json!({"confirm": true})))
+                .await;
         let body = body_json(r).await;
         assert_eq!(body["counts"]["triggered"], 1, "终态设备必须可以再次升级: {body}");
         assert!(rx.try_recv().is_ok(), "终态设备应收到新指令");
@@ -2559,7 +2708,7 @@ mod tests {
         let r = agent_upgrade_fleet_handler(
             State(state.clone()),
             h,
-            Json(json!({"session_ids": [a.clone()]})),
+            Json(json!({"confirm": true, "session_ids": [a.clone()]})),
         )
         .await;
         let body = body_json(r).await;
@@ -2576,7 +2725,12 @@ mod tests {
         let dir = upgrade_dir_with_artifacts();
         let state = state_with_manifest_mock(&dir, b"new-binary-x86").await;
         register_device(&state, "secdev", "x86_64", "linux", NEW_AGENT_CAPS, Some("0.59.1")).await;
-        let r = agent_upgrade_fleet_handler(State(state), HeaderMap::new(), Json(json!({}))).await;
+        let r = agent_upgrade_fleet_handler(
+            State(state),
+            HeaderMap::new(),
+            Json(json!({"confirm": true})),
+        )
+        .await;
         assert_eq!(r.status(), 401);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3034,6 +3188,302 @@ mod tests {
         assert_eq!(v["target_filename"], "shell-remote-x86_64");
         assert_eq!(v["local_artifact_present"], true);
         assert!(rx.try_recv().is_err(), "plan 只读，不得下发任何指令");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── target_not_writable 阻断（MYS-2575）────────────────────────
+
+    /// 把一台设备标成"上一轮因目标目录不可写而失败"。
+    async fn mark_target_not_writable(state: &Arc<SharedState>, sid: &str) {
+        state.agent_upgrades.write().await.insert(
+            sid.to_string(),
+            json!({
+                "stage": "failed",
+                "upgrade_id": "u-fail",
+                "target_version": env!("CARGO_PKG_VERSION"),
+                "error": "cannot move the current binary to /usr/local/bin/shell-remote: \
+                          Permission denied (os error 13)",
+                "last_failure_kind": crate::relay::ws::FAILURE_KIND_TARGET_NOT_WRITABLE,
+                "last_failure_at_unix_s": 1_800_000_000u64,
+                "at_unix_s": 1_800_000_000u64,
+            }),
+        );
+    }
+
+    /// plan：不可写且无 overlay 能力 → `blocked_reason` + `hint`；有
+    /// `upgrade:overlay-v1` 则不阻断。同一条判据必须两头一致。
+    #[tokio::test]
+    async fn test_plan_blocks_target_not_writable_unless_overlay_capable() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_admin_artifacts(&dir);
+        let h = login(&state).await;
+
+        // A：老设备（无 overlay）上一轮被 EACCES 挡住 → 阻断。
+        let sid = register_device(
+            &state,
+            "nowrite1",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        mark_target_not_writable(&state, &sid).await;
+
+        let q = axum::extract::Query(vec![("session_id".to_string(), sid.clone())]);
+        let r = agent_upgrade_plan_handler(State(state.clone()), h.clone(), q).await;
+        let v = body_json(r).await;
+        assert_eq!(v["blocked_reason"], "target_not_writable", "{v}");
+        assert_eq!(v["hint"], HINT_TARGET_NOT_WRITABLE, "{v}");
+        assert_eq!(v["supports_overlay_upgrade"], false, "{v}");
+        assert_eq!(
+            v["last_failure_kind"],
+            crate::relay::ws::FAILURE_KIND_TARGET_NOT_WRITABLE,
+            "{v}"
+        );
+
+        // B：同样失败过，但声明了 overlay 能力 → 不阻断（overlay 不碰目标目录）。
+        let sid2 = register_device(
+            &state,
+            "overlay1",
+            "x86_64",
+            "linux",
+            &[
+                "codec:h264",
+                "variant:cli",
+                "upgrade:v2",
+                CAP_UPGRADE_OVERLAY_V1,
+            ],
+            Some("0.59.1"),
+        )
+        .await;
+        mark_target_not_writable(&state, &sid2).await;
+
+        let q = axum::extract::Query(vec![("session_id".to_string(), sid2.clone())]);
+        let r = agent_upgrade_plan_handler(State(state.clone()), h.clone(), q).await;
+        let v = body_json(r).await;
+        assert_eq!(
+            v["blocked_reason"],
+            Value::Null,
+            "有 upgrade:overlay-v1 的设备不该被目录权限阻断: {v}"
+        );
+        assert_eq!(v["hint"], Value::Null, "{v}");
+        assert_eq!(v["supports_overlay_upgrade"], true, "{v}");
+        assert_eq!(
+            v["last_failure_kind"],
+            crate::relay::ws::FAILURE_KIND_TARGET_NOT_WRITABLE,
+            "归类本身仍要如实展示，只是不阻断"
+        );
+
+        // C：失败归类是 `other` 的设备不阻断——网络/校验失败重试有意义。
+        let sid3 = register_device(
+            &state,
+            "otherfail",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        state.agent_upgrades.write().await.insert(
+            sid3.clone(),
+            json!({"stage": "failed", "last_failure_kind": "other"}),
+        );
+        let q = axum::extract::Query(vec![("session_id".to_string(), sid3.clone())]);
+        let r = agent_upgrade_plan_handler(State(state.clone()), h, q).await;
+        let v = body_json(r).await;
+        assert_eq!(v["blocked_reason"], Value::Null, "{v}");
+        assert_eq!(v["last_failure_kind"], "other", "{v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// plan 的 `cdn_base_urls` 必须是**这台设备实际会收到的**（已按版本裁剪），
+    /// 而不是 relay 配置原样——否则页面会显示一个旧 agent 根本用不了的源。
+    #[tokio::test]
+    async fn test_plan_reports_trimmed_cdn_for_legacy_agent() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_admin_artifacts(&dir);
+        let h = login(&state).await;
+
+        let old = register_device(
+            &state,
+            "oldcdn",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.4"),
+        )
+        .await;
+        let q = axum::extract::Query(vec![("session_id".to_string(), old.clone())]);
+        let r = agent_upgrade_plan_handler(State(state.clone()), h.clone(), q).await;
+        let v = body_json(r).await;
+        let urls: Vec<&str> = v["cdn_base_urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert!(
+            !urls.contains(&"https://github.com"),
+            "0.59.4 跟不了官方 origin 的 302: {urls:?}"
+        );
+        assert!(
+            urls.iter().any(|u| u.starts_with("https://gh-proxy.com/")),
+            "前缀镜像必须保留: {urls:?}"
+        );
+
+        // 新 agent 拿到完整列表。
+        let new = register_device(
+            &state,
+            "newcdn",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.8"),
+        )
+        .await;
+        let q = axum::extract::Query(vec![("session_id".to_string(), new)]);
+        let r = agent_upgrade_plan_handler(State(state.clone()), h, q).await;
+        let v = body_json(r).await;
+        let urls: Vec<&str> = v["cdn_base_urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert!(urls.contains(&"https://github.com"), "{urls:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fleet：不带 `confirm` 一律 400，且**一台设备都不许被碰**。
+    #[tokio::test]
+    async fn test_upgrade_fleet_requires_confirm() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_manifest_mock(&dir, b"new-binary-x86").await;
+        let h = login(&state).await;
+        let sid = register_device(
+            &state,
+            "confirmme",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx = attach_agent_channel(&state, &sid).await;
+
+        // 空 body（误触的典型形状）、显式 false、字符串 "true"、"1" 都不算确认。
+        for body in [
+            json!({}),
+            json!({"confirm": false}),
+            json!({"confirm": "true"}),
+            json!({"confirm": 1}),
+        ] {
+            let r =
+                agent_upgrade_fleet_handler(State(state.clone()), h.clone(), Json(body.clone()))
+                    .await;
+            assert_eq!(r.status(), 400, "缺 confirm 必须 400: {body}");
+            let v = body_json(r).await;
+            assert_eq!(v["code"], "confirm_required", "{v}");
+            let err = v["error"].as_str().unwrap();
+            assert!(err.contains("confirm"), "要说清怎么确认: {err}");
+            assert!(
+                err.contains("/api/agent/upgrade/plan"),
+                "要指向只读入口: {err}"
+            );
+            assert!(rx.try_recv().is_err(), "未确认时不得下发任何指令: {body}");
+        }
+
+        // 带了确认才真的执行。
+        let r =
+            agent_upgrade_fleet_handler(State(state.clone()), h, Json(json!({"confirm": true})))
+                .await;
+        assert_eq!(r.status(), 200);
+        let v = body_json(r).await;
+        assert_eq!(v["counts"]["triggered"], 1, "{v}");
+        assert!(rx.try_recv().is_ok(), "确认后应正常下发");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fleet：跳过 `target_not_writable` 的设备并单独列出；有 overlay 能力的
+    /// 同一条件下照常升级。
+    #[tokio::test]
+    async fn test_upgrade_fleet_skips_target_not_writable_devices() {
+        let dir = upgrade_dir_with_artifacts();
+        let state = state_with_manifest_mock(&dir, b"new-binary-x86").await;
+        let h = login(&state).await;
+
+        // 1 台正常、1 台不可写且无 overlay、1 台不可写但有 overlay。
+        let healthy = register_device(
+            &state,
+            "fleetok",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        let mut rx_healthy = attach_agent_channel(&state, &healthy).await;
+
+        let blocked = register_device(
+            &state,
+            "fleetnowrite",
+            "x86_64",
+            "linux",
+            NEW_AGENT_CAPS,
+            Some("0.59.1"),
+        )
+        .await;
+        mark_target_not_writable(&state, &blocked).await;
+        let mut rx_blocked = attach_agent_channel(&state, &blocked).await;
+
+        let overlay = register_device(
+            &state,
+            "fleetoverlay",
+            "x86_64",
+            "linux",
+            &[
+                "codec:h264",
+                "variant:cli",
+                "upgrade:v2",
+                CAP_UPGRADE_OVERLAY_V1,
+            ],
+            Some("0.59.1"),
+        )
+        .await;
+        mark_target_not_writable(&state, &overlay).await;
+        let mut rx_overlay = attach_agent_channel(&state, &overlay).await;
+
+        let r =
+            agent_upgrade_fleet_handler(State(state.clone()), h, Json(json!({"confirm": true})))
+                .await;
+        let v = body_json(r).await;
+
+        assert_eq!(v["counts"]["triggered"], 2, "{v}");
+        assert_eq!(v["counts"]["blocked"], 1, "{v}");
+        assert_eq!(v["counts"]["failed"], 0, "{v}");
+
+        // 被跳过的设备必须单列并带原因/提示，而不是静默少一台。
+        let list = v["blocked"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "{v}");
+        assert_eq!(list[0]["session_id"], blocked, "{v}");
+        assert_eq!(list[0]["reason"], "target_not_writable", "{v}");
+        assert_eq!(list[0]["hint"], HINT_TARGET_NOT_WRITABLE, "{v}");
+
+        // 真的没下发；另外两台照常收到。
+        assert!(
+            rx_blocked.try_recv().is_err(),
+            "不可写的设备不得收到升级指令"
+        );
+        assert!(rx_healthy.try_recv().is_ok(), "正常设备必须被触发");
+        assert!(
+            rx_overlay.try_recv().is_ok(),
+            "有 overlay 能力的设备不受目录权限影响，必须被触发"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
