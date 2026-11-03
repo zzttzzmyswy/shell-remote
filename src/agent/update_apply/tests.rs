@@ -128,6 +128,7 @@ fn sample_ctx(dir: &TmpDir, upgrade_id: &str) -> RestartContext {
         service_cgroup: None,
         service_restart_policy: None,
         managed_plan: None,
+        overlay: false,
     }
 }
 
@@ -147,6 +148,35 @@ fn test_handoff_roundtrip_preserves_identity_and_argv() {
     assert_eq!(back.target_path, ctx.target_path);
     assert_eq!(back.new_binary, ctx.new_binary);
     assert_eq!(back.new_sha256, ctx.new_sha256);
+    assert_eq!(back.overlay, ctx.overlay);
+}
+
+/// overlay 标记必须能从交接文件里读回来（MYS-2574）。
+///
+/// 它是"助手不要搬文件"的唯一依据：读丢了，助手会去改写一个不可写目录并失败，
+/// 整条 overlay 路径就断在最后一步。
+#[test]
+fn test_handoff_roundtrip_preserves_the_overlay_flag() {
+    let dir = TmpDir::new("roundtrip-overlay");
+    let mut ctx = sample_ctx(&dir, "up-ovl");
+    ctx.overlay = true;
+    let path = ctx.write_handoff_into(dir.path()).unwrap();
+    let back = RestartContext::read_handoff(&path).unwrap();
+    assert!(back.overlay, "overlay 标记必须落盘并读回");
+    // 目标仍然是 base（重启要拉起它），新文件名是 overlay 里那一份。
+    assert_eq!(back.target_path, ctx.target_path);
+    assert_eq!(back.new_binary, ctx.new_binary);
+
+    // 老交接文件没有这个字段：缺省即 false（既有行为），不能读失败。
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v.as_object_mut().unwrap().remove("overlay");
+    let legacy = dir.join(".handoff-legacy.json");
+    std::fs::write(&legacy, serde_json::to_vec(&v).unwrap()).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let back = RestartContext::read_handoff(&legacy).expect("缺 overlay 字段必须能读");
+    assert!(!back.overlay, "老文件的缺省必须是非 overlay");
 }
 
 #[test]
@@ -331,6 +361,7 @@ fn test_restart_context_new_strips_restore_args() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(rebuilt.argv, vec![OsString::from("agent")]);
 }
@@ -637,6 +668,105 @@ fn test_helper_changes_nothing_while_the_old_process_still_runs() {
         "旧进程未退出时不得改动目标二进制"
     );
     assert!(ctx.new_binary.exists(), "新文件也不该被删（可断点重试）");
+}
+
+/// overlay 换机的助手**不碰目标目录**（MYS-2574）。
+///
+/// 这条路径存在的全部理由就是"目标目录不可写"。助手如果真的去 `rename` 目标
+/// 二进制，整条链路会在最后一步失败——所以这里明确断言：进入 overlay 分支时，
+/// 即使目标目录不可写、即使旧进程一直不退出，助手也是**先 ready 再等**，
+/// 而不是先动磁盘。
+#[cfg(unix)]
+#[test]
+fn test_overlay_helper_never_touches_the_read_only_target_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TmpDir::new("ovl-helper");
+    // 目标目录做成 0555（root 所有 /usr/local/bin 的等价物）。
+    let bin_dir = dir.join("ro-bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    let target = bin_dir.join("shell-remote");
+    std::fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let target_bytes = std::fs::read(&target).unwrap();
+    std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // overlay 里"已就位"的新版本（助手只校验它，不搬动它）。
+    let overlay_bin = dir.join("overlay-version");
+    let payload = b"#!/bin/sh\n# overlay version\nexit 0\n";
+    std::fs::write(&overlay_bin, payload).unwrap();
+    std::fs::set_permissions(&overlay_bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let old = live_old_process();
+    let mut ctx = sample_ctx(&dir, "up-ovl-helper");
+    ctx.overlay = true;
+    ctx.target_path = target.clone();
+    ctx.new_binary = overlay_bin.clone();
+    ctx.new_sha256 = sha256_of(payload);
+    ctx.old_pid = old.id();
+    ctx.old_start = None;
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+
+    // 旧进程一直不退 ⇒ 助手超时放弃。关键是它**没有**试图写目标目录。
+    let outcome = helper_main_with_old_timeout(&handoff, Duration::from_millis(400));
+    let mut old = old;
+    let _ = old.kill();
+    let _ = old.wait();
+
+    match outcome {
+        HelperOutcome::Aborted { reason } => {
+            assert!(reason.contains("still running"), "{reason}");
+        }
+        other => panic!("旧进程还在时必须放弃，实际: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        target_bytes,
+        "overlay 路径下助手不得改动 base 二进制"
+    );
+    assert!(overlay_bin.exists(), "overlay 里那份也不该被搬走");
+    // 目标目录里除了原来那个文件，什么都不能多出来（没有备份、没有临时文件）。
+    let entries: Vec<String> = std::fs::read_dir(&bin_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(entries, vec!["shell-remote".to_string()], "目标目录不得被写入: {entries:?}");
+
+    // 日志必须写明走的是 overlay 模式（运维排查的第一条线索）。
+    let log = std::fs::read_to_string(dir.join("update-apply.log")).unwrap_or_default();
+    assert!(log.contains("overlay mode"), "助手日志必须写明 overlay 模式: {log}");
+    // 收尾：恢复目录权限，让 TmpDir::drop 能删掉。
+    std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// overlay 换机时助手要校验的是 **overlay 里那份**字节，不是目标目录里的旧文件。
+#[cfg(unix)]
+#[test]
+fn test_overlay_helper_refuses_a_tampered_overlay_artifact() {
+    let dir = TmpDir::new("ovl-helper-bad");
+    let mut ctx = sample_ctx(&dir, "up-ovl-bad");
+    ctx.overlay = true;
+    // 声明一个与磁盘内容不符的 digest：等价于"下载后被改过"。
+    ctx.new_sha256 = "0".repeat(64);
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    // `announce_ready` 关掉：这条用例断言的是**判定结果**，不是握手时序；
+    // 开着它会让 `fail_to_stdout` 往 stdout 写一行并触发测试 harness 的
+    // "unexpected output" 噪声。
+    let outcome = helper_main_with(
+        &handoff,
+        false,
+        HelperTimeouts {
+            old_exit: Duration::from_millis(400),
+            register: Duration::from_millis(100),
+        },
+    );
+    match outcome {
+        HelperOutcome::Aborted { reason } => {
+            assert!(reason.contains("no longer matches its digest"), "{reason}")
+        }
+        other => panic!("digest 不符必须放弃，实际: {other:?}"),
+    }
 }
 
 #[cfg(unix)]
@@ -1461,6 +1591,7 @@ esac
             service_cgroup: None,
             service_restart_policy: None,
             managed_plan: None,
+            overlay: false,
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
 
@@ -2012,6 +2143,7 @@ mod real_old_binary {
             service_cgroup: None,
             service_restart_policy: None,
             managed_plan: None,
+            overlay: false,
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
 

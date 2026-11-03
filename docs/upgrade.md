@@ -342,9 +342,154 @@ target 即可。
 | 两个 agent | `pgrep -af 'shell-remote agent'`；`systemctl show -p NRestarts <unit>` | 不该再出现；若出现，检查是否有 systemd 之外的启动方式（cron/手工/nohup） |
 
 
+## 目录不可写时的 overlay 升级
+
+### 为什么需要它
+
+最常见的生产形态是「root 所有的 `/usr/local/bin` + `User=<普通用户>` 的
+systemd unit」：
+
+```text
+[Service] User=sr-agent  ExecStart=/usr/local/bin/shell-remote agent …  Restart=always
+drwxr-xr-x root root /usr/local/bin
+-rwxr-xr-x root root /usr/local/bin/shell-remote
+```
+
+前面三节的所有换机方式（`Direct` / `Coordinated` / `SystemdRestart`）都要
+**改写目标二进制所在目录**，在这种部署下必然失败（`Permission denied (os error
+13)`）。overlay 升级换一个思路：**base 二进制一个字节都不动**，新版本装进用户
+可写目录，每次启动由 base 做完安全检查后把执行权交给它。
+
+只在**目标目录确实不可写**时启用（判据：能不能在该目录里建出一个临时文件）。
+可写时一切照旧，行为与 v0.59.12 逐字节一致。Windows 不适用：那里的换机由
+SCM/ACL 语义决定，本机制只在 `cfg(unix)` 下编译。
+
+### 目录布局
+
+```text
+${XDG_DATA_HOME:-$HOME/.local/share}/shell-remote/overlay/     0700
+  current.json                                                 0600  指针
+  bin/shell-remote-0.59.13-1a2b3c4d                            0700  新版本二进制
+  bin/shell-remote-0.59.12-9f8e7d6c                            0700  上一代（人工回退用）
+  .shell-remote-upgrade-<sha 前 16 位>.part                          断点续传残片
+```
+
+- 版本文件名里的 `sha256 前 8 位` 让"同一版重装"能幂等复用，"另一版"绝不会
+  覆盖掉当前版本。
+- **只保留当前版本和上一版本**，更早的安装时顺手删掉。留两代是因为新版本刚
+  装上还没验证时，上一代是唯一能手工回退的东西。
+- `.part` 也放在这里——目标目录不可写，别处放不下。下载器的断点续传与换源
+  逻辑一行没改，只是换了目录。
+
+### 指针 `current.json`
+
+```json
+{
+  "schema": 1,
+  "version": "0.59.13",
+  "sha256": "1a2b3c4d…",
+  "path": "/home/sr-agent/.local/share/shell-remote/overlay/bin/shell-remote-0.59.13-1a2b3c4d",
+  "base_exe": "/usr/local/bin/shell-remote",
+  "installed_at": 1793673852,
+  "healthy": false,
+  "attempts": 0,
+  "rejected": false,
+  "upgrade_id": "4f2c…",
+  "rejected_reported": false,
+  "previous": []
+}
+```
+
+写临时文件后 `rename`，读端永远看到完整内容。`rejected` / `rejected_reported`
+/ `upgrade_id` / `previous` 是为自动回滚与如实上报追加的可选字段：老文件没有
+它们也能读，缺省即 `false` / `null`。
+
+### 启动交接
+
+只对 `agent` 子命令生效，时机在注册之前、任何连接建立之前。下面**全部**满足
+才会 `exec` 到 overlay 二进制（argv 原样传递，env 原样继承，另加
+`SR_OVERLAY_FROM=<base 绝对路径>`）：
+
+| 检查 | 要求 |
+|------|------|
+| 防循环 | 当前进程没有 `SR_OVERLAY_FROM`，且 `current_exe` 不是指针里的 `path` |
+| 版本 | 指针里的版本**严格高于**自身版本（semver） |
+| 安全 | overlay 目录、`bin` 目录、二进制、`current.json` 的属主都是 euid，且**都不可被 group/other 写**（符号链接一律判失败） |
+| 完整性 | 二进制的 sha256 与 `current.json` 一致 |
+| 健康 | `healthy == true`，或 `attempts < 3` |
+
+任何一项不满足就照常用 base 运行，并记一条 warn 写明原因（`journalctl -u <unit>`
+可见）。版本**低于**自身时说明管理员手工把 base 换成了更新的版本：忽略 overlay，
+并删掉比自身旧的版本文件。
+
+### 回滚
+
+**base 一直在盘上、且永不被改动，所以回滚不需要备份**：把指针判死，下次启动就
+自然跑 base。
+
+- 每次 `exec` 之前先把 `attempts` 加 1 写回（进程被 exec 替换后没有机会再写盘，
+  这是唯一能数清"交接了几次"的时机）。写不进去就**不交接**——否则一个起不来
+  的版本会被 systemd 无限拉起，永远数不到 3。
+- `attempts` 达到 3 且仍未 `healthy` ⇒ 在指针里记 `rejected: true`，此后不再
+  交接，等于自动回落到 base。
+- overlay 版本注册成功后（`run_session` 里紧接身份回执的位置）把指针写成
+  `healthy=true, attempts=0`，此后不再受次数限制（它只是被重启过很多次）。
+- 回落到 base 后，`run_session` 会推一条 `agent:upgrade_progress`
+  `stage=failed`，`detail` 里带 `mode: overlay`，管理面板能直接看到"新版本起
+  不来、这台已经回到 base"。**只报一次**（`rejected_reported`），否则设备每次
+  重启都刷一条。
+
+### 手工清除
+
+想彻底放弃 overlay、回到纯 base：
+
+```bash
+rm ~/.local/share/shell-remote/overlay/current.json   # 删指针即可，下次启动不再交接
+# 或者整个目录一起删（base 不受影响）
+rm -rf ~/.local/share/shell-remote/overlay
+```
+
+想人工回退到上一代：把 `current.json` 的 `path` / `version` / `sha256` 改成
+`bin/` 里上一代那三个值，并置 `healthy=false, attempts=0, rejected=false`。
+
+### 重启由谁负责
+
+overlay 装好之后，**必须把 base 重新拉起来**（不能直接拉起 overlay，否则启动
+校验被绕过，`healthy` 永远标不上、`attempts` 也数不起来）：
+
+| 现场 | 怎么做 |
+|------|--------|
+| `Restart=always` 且本进程是该 unit 的 `MainPID` | 写两行恢复指针后 `exit 0`，systemd 按 `ExecStart` 拉起 base |
+| 其它（非 systemd / 非主进程 / 其它 `Restart=`） | 走既有换机助手：助手**不碰任何文件**，只等旧进程退出再把 base 拉起来 |
+
+判据里"本进程是不是 `MainPID`"不能省：`Restart=` 只对主进程生效，一个 `exit 0`
+的非主进程不会触发任何重启，设备就此失联。
+
+### 版本要求与实测
+
+**线上已有的 ≤ v0.59.12 的旧 agent 必须人工以 root 替换一次 base 二进制**
+（换成 ≥ v0.59.13），之后才能用上本机制。旧 agent 的升级代码已经固化在设备上，
+没法远程让它获得 overlay 能力。v0.59.13 部署后，升级计划里标成
+`target_not_writable` 的就是需要人工处理的设备。
+
+实测（`src/agent/overlay/tests/e2e.rs`，真 relay + 真二进制 + `chmod 0555`
+目录，用 `SR_OVERLAY_BASE_BIN` / `SR_OVERLAY_NEW_BIN` 门控：
+
+```bash
+SR_OVERLAY_BASE_BIN=/path/to/0.59.12 SR_OVERLAY_NEW_BIN=/path/to/0.59.13 \
+  cargo test --lib overlay::tests::e2e -- --test-threads 1 --nocapture
+```
+
+| 场景 | 结果 |
+|------|------|
+| base 在 0555 目录里 → relay 下发升级 | 装进 overlay、重启、base 交接、新版本注册上线；base 字节未变、指针 `healthy=true` |
+| 再次启动 base（模拟机器重启 systemd 拉起） | 再次交接，版本仍是新版本；指针未被重置 |
+| overlay 换成立即退出的坏程序 + 改指针 sha | 连续 3 次交接后回到 base，`rejected=true`，relay 收到 `failed`（含 `mode: overlay`） |
+| overlay 二进制改成 group-writable | 拒绝交接（warn 写明原因），base 照常注册 |
+
 ## 身份保持与回滚
 
-- **制品目录必须可读**（relay 需要现场算 hash）；**agent 所在目录必须可写**（替换需要该目录写权限），失败会在后台明确提示
+- **制品目录必须可读**（relay 需要现场算 hash）；**agent 所在目录必须可写**（替换需要该目录写权限），失败会在后台明确提示。目录不可写时改走 [overlay 升级](#目录不可写时的-overlay-升级)（≥ v0.59.13，仅 unix），不再是一条死路
 - **旧 agent（≤ v0.59.2）只认 relay 的 `url`**：收到仅含外部 CDN 的任务时会解析失败、只回一个错误帧，旧进程根本不会升级。因此没有本地镜像时 relay 会对这类 agent 返回 `409 legacy_agent_needs_relay_mirror`，而不是白发送。它们同样不会上报 `variant:*`，未配 `--upgrade-variant` 时返回 `409 variant_unknown`
 - **身份在换机后保持不变，临时 agent 也一样。** 旧进程退出前会把**实际** `session_id`、全部 `(token, permission)` 与原始 argv 写进一次性交接文件；新进程用它作为首次注册的 `cached_tokens`，走既有 `register_existing` 路径，`session_id`、Token 与权限都不变，不新增任何 relay API。未指定 `--key` 的临时 agent 同样保住 `session_id` **和** Token，浏览器上已打开的页面与已下发的 MCP 凭据继续可用
 - **交接文件安全**：放在 `0700` 私有目录下的 `0600` 文件（Unix）/ 限当前用户的 DACL（Windows），随机文件名 + `create_new`。Token 不进 argv、不进日志、不进握手管道。新进程注册成功后立即删除，**不作为长期凭据存储**

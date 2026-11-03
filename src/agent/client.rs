@@ -200,6 +200,11 @@ fn build_capabilities() -> Vec<String> {
     // 升级协议（MYS-2425 阶段2）：声明能消费 CDN 优先的完整任务（契约 1），
     // relay 据此允许下发 CDN-only 任务；没有它 relay 必须要求本地镜像兜底。
     caps.push(crate::agent::download::CAPABILITY_UPGRADE_V2.to_string());
+    // overlay 自升级（MYS-2574）：目标目录不可写时也能升级——新版本装进用户
+    // 目录、启动时由 base 校验后交接。relay 据此知道"目录不可写"不再是死路。
+    // 仅 unix：Windows 的那条路径由 SCM/ACL 语义决定，本机制不适用。
+    #[cfg(unix)]
+    caps.push(crate::agent::overlay::CAPABILITY.to_string());
     // 制品形态：不能靠 desktop:* 推断（lean CLI 也上报 desktop:*）。名字无法
     // 判定时**不声明**，让 relay 按其契约显式拒绝，而不是冒充某个形态被换错包。
     if let Some(variant) = crate::agent::download::AgentVariant::detect() {
@@ -816,6 +821,28 @@ mod tests {
             "注册能力必须包含 web:proxy-v1"
         );
         assert_eq!(crate::agent::web_proxy::CAPABILITY, "web:proxy-v1");
+    }
+
+    /// overlay 升级能力（MYS-2574）：仅 unix 声明，且必须真的进注册消息。
+    ///
+    /// relay 靠它区分"目录不可写就必然失败的旧 agent"和"能装进用户目录的新
+    /// agent"，所以这条字符串漏掉不会崩，只会让 relay 继续白发注定失败的任务。
+    #[test]
+    fn test_build_capabilities_declares_overlay_upgrade() {
+        let caps = build_capabilities();
+        #[cfg(unix)]
+        {
+            assert!(
+                caps.iter().any(|c| c == crate::agent::overlay::CAPABILITY),
+                "注册能力必须包含 upgrade:overlay-v1（unix）"
+            );
+            assert_eq!(crate::agent::overlay::CAPABILITY, "upgrade:overlay-v1");
+        }
+        #[cfg(not(unix))]
+        assert!(
+            !caps.iter().any(|c| c.contains("overlay")),
+            "overlay 只在 unix 上存在，Windows 不得声明"
+        );
     }
 
     #[test]

@@ -55,6 +55,7 @@ agent → relay（注册消息的 `capabilities` 数组，构建于
 | `web:proxy-v1` | 恒声明（`crate::agent::web_proxy::CAPABILITY`） |
 | `net:tcp-v1` | 恒声明（`crate::agent::tcp_tunnel::CAPABILITY`） |
 | `upgrade:v2` | 恒声明（`crate::agent::download::CAPABILITY_UPGRADE_V2`） |
+| `upgrade:overlay-v1` | `cfg(unix)` 恒声明（`crate::agent::overlay::CAPABILITY`） |
 | `variant:cli` / `variant:ui` | 制品形态可判定时才声明 |
 | `codec:h264` | 恒声明 |
 | `codec:av1` | 编译 `av1` feature |
