@@ -445,6 +445,10 @@ pub struct Facts {
     pub binary: FileFacts,
     /// 指针文件本身的权限事实。
     pub pointer_file: FileFacts,
+    /// 指针里的版本二进制是否**直接位于** overlay 的 `bin/` 目录下。`bin/` 是
+    /// 已核验过属主与权限的 0700 目录；放行它之外的路径，等于把"文件在
+    /// sha256 校验与 exec 之间不被替换"寄托在一个没检查过的父目录上。
+    pub binary_in_bin_dir: bool,
     /// 版本二进制实测 sha256（读不到为 `None`）。
     pub binary_sha256: Option<String>,
 }
@@ -523,7 +527,16 @@ pub fn decide(facts: &Facts) -> Verdict {
         };
     }
 
-    // 3. 安全：四样东西都必须是当前用户所有、且不可被 group/other 写。
+    // 3. 安全：版本二进制必须就在 overlay 的 bin/ 里；四样东西都必须是当前
+    //    用户所有、且不可被 group/other 写。
+    if !facts.binary_in_bin_dir {
+        return Verdict::Skip {
+            reason: format!(
+                "the overlay binary {} is not inside the overlay bin directory",
+                facts.pointer.path.display()
+            ),
+        };
+    }
     for (what, facts_ok) in [
         ("the overlay directory", facts.root),
         ("the overlay bin directory", facts.bin),
@@ -587,6 +600,18 @@ pub fn decide(facts: &Facts) -> Verdict {
     }
 }
 
+/// `path` 的父目录是否就是 `dir`（两侧都按 canonicalize 比较；任一侧解析
+/// 失败一律判否）。
+pub fn is_directly_inside(path: &Path, dir: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    match (parent.canonicalize(), dir.canonicalize()) {
+        (Ok(p), Ok(d)) => p == d,
+        _ => false,
+    }
+}
+
 fn paths_equal(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -616,6 +641,7 @@ pub fn probe(layout: &Layout, self_exe: &Path, self_version: &str) -> Option<Fac
         bin: dir_facts(&layout.bin_dir()),
         binary: file_facts(&pointer.path),
         pointer_file: file_facts(&layout.pointer_path()),
+        binary_in_bin_dir: is_directly_inside(&pointer.path, &layout.bin_dir()),
         binary_sha256: crate::agent::download::sha256_hex_file(&pointer.path)
             .ok()
             .map(|s| s.to_ascii_lowercase()),

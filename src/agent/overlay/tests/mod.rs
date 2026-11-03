@@ -100,6 +100,7 @@ fn facts_for(layout: &Layout, pointer: &Pointer, self_version: &str, self_exe: &
         bin: dir_facts(&layout.bin_dir()),
         binary: file_facts(&pointer.path),
         pointer_file: file_facts(&layout.pointer_path()),
+        binary_in_bin_dir: crate::agent::overlay::is_directly_inside(&pointer.path, &layout.bin_dir()),
         binary_sha256: crate::agent::download::sha256_hex_file(&pointer.path).ok(),
         pointer: pointer.clone(),
     }
@@ -265,6 +266,25 @@ fn test_decide_execs_when_everything_checks_out() {
     let (dir, layout, pointer, _) = fixture("ok", "0.59.13", "0.59.12");
     let facts = facts_for(&layout, &pointer, "0.59.12", &dir.join("base"));
     assert_eq!(decide(&facts), Verdict::Exec { path: pointer.path });
+}
+
+#[test]
+fn test_decide_skips_when_binary_is_outside_bin_dir() {
+    // 指针指向 bin/ 之外（哪怕文件本身属主、权限、sha256 全对）也不交接。
+    let (dir, layout, mut pointer, _) = fixture("outside", "0.59.13", "0.59.12");
+    let outside = dir.join("shell-remote-elsewhere");
+    std::fs::copy(&pointer.path, &outside).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    pointer.path = outside;
+    let facts = facts_for(&layout, &pointer, "0.59.12", &dir.join("base"));
+    assert!(!facts.binary_in_bin_dir);
+    match decide(&facts) {
+        Verdict::Skip { reason } => assert!(reason.contains("not inside the overlay bin directory"), "{reason}"),
+        other => panic!("bin/ 之外的二进制不得交接，实际 {other:?}"),
+    }
 }
 
 #[test]
