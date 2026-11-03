@@ -1394,6 +1394,18 @@ async fn run_session(
         tracing::info!(session = %client.session_id, permission = %perm, "token: {}", token);
     }
 
+    // MYS-2558：**注册之后**才做启动探测。
+    //
+    // 探测要起一个 PowerShell，而 360 那类安全软件会把 `CreateProcess` 串行化：
+    // 实测探测期间连同进程里另一个无关的 `cmd /c ver` 也被一起卡了 29.5 秒，
+    // 而注册本身（`device::probe` 也起 `cmd`）因此被拖到 32 秒之后——那就正好
+    // 违反了"不能阻塞注册"。所以探测排在注册成功之后，且只做一次：重连不再
+    // 探测（判定在此期间已经写进进程标志）。
+    #[cfg(not(unix))]
+    if !PS_STARTUP_PROBE_STARTED.swap(true, Ordering::Relaxed) {
+        startup_powershell_probe();
+    }
+
     // 换机恢复的回执：**注册成功之后**才做（"进程起来了"不算数）。
     //
     // 两件事：删交接文件（身份已进内存，文件留着只是风险）+ 向助手写
@@ -3378,6 +3390,279 @@ fn encoded_command_known_denied() -> bool {
     PS_ENCODED_COMMAND_DENIED.load(Ordering::Relaxed)
 }
 
+// ── MYS-2558: 持久化被拦判定 + 启动探测 ─────────────────────────────────────
+//
+// 进程级标志只活到进程退出，而 360 那类安全软件是**每次 CreateProcess 都要
+// 审 32 秒左右**才拒绝的：agent 重启后的第一次 PowerShell 调用仍要现付这 32
+// 秒——它不计入超时，于是被拦之后 `-File` 还要再跑一个完整的 `timeout_ms`，
+// relay 只等 `timeout_ms + 5s`，第一次调用必然报 `no response from agent`。
+//
+// 两件事把这段等待挪出调用路径：
+// 1. 判定结果落盘（`%LOCALAPPDATA%\shell-remote\powershell-launch.json`），
+//    下次启动直接读，不再现探测；
+// 2. 首次启动（或判定过期）时在后台线程探测一次，探测期不阻塞注册。
+
+/// 判定文件的 schema 版本；不认识的版本一律当作「没有记录」重新探测。
+const PS_LAUNCH_SCHEMA: u32 = 1;
+const PS_LAUNCH_FILE: &str = "powershell-launch.json";
+/// 「被拦」判定的有效期：安全软件/策略是会变的，30 天后重新确认一次。
+const PS_DENIED_TTL_SECS: u64 = 30 * 24 * 3600;
+/// 「正常」判定的有效期：短一些，装了新安全软件能较快被发现。
+const PS_ALLOWED_TTL_SECS: u64 = 7 * 24 * 3600;
+/// 探测进程的最长存活时间；超时就杀掉，判定仍按「spawn 成功」记。
+#[cfg_attr(not(windows), allow(dead_code))]
+const PS_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 落盘的判定：`{"schema":1,"encoded_denied":bool,"checked_at":<unix 秒>}`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PsLaunchRecord {
+    schema: u32,
+    encoded_denied: bool,
+    checked_at: u64,
+}
+
+/// 判定文件路径：`%LOCALAPPDATA%\shell-remote\powershell-launch.json`。
+///
+/// 取不到 `LOCALAPPDATA`（服务账号、精简环境）时退回系统临时目录——同一台
+/// 机器上的同一用户仍然稳定，只是可能被清理掉，那只会导致重新探测一次。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ps_launch_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("shell-remote").join(PS_LAUNCH_FILE)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ps_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 读判定文件。任何失败（不存在、不可读、不是 JSON、字段缺失/类型不对）
+/// 都返回 `None`，调用方据此重新探测——判定文件是纯优化，坏掉不能影响功能。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn read_launch_record(path: &Path) -> Option<PsLaunchRecord> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice::<PsLaunchRecord>(&bytes).ok()
+}
+
+/// 原子写回：先写同目录临时文件再 `rename`，读端永远看不到写了一半的内容。
+///
+/// Windows 上 `rename` 覆盖已存在的目标文件是允许的（`MoveFileEx` +
+/// `MOVEFILE_REPLACE_EXISTING`），所以这条路径两端一致。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn write_launch_record(path: &Path, record: &PsLaunchRecord) -> std::io::Result<()> {
+    let body = serde_json::to_vec(record)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_file_name(format!(
+        "{PS_LAUNCH_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// 读到记录之后该怎么做。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchVerdict {
+    /// 记得被拦、未过期：直接走 `-File`，不探测。
+    Denied,
+    /// 记得正常、未过期：保持主路径，不探测。
+    Allowed,
+    /// 没有记录 / schema 不认识 / 已过期：探测一次。
+    Probe,
+}
+
+/// 判定表（纯函数，Linux 上可测）：
+///
+/// | 记录 | 年龄 | 结果 |
+/// |------|------|------|
+/// | 无 / schema ≠ 1 | — | `Probe` |
+/// | `encoded_denied=true` | < 30 天 | `Denied` |
+/// | `encoded_denied=true` | ≥ 30 天 | `Probe` |
+/// | `encoded_denied=false` | < 7 天 | `Allowed` |
+/// | `encoded_denied=false` | ≥ 7 天 | `Probe` |
+///
+/// `checked_at` 落在未来（时钟回拨）按「刚检查过」处理，不会因此永远探测。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn judge_launch_record(record: Option<PsLaunchRecord>, now: u64) -> LaunchVerdict {
+    let Some(record) = record.filter(|r| r.schema == PS_LAUNCH_SCHEMA) else {
+        return LaunchVerdict::Probe;
+    };
+    let age = now.saturating_sub(record.checked_at);
+    let ttl = if record.encoded_denied { PS_DENIED_TTL_SECS } else { PS_ALLOWED_TTL_SECS };
+    if age >= ttl {
+        return LaunchVerdict::Probe;
+    }
+    if record.encoded_denied {
+        LaunchVerdict::Denied
+    } else {
+        LaunchVerdict::Allowed
+    }
+}
+
+/// 一次启动探测的 spawn 结果，摊成 (kind, raw_os_error) 以便跨平台单测。
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeSpawn {
+    Started,
+    Failed { kind: std::io::ErrorKind, raw_os_error: Option<i32> },
+}
+
+/// 探测结果该写什么（纯函数）。
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupProbeAction {
+    /// spawn 被拒：置进程标志 + 落盘 `encoded_denied=true`。
+    RecordDenied,
+    /// spawn 成功（含等待超时后被我们杀掉）：落盘 `encoded_denied=false`。
+    /// 判定只看「进程能不能起来」——这正是 `-EncodedCommand` 被拦时的症状。
+    RecordAllowed,
+    /// 其它错误（找不到 PowerShell、参数非法…）：什么都不写，下次照样探测。
+    RecordNothing,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn startup_probe_action(spawn: ProbeSpawn) -> StartupProbeAction {
+    match spawn {
+        ProbeSpawn::Started => StartupProbeAction::RecordAllowed,
+        ProbeSpawn::Failed { kind, raw_os_error } => {
+            if should_retry_with_file(WinShell::PowerShell, kind, raw_os_error) {
+                StartupProbeAction::RecordDenied
+            } else {
+                StartupProbeAction::RecordNothing
+            }
+        }
+    }
+}
+
+/// 把判定落盘。失败只记 debug：判定本身已在进程内生效，写不进去的后果
+/// 仅仅是下次启动多探测一次。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn persist_launch_verdict(encoded_denied: bool) {
+    let path = ps_launch_path();
+    let record = PsLaunchRecord {
+        schema: PS_LAUNCH_SCHEMA,
+        encoded_denied,
+        checked_at: ps_now_unix(),
+    };
+    if let Err(e) = write_launch_record(&path, &record) {
+        tracing::debug!("failed to persist the PowerShell launch verdict to {}: {e}", path.display());
+    }
+}
+
+/// 启动探测只做一次（每个进程）。重连会重新执行 `run_session`，但判定早已
+/// 落进进程标志/磁盘，再探一遍只会再付一次 ~32 秒。
+#[cfg(not(unix))]
+static PS_STARTUP_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// 启动时的探测入口：先看落盘的判定，需要时才真正起一个 PowerShell。
+///
+/// 立刻返回——真正的读盘/探测跑在阻塞线程池里。**调用点必须在注册成功之后**
+/// （见 `run_session`）：探测期间 360 会把整个进程的进程创建串行化，注册路径
+/// 里的 `cmd /c ver` 会跟着一起卡住。
+#[cfg(not(unix))]
+fn startup_powershell_probe() {
+    let Some(ps_exe) = find_powershell() else {
+        // 没有 PowerShell 的机器不存在这个问题（也不会走 PowerShell 路径）。
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let path = ps_launch_path();
+        match judge_launch_record(read_launch_record(&path), ps_now_unix()) {
+            LaunchVerdict::Denied => {
+                PS_ENCODED_COMMAND_DENIED.store(true, Ordering::Relaxed);
+                tracing::info!(
+                    file = %path.display(),
+                    "PowerShell -EncodedCommand was denied here in a previous run; using -File directly"
+                );
+            }
+            LaunchVerdict::Allowed => {
+                tracing::debug!(
+                    file = %path.display(),
+                    "PowerShell -EncodedCommand is known to work here; no startup probe"
+                );
+            }
+            LaunchVerdict::Probe => run_startup_probe(&ps_exe),
+        }
+    });
+}
+
+/// 真探一次：用**和真实调用完全相同的脚本头**（[`build_powershell_script`]
+/// 产出）、同样的 `-EncodedCommand` 参数起一个只做 `exit 0` 的进程。
+#[cfg(not(unix))]
+fn run_startup_probe(ps_exe: &Path) {
+    use std::os::windows::process::CommandExt as _;
+
+    let (program, raw_args) = build_windows_invocation(WinShell::PowerShell, Some(ps_exe), "exit 0");
+    let mut command = std::process::Command::new(&program);
+    command.raw_arg(&raw_args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let spawn = match command.spawn() {
+        Ok(child) => {
+            wait_probe_child(child);
+            ProbeSpawn::Started
+        }
+        Err(e) => ProbeSpawn::Failed { kind: e.kind(), raw_os_error: e.raw_os_error() },
+    };
+    let action = startup_probe_action(spawn);
+    match action {
+        StartupProbeAction::RecordDenied => {
+            if note_encoded_command_denied() {
+                tracing::warn!(
+                    "PowerShell -EncodedCommand was denied (os error 5), likely by security software; \
+                     falling back to -File (detected at startup)"
+                );
+            }
+            persist_launch_verdict(true);
+        }
+        StartupProbeAction::RecordAllowed => {
+            tracing::debug!("PowerShell -EncodedCommand is usable here; recording the verdict");
+            persist_launch_verdict(false);
+        }
+        StartupProbeAction::RecordNothing => {
+            tracing::debug!("PowerShell startup probe failed for an unrelated reason; recording nothing");
+        }
+    }
+}
+
+/// 等探测进程退出，最多 [`PS_PROBE_TIMEOUT`]；超时就杀掉（判定仍是「能起来」）。
+#[cfg(not(unix))]
+fn wait_probe_child(mut child: std::process::Child) {
+    let deadline = std::time::Instant::now() + PS_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            // 等待本身失败（句柄失效等）也不能改判定：进程确实起来过。
+            Err(_) => return,
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::debug!("PowerShell startup probe did not exit within {PS_PROBE_TIMEOUT:?}; killing it");
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Result of one Windows spawn-and-wait attempt.
 #[cfg_attr(not(windows), allow(dead_code))]
 struct WinRun {
@@ -3394,6 +3679,11 @@ struct WinRun {
 ///
 /// `shell` only decides whether an access-denied `spawn` is worth retrying via
 /// `-File`: cmd has no encoded payload to be blocked, so it never is.
+///
+/// The `spawn()` and the wait both run on blocking threads (MYS-2558): 360
+/// inspects the `CreateProcess` for ~32s before refusing it, and doing that
+/// synchronously pinned a runtime worker for the whole time — starving the
+/// heartbeat and every other task on a small runtime.
 #[cfg(not(unix))]
 async fn run_windows_invocation(
     shell: WinShell,
@@ -3402,47 +3692,61 @@ async fn run_windows_invocation(
     timeout_ms: u64,
     cwd: Option<&str>,
 ) -> WinRun {
-    let timeout = std::time::Duration::from_millis(timeout_ms);
-    let mut command = tokio::process::Command::new(program);
-    command.raw_arg(raw_args);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Deliberately *not* kill_on_drop: dropping the `wait_with_output`
-        // future on timeout would kill only the direct child and orphan its
-        // children *before* `taskkill /T` can walk the tree. The timeout arm
-        // below owns the kill instead.
-        .kill_on_drop(false);
-    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
-        command.current_dir(dir);
-    }
+    use std::os::windows::process::CommandExt as _;
 
-    let child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let (program, raw_args, cwd) = (program.to_string(), raw_args.to_string(), cwd.map(str::to_string));
+
+    let spawned = tokio::task::spawn_blocking(move || {
+        let mut command = std::process::Command::new(&program);
+        command.raw_arg(&raw_args);
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(dir) = cwd.as_deref().filter(|d| !d.is_empty()) {
+            command.current_dir(dir);
+        }
+        command.spawn()
+    })
+    .await;
+
+    let mut child = match spawned {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             let denied = should_retry_with_file(shell, e.kind(), e.raw_os_error());
-            let stderr = if denied {
-                String::new()
-            } else {
-                format!("Failed to execute command: {}", e)
-            };
+            let stderr = if denied { String::new() } else { format!("Failed to execute command: {}", e) };
             return WinRun { stdout: String::new(), stderr, exit_code: -1, denied };
         }
+        // The blocking pool refused the job (runtime shutting down). Not an
+        // access denial — it must never be mistaken for one.
+        Err(e) => {
+            return WinRun {
+                stdout: String::new(),
+                stderr: format!("Failed to execute command: {}", e),
+                exit_code: -1,
+                denied: false,
+            }
+        }
     };
-    let pid = child.id();
+    let pid = Some(child.id());
+    // Re-register the pipes with the async runtime. A pipe that fails to
+    // register degrades to "no output" rather than failing the command: the
+    // child is already running and its exit status is still meaningful.
+    let stdout = child.stdout.take().and_then(|s| tokio::process::ChildStdout::from_std(s).ok());
+    let stderr = child.stderr.take().and_then(|s| tokio::process::ChildStderr::from_std(s).ok());
+    // `std::process` has no async wait, and this also blocks for the process's
+    // whole lifetime — keep it off the runtime as well.
+    let waiter = tokio::task::spawn_blocking(move || child.wait());
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(out)) => WinRun {
-            stdout: crate::agent::encoding::decode_bytes(&out.stdout),
-            stderr: crate::agent::encoding::decode_bytes(&out.stderr),
-            exit_code: out.status.code().unwrap_or(-1),
-            denied: false,
-        },
-        Ok(Err(e)) => WinRun {
-            stdout: String::new(),
-            stderr: format!("Failed to execute command: {}", e),
-            exit_code: -1,
+    let collect = async move {
+        let (out, err) = tokio::join!(read_pipe(stdout), read_pipe(stderr));
+        let status = waiter.await.ok().and_then(|r| r.ok());
+        (out, err, status)
+    };
+
+    match tokio::time::timeout(timeout, collect).await {
+        Ok((out, err, status)) => WinRun {
+            stdout: crate::agent::encoding::decode_bytes(&out),
+            stderr: crate::agent::encoding::decode_bytes(&err),
+            exit_code: status.and_then(|s| s.code()).unwrap_or(-1),
             denied: false,
         },
         Err(_) => {
@@ -3455,6 +3759,16 @@ async fn run_windows_invocation(
             }
         }
     }
+}
+
+/// Drain one child pipe to EOF; a read error just ends the stream.
+#[cfg(not(unix))]
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt as _;
+    let Some(mut pipe) = pipe else { return Vec::new() };
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf).await;
+    buf
 }
 
 /// Run one Windows MCP attempt.
@@ -3629,6 +3943,10 @@ async fn execute_command(
              falling back to -File"
         );
     }
+    // Record the denial so the next process skips both the doomed
+    // `-EncodedCommand` and the ~32s the block costs. Unconditional: the
+    // startup probe may have set the flag without managing to write the file.
+    persist_launch_verdict(true);
     let file = run_windows_command(shell, cmd, false, ps_path.as_deref(), timeout_ms, cwd).await;
     if file.denied {
         // Both ways in are blocked. Say what the caller can still do, rather
@@ -4666,6 +4984,206 @@ mod tests {
         assert!(encoded_command_known_denied(), "subsequent calls go straight to -File");
         assert!(!note_encoded_command_denied(), "a second denial must not log another warn");
         PS_ENCODED_COMMAND_DENIED.store(previous, Ordering::Relaxed);
+    }
+
+    // ── MYS-2558：持久化判定 + 启动探测 ─────────────────────────────────
+
+    /// 每个测试用自己的临时目录，互不干扰（这些测试会并发跑）。
+    fn temp_launch_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-ps-launch-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join(PS_LAUNCH_FILE)
+    }
+
+    #[test]
+    fn test_launch_record_round_trips_through_disk() {
+        let path = temp_launch_path("roundtrip");
+        let record =
+            PsLaunchRecord { schema: PS_LAUNCH_SCHEMA, encoded_denied: true, checked_at: 1_700_000_000 };
+        write_launch_record(&path, &record).expect("write must succeed");
+        assert_eq!(read_launch_record(&path), Some(record));
+
+        // The on-disk shape is a contract (fields the next version must keep
+        // reading): pin the exact key set, not just the round trip.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("valid JSON");
+        assert_eq!(raw["schema"], 1);
+        assert_eq!(raw["encoded_denied"], true);
+        assert_eq!(raw["checked_at"], 1_700_000_000u64);
+
+        // A rewrite replaces the file atomically and leaves no temp files behind.
+        write_launch_record(&path, &PsLaunchRecord { encoded_denied: false, ..record })
+            .expect("overwrite must succeed");
+        assert_eq!(read_launch_record(&path).map(|r| r.encoded_denied), Some(false));
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must not survive the rename: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_launch_record_writes_into_a_missing_directory() {
+        // First run on a fresh profile: `%LOCALAPPDATA%\shell-remote\` does not
+        // exist yet, and creating it must not be the caller's job.
+        let base = std::env::temp_dir().join(format!(
+            "sr-ps-launch-mkdir-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let path = base.join("shell-remote").join(PS_LAUNCH_FILE);
+        assert!(!path.parent().unwrap().exists());
+        write_launch_record(
+            &path,
+            &PsLaunchRecord { schema: PS_LAUNCH_SCHEMA, encoded_denied: true, checked_at: 1 },
+        )
+        .expect("must create the parent directory");
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_unreadable_launch_records_are_ignored() {
+        let path = temp_launch_path("garbage");
+        let now = 1_700_000_000u64;
+
+        // Missing file → probe.
+        assert_eq!(read_launch_record(&path), None);
+        assert_eq!(judge_launch_record(None, now), LaunchVerdict::Probe);
+
+        // Every malformed shape degrades to "no record" rather than failing:
+        // a corrupt cache must never stop the agent or the fallback.
+        for body in [
+            &b""[..],
+            b"{",
+            b"not json at all",
+            br#"{"schema":1,"encoded_denied":true}"#,       // checked_at missing
+            br#"{"schema":1,"checked_at":100}"#,            // encoded_denied missing
+            br#"{"schema":1,"encoded_denied":"yes","checked_at":100}"#, // wrong type
+            br#"{"schema":1,"encoded_denied":true,"checked_at":-5}"#,   // negative time
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(read_launch_record(&path), None, "must ignore {:?}", String::from_utf8_lossy(body));
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_launch_verdict_denied_expires_after_30_days() {
+        let now = 1_700_000_000u64;
+        let rec = |age: u64| PsLaunchRecord {
+            schema: PS_LAUNCH_SCHEMA,
+            encoded_denied: true,
+            checked_at: now - age,
+        };
+        assert_eq!(judge_launch_record(Some(rec(0)), now), LaunchVerdict::Denied);
+        assert_eq!(judge_launch_record(Some(rec(PS_DENIED_TTL_SECS - 1)), now), LaunchVerdict::Denied);
+        // Boundary: exactly 30 days is already expired.
+        assert_eq!(judge_launch_record(Some(rec(PS_DENIED_TTL_SECS)), now), LaunchVerdict::Probe);
+        assert_eq!(judge_launch_record(Some(rec(PS_DENIED_TTL_SECS + 1)), now), LaunchVerdict::Probe);
+        // A clock that jumped back must not turn into "永远探测".
+        assert_eq!(
+            judge_launch_record(
+                Some(PsLaunchRecord {
+                    schema: PS_LAUNCH_SCHEMA,
+                    encoded_denied: true,
+                    checked_at: now + 10_000
+                }),
+                now
+            ),
+            LaunchVerdict::Denied
+        );
+    }
+
+    #[test]
+    fn test_launch_verdict_allowed_expires_after_7_days() {
+        let now = 1_700_000_000u64;
+        let rec = |age: u64| PsLaunchRecord {
+            schema: PS_LAUNCH_SCHEMA,
+            encoded_denied: false,
+            checked_at: now - age,
+        };
+        assert_eq!(judge_launch_record(Some(rec(0)), now), LaunchVerdict::Allowed);
+        assert_eq!(judge_launch_record(Some(rec(PS_ALLOWED_TTL_SECS - 1)), now), LaunchVerdict::Allowed);
+        assert_eq!(judge_launch_record(Some(rec(PS_ALLOWED_TTL_SECS)), now), LaunchVerdict::Probe);
+        // The two TTLs must stay distinct: a 30-day "allowed" record is stale.
+        assert!(PS_ALLOWED_TTL_SECS < PS_DENIED_TTL_SECS);
+        assert_eq!(judge_launch_record(Some(rec(30 * 24 * 3600)), now), LaunchVerdict::Probe);
+        // An unknown schema version is not trusted even when fresh.
+        assert_eq!(
+            judge_launch_record(Some(PsLaunchRecord { schema: 2, ..rec(0) }), now),
+            LaunchVerdict::Probe
+        );
+    }
+
+    #[test]
+    fn test_startup_probe_decision_table() {
+        use std::io::ErrorKind;
+
+        // spawn 成功 → 记「能用」（等待超时也走这条：进程确实起来了）。
+        assert_eq!(startup_probe_action(ProbeSpawn::Started), StartupProbeAction::RecordAllowed);
+
+        // 只有 access denied 才是被安全软件拦了。
+        for (kind, raw) in [
+            (ErrorKind::PermissionDenied, None),
+            (ErrorKind::PermissionDenied, Some(5)),
+            (ErrorKind::Other, Some(5)),
+        ] {
+            assert_eq!(
+                startup_probe_action(ProbeSpawn::Failed { kind, raw_os_error: raw }),
+                StartupProbeAction::RecordDenied,
+                "{kind:?}/{raw:?} is a denial"
+            );
+        }
+
+        // 其它错误（找不到 PowerShell、参数非法…）什么都不写——写成
+        // `encoded_denied=false` 会让下次启动 7 天不探测，写成 true 又会
+        // 无谓地放弃主路径。
+        for (kind, raw) in [
+            (ErrorKind::NotFound, None),
+            (ErrorKind::NotFound, Some(2)),
+            (ErrorKind::Other, None),
+            (ErrorKind::InvalidInput, None),
+        ] {
+            assert_eq!(
+                startup_probe_action(ProbeSpawn::Failed { kind, raw_os_error: raw }),
+                StartupProbeAction::RecordNothing,
+                "{kind:?}/{raw:?} must record nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_persist_launch_verdict_is_readable_by_the_next_start() {
+        // 端到端：运行中被拦时写下的就是下一次启动读到并据此跳过探测的东西。
+        let path = temp_launch_path("persist");
+        let record = PsLaunchRecord {
+            schema: PS_LAUNCH_SCHEMA,
+            encoded_denied: true,
+            checked_at: ps_now_unix(),
+        };
+        write_launch_record(&path, &record).expect("write");
+        let read = read_launch_record(&path).expect("next start must read it back");
+        assert_eq!(judge_launch_record(Some(read), ps_now_unix()), LaunchVerdict::Denied);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn test_launch_path_falls_back_to_temp_dir_without_localappdata() {
+        // The variable is read per call, so this stays safe to run in parallel
+        // with other tests: only this thread's env mutation is observable here,
+        // and the assertion is on the shape of the path, not on success.
+        let path = ps_launch_path();
+        assert_eq!(path.file_name().unwrap(), PS_LAUNCH_FILE);
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "shell-remote");
     }
 
     #[test]
