@@ -3196,6 +3196,25 @@ fn find_powershell() -> Option<PathBuf> {
         .clone()
 }
 
+/// Build the PowerShell script that runs `cmd`: UTF-8 console setup, the user's
+/// command verbatim, then `$LASTEXITCODE` propagation.
+///
+/// Both execution paths use this — `-EncodedCommand` (primary) and the
+/// temporary `.ps1` + `-File` fallback (MYS-2553) — so the two can never drift
+/// apart in what they actually run.
+///
+/// Head and tail are separated from the user's command by **newlines**, not
+/// `;`: a `;` after a command ending in a `#` comment (`echo 1 # c`) sits on the
+/// commented-out remainder of that line and is swallowed, so `$LASTEXITCODE`
+/// would never be propagated. A newline terminates the comment and keeps the
+/// tail on its own line regardless of what the command ends with.
+pub fn build_powershell_script(cmd: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\n{}\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}",
+        cmd
+    )
+}
+
 /// Render a PowerShell script as `-EncodedCommand`'s value: base64 of the
 /// script encoded in UTF-16LE. Shipping the whole script encoded sidesteps
 /// cmd/PowerShell quote, `$` and `%` parsing entirely — the root cause of
@@ -3212,10 +3231,7 @@ fn find_powershell() -> Option<PathBuf> {
 /// would never be propagated. A newline terminates the comment and keeps the
 /// tail on its own line regardless of what the command ends with.
 pub fn encode_powershell_command(cmd: &str) -> String {
-    let script = format!(
-        "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\n{}\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}",
-        cmd
-    );
+    let script = build_powershell_script(cmd);
     let utf16le: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     crate::agent::fs::encode_b64(&utf16le)
 }
@@ -3246,6 +3262,220 @@ pub fn build_windows_invocation(shell: WinShell, ps_exe: Option<&Path>, cmd: &st
             )
         }
     }
+}
+
+// ── MYS-2553: `-File` fallback when `-EncodedCommand` is blocked ────────────
+//
+// Security software (360 安全卫士 on the test VM) denies `CreateProcess` for
+// `powershell -EncodedCommand` — the process fails to start at all with
+// `os error 5` (access denied), because a base64 payload starting with `JAB`
+// (`$`) looks like a malicious script. The very same script written to a
+// `.ps1` and started with `-File` runs fine, so the fallback keeps working on
+// such machines without giving up the primary path (which is what survives a
+// group-policy AllSigned execution policy).
+
+/// Whether a failed PowerShell `spawn` should be retried via `-File`.
+///
+/// Only access-denied means "the process never started because something
+/// blocked it". Any other error (missing executable, bad arguments) would fail
+/// identically on the fallback path, so it must be reported as-is.
+///
+/// `kind`/`raw_os_error` are passed in — rather than taken from a `std::io::Error`
+/// — so the decision table is unit-testable on Linux.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn should_retry_with_file(shell: WinShell, kind: std::io::ErrorKind, raw_os_error: Option<i32>) -> bool {
+    shell == WinShell::PowerShell
+        && (kind == std::io::ErrorKind::PermissionDenied || raw_os_error == Some(5))
+}
+
+/// Build the `-File` fallback invocation: `(program, raw_args)`.
+///
+/// The script file holds [`build_powershell_script`] — byte-for-byte what
+/// `-EncodedCommand` carries. The path is quoted because `%TEMP%` (or the user
+/// name in it) can contain spaces.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn build_file_fallback(ps_exe: Option<&Path>, script_path: &Path) -> (String, String) {
+    let exe = ps_exe
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "powershell.exe".to_string());
+    let raw_args = format!(
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+        script_path.display()
+    );
+    (exe, raw_args)
+}
+
+/// Write a PowerShell script as UTF-8 with BOM and return its path inside
+/// `<temp>/shell-remote-mcp/`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn write_temp_powershell_script(cmd: &str) -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("shell-remote-mcp");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.ps1", uuid::Uuid::new_v4()));
+    let script = build_powershell_script(cmd);
+    let mut bytes = Vec::with_capacity(3 + script.len());
+    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    bytes.extend_from_slice(script.as_bytes());
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// The stderr both PowerShell entry points report when nothing that could be
+/// blocked will run: access denied is never actionable on its own, so name the
+/// one workaround the caller has.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_denied_message() -> String {
+    "PowerShell could not be started: access denied (os error 5), possibly blocked by \
+     security software. Retry with shell:\"cmd\"."
+        .to_string()
+}
+
+/// Remove a temp script; a failure only gets a debug line — the command's
+/// result is already decided, and a leftover `.ps1` in `%TEMP%` is not worth
+/// changing the answer over.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn remove_temp_script(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        tracing::debug!("failed to remove temp PowerShell script {}: {e}", path.display());
+    }
+}
+
+/// Process-wide memory of "`-EncodedCommand` is blocked here".
+///
+/// Once security software has denied it, every later call would pay the same
+/// doomed `CreateProcess`. The first denial logs one warn; after that the
+/// `-File` path is chosen up front.
+#[cfg_attr(not(windows), allow(dead_code))]
+static PS_ENCODED_COMMAND_DENIED: AtomicBool = AtomicBool::new(false);
+
+/// Record a denial and report whether this was the first one (so the caller
+/// logs the warn exactly once).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn note_encoded_command_denied() -> bool {
+    !PS_ENCODED_COMMAND_DENIED.swap(true, Ordering::Relaxed)
+}
+
+/// Whether to skip `-EncodedCommand` and use `-File` directly.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn encoded_command_known_denied() -> bool {
+    PS_ENCODED_COMMAND_DENIED.load(Ordering::Relaxed)
+}
+
+/// Result of one Windows spawn-and-wait attempt.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct WinRun {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    /// `spawn()` was refused with access denied — the process never started.
+    denied: bool,
+}
+
+/// Spawn `(program, raw_args)` through `raw_arg` and collect its output,
+/// mirroring the pre-MYS-2553 behaviour exactly (no `kill_on_drop`; the timeout
+/// arm owns the kill so `taskkill /T` can still walk the tree).
+///
+/// `shell` only decides whether an access-denied `spawn` is worth retrying via
+/// `-File`: cmd has no encoded payload to be blocked, so it never is.
+#[cfg(not(unix))]
+async fn run_windows_invocation(
+    shell: WinShell,
+    program: &str,
+    raw_args: &str,
+    timeout_ms: u64,
+    cwd: Option<&str>,
+) -> WinRun {
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let mut command = tokio::process::Command::new(program);
+    command.raw_arg(raw_args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Deliberately *not* kill_on_drop: dropping the `wait_with_output`
+        // future on timeout would kill only the direct child and orphan its
+        // children *before* `taskkill /T` can walk the tree. The timeout arm
+        // below owns the kill instead.
+        .kill_on_drop(false);
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        command.current_dir(dir);
+    }
+
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let denied = should_retry_with_file(shell, e.kind(), e.raw_os_error());
+            let stderr = if denied {
+                String::new()
+            } else {
+                format!("Failed to execute command: {}", e)
+            };
+            return WinRun { stdout: String::new(), stderr, exit_code: -1, denied };
+        }
+    };
+    let pid = child.id();
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => WinRun {
+            stdout: crate::agent::encoding::decode_bytes(&out.stdout),
+            stderr: crate::agent::encoding::decode_bytes(&out.stderr),
+            exit_code: out.status.code().unwrap_or(-1),
+            denied: false,
+        },
+        Ok(Err(e)) => WinRun {
+            stdout: String::new(),
+            stderr: format!("Failed to execute command: {}", e),
+            exit_code: -1,
+            denied: false,
+        },
+        Err(_) => {
+            kill_process_tree(pid).await;
+            WinRun {
+                stdout: String::new(),
+                stderr: format!("Command timed out after {}s", timeout_ms / 1000),
+                exit_code: -1,
+                denied: false,
+            }
+        }
+    }
+}
+
+/// Run one Windows MCP attempt.
+///
+/// - `Cmd`: cmd.exe, exactly as before.
+/// - `PowerShell` + `encoded`: the `-EncodedCommand` payload.
+/// - `PowerShell` + `!encoded`: the temp `.ps1` + `-File` fallback. The temp
+///   script is removed on every outcome — success, failure and timeout alike.
+#[cfg(not(unix))]
+async fn run_windows_command(
+    shell: WinShell,
+    cmd: &str,
+    encoded: bool,
+    ps_exe: Option<&Path>,
+    timeout_ms: u64,
+    cwd: Option<&str>,
+) -> WinRun {
+    if shell == WinShell::Cmd || encoded {
+        let (program, raw_args) = build_windows_invocation(shell, ps_exe, cmd);
+        return run_windows_invocation(shell, &program, &raw_args, timeout_ms, cwd).await;
+    }
+    let script_path = match write_temp_powershell_script(cmd) {
+        Ok(p) => p,
+        Err(e) => {
+            return WinRun {
+                stdout: String::new(),
+                stderr: format!("Failed to write temporary PowerShell script: {}", e),
+                exit_code: -1,
+                denied: false,
+            }
+        }
+    };
+    let (program, raw_args) = build_file_fallback(ps_exe, &script_path);
+    let run = run_windows_invocation(shell, &program, &raw_args, timeout_ms, cwd).await;
+    // The timeout arm already ran `taskkill /T` (inside the runner), so the
+    // script is no longer in use by the time we get here.
+    remove_temp_script(&script_path);
+    run
 }
 
 #[cfg(unix)]
@@ -3355,62 +3585,40 @@ async fn execute_command(
     shell_override: Option<&str>,
     cwd: Option<&str>,
 ) -> (String, String, i32) {
-    let timeout = std::time::Duration::from_millis(timeout_ms);
     // PowerShell is the MCP default on Windows; `--shell` plays no part here.
     let ps_path = find_powershell();
     let shell = pick_windows_shell(shell_override, ps_path.clone());
-    let (program, raw_args) = build_windows_invocation(shell, ps_path.as_deref(), cmd);
 
-    let mut command = tokio::process::Command::new(program);
-    command.raw_arg(raw_args);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Deliberately *not* kill_on_drop: dropping the `wait_with_output`
-        // future on timeout would kill only the direct child and orphan its
-        // children *before* `taskkill /T` can walk the tree. The timeout arm
-        // below owns the kill instead.
-        .kill_on_drop(false);
-    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
-        command.current_dir(dir);
+    if shell == WinShell::PowerShell && encoded_command_known_denied() {
+        // Security software already refused `-EncodedCommand` in this process:
+        // starting it again would only burn another doomed `CreateProcess`.
+        let run = run_windows_command(shell, cmd, false, ps_path.as_deref(), timeout_ms, cwd).await;
+        return if run.denied {
+            (run.stdout, powershell_denied_message(), -1)
+        } else {
+            (run.stdout, run.stderr, run.exit_code)
+        };
     }
 
-    let child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                String::new(),
-                format!("Failed to execute command: {}", e),
-                -1,
-            )
-        }
-    };
-    let pid = child.id();
-
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-
-    match result {
-        Ok(Ok(out)) => {
-            let stdout = crate::agent::encoding::decode_bytes(&out.stdout);
-            let stderr = crate::agent::encoding::decode_bytes(&out.stderr);
-            let exit_code = out.status.code().unwrap_or(-1);
-            (stdout, stderr, exit_code)
-        }
-        Ok(Err(e)) => (
-            String::new(),
-            format!("Failed to execute command: {}", e),
-            -1,
-        ),
-        Err(_) => {
-            kill_process_tree(pid).await;
-            (
-                String::new(),
-                format!("Command timed out after {}s", timeout_ms / 1000),
-                -1,
-            )
-        }
+    let first = run_windows_command(shell, cmd, true, ps_path.as_deref(), timeout_ms, cwd).await;
+    if !first.denied {
+        return (first.stdout, first.stderr, first.exit_code);
     }
+    // Only PowerShell can be denied this way, and only for `-EncodedCommand`:
+    // hand the very same script to `powershell -File` instead.
+    if note_encoded_command_denied() {
+        tracing::warn!(
+            "PowerShell -EncodedCommand was denied (os error 5), likely by security software; \
+             falling back to -File"
+        );
+    }
+    let file = run_windows_command(shell, cmd, false, ps_path.as_deref(), timeout_ms, cwd).await;
+    if file.denied {
+        // Both ways in are blocked. Say what the caller can still do, rather
+        // than echoing a bare OS error to the AI and the user.
+        return (file.stdout, powershell_denied_message(), -1);
+    }
+    (file.stdout, file.stderr, file.exit_code)
 }
 
 #[cfg(test)]
@@ -4334,6 +4542,113 @@ mod tests {
         assert_eq!(decode_encoded_command(&raw_args), format!(
             "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\necho 中文\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
         ));
+    }
+
+    // ── MYS-2553: `-File` fallback when `-EncodedCommand` is blocked ─────────
+
+    #[test]
+    fn test_build_powershell_script_matches_encoded_command_payload() {
+        // Both execution paths must run the *same* script. The `-File` file is
+        // the extracted builder's output; the encoded payload must decode to
+        // exactly that, byte for byte, for every shape of command.
+        for cmd in [
+            "Write-Output \"hello world\"",
+            "echo 1 # trailing comment",
+            "Write-Output 中文; Get-ChildItem 'C:\\Program Files'",
+            "Write-Output \"$env:USERPROFILE\"",
+            "",
+        ] {
+            let script = build_powershell_script(cmd);
+            let (_, raw_args) =
+                build_windows_invocation(WinShell::PowerShell, Some(Path::new("powershell.exe")), cmd);
+            assert_eq!(
+                decode_encoded_command(&raw_args),
+                script,
+                "encoded payload must equal the -File script for {cmd:?}"
+            );
+            assert!(
+                script.contains(&format!("\n{}\n", cmd)),
+                "the user command must sit verbatim between head and tail, got {script:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_file_fallback_quotes_path_with_spaces() {
+        // `%TEMP%` under a user with a space in the name (`C:\Users\Zhang San`)
+        // must still launch: the path is quoted and passed through raw_arg, so
+        // Rust's default escaping never turns `"` into `\"`.
+        let script = Path::new("C:\\Users\\Zhang San\\AppData\\Local\\Temp\\shell-remote-mcp\\a b.ps1");
+        let (program, raw_args) = build_file_fallback(Some(Path::new("pwsh.exe")), script);
+        assert_eq!(program, "pwsh.exe");
+        assert_eq!(
+            raw_args,
+            format!(
+                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+                script.display()
+            )
+        );
+        assert!(raw_args.ends_with("-File \"C:\\Users\\Zhang San\\AppData\\Local\\Temp\\shell-remote-mcp\\a b.ps1\""),
+            "path must be one quoted argument, got {raw_args}");
+        for flag in ["-NoProfile", "-NonInteractive", "-ExecutionPolicy Bypass", "-File"] {
+            assert!(raw_args.contains(flag), "missing {flag} in {raw_args}");
+        }
+        // No `-EncodedCommand`: that is the whole point of the fallback.
+        assert!(!raw_args.contains("-EncodedCommand"));
+
+        // With no probed exe the bare name is used, resolved from PATH.
+        let (program, _) = build_file_fallback(None, script);
+        assert_eq!(program, "powershell.exe");
+    }
+
+    #[test]
+    fn test_write_temp_powershell_script_is_utf8_bom_with_verbatim_command() {
+        // PS 5.1 reads a BOM-less script as ANSI (GBK here) and mangles any
+        // non-ASCII command, so the BOM is load-bearing, not cosmetic.
+        let cmd = "Write-Output \"中文\"; $x = '不'";
+        let path = write_temp_powershell_script(cmd).expect("temp script must be written");
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "shell-remote-mcp");
+        assert_eq!(path.extension().unwrap(), "ps1");
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF], "script must start with a UTF-8 BOM");
+        let text = std::str::from_utf8(&bytes[3..]).expect("body must be valid UTF-8");
+        assert_eq!(text, build_powershell_script(cmd));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("\u{feff}{}", build_powershell_script(cmd)));
+
+        remove_temp_script(&path);
+        assert!(!path.exists(), "temp script must be deleted");
+    }
+
+    #[test]
+    fn test_should_retry_with_file_only_on_access_denied_for_powershell() {
+        use std::io::ErrorKind;
+        // The two shapes a blocked CreateProcess shows up as on Windows.
+        assert!(should_retry_with_file(WinShell::PowerShell, ErrorKind::PermissionDenied, Some(5)));
+        assert!(should_retry_with_file(WinShell::PowerShell, ErrorKind::Other, Some(5)));
+        assert!(should_retry_with_file(WinShell::PowerShell, ErrorKind::PermissionDenied, None));
+        // Anything else would fail on the fallback path too — report it as-is.
+        for kind in [ErrorKind::NotFound, ErrorKind::InvalidInput, ErrorKind::TimedOut, ErrorKind::Other] {
+            assert!(!should_retry_with_file(WinShell::PowerShell, kind, None), "{kind:?} must not retry");
+        }
+        assert!(!should_retry_with_file(WinShell::PowerShell, ErrorKind::Other, Some(2)));
+        // cmd has no encoded payload to be blocked: never retried.
+        assert!(!should_retry_with_file(WinShell::Cmd, ErrorKind::PermissionDenied, Some(5)));
+        assert!(!should_retry_with_file(WinShell::Cmd, ErrorKind::Other, Some(5)));
+    }
+
+    #[test]
+    fn test_encoded_command_denial_is_remembered_after_first_hit() {
+        // The flag is process-wide; a test that flips it must leave it set, so
+        // no other test may assume "not denied". Restore it to keep this test
+        // self-contained and order-independent.
+        let previous = encoded_command_known_denied();
+        PS_ENCODED_COMMAND_DENIED.store(false, Ordering::Relaxed);
+        assert!(!encoded_command_known_denied());
+        assert!(note_encoded_command_denied(), "first denial is reported so the warn logs once");
+        assert!(encoded_command_known_denied(), "subsequent calls go straight to -File");
+        assert!(!note_encoded_command_denied(), "a second denial must not log another warn");
+        PS_ENCODED_COMMAND_DENIED.store(previous, Ordering::Relaxed);
     }
 
     #[test]
