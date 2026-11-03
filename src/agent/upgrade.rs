@@ -356,6 +356,8 @@ fn hand_over_to_helper(
             .map(|cg| crate::agent::systemd_helper::service_unit_name(&cg))
             .and_then(|u| crate::agent::systemd_helper::service_restart_policy(&u)),
         managed_plan.clone(),
+        // 常规换机：助手负责搬动二进制，overlay 不参与。
+        false,
     );
     // Token 只进 0600/当前用户 ACL 的交接文件：argv 会出现在 `ps` 里，
     // 日志会被收集走，两者都不能碰。
@@ -425,6 +427,133 @@ pub enum Handover {
     Helper(std::process::Child),
     /// 本进程已换盘完毕，退出后由 systemd 拉起新版。
     SystemdRestart,
+}
+
+/// overlay 路径的交接（MYS-2574）：overlay 里已经装好新版本，**不搬任何文件**，
+/// 只安排"把 base 重新拉起来"这一件事。
+///
+/// 两种收尾，按 systemd 会不会自己重启来分（设计与既有 `ManagedPlan` 同源）：
+///
+/// - `Restart=always` 的托管 service：写两行恢复指针（新 agent 由 systemd 拉起，
+///   拿不到环境变量，只能靠指针找交接文件）后让调用方 `exit 0`；
+/// - 其它：走既有助手路径。助手这次**不换盘**（交接文件里 `overlay: true`），
+///   只等旧进程退出、把 **base** 拉起来——由 base 自己完成 overlay 交接。
+///
+/// 为什么必须拉起 base 而不是 overlay：直接拉起 overlay 就把启动校验绕过去了，
+/// `healthy` 永远标不上、`attempts` 也数不起来，等于没有回滚。
+#[cfg(unix)]
+fn hand_over_overlay(
+    ctx: &UpgradeContext,
+    task: &UpgradeTask,
+    overlay_binary: &std::path::Path,
+) -> Result<Handover, String> {
+    let raw_argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // 要重启的是 **base**，不是本进程（本进程可能就是 overlay 里那一份）。
+    let base = crate::agent::overlay::base_exe();
+    let restart = update_apply::RestartContext::new(
+        ctx.session_id.clone(),
+        ctx.handoff_tokens(),
+        ctx.fixed_key.clone(),
+        ctx.token_type.clone(),
+        Some(ctx.relay_base.clone()),
+        ctx.relay_insecure,
+        raw_argv,
+        base,
+        overlay_binary.to_path_buf(),
+        task.sha256.clone(),
+        task.upgrade_id.clone(),
+        task.target_version.clone(),
+        crate::agent::systemd_helper::current_cgroup_path(),
+        crate::agent::systemd_helper::current_cgroup_path()
+            .map(|cg| crate::agent::systemd_helper::service_unit_name(&cg))
+            .and_then(|u| crate::agent::systemd_helper::service_restart_policy(&u)),
+        // overlay 路径不接受 "拒绝协调" 的结论：它本来就不写目标目录，所以既
+        // 不需要 stop/start 授权，也不关心 ExecStart 归属。
+        None,
+        true,
+    );
+    let handoff = restart
+        .write_handoff()
+        .map_err(|e| format!("cannot write the upgrade handoff file: {e}"))?;
+
+    if systemd_will_restart_us() {
+        // 由 systemd 按 `ExecStart` 拉起 base：它拿不到 `SR_UPGRADE_RESTORE`（环境
+        // 由 unit 决定），只能靠指针找到交接文件。**只有这一条路径写指针**——
+        // 助手路径用环境变量传递，写指针只会留下一个永远没人消费的僵尸。
+        let dir = handoff
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| "the handoff file has no parent directory".to_string())?;
+        update_apply::mark_restore_pending(&task.upgrade_id, &handoff, &dir);
+        tracing::info!(
+            handoff = %handoff.display(),
+            upgrade_id = %task.upgrade_id,
+            "the overlay version is installed; exiting so systemd restarts the base binary, which \
+             will hand the exec over"
+        );
+        return Ok(Handover::SystemdRestart);
+    }
+
+    tracing::info!(
+        handoff = %handoff.display(),
+        upgrade_id = %task.upgrade_id,
+        "the overlay version is installed; starting a helper that will restart the base binary"
+    );
+    match update_apply::launch_helper_and_wait_ready(
+        &ctx.helper_exe,
+        &handoff,
+        &task.upgrade_id,
+        update_apply::HELPER_READY_TIMEOUT,
+    ) {
+        Ok(child) => Ok(Handover::Helper(child)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&handoff);
+            Err(e)
+        }
+    }
+}
+
+/// 本进程退出后 systemd 会不会用**同一条 `ExecStart`** 把它再拉起来。
+///
+/// 三个条件缺一不可：
+///
+/// 1. 受 systemd service 托管（`INVOCATION_ID` + cgroup 落在 `*.service`）；
+/// 2. `Restart=always`——systemd 唯一会在"正常退出（exit 0）"后补起实例的策略；
+/// 3. **本进程就是该 unit 的 `MainPID`**。`Restart=` 只对主进程生效：如果一个
+///    service 里还跑着别的进程，或者在 unit 的终端里手工起了第二个 agent，
+///    那个进程 `exit 0` 之后 systemd 什么都不会做——设备就此失联。
+///
+/// 任何一条读不到都按 `false` 处理（走助手路径自己拉起 base），绝不假设。
+#[cfg(unix)]
+fn systemd_will_restart_us() -> bool {
+    if !crate::agent::systemd_helper::current_is_managed() {
+        return false;
+    }
+    let Some(unit) = crate::agent::systemd_helper::current_cgroup_path()
+        .map(|cg| crate::agent::systemd_helper::service_unit_name(&cg))
+    else {
+        return false;
+    };
+    let respawns = crate::agent::systemd_helper::service_restart_policy(&unit)
+        .map(|p| crate::agent::systemd_helper::restart_policy_respawns_on_success(&p))
+        .unwrap_or(false);
+    if !respawns {
+        return false;
+    }
+    match crate::agent::systemd_helper::unit_main_pid(&unit) {
+        Some(pid) if pid == std::process::id() => true,
+        Some(pid) => {
+            tracing::warn!(
+                unit = %unit,
+                main_pid = pid,
+                self_pid = std::process::id(),
+                "this agent is not the service's main process; systemd will not restart it after a \
+                 clean exit, so the base binary has to be started by the update helper"
+            );
+            false
+        }
+        None => false,
+    }
 }
 
 /// 建 relay 兜底下载用的客户端：**禁止重定向**，TLS 策略与 relay 上行一致。
@@ -530,17 +659,89 @@ pub async fn perform_upgrade(ctx: UpgradeContext, task: UpgradeTask) {
         report_failed(&ctx, &version, "cannot locate executable directory".into()).await;
         return;
     };
-    // `.part` 与目标同目录：同一文件系统，最终 rename 才能原子。
+
+    // 本进程是不是 overlay 版本？是的话"目标目录"这个概念已经变了：要改写的是
+    // **overlay 目录**（`ctx.target` 已经是里面那一份），而不是 base 所在的那个
+    // 不可写目录。第二次及以后的升级都落在这一支上。
+    #[cfg(unix)]
+    let running_from_overlay = super::overlay::running_from_overlay();
+
+    // 目标目录不可写时改走 overlay（MYS-2574）：新版本装进用户目录，由 base
+    // 在启动时校验后交接执行权。**可写时一切都与既有路径完全一致**——这条
+    // 分支只看一次"能不能在目标目录里建出文件"，判定方式与换机助手相同。
+    //
+    // overlay 判定必须在这里做、而不是等助手 ready 时才发现：那时的失败已经
+    // 白白下完了几十 MB。
+    #[cfg(unix)]
+    let overlay = if running_from_overlay || !super::overlay::dir_is_writable(&dir) {
+        match super::overlay::Layout::from_env() {
+            Ok(layout) => match layout.ensure() {
+                Ok(()) => {
+                    if !running_from_overlay {
+                        tracing::info!(
+                            target_dir = %dir.display(),
+                            overlay = %layout.root().display(),
+                            "the executable directory is not writable; installing the new version into \
+                             the overlay directory"
+                        );
+                    }
+                    Some(layout)
+                }
+                Err(e) => {
+                    report_failed(
+                        &ctx,
+                        &version,
+                        format!(
+                            "cannot write to {} and the overlay directory is unusable: {e}",
+                            dir.display()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            Err(e) => {
+                report_failed(&ctx, &version, e).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    // 非 unix：overlay 模块整个不编译。Windows 上"目录不可写"这件事交给
+    // SCM/ACL 那一套处理，本机制不适用；显式给一个恒 `None` 的占位，让下面
+    // 那条分支在类型上成立，且永远不会走到。
+    #[cfg(not(unix))]
+    let _overlay = ();
+    #[cfg(unix)]
+    let overlay_mode = overlay.is_some();
+    #[cfg(not(unix))]
+    let overlay_mode = false;
+
+    // `.part` 与最终落位同一文件系统，最终 rename 才能原子。
+    //
+    // - 常规路径：与目标同目录（既有行为）。
+    // - overlay 路径：放进 overlay 根目录——目标目录不可写，别处放不下；下载
+    //   器的断点续传与换源逻辑只认这个路径，其余逻辑一行没变。
     //
     // 文件名按**目标制品的 SHA-256 前缀**区分（而不是 pid）：断点续传要跨
     // 「这次下载失败 → admin 再点一次升级」也能接上，pid 命名会让每次重试都
     // 从头下几十 MB。hash 不同则是另一个制品，不能复用旧字节。
+    #[cfg(unix)]
+    let part = match &overlay {
+        Some(layout) => layout.part_path(&task.sha256),
+        None => dir.join(format!(
+            ".shell-remote-upgrade-{}.part",
+            &task.sha256[..task.sha256.len().min(16)]
+        )),
+    };
+    #[cfg(not(unix))]
     let part = dir.join(format!(
         ".shell-remote-upgrade-{}.part",
         &task.sha256[..task.sha256.len().min(16)]
     ));
     // 清理历史命名遗留（旧版本用 pid 命名的临时文件），避免堆积。
-    cleanup_stale_parts(&dir).await;
+    cleanup_stale_parts(part.parent().unwrap_or(&dir)).await;
 
     // 1. 下载（多源 + 续传 + 预算，进度在下载器内部上报）。
     let downloaded = match build_downloader(&ctx, &task) {
@@ -653,13 +854,102 @@ pub async fn perform_upgrade(ctx: UpgradeContext, task: UpgradeTask) {
         &ctx.session_id,
         "swapping",
         None,
-        Some(format!(
-            "verified {} from {}; installing it",
-            version, downloaded.source
-        )),
+        Some(if overlay_mode {
+            format!(
+                "verified {} from {}; installing it into the overlay directory (mode: overlay)",
+                version, downloaded.source
+            )
+        } else {
+            format!(
+                "verified {} from {}; installing it",
+                version, downloaded.source
+            )
+        }),
         &version,
     )
     .await;
+
+    // 4a. overlay 路径：装进用户目录、写指针，然后**按既有托管判定重启 base**。
+    //
+    // 拉起的是 base 二进制（`ctx.target`），由它在下次启动时校验并 exec 到新
+    // 版本——直接拉起 overlay 二进制就把交接逻辑绕过去了，`healthy` 永远标不上、
+    // 回滚也就无从触发。
+    #[cfg(unix)]
+    if let Some(layout) = &overlay {
+        let installed = match super::overlay::install(
+            layout,
+            &part,
+            &version,
+            &task.sha256,
+            // 记的是 **base** 的路径（本进程可能就是 overlay 版本）：诊断与
+            // "管理员手工换过 base" 的判定都依赖它。
+            Some(&super::overlay::base_exe()),
+            Some(&task.upgrade_id),
+        ) {
+            Ok(installed) => {
+                tracing::info!(
+                    overlay = %installed.path.display(),
+                    version = %version,
+                    upgrade_id = %task.upgrade_id,
+                    "the new version is installed in the overlay directory; restarting the base \
+                     binary so it can hand the exec over"
+                );
+                installed
+            }
+            Err(e) => {
+                report_failed(
+                    &ctx,
+                    &version,
+                    format!("cannot install the new version into the overlay directory: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+        // 交接文件里仍然写 base（`target_path`）与新文件名（overlay 路径），
+        // 只是 `new_binary` 已经就位、不需要助手搬动任何文件——这里复用现有
+        // 的「退出让 systemd 拉起」与「助手按 PID 等旧进程退出」两条收尾，
+        // 只是不再让助手改磁盘。
+        match hand_over_overlay(&ctx, &task, &installed.path) {
+            Ok(handover) => match handover {
+                Handover::Helper(helper) => tracing::info!(
+                    helper_pid = helper.id(),
+                    upgrade_id = %task.upgrade_id,
+                    "restart helper is ready; exiting so the base binary is started again"
+                ),
+                Handover::SystemdRestart => tracing::info!(
+                    upgrade_id = %task.upgrade_id,
+                    "overlay installed; exiting so systemd restarts the base binary"
+                ),
+            },
+            Err(e) => {
+                // overlay 已就位但重启没安排上：指针带 `healthy=false`、
+                // `attempts=0`，下次任何一次重启都会照常交接，不会卡住。
+                report_failed(
+                    &ctx,
+                    &version,
+                    format!("the overlay version is installed but the agent could not be restarted: {e}"),
+                )
+                .await;
+                return;
+            }
+        }
+        send_progress(
+            &ctx.ctrl_tx,
+            &ctx.session_id,
+            "swapping",
+            None,
+            Some(format!(
+                "the new version {version} is installed in the overlay directory; the base binary \
+                 is restarting and will hand the exec over (mode: overlay)"
+            )),
+            &version,
+        )
+        .await;
+        tokio::time::sleep(EXIT_FLUSH_GRACE).await;
+        std::process::exit(0);
+    }
+
     let helper = match hand_over_to_helper(&ctx, &task, &part) {
         Ok(h) => h,
         Err(e) => {
@@ -1164,6 +1454,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // 上一轮的恢复参数必须被剥掉，否则新一轮会去读上一轮的身份。
         assert_eq!(

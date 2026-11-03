@@ -309,6 +309,15 @@ async fn main() -> anyhow::Result<()> {
             no_cmd_log,
             upgrade_restore,
         } => {
+            // overlay 交接（MYS-2574）：目标目录不可写时，新版本装在用户目录里，
+            // 由**这里**决定要不要把执行权交给它。
+            //
+            // 时机必须尽量早（注册之前、甚至早于日志初始化之后的其它准备工作）：
+            // 交接之后本进程就不存在了，任何已经做过的初始化都白做。但仍然放在
+            // `init_logging()` 之后 —— 交接本身要留一行可查的日志。
+            #[cfg(unix)]
+            agent::overlay::handoff_on_startup();
+
             // 命令日志开关：默认开启，`--no-cmd-log` 关闭。
             agent::cmd_log::set_enabled(!no_cmd_log);
             let desired = match session_id.as_deref() {

@@ -28,6 +28,10 @@ pub mod upgrade;
 // MYS-2425 阶段3：隐藏换机助手（`update-apply`）、一次性身份交接与有界回滚。
 // 与桌面无关，lean 构建同样编译。
 pub mod update_apply;
+// MYS-2574：目标目录不可写时的 overlay 自升级（新版本装进用户目录，启动时由
+// base 校验后 exec 交接）。只在 unix 上有意义——Windows 走 SCM/ACL 那套语义。
+#[cfg(unix)]
+pub mod overlay;
 pub mod web_proxy;
 
 /// Unix 登录环境策略（网页终端与 MCP exec 共用，MYS-2421）。
@@ -1460,6 +1464,19 @@ async fn run_session(
     // processing (and MCP round-trips time out as "i/o error").
     let (control_tx, control_rx) = tokio::sync::mpsc::channel::<String>(64);
     let (output_tx, output_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(64);
+
+    // overlay 升级的两个注册后动作（MYS-2574），都只在有 overlay 指针时才发生：
+    //
+    // - 本进程是 overlay 版本 → 指针标 `healthy=true`，此后不受尝试次数限制；
+    // - 本进程是 base、且指针已被 `rejected` → 推一条 `failed`，如实告诉 relay
+    //   "新版本起不来、已回落到 base"。只报一次。
+    //
+    // 放在注册成功之后、与身份回执同一段：`healthy` 的语义是"这一版能注册"，
+    // 而不是"这一版能启动"。
+    #[cfg(unix)]
+    if let Some(frame) = crate::agent::overlay::after_registration(&client.session_id) {
+        let _ = control_tx.send(frame).await;
+    }
     // 回滚后的重启：把失败原因送回 relay。否则管理界面只会看到一个
     // "升级过、版本却没变"的状态，运维无从判断是没升成还是又退了回来。
     if let Some(r) = restored {

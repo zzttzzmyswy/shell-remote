@@ -64,6 +64,12 @@ impl AgentVariant {
     /// 从可执行文件名判定形态（发布产物就是 `shell-remote-<arch>` /
     /// `shell-remote-ui-<arch>`，名字即身份）。
     ///
+    /// overlay 里装的那一份还要认：它的名字是
+    /// `shell-remote-<版本>-<sha256 前 8 位>`（MYS-2574），形态由**名字开头的
+    /// 发布名**决定。不认它的话，base 交接过去的 overlay 版本自报不出
+    /// `variant:*`，relay 会按"形态未知"拒绝它的**下一次**升级——升级链在第一次
+    /// overlay 之后就断了。
+    ///
     /// 为什么不用 `cfg!(feature = "desktop")`：默认 feature 包含 desktop，用
     /// 默认 feature 构建的 CLI 二进制会被误判成 UI——那正是「升级时把 CLI 设备
     /// 换成 30MB 桌面包」的事故路径。lib 里也拿不到 `CARGO_BIN_NAME`（只有 bin
@@ -76,6 +82,11 @@ impl AgentVariant {
         // UI 名必须先判：`shell-remote-ui-*` 也以 `shell-remote` 开头。
         if stem.contains("shell-remote-ui") {
             return Some(Self::Ui);
+        }
+        // overlay 里那一份（`shell-remote-<版本>-<sha8>`）：形态看开头，是否真的是
+        // overlay 的命名由后缀把关，避免把任意被改名的文件都当 CLI。
+        if let Some(variant) = overlay_name_variant(&stem) {
+            return Some(variant);
         }
         // CLI 只认**确切**的发布名（`shell-remote` 或 `shell-remote-<arch>`）。
         // 放宽成前缀匹配会把「被改名的 UI 二进制」判成 CLI，进而被换成 lean
@@ -110,6 +121,37 @@ impl AgentVariant {
             None => Self::from_exe_name(""),
         }
     }
+}
+
+/// overlay 里那份二进制的命名是不是 `shell-remote[-ui]-<版本>-<sha256 前 8 位>`？
+///
+/// 两个条件同时满足才算：**版本号能被 semver 解析**、**后缀是 8 位十六进制**。
+/// 这样 `shell-remote-x86_64`（架构名解析不出 semver）、`shell-remote-notes`、
+/// 人为改名的文件都不会被误认成 overlay 制品；而 `shell-remote-ui-0.59.13-1a2b3c4d`
+/// 也不会被漏掉。
+///
+/// 与 `crate::agent::overlay` 的落位命名（`Layout::version_file`）是同一份约定，
+/// 但这里刻意不依赖那个模块：`download` 是 lean 构建也必须能编译的基础模块，
+/// 而 overlay 只在 unix 上存在。
+fn overlay_name_variant(stem: &str) -> Option<AgentVariant> {
+    for (prefix, variant) in [
+        ("shell-remote-ui-", AgentVariant::Ui),
+        ("shell-remote-", AgentVariant::Cli),
+    ] {
+        let Some(rest) = stem.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some((version, sha)) = rest.rsplit_once('-') else {
+            continue;
+        };
+        if sha.len() != 8 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        if semver::Version::parse(version).is_ok() {
+            return Some(variant);
+        }
+    }
+    None
 }
 
 /// 本机发布架构 key（与 relay 的制品命名一致）。
@@ -2755,6 +2797,56 @@ mod tests {
         assert_eq!(CAPABILITY_VARIANT_UI, "variant:ui");
         assert_eq!(AgentVariant::Cli.capability(), "variant:cli");
         assert_eq!(AgentVariant::Ui.as_str(), "ui");
+    }
+
+    /// overlay 里那份二进制的命名（MYS-2574）必须也能判出形态。
+    ///
+    /// 这不是锦上添花：base 把执行权交给 overlay 版本之后，`current_exe()` 就变
+    /// 成 `.../bin/shell-remote-<版本>-<sha8>`。认不出来的话，升级后的 agent 会
+    /// **不声明** `variant:*`，relay 按契约返回 `409 variant_unknown`——第一次
+    /// overlay 升级成功，之后就再也升不动了。
+    #[test]
+    fn test_variant_detection_for_overlay_file_names() {
+        // CLI 与 UI 两种形态都要认。
+        assert_eq!(
+            AgentVariant::from_exe_name("shell-remote-0.59.13-1a2b3c4d"),
+            Some(AgentVariant::Cli)
+        );
+        assert_eq!(
+            AgentVariant::from_exe_name("shell-remote-ui-0.59.13-1a2b3c4d"),
+            Some(AgentVariant::Ui)
+        );
+        // 预发布版本号也要认（semver 允许 `-beta.1`，后缀仍是 `-<sha8>`）。
+        assert_eq!(
+            AgentVariant::from_exe_name("shell-remote-0.59.13-beta.1-0a1b2c3d"),
+            Some(AgentVariant::Cli)
+        );
+        // 反例：这些名字**不是** overlay 命名，`overlay_name_variant` 必须返回
+        // `None`（它们随后的归类由既有规则决定：lean 构建会把任何未知名字当
+        // CLI，含桌面代码的构建则拒绝声明——那是本改动之前的行为，不在此断言）。
+        for name in [
+            // 架构名解析不出 semver
+            "shell-remote-x86_64",
+            // 后缀不是 8 位十六进制
+            "shell-remote-0.59.13-notahash",
+            "shell-remote-0.59.13-1a2b",
+            // 版本号不是 semver
+            "shell-remote-custom-build-1a2b3c4d",
+            "shell-remote-notes.txt",
+            "not-shell-remote-0.59.13-1a2b3c4d",
+        ] {
+            assert_eq!(
+                overlay_name_variant(name),
+                None,
+                "{name} 不是 overlay 命名，不能被 overlay 规则命中"
+            );
+        }
+        // 架构名那条仍然保持既有语义（发布产物的 CLI 名），不是 overlay 规则
+        // 的功劳。
+        assert_eq!(
+            AgentVariant::from_exe_name("shell-remote-x86_64"),
+            Some(AgentVariant::Cli)
+        );
     }
 
     // ── 代理 ────────────────────────────────────────────────────

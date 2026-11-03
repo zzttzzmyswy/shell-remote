@@ -189,6 +189,12 @@ pub struct RestartContext {
     ///
     /// 由旧 agent 在交接时读一次写进来（非 systemd 环境恒为 `None`）。
     pub service_restart_policy: Option<String>,
+    /// **overlay 换机**（MYS-2574）：`new_binary` 已经在 overlay 目录里就位，
+    /// 助手不许搬动任何文件，只需把 `target_path`（base）重新拉起来。
+    ///
+    /// 为什么不让助手直接拉起 overlay：那样就把启动校验绕过去了——base 才是
+    /// "读指针 → 校验属主/权限/sha256 → exec" 的那一环，绕过它等于没有回滚。
+    pub overlay: bool,
 }
 
 impl std::fmt::Debug for RestartContext {
@@ -213,6 +219,7 @@ impl std::fmt::Debug for RestartContext {
             .field("service_cgroup", &self.service_cgroup)
             .field("managed_plan", &self.managed_plan)
             .field("service_restart_policy", &self.service_restart_policy)
+            .field("overlay", &self.overlay)
             .finish()
     }
 }
@@ -254,6 +261,12 @@ struct HandoffFile {
     /// 用字符串而不是枚举序列化，是为了让交接文件对旧版/未来版都保持可读。
     #[serde(default)]
     managed_plan: Option<String>,
+    /// 这是一次 **overlay 换机**（MYS-2574）：新版本已经落在 overlay 目录里，
+    /// 助手/新进程**不需要**搬动任何文件，只需要把 base 二进制重新拉起来。
+    ///
+    /// 老助手读不到这个字段时默认 `false`（既有行为），所以它是一个纯加法。
+    #[serde(default)]
+    overlay: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -417,6 +430,7 @@ impl RestartContext {
         service_cgroup: Option<String>,
         service_restart_policy: Option<String>,
         managed_plan: Option<super::systemd_helper::ManagedPlan>,
+        overlay: bool,
     ) -> Self {
         Self {
             session_id,
@@ -436,6 +450,7 @@ impl RestartContext {
             service_cgroup,
             service_restart_policy,
             managed_plan,
+            overlay,
         }
     }
 
@@ -467,6 +482,7 @@ impl RestartContext {
             service_cgroup: self.service_cgroup.clone(),
             service_restart_policy: self.service_restart_policy.clone(),
             managed_plan: self.managed_plan.as_ref().map(encode_plan),
+            overlay: self.overlay,
         }
     }
 
@@ -524,6 +540,7 @@ impl RestartContext {
             service_cgroup: f.service_cgroup,
             service_restart_policy: f.service_restart_policy,
             managed_plan: f.managed_plan.as_deref().and_then(decode_plan),
+            overlay: f.overlay,
         })
     }
 
@@ -1636,6 +1653,97 @@ fn verify_new_binary(ctx: &RestartContext) -> Result<(), String> {
     Ok(())
 }
 
+/// overlay 换机时校验"已经就位的那份字节"（`ctx.new_binary` 就是 overlay 里
+/// 的版本文件，由旧 agent 装好并写好指针）。
+///
+/// 与 [`verify_new_binary`] 的差别只有一处：overlay 路径不看目标目录（那条路径
+/// 存在的全部意义就是目标目录不可写）。校验内容一致——普通文件、非空、sha256
+/// 与任务 digest 相符。
+fn verify_overlay_artifact(ctx: &RestartContext) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(&ctx.new_binary)
+        .map_err(|e| format!("cannot stat the overlay binary: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("the overlay binary is not a regular file".to_string());
+    }
+    if meta.len() == 0 {
+        return Err("the overlay binary is empty".to_string());
+    }
+    let actual = crate::agent::download::sha256_hex_file(&ctx.new_binary)
+        .map_err(|e| format!("cannot hash the overlay binary: {e}"))?;
+    if !crate::agent::download::verify_sha256(&actual, &ctx.new_sha256) {
+        return Err(format!(
+            "the overlay binary no longer matches its digest (got {actual}, expected {})",
+            ctx.new_sha256
+        ));
+    }
+    Ok(())
+}
+
+/// overlay 换机的助手收尾：**不动磁盘**，只把 base 二进制重新拉起来，由 base
+/// 在下次启动时校验并 `exec` 到 overlay 版本。
+///
+/// 与既有 rollback 路径的区别在于"失败要不要回滚"：overlay 路径上磁盘根本没
+/// 被换过——base 一直在原地、overlay 只是多了一个文件，所以任何失败都只是
+/// "这次重启没做成"，如实 `aborted` 即可，没有可回滚的东西。
+#[cfg(unix)]
+#[cfg(unix)]
+fn overlay_restart(
+    ctx: &RestartContext,
+    handoff: &Path,
+    _announce_ready: bool,
+    log: &mut HelperLog,
+    timeouts: HelperTimeouts,
+) -> HelperOutcome {
+    // `ready` 已经在上面的公共检查之后发过一次（`helper_main_with` 里那段），
+    // 这里**不再重发**：stdout 是单行握手通道，第二行会被旧 agent 当成"助手
+    // 没 ready 就报了别的东西"直接判失败。本助手不写任何文件，那次 ready 之后
+    // 旧进程退出不会留下半个磁盘状态。
+    log.line("overlay mode: waiting for the old process to exit");
+    match wait_for_exit(ctx.old_pid, ctx.old_start, timeouts.old_exit) {
+        ExitWait::Exited => log.line("old process exited"),
+        ExitWait::Timeout => {
+            let msg = format!(
+                "the old process (pid {}) is still running after {:?}; nothing was changed",
+                ctx.old_pid, timeouts.old_exit
+            );
+            log.line(&msg);
+            return HelperOutcome::aborted(msg);
+        }
+    }
+
+    // 拉起的是 **base**（`ctx.target_path`），不是 overlay 文件：交接逻辑在 base
+    // 里，绕过去就没有校验、也不会有 `attempts` 计数与自动回滚。
+    let mut child = match spawn_agent(ctx, handoff, None) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("cannot start the agent again: {e}");
+            log.line(&msg);
+            return HelperOutcome::aborted(msg);
+        }
+    };
+    log.line(&format!("agent started again (pid {})", child.id()));
+
+    match await_registration(&mut child, ctx, log, timeouts.register) {
+        Ok(version) => {
+            log.line(&format!(
+                "the agent registered version={version}; it is now running the overlay build"
+            ));
+            let _ = std::fs::remove_file(handoff);
+            HelperOutcome::Registered { version }
+        }
+        Err(reason) => {
+            log.line(&format!("the restarted agent did not register: {reason}"));
+            kill_process_tree(&mut child);
+            // 磁盘没动过：base 还在、overlay 也还在，下次任何一次重启都会重新
+            // 走一遍交接（`attempts` 已加过，三次之后自动回落 base）。
+            HelperOutcome::aborted(format!(
+                "the agent did not register after the overlay install: {reason}. The base binary \
+                 and the overlay are both untouched; the next start will try the handover again."
+            ))
+        }
+    }
+}
+
 fn backup_path_for(target: &Path, upgrade_id: &str) -> PathBuf {
     let tag: String = upgrade_id
         .chars()
@@ -1950,20 +2058,34 @@ pub fn helper_main_with(
         }
         return HelperOutcome::aborted(msg);
     };
-    if let Err(e) = verify_new_binary(&ctx) {
-        log.line(&format!("refusing to swap: {e}"));
-        if announce_ready {
-            fail_to_stdout(&e);
+    if ctx.overlay {
+        // overlay 换机（MYS-2574）：新版本已经落在用户可写的 overlay 目录里，
+        // 助手**不碰**目标目录——那正是这条路径存在的理由（目标目录不可写）。
+        // 要校验的是 overlay 里那份字节，以及"它确实在磁盘上、能被 base 交接"。
+        log.line("overlay mode: the new version is already installed; this helper only restarts the base binary");
+        if let Err(e) = verify_overlay_artifact(&ctx) {
+            log.line(&format!("refusing to restart: {e}"));
+            if announce_ready {
+                fail_to_stdout(&e);
+            }
+            return HelperOutcome::aborted(e);
         }
-        return HelperOutcome::aborted(e);
-    }
-    if let Err(e) = probe_dir_writable(&target_dir) {
-        let msg = format!("cannot write to {}: {e}", target_dir.display());
-        log.line(&format!("refusing to swap: {msg}"));
-        if announce_ready {
-            fail_to_stdout(&msg);
+    } else {
+        if let Err(e) = verify_new_binary(&ctx) {
+            log.line(&format!("refusing to swap: {e}"));
+            if announce_ready {
+                fail_to_stdout(&e);
+            }
+            return HelperOutcome::aborted(e);
         }
-        return HelperOutcome::aborted(msg);
+        if let Err(e) = probe_dir_writable(&target_dir) {
+            let msg = format!("cannot write to {}: {e}", target_dir.display());
+            log.line(&format!("refusing to swap: {msg}"));
+            if announce_ready {
+                fail_to_stdout(&msg);
+            }
+            return HelperOutcome::aborted(msg);
+        }
     }
     cleanup_stale_helper_copies(&target_dir, &mut log);
     let old_timeout = timeouts.old_exit;
@@ -1985,6 +2107,17 @@ pub fn helper_main_with(
             log.line(&msg);
             return HelperOutcome::aborted(msg);
         }
+    }
+
+    // ── overlay 换机：不碰磁盘，只把 base 拉起来 ────────────────────
+    //
+    // 这里必须排在 `managed_plan` 分流**之前**：overlay 路径不写目标目录，所以
+    // 既不关心 `Coordinated`（要 stop/start 授权），也不关心 `Refuse` 那几条
+    // "归属/ExecStart/重启策略"的结论——那些判据的存在意义是"能不能安全地换掉
+    // 目标二进制"，而这条路径根本不换它。
+    #[cfg(unix)]
+    if ctx.overlay {
+        return overlay_restart(&ctx, handoff, announce_ready, &mut log, timeouts);
     }
 
     // ── 受管 service：协调 stop → swap → start，或 fail-closed ──────
@@ -2350,6 +2483,16 @@ fn coordinated_swap_with(
 /// 指针只含路径、`0600`、写在 `0700` 目录里；Token 始终只在交接文件内。
 fn pending_restore_marker(upgrade_id: &str, handoff: &Path, dir: &Path) {
     pending_restore_marker_with(upgrade_id, handoff, None, dir)
+}
+
+/// 写两行恢复指针（`upgrade_id` + 交接文件路径）。
+///
+/// 公开入口给 overlay 换机用（MYS-2574）：那条路径上旧 agent 自己退出、由
+/// systemd 拉起 base，新进程拿不到 `SR_UPGRADE_RESTORE`，只能靠这个指针找到
+/// 交接文件并恢复原身份。第三行 backup 只在 `SystemdRestart` 换机里出现——
+/// overlay 路径没有备份可言（base 从未被替换）。
+pub fn mark_restore_pending(upgrade_id: &str, handoff: &Path, dir: &Path) {
+    pending_restore_marker(upgrade_id, handoff, dir)
 }
 
 /// [`pending_restore_marker`] 的两行/三行版本：`backup` 非空时写第三行。
