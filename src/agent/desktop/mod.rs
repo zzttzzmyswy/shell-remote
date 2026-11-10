@@ -229,6 +229,26 @@ fn pooled_frame(pool: &FramePool, w: usize, h: usize, bgra: &[u8]) -> capture::F
     }
 }
 
+/// 转换完成后处置帧 buffer：真实帧（`synthetic=false`）move 进 `last`，作为
+/// 静态心跳 IDR / reqkey 重编的"最近画面"，被替换的旧 buffer 归还池；合成帧
+/// （本身就是 `last` 的拷贝）直接归还池。保证静态重编的永远是最近一次真正
+/// 编码出去的内容，而不是更早的采样（MYS-2765 验收复核）。
+fn retain_last_encoded(
+    last: &mut Option<(usize, usize, Vec<u8>)>,
+    fr: &mut capture::Frame,
+    synthetic: bool,
+    pool: &FramePool,
+) {
+    let bgra = std::mem::take(&mut fr.bgra);
+    if synthetic {
+        pool.release(bgra);
+        return;
+    }
+    if let Some((_, _, old)) = last.replace((fr.width, fr.height, bgra)) {
+        pool.release(old);
+    }
+}
+
 /// Controls the desktop capture+encode task.
 /// 心跳扩展 KPI 快照（R5#150）：agent 心跳携带的最小桌面运行态。
 /// 供 relay/admin 侧可观测（不依赖浏览器面板），字段无锁原子读。
@@ -1408,10 +1428,12 @@ async fn run_desktop_pipeline(
     // 上次编码/上次墙钟采样点（真实时间，见下方循环内说明）。
     let mut last_encode = std::time::Instant::now();
     let mut last_wall = std::time::Instant::now();
-    // 最近一帧原始像素（静态 IDR / reqkey 重编用）。采样低频（≥500ms 才
-    // 更新一次）限制拷贝开销；静态 IDR 只需要"最近画面"。
+    // 最近一次**真实编码**的原始像素（静态 IDR / reqkey 重编用）。转换完成后
+    // 把帧 buffer 直接 move 进来（零拷贝，旧 buffer 归还池），见
+    // [`retain_last_encoded`]。旧实现每 ≥500ms 才 clone 采样一次：一串变化
+    // 的最后几帧落在采样窗口内时，静态心跳 IDR 会重编更早的画面，浏览器
+    // 每 4s 被"倒回"旧画面（MYS-2765 验收复核）。
     let mut last_static: Option<(usize, usize, Vec<u8>)> = None;
-    let mut last_static_at = std::time::Instant::now();
     // 编码耗时预算（R2 甲19/20 / R5#84）：连续 ≥10 帧单帧编码 >66ms 判定
     // 当前 codec 在软编上不堪重负，降级到更低复杂度的 codec（av1→h264，
     // 复用 fallback 链）。避免"持续超帧预算 → e2e 堆积 → QoS 误判拥塞"的
@@ -1453,10 +1475,6 @@ async fn run_desktop_pipeline(
         let mut synthetic = false;
         let fr = match threaded.try_latest() {
             Some(f) => {
-                if last_static.is_none() || last_static_at.elapsed() >= Duration::from_millis(500) {
-                    last_static = Some((f.width, f.height, f.bgra.clone()));
-                    last_static_at = std::time::Instant::now();
-                }
                 // R5#25 空闲回收可见性：真实新帧 = 内容活动。静止（无新帧/
                 // 静态 IDR 心跳）时保持 ||last_active_at|| 旧值，qos-ack 据此
                 // 上报 active=false，浏览器面板显示"静止"。
@@ -1660,8 +1678,9 @@ async fn run_desktop_pipeline(
         } else {
             color::bgra_to_i420_scaled(&fr.bgra, w, h, stride, enc_w, enc_h)
         };
-        // R5 #127：帧 bgra 已消耗（转换完成），buffer 归还池复用（cap 保留）。
-        frame_pool.release(std::mem::take(&mut fr.bgra));
+        // R5 #127：帧 bgra 已消耗（转换完成）。真实帧留作静态心跳/reqkey 重编
+        // 的"最近画面"（move，零拷贝），被替换的旧 buffer 与合成帧 buffer 归还池。
+        retain_last_encoded(&mut last_static, &mut fr, synthetic, &frame_pool);
         // 灰度模式（web 端可选，弱网省带宽）：编码前把 UV 平面置中性 128，
         // 色度信息≈0，码率显著下降（亮度是弱网下的主观关键）。切换即时生效
         // （下帧起），不重建编码器。
@@ -3358,35 +3377,68 @@ mod tests {
             let p2 = posted.clone();
             let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
 
-            dm.start(post.clone()).await;
-            assert!(dm.is_running(), "start 后立即处于 running");
-
-            // 等早退发生：guard 必须清 running（最多 5s，X11 连接失败是立即的）。
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while dm.is_running() && std::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(
-                !dm.is_running(),
-                "循环早退后 running 必须归零，否则 start() 永远直接 return"
-            );
-
-            // 失败路径已广播 `desktop:started{error}`，浏览器知道原因。
-            {
-                let list = posted.lock().unwrap();
+            // 早退在另一 worker 线程上几乎立即发生（X11 连接失败是同步的），
+            // `start()` 返回后再断言 `is_running()==true` 与之竞态（全量并行
+            // 跑测试时偶发失败）。改为以「循环真的跑了一次」为证据：每次
+            // start 都必须产出一条新的 `desktop:started{error}`，且随后
+            // running 归零。旧实现第二次 start 被 running 卡住直接 return，
+            // 不会产生第二条 error —— 断言仍然能抓住原缺陷。
+            let errors = |posted: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>| {
+                posted
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|v| {
+                        v["type"] == "desktop:started" && v["payload"]["error"].as_str().is_some()
+                    })
+                    .count()
+            };
+            for round in 1..=2usize {
+                dm.start(post.clone()).await;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while (errors(&posted) < round || dm.is_running())
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(
+                    errors(&posted),
+                    round,
+                    "第 {round} 次 start 必须真的拉起循环并报告 started{{error}}（旧实现第二次被 running 卡住直接 return）"
+                );
                 assert!(
-                    list.iter().any(|v| v["type"] == "desktop:started"
-                        && v["payload"]["error"].as_str().is_some()),
-                    "early exit must report started{{error}}, got {list:?}"
+                    !dm.is_running(),
+                    "第 {round} 次早退后 running 必须归零，否则 start() 永远直接 return"
                 );
             }
-
-            // 再次 start 必须真的重新拉起（不是被 running 卡住返回）。
-            dm.start(post.clone()).await;
-            assert!(dm.is_running(), "早退后再次 start 必须能重新拉起流");
             dm.stop(post).await;
             assert!(!dm.is_running(), "stop 后 running 归零");
         });
+    }
+
+    /// 静态心跳 / reqkey 重编的必须是**最近一次真实编码**的画面：真实帧 move
+    /// 进 last（旧 buffer 归还池），合成帧不覆盖 last（MYS-2765 验收复核：
+    /// 旧实现 ≥500ms 才采样一次，心跳 IDR 会把画面倒回更早的内容）。
+    #[test]
+    fn test_retain_last_encoded_keeps_latest_real_frame() {
+        let pool = FramePool::new(4);
+        let mut last: Option<(usize, usize, Vec<u8>)> = None;
+        let frame = |v: u8| capture::Frame { bgra: vec![v; 2 * 2 * 4], width: 2, height: 2 };
+
+        // 连续两帧真实内容（间隔远小于 500ms）：last 必须是第二帧。
+        let mut a = frame(1);
+        retain_last_encoded(&mut last, &mut a, false, &pool);
+        let mut b = frame(2);
+        retain_last_encoded(&mut last, &mut b, false, &pool);
+        assert_eq!(last.as_ref().unwrap().2[0], 2, "last 必须是最近一次真实编码的帧");
+        assert!(a.bgra.is_empty() && b.bgra.is_empty(), "buffer 已 move 走");
+
+        // 合成帧（last 的拷贝）编码后不得覆盖 last，buffer 归还池。
+        let mut syn = pooled_frame(&pool, 2, 2, &last.as_ref().unwrap().2);
+        syn.bgra[0] = 9; // 若被误存，last 会变成 9
+        retain_last_encoded(&mut last, &mut syn, true, &pool);
+        assert_eq!(last.as_ref().unwrap().2[0], 2, "合成帧不得覆盖 last");
+        assert_eq!(last.as_ref().unwrap().0, 2);
     }
 
     /// #1 旧代任务退出不得清除新代的 running（否则新流被误标未运行，
