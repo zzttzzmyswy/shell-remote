@@ -1732,16 +1732,40 @@ mod tests {
 
     /// 制品名必须与测试机身份匹配（`verify_artifact_identity` 会拦）。
     fn local_filename() -> String {
-        let variant = if cfg!(feature = "gui") && cfg!(feature = "desktop") && cfg!(feature = "tui")
-        {
+        format!(
+            "{}-{}{}",
+            own_variant(),
+            own_arch_key(),
+            if cfg!(windows) { ".exe" } else { "" }
+        )
+    }
+
+    /// 本机构建的制品前缀（UI 三特性齐备时为 `shell-remote-ui`，否则 CLI）。
+    fn own_variant() -> &'static str {
+        if cfg!(feature = "gui") && cfg!(feature = "desktop") && cfg!(feature = "tui") {
             "shell-remote-ui"
         } else {
             "shell-remote"
+        }
+    }
+
+    /// 与 [`local_filename`] **必然不同**的另一个合法制品名。
+    ///
+    /// 交叉校验类测试（"official_path 指向另一个制品必须拒绝"）需要一个确定
+    /// 不等于本机制品的名字。以前这里写死 `shell-remote-ui-x86_64`：默认特性
+    /// x86_64 构建下它**恰好就是** `local_filename()`，测试于是恒失败（基线
+    /// 红测，MYS-2765）。改为按本机名派生——换一个架构 key，名字必定不同，
+    /// 且仍是合法的 `shell-remote[-ui]-<arch>` 形态。
+    fn other_artifact_name() -> String {
+        let other_arch = if own_arch_key() == "aarch64" {
+            "x86_64"
+        } else {
+            "aarch64"
         };
         format!(
             "{}-{}{}",
-            variant,
-            own_arch_key(),
+            own_variant(),
+            other_arch,
             if cfg!(windows) { ".exe" } else { "" }
         )
     }
@@ -2638,13 +2662,21 @@ mod tests {
             use sha2::Digest;
             hex::encode(sha2::Sha256::digest(ARTIFACT))
         };
+        // "另一个制品"必须是**必然不同于** local_filename() 的名字（按本机名
+        // 派生），否则默认特性 x86_64 下会与本机制品同名，断言恒失败。
+        let other = other_artifact_name();
+        assert_ne!(
+            other,
+            local_filename(),
+            "test precondition: the mismatched artifact name must differ from ours"
+        );
         let task = UpgradeTask::from_payload(&serde_json::json!({
             "target_version": "9.9.9",
             "filename": local_filename(),
             "size": ARTIFACT.len(),
             "sha256": hash,
             // 指向另一个制品
-            "official_path": "/zzttzzmyswy/shell-remote/releases/download/v9.9.9/shell-remote-ui-x86_64",
+            "official_path": format!("/zzttzzmyswy/shell-remote/releases/download/v9.9.9/{other}"),
             "cdn_base_urls": ["https://cdn.test"],
             "relay_url": format!("/agent/upgrade/blob/{}", local_filename()),
         }));
