@@ -33,12 +33,73 @@ pub struct MonitorInfo {
     pub y: i32,
 }
 
+/// 把所选显示器原点打包进一个原子量（`x << 32 | y`，两半都按 u32 位模式
+/// 存，负数原点如 Windows 主屏左侧的副屏 `-1920` 也能原样取回）。
+///
+/// 采集源（`FrameSource::origin`）在打开/重建后把值写进共享原子，
+/// `DesktopManager::handle_mouse` 读它给鼠标移动加偏移（MYS-2765 #10）。
+pub fn pack_origin(x: i32, y: i32) -> i64 {
+    (((x as u32) as u64) << 32 | (y as u32) as u64) as i64
+}
+
+/// [`pack_origin`] 的逆运算。
+pub fn unpack_origin(packed: i64) -> (i32, i32) {
+    let v = packed as u64;
+    ((v >> 32) as u32 as i32, (v & 0xffff_ffff) as u32 as i32)
+}
+
+// ── DXGI 错误分类（MYS-2765 #4）───────────────────────────────
+//
+// Windows 侧 `windows-result` 的 `Error` Display 是本地化的 `消息 (0x887A0026)`，
+// 不含常量名——旧实现用 `err.contains("ACCESS_LOST")` 判定重建，永不匹配，
+// 锁屏/UAC/分辨率切换后捕获必死。这里按 **HRESULT 值**分类，纯函数放平台
+// 无关模块，非 Windows 构建也能编译并单测。
+
+/// `DXGI_ERROR_ACCESS_LOST`（0x887A0026）：duplication 失效（锁屏、UAC、
+/// 会话切换、显示器拓扑变化）——重建即可恢复。
+pub const DXGI_ERROR_ACCESS_LOST_CODE: i32 = 0x887A_0026u32 as i32;
+/// `DXGI_ERROR_WAIT_TIMEOUT`（0x887A0027）：静止桌面在超时窗口内无新帧，
+/// **不是错误**。
+pub const DXGI_ERROR_WAIT_TIMEOUT_CODE: i32 = 0x887A_0027u32 as i32;
+/// `DXGI_ERROR_DEVICE_REMOVED`（0x887A0005）：显卡驱动重置/设备拔除。
+pub const DXGI_ERROR_DEVICE_REMOVED_CODE: i32 = 0x887A_0005u32 as i32;
+/// `DXGI_ERROR_DEVICE_RESET`（0x887A0007）：设备被驱动重置。
+pub const DXGI_ERROR_DEVICE_RESET_CODE: i32 = 0x887A_0007u32 as i32;
+
+/// 一次捕获失败该怎么处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRecovery {
+    /// 静止桌面：没有新帧，复用上一帧（不是错误）。
+    WaitTimeout,
+    /// duplication 已失效：重建捕获对象后重试。
+    Rebuild,
+    /// 其它错误：不重建，直接上报给上层（计入连续失败）。
+    Fatal,
+}
+
+/// 按 HRESULT 判定 DXGI 捕获失败是否可通过重建自愈。
+pub fn classify_dxgi_error(hresult: i32) -> CaptureRecovery {
+    match hresult {
+        DXGI_ERROR_WAIT_TIMEOUT_CODE => CaptureRecovery::WaitTimeout,
+        DXGI_ERROR_ACCESS_LOST_CODE
+        | DXGI_ERROR_DEVICE_REMOVED_CODE
+        | DXGI_ERROR_DEVICE_RESET_CODE => CaptureRecovery::Rebuild,
+        _ => CaptureRecovery::Fatal,
+    }
+}
+
 /// Frame source abstraction over a captured desktop.
 pub trait FrameSource: Send {
     /// Capture the next frame (`bgra` length must be `width*height*4`).
     fn next_frame(&mut self) -> Result<Frame, String>;
     /// Fixed capture resolution in pixels.
     fn resolution(&self) -> (usize, usize);
+    /// 所选显示器在虚拟桌面坐标系中的原点（MYS-2765 #10）：鼠标注入要加上
+    /// 它才能落到正在采集的那块屏。默认 `(0,0)`（单屏/全屏/无坐标后端）。
+    fn origin(&self) -> (i32, i32) {
+        (0, 0)
+    }
+
     /// 光标位置回调（R5#64 光标独立通道）：默认 no-op，X11 实现注入生效。
     /// 捕获画面通常不含光标层——独立查询位置经 `desktop:cursor` 轻量消息
     /// 发给浏览器 overlay（光标移动不触发整帧重编码）。
@@ -154,6 +215,9 @@ fn open_auto(display: Option<&str>) -> Result<(Box<dyn FrameSource>, String), St
                 }
             }
         }
+        // MYS-2765 #9：`display` 是纯数字时表示"选第 N 块 X11 输出"，
+        // 此时 X 连接必须走 `$DISPLAY`（把它当 display 字符串连必然失败）。
+        // 非数字（":1"）保持旧语义——显式 X display。
         if display.is_some() || std::env::var("DISPLAY").is_ok() {
             ok_backend(X11Source::open(display), "x11")
         } else {
@@ -205,11 +269,31 @@ impl ThreadedFrameSource {
     /// `max_fps` > 0 时限制**动态**产帧率（静态仍走 would-block 退避；
     /// R5#135 抓帧独立上限，与编码 fps 解耦）。
     pub fn spawn_with_max_fps(
-        mut inner: Box<dyn FrameSource>,
+        inner: Box<dyn FrameSource>,
         max_fps: f64,
         pool: Option<std::sync::Arc<FramePool>>,
     ) -> Result<Self, String> {
+        Self::spawn_full(inner, max_fps, pool, None)
+    }
+
+    /// 同 [`Self::spawn_with_max_fps`]，额外把捕获源的**原点**持续写进
+    /// `origin_sink`（打包格式见 [`pack_origin`]）。
+    ///
+    /// 源被 move 进线程后外部就取不到 `origin()` 了，而原点会随显示器位置
+    /// 变化（用户在系统设置里挪屏）——由抓帧线程每拍同步一次给鼠标注入用
+    /// （MYS-2765 #10）。
+    pub fn spawn_full(
+        mut inner: Box<dyn FrameSource>,
+        max_fps: f64,
+        pool: Option<std::sync::Arc<FramePool>>,
+        origin_sink: Option<Arc<std::sync::atomic::AtomicI64>>,
+    ) -> Result<Self, String> {
         let (width, height) = inner.resolution();
+        // 打开时就把原点写一次：首帧到达前浏览器就可能发点击。
+        if let Some(sink) = &origin_sink {
+            let (ox, oy) = inner.origin();
+            sink.store(pack_origin(ox, oy), std::sync::atomic::Ordering::Relaxed);
+        }
         // R5 #127 捕获侧池：注入线程内 capture（next_frame 从池借出）。
         if let Some(p) = &pool {
             inner.attach_pool(p.clone());
@@ -219,6 +303,7 @@ impl ThreadedFrameSource {
         let last_err = Arc::new(std::sync::Mutex::new(None));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (s1, l1, e1, le1) = (stop.clone(), latest.clone(), err_count.clone(), last_err.clone());
+        let o1 = origin_sink.clone();
         let builder = std::thread::Builder::new().name("desktop-capture".to_string());
         let thread = builder
             .spawn(move || {
@@ -234,6 +319,13 @@ impl ThreadedFrameSource {
                     loop {
                     if s1.load(O::Relaxed) {
                         break;
+                    }
+                    // 原点同步（MYS-2765 #10）：显示器被挪动 / 换分辨率 /
+                    // DXGI 掉线重建都可能改变它，每拍读一次（后端内部只是
+                    // 缓存字段，真机零成本）写进共享原子供鼠标注入使用。
+                    if let Some(sink) = &o1 {
+                        let (ox, oy) = inner.origin();
+                        sink.store(pack_origin(ox, oy), O::Relaxed);
                     }
                     let mut same = false; // 本拍画面未变（静止退化）
                     match inner.next_frame() {
@@ -383,6 +475,15 @@ pub struct X11Source {
     cursor_cb: Option<Box<dyn FnMut(i32, i32, bool) + Send>>,
     /// 上次光标查询时刻（100ms 节流）。
     last_cursor_at: std::time::Instant,
+    /// 选中的 RANDR 输出序号（MYS-2765 #9）：`Some(i)` = 只采集第 i 个输出
+    /// 的 CRTC 矩形（浏览器显示器下拉发来的枚举序号）；`None` = 采集整个
+    /// root（`--desktop-display` 传的是 X display 字符串，旧语义）。
+    output_index: Option<usize>,
+    /// 采集区域在 root 坐标系中的原点：序号选屏时 = 该输出 CRTC 的 x/y，
+    /// 整屏采集时为 (0,0)。`GetImage`/`ShmGetImage` 用它做裁剪偏移，
+    /// `FrameSource::origin()` 把它交给鼠标注入做坐标补偿。
+    crop_x: i16,
+    crop_y: i16,
 }
 
 /// MIT-SHM segment: SysV shared memory mapped into our address space and
@@ -410,17 +511,39 @@ unsafe impl Send for ShmState {}
 
 #[cfg(not(windows))]
 impl X11Source {
+    /// 打开 X11 捕获源。
+    ///
+    /// `display` 有两种语义（MYS-2765 #9）：
+    /// - **可解析为 `usize`** → RANDR 输出枚举序号（与 `list_monitors` /
+    ///   `desktop:started.displays` 的数组下标一致）。此时 X 连接仍走
+    ///   `$DISPLAY`（或非数字的 `--desktop-display`，见
+    ///   [`Self::open_with_x_display`]），采集区域裁剪到该输出的 CRTC 矩形。
+    ///   序号越界、或该输出没有活动 CRTC（0x0，未连接的输出）→ 明确报错。
+    /// - 其它字符串 → 旧语义：直接当 X display 连（`":1"`、`"host:0"`）。
     pub fn open(display: Option<&str>) -> Result<Self, String> {
+        Self::open_with_x_display(display, None)
+    }
+
+    /// 同上，但把"捕获源选择值"与"X display 连接串"分开：`selector` 是
+    /// 浏览器下拉发来的枚举序号（可解析为 `usize` 时按序号裁剪），
+    /// `x_display` 是 `--desktop-display` 里真正的 X display（非数字时）。
+    fn open_with_x_display(selector: Option<&str>, x_display: Option<&str>) -> Result<Self, String> {
         use x11rb::connection::Connection;
         use x11rb::rust_connection::RustConnection;
-        let display = if let Some(d) = display {
-            Some(d.to_string())
-        } else {
-            std::env::var("DISPLAY").ok()
+        // 序号 vs X display 字符串：只有纯数字才是"选第 N 块屏"。
+        let output_index = selector.and_then(|s| s.trim().parse::<usize>().ok());
+        let display = match (output_index, x_display) {
+            // 序号选屏：X 连接用显式的 x_display，否则 $DISPLAY（再否则 X 默认）。
+            (Some(_), xd) => xd.map(|d| d.to_string()).or_else(|| std::env::var("DISPLAY").ok()),
+            // X display 字符串语义：优先显式传入，其次 $DISPLAY。
+            (None, xd) => xd
+                .map(|d| d.to_string())
+                .or_else(|| selector.map(|d| d.to_string()))
+                .or_else(|| std::env::var("DISPLAY").ok()),
         };
         let (conn, screen_num) =
             RustConnection::connect(display.as_deref()).map_err(|e| format!("x11rb connect: {e}"))?;
-        let (width, height, depth, root) = {
+        let (full_w, full_h, depth, root) = {
             let screen = &conn.setup().roots[screen_num];
             (
                 screen.width_in_pixels,
@@ -432,8 +555,8 @@ impl X11Source {
         let mut src = Self {
             conn,
             root,
-            width,
-            height,
+            width: full_w,
+            height: full_h,
             depth,
             composite: None,
             shm: None,
@@ -443,7 +566,24 @@ impl X11Source {
             randr_registered: false,
             cursor_cb: None,
             last_cursor_at: std::time::Instant::now(),
+            output_index,
+            crop_x: 0,
+            crop_y: 0,
         };
+        // 序号选屏：把采集区域与尺寸裁到该输出的 CRTC 矩形。序号越界 /
+        // 未连接输出在这里就报错，而不是悄悄退化成整屏（旧实现把输出名
+        // 当 DISPLAY 连接，必然失败）。
+        if let Some(idx) = output_index {
+            let rect = src
+                .output_rect(idx)
+                .map_err(|e| format!("x11 monitor #{idx}: {e}"))?;
+            src.apply_crop(rect);
+            tracing::info!(
+                monitor = idx,
+                geom = %format!("{}x{}+{},{}", rect.2, rect.3, rect.0, rect.1),
+                "x11 capture output selected"
+            );
+        }
         // 注册 XRANDR ScreenChangeNotify（R5#131）：分辨率事件驱动替代轮询。
         // 失败静默——事件驱动是优化，无扩展时回落现有 30 帧轮询。
         use x11rb::protocol::randr::{ConnectionExt as _, NotifyMask};
@@ -468,36 +608,33 @@ impl X11Source {
 
     /// R5#136-146 多显示器最小子集：枚举 X11 RANDR 输出（名称/分辨率/偏移）。
     /// 失败返回空（观测缺失不致命，desktop:started 的 displays 为空数组）。
+    ///
+    /// **数组下标即选屏序号**（MYS-2765 #9）：浏览器显示器下拉的 value 是这个
+    /// 下标，`open(Some("1"))` 采的就是 `list_monitors()[1]`。未连接/无 CRTC
+    /// 的输出仍留在数组里（尺寸 0，浏览器据此过滤掉不下拉），但选中它会报错
+    /// （见 [`Self::output_rect`]）——序号不会因过滤而错位。
     pub fn list_monitors(&self) -> Vec<MonitorInfo> {
         use x11rb::protocol::randr::ConnectionExt as _;
         let mut out = Vec::new();
-        let res = match self.conn.randr_get_screen_resources_current(self.root) {
-            Ok(cookie) => match cookie.reply() {
-                Ok(r) => r,
-                Err(_) => return out,
-            },
-            Err(_) => return out,
+        let Some(res) = self
+            .conn
+            .randr_get_screen_resources_current(self.root)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        else {
+            return out;
         };
         for oid in res.outputs {
-            let info = match self.conn.randr_get_output_info(oid, 0) {
-                Ok(cookie) => match cookie.reply() {
-                    Ok(i) => i,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
+            let Some(info) = self
+                .conn
+                .randr_get_output_info(oid, 0)
+                .ok()
+                .and_then(|c| c.reply().ok())
+            else {
+                continue;
             };
             let name = String::from_utf8_lossy(&info.name).to_string();
-            let (w, h, x, y) = if info.crtc != 0 {
-                match self.conn.randr_get_crtc_info(info.crtc, 0) {
-                    Ok(cookie) => match cookie.reply() {
-                        Ok(c) => (c.width as u32, c.height as u32, c.x as i32, c.y as i32),
-                        Err(_) => (0, 0, 0, 0),
-                    },
-                    Err(_) => (0, 0, 0, 0),
-                }
-            } else {
-                (0, 0, 0, 0)
-            };
+            let (w, h, x, y) = Self::crtc_rect_of(&self.conn, info.crtc);
             out.push(MonitorInfo {
                 name,
                 width: w,
@@ -507,6 +644,88 @@ impl X11Source {
             });
         }
         out
+    }
+
+    /// 某个 RANDR 输出的 CRTC 矩形 `(x, y, w, h)`；`crtc == 0` 或查询失败时
+    /// 返回全 0（未连接输出）。
+    fn crtc_rect_of(
+        conn: &x11rb::rust_connection::RustConnection,
+        crtc: x11rb::protocol::randr::Crtc,
+    ) -> (u32, u32, i32, i32) {
+        use x11rb::protocol::randr::ConnectionExt as _;
+        if crtc == 0 {
+            return (0, 0, 0, 0);
+        }
+        match conn.randr_get_crtc_info(crtc, 0) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(c) => (c.width as u32, c.height as u32, c.x as i32, c.y as i32),
+                Err(_) => (0, 0, 0, 0),
+            },
+            Err(_) => (0, 0, 0, 0),
+        }
+    }
+
+    /// 第 `index` 个 RANDR 输出（`list_monitors` 下标顺序）的 CRTC 矩形，
+    /// 作为可采集区域 `(x, y, w, h)`。
+    ///
+    /// 序号越界 / 该输出没有活动 CRTC / 尺寸为 0（未连接）→ 明确报错：选中的
+    /// 屏不可采集时必须让浏览器看到失败，而不是悄悄回落到整屏把用户点的位置
+    /// 映射到另一个屏上。
+    fn output_rect(&self, index: usize) -> Result<(i32, i32, u16, u16), String> {
+        use x11rb::protocol::randr::ConnectionExt as _;
+        let res = self
+            .conn
+            .randr_get_screen_resources_current(self.root)
+            .map_err(|e| format!("randr get_screen_resources: {e}"))?
+            .reply()
+            .map_err(|e| format!("randr get_screen_resources reply: {e}"))?;
+        let oid = *res.outputs.get(index).ok_or_else(|| {
+            format!(
+                "output index {index} out of range (only {} outputs)",
+                res.outputs.len()
+            )
+        })?;
+        let info = self
+            .conn
+            .randr_get_output_info(oid, 0)
+            .map_err(|e| format!("randr get_output_info: {e}"))?
+            .reply()
+            .map_err(|e| format!("randr get_output_info reply: {e}"))?;
+        let name = String::from_utf8_lossy(&info.name).to_string();
+        if info.crtc == 0 {
+            return Err(format!(
+                "output #{index} ({name}) is not connected (no CRTC) — pick a connected display"
+            ));
+        }
+        let (w, h, x, y) = Self::crtc_rect_of(&self.conn, info.crtc);
+        if w < 2 || h < 2 {
+            return Err(format!(
+                "output #{index} ({name}) has no active mode ({w}x{h}) — pick a connected display"
+            ));
+        }
+        // GetImage 的宽高是 u16：超出协议域的屏（>65535px）无法按矩形裁剪，
+        // 直接报错而不是截断成错误的区域。
+        let (w16, h16) = (
+            u16::try_from(w).map_err(|_| format!("output #{index} ({name}) width {w} exceeds X11 limits"))?,
+            u16::try_from(h).map_err(|_| format!("output #{index} ({name}) height {h} exceeds X11 limits"))?,
+        );
+        let (x16, y16) = (
+            i16::try_from(x).map_err(|_| format!("output #{index} ({name}) x={x} exceeds X11 limits"))?,
+            i16::try_from(y).map_err(|_| format!("output #{index} ({name}) y={y} exceeds X11 limits"))?,
+        );
+        Ok((x16 as i32, y16 as i32, w16, h16))
+    }
+
+    /// 把采集区域设为 `rect`（root 坐标系）并清掉依赖旧几何的缓存。
+    fn apply_crop(&mut self, rect: (i32, i32, u16, u16)) {
+        let (x, y, w, h) = rect;
+        self.crop_x = x as i16;
+        self.crop_y = y as i16;
+        self.width = w;
+        self.height = h;
+        // SHM 段尺寸绑定旧几何，换区域必须重建。
+        self.teardown_shm();
+        self.shm_failed = false;
     }
 
     /// Try to initialise the MIT-SHM fast path. Quietly falls back to
@@ -625,6 +844,10 @@ impl X11Source {
 
     /// `GetImage` on a drawable and return packed BGRA rows for the capture
     /// region (see `next_frame` for the depth/stride contract).
+    ///
+    /// MYS-2765 #9：采集区域是 `(crop_x, crop_y, width, height)`——整屏采集
+    /// 时原点是 (0,0)，序号选屏时是该输出 CRTC 的左上角。`GetImage` 直接按
+    /// 矩形读，不需要额外裁切。
     fn capture_impl(&self, drawable: impl Into<x11rb::protocol::xproto::Drawable>) -> Result<Vec<u8>, String> {
         use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 
@@ -633,7 +856,15 @@ impl X11Source {
         let h = self.height as u16;
         let reply = self
             .conn
-            .get_image(ImageFormat::Z_PIXMAP, drawable, 0, 0, w, h, !0)
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                drawable,
+                self.crop_x,
+                self.crop_y,
+                w,
+                h,
+                !0,
+            )
             .map_err(|e| format!("get_image cookie: {e}"))?
             .reply()
             .map_err(|e| format!("get_image reply: {e}"))?;
@@ -645,6 +876,8 @@ impl X11Source {
     /// straight into our attached SysV segment (no X protocol frame payload),
     /// then we copy the segment into a fresh BGRA buffer for the encoder.
     /// This is the rustdesk `x11/capturer.rs` fast path.
+    ///
+    /// 序号选屏时同样按裁剪矩形 `(crop_x, crop_y)` 取图（MYS-2765 #9）。
     fn capture_shm(&self) -> Result<Vec<u8>, String> {
         use x11rb::protocol::shm::ConnectionExt as _;
         use x11rb::protocol::xproto::ImageFormat;
@@ -657,7 +890,17 @@ impl X11Source {
         let h = self.height as u16;
         // Wait for the reply: after it lands the segment holds the frame.
         self.conn
-            .shm_get_image(self.root, 0, 0, w, h, !0, ImageFormat::Z_PIXMAP.into(), s.seg, 0)
+            .shm_get_image(
+                self.root,
+                self.crop_x,
+                self.crop_y,
+                w,
+                h,
+                !0,
+                ImageFormat::Z_PIXMAP.into(),
+                s.seg,
+                0,
+            )
             .map_err(|e| format!("shm_get_image cookie: {e}"))?
             .reply()
             .map_err(|e| format!("shm_get_image reply: {e}"))?;
@@ -757,12 +1000,22 @@ impl FrameSource for X11Source {
         (self.width as usize, self.height as usize)
     }
 
+    /// 所选输出的桌面原点（MYS-2765 #10）：鼠标注入加它才能落在采集的那块
+    /// 屏上。整屏采集（未选序号）时为 (0,0)。
+    fn origin(&self) -> (i32, i32) {
+        (self.crop_x as i32, self.crop_y as i32)
+    }
+
     fn next_frame(&mut self) -> Result<Frame, String> {
         use x11rb::connection::Connection as _;
         use x11rb::protocol::xproto::ConnectionExt as _;
         // 分辨率变更检测（R5#131 事件驱动）：已注册 XRANDR ScreenChangeNotify
         // 时用 poll_for_event 读事件——只有真变更才重建，替代固定 30 帧一次的
         // get_geometry 轮询往返。无事件/未注册时回落轮询（保持旧行为）。
+        //
+        // MYS-2765 #9：序号选屏时关心的不是 root 几何，而是**所选输出的
+        // CRTC 矩形**——用户在系统设置里换分辨率/挪动屏幕位置都会改它，
+        // 采集区域与鼠标原点必须同步重算。事件里描述的 root 尺寸此时无关。
         let mut resized = false;
         if self.randr_registered {
             loop {
@@ -771,9 +1024,21 @@ impl FrameSource for X11Source {
                         if let Ok(x11rb::protocol::Event::RandrScreenChangeNotify(randr_ev)) =
                             x11rb::protocol::Event::try_from(ev)
                         {
-                            let width = randr_ev.width;
-                            let height = randr_ev.height;
-                            if width > 0 && height > 0 {
+                            let (width, height) = (randr_ev.width, randr_ev.height);
+                            if let Some(idx) = self.output_index {
+                                // 该输出可能被拔掉/关掉：解析失败保持旧区域
+                                // （画面冻结不如报错？——保持采集比中断更友好，
+                                // 下一帧会再试；真断线由 capture 线程错误计数兜底）。
+                                if let Ok(rect) = self.output_rect(idx) {
+                                    if (rect.2, rect.3) != (self.width, self.height)
+                                        || (rect.0 as i16, rect.1 as i16)
+                                            != (self.crop_x, self.crop_y)
+                                    {
+                                        resized = true;
+                                        self.apply_crop(rect);
+                                    }
+                                }
+                            } else if width > 0 && height > 0 {
                                 if self.width != width || self.height != height {
                                     resized = true;
                                 }
@@ -794,7 +1059,16 @@ impl FrameSource for X11Source {
             self.recheck += 1;
             if self.recheck >= 30 {
                 self.recheck = 0;
-                if let Ok(cookie) = self.conn.get_geometry(self.root) {
+                if let Some(idx) = self.output_index {
+                    if let Ok(rect) = self.output_rect(idx) {
+                        if (rect.2, rect.3) != (self.width, self.height)
+                            || (rect.0 as i16, rect.1 as i16) != (self.crop_x, self.crop_y)
+                        {
+                            resized = true;
+                            self.apply_crop(rect);
+                        }
+                    }
+                } else if let Ok(cookie) = self.conn.get_geometry(self.root) {
                     if let Ok(geo) = cookie.reply() {
                         if geo.width > 0 && geo.height > 0 {
                             if self.width != geo.width || self.height != geo.height {
@@ -890,8 +1164,16 @@ impl X11Source {
         match self.conn.query_pointer(self.root) {
             Ok(cookie) => match cookie.reply() {
                 Ok(reply) => {
+                    // 坐标减去采集区域原点（MYS-2765 #9/#10）：浏览器 overlay 是
+                    // 画在**采集画面**上的，序号选屏时 root 坐标必须换成画面内
+                    // 坐标，否则光标渲染在另一块屏的位置上。光标不在采集区域内
+                    // 时上报 `shown=false`（隐藏 overlay，而不是画到画面外）。
+                    let x = reply.root_x as i32 - self.crop_x as i32;
+                    let y = reply.root_y as i32 - self.crop_y as i32;
+                    let inside =
+                        x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32;
                     if let Some(cb) = self.cursor_cb.as_mut() {
-                        cb(reply.root_x as i32, reply.root_y as i32, true);
+                        cb(x, y, inside);
                     }
                 }
                 Err(e) => tracing::debug!(%e, "query_pointer reply failed"),
@@ -945,7 +1227,8 @@ mod gdi {
     use windows_sys::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
         EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject,
-        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, MONITORINFO, SRCCOPY,
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO,
+        SRCCOPY,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
@@ -964,6 +1247,11 @@ mod gdi {
         screen_dc: HDC,
         mem_dc: HDC,
         bmp: HBITMAP,
+        /// `SelectObject(mem_dc, bmp)` 返回的旧对象（DC 默认的 1x1 单色位图）。
+        /// 删除 `bmp` 前必须先把它选回 `mem_dc`——GDI 不允许删除仍被 DC 选中的
+        /// 对象（DeleteObject 静默失败 → 每次 resize/重建漏一张全屏位图，
+        /// MYS-2765 #5）。
+        old_bmp: HGDIOBJ,
     }
 
     unsafe impl Send for GdiSource {}
@@ -996,8 +1284,11 @@ mod gdi {
             mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
             if unsafe { GetMonitorInfoW(hmon, &mut mi) } != 0 {
                 let r = &mi.rcMonitor;
+                // 名称里的序号用**已收集数量**，与 `open_at`/`list_monitors`
+                // 的数组下标（浏览器下拉 value）严格一致（MYS-2765 #9）。
+                let ordinal = ctx.out.len() + 1;
                 ctx.out.push(MonitorInfo {
-                    name: format!("DISPLAY{}", ctx.idx + 1),
+                    name: format!("DISPLAY{ordinal}"),
                     width: (r.right - r.left).max(0) as u32,
                     height: (r.bottom - r.top).max(0) as u32,
                     x: r.left,
@@ -1037,6 +1328,7 @@ mod gdi {
                 screen_dc: std::ptr::null_mut(),
                 mem_dc: std::ptr::null_mut(),
                 bmp: std::ptr::null_mut(),
+                old_bmp: std::ptr::null_mut(),
             };
             unsafe { s.rebuild()? };
             Ok(s)
@@ -1046,7 +1338,17 @@ mod gdi {
         /// screen, and refresh the cached resolution. Called at open and
         /// again to self-heal when a capture fails (e.g. display mode
         /// changed or a screen-DC handle went stale).
+        ///
+        /// MYS-2765 #5：删除位图前必须先把 `SelectObject` 返回的旧对象选回
+        /// `mem_dc`——GDI 不允许删除仍被 DC 选中的位图，`DeleteObject` 会静默
+        /// 失败，每次分辨率变化/自愈重建都漏掉一张全屏位图。`screen_dc` 也
+        /// 必须在重建后**重新取**：旧实现在 `blit` 的失败重试路径里沿用了
+        /// 刚被 `ReleaseDC` 的句柄，重试必然再失败（"即时重试"形同虚设）。
         unsafe fn rebuild(&mut self) -> Result<(), String> {
+            if !self.mem_dc.is_null() && !self.old_bmp.is_null() {
+                SelectObject(self.mem_dc, self.old_bmp);
+                self.old_bmp = std::ptr::null_mut();
+            }
             if !self.bmp.is_null() {
                 DeleteObject(self.bmp);
                 self.bmp = std::ptr::null_mut();
@@ -1072,6 +1374,7 @@ mod gdi {
             };
             self.mon_x = monitors.get(self.monitor_index).map(|m| m.x).unwrap_or(0);
             self.mon_y = monitors.get(self.monitor_index).map(|m| m.y).unwrap_or(0);
+            // 缓存屏幕 DC（blit 的热路径用它；这里建好就不用每帧 GetDC）。
             let screen_dc = GetDC(std::ptr::null_mut());
             if screen_dc.is_null() {
                 return Err(format!("GetDC failed (err={})", GetLastError()));
@@ -1079,15 +1382,24 @@ mod gdi {
             let mem_dc = CreateCompatibleDC(screen_dc);
             let bmp = CreateCompatibleBitmap(screen_dc, width as i32, height as i32);
             let err = GetLastError();
-            ReleaseDC(std::ptr::null_mut(), screen_dc);
             if mem_dc.is_null() || bmp.is_null() {
+                if !mem_dc.is_null() {
+                    DeleteDC(mem_dc);
+                }
+                if !bmp.is_null() {
+                    DeleteObject(bmp);
+                }
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
                 return Err(format!("GDI init failed (err={err})"));
             }
-            SelectObject(mem_dc, bmp);
+            let old_bmp = SelectObject(mem_dc, bmp);
             self.width = width;
             self.height = height;
             self.mem_dc = mem_dc;
             self.bmp = bmp;
+            self.old_bmp = old_bmp;
+            // 保留屏幕 DC 供 blit 复用；失败重试时由 blit 自己判空重取。
+            self.screen_dc = screen_dc;
             Ok(())
         }
 
@@ -1166,23 +1478,33 @@ mod gdi {
             (self.width, self.height)
         }
 
+        /// 所选显示器在虚拟桌面坐标系中的原点（MYS-2765 #10）：鼠标注入要把
+        /// 它加上，否则点副屏会落到主屏。
+        fn origin(&self) -> (i32, i32) {
+            (self.mon_x, self.mon_y)
+        }
+
         fn list_monitors(&self) -> Vec<MonitorInfo> {
             list_monitors_gdi()
         }
 
         fn next_frame(&mut self) -> Result<Frame, String> {
             unsafe {
-                // display 分辨率运行时变更检测：每帧重读显示器矩形（廉价），
-                // 变化则重建整个 GDI context（rustdesk display 变更对齐）。
-                // rebuild 内部重新枚举 monitors + 建 screen DC / compatible
-                // bitmap，BitBlt 下一帧即新尺寸/新偏移。
+                // display 分辨率 / 屏幕排布运行时变更检测：每帧重读显示器矩形
+                // （廉价），变化则重建整个 GDI context（rustdesk display 变更
+                // 对齐）。rebuild 内部重新枚举 monitors + 建 screen DC /
+                // compatible bitmap，BitBlt 下一帧即新尺寸/新偏移。
+                // 位置（mon_x/mon_y）变化同样要重建：屏幕在系统设置里被挪动时
+                // 分辨率不变，但 BitBlt 源偏移和鼠标原点都变了（MYS-2765 #9）。
                 let m = list_monitors_gdi().get(self.monitor_index).cloned();
                 if let Some(m) = m {
                     let (mw, mh) = (m.width as usize, m.height as usize);
-                    if mw >= 2 && mh >= 2 && (mw != self.width || mh != self.height) {
+                    let moved = (m.x, m.y) != (self.mon_x, self.mon_y);
+                    if mw >= 2 && mh >= 2 && (mw != self.width || mh != self.height || moved) {
                         tracing::info!(
-                            "gdi display resize: {}x{} -> {}x{}",
-                            self.width, self.height, mw, mh
+                            from = %format!("{}x{}+{},{}", self.width, self.height, self.mon_x, self.mon_y),
+                            to = %format!("{}x{}+{},{}", mw, mh, m.x, m.y),
+                            "gdi display geometry changed — rebuilding capture context"
                         );
                         self.rebuild()?;
                     }
@@ -1203,6 +1525,12 @@ mod gdi {
     impl Drop for GdiSource {
         fn drop(&mut self) {
             unsafe {
+                // 先解除选中再删位图（MYS-2765 #5）：仍被 mem_dc 选中的位图
+                // DeleteObject 会静默失败。
+                if !self.mem_dc.is_null() && !self.old_bmp.is_null() {
+                    SelectObject(self.mem_dc, self.old_bmp);
+                    self.old_bmp = std::ptr::null_mut();
+                }
                 if !self.bmp.is_null() {
                     DeleteObject(self.bmp);
                 }
@@ -1220,6 +1548,75 @@ mod gdi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── MYS-2765 #4/#9/#10 平台无关部分 ───────────────────────
+
+    /// 原点打包必须能原样往返，**包括负坐标**（Windows 主屏左侧的副屏是
+    /// 负原点，X11 也可能有负 CRTC 偏移）。
+    #[test]
+    fn test_origin_pack_roundtrip() {
+        for (x, y) in [
+            (0, 0),
+            (1280, 0),
+            (0, 720),
+            (-1920, 0),
+            (-1, -1),
+            (i32::MAX, i32::MIN),
+            (65535, -65535),
+        ] {
+            assert_eq!(unpack_origin(pack_origin(x, y)), (x, y), "origin ({x},{y})");
+        }
+        // 默认值 0 解出来就是 (0,0)（未选屏/单屏语义）。
+        assert_eq!(unpack_origin(0), (0, 0));
+    }
+
+    /// DXGI 错误分类（MYS-2765 #4）：必须按 **HRESULT** 判定，而不是字符串。
+    /// windows-result 的 Display 是本地化的 `消息 (0x887A0026)`，不含常量名。
+    #[test]
+    fn test_classify_dxgi_error() {
+        // 需要重建的三类：锁屏/UAC/会话切换（ACCESS_LOST）、驱动重置。
+        for hr in [
+            DXGI_ERROR_ACCESS_LOST_CODE,
+            DXGI_ERROR_DEVICE_REMOVED_CODE,
+            DXGI_ERROR_DEVICE_RESET_CODE,
+        ] {
+            assert_eq!(
+                classify_dxgi_error(hr),
+                CaptureRecovery::Rebuild,
+                "0x{:08X} 必须触发重建",
+                hr as u32
+            );
+        }
+        // 静止桌面超时不是错误。
+        assert_eq!(
+            classify_dxgi_error(DXGI_ERROR_WAIT_TIMEOUT_CODE),
+            CaptureRecovery::WaitTimeout
+        );
+        // 其它（如 DXGI_ERROR_UNSUPPORTED 0x887A0004、任意 HRESULT）→ 不重建。
+        assert_eq!(classify_dxgi_error(0x887A_0004u32 as i32), CaptureRecovery::Fatal);
+        assert_eq!(classify_dxgi_error(0), CaptureRecovery::Fatal);
+        assert_eq!(classify_dxgi_error(0x8007_0057u32 as i32), CaptureRecovery::Fatal);
+        // 常量值本身必须与 DXGI 头文件一致（写错就永远匹配不上）。
+        assert_eq!(DXGI_ERROR_ACCESS_LOST_CODE as u32, 0x887A_0026);
+        assert_eq!(DXGI_ERROR_WAIT_TIMEOUT_CODE as u32, 0x887A_0027);
+        assert_eq!(DXGI_ERROR_DEVICE_REMOVED_CODE as u32, 0x887A_0005);
+        assert_eq!(DXGI_ERROR_DEVICE_RESET_CODE as u32, 0x887A_0007);
+    }
+
+    /// 默认 `FrameSource::origin()` 是 (0,0)（单屏/全屏后端的语义）。
+    #[test]
+    fn test_default_origin_is_zero() {
+        struct Stub;
+        impl FrameSource for Stub {
+            fn next_frame(&mut self) -> Result<Frame, String> {
+                Err("unused".into())
+            }
+            fn resolution(&self) -> (usize, usize) {
+                (4, 4)
+            }
+        }
+        assert_eq!(Stub.origin(), (0, 0));
+    }
 
     #[test]
     fn test_open_source_none_errors() {
@@ -1376,6 +1773,149 @@ mod tests {
         let (w, h) = src.resolution();
         let fr = src.next_frame().expect("frame with randr registered");
         assert_eq!(fr.bgra.len(), w * h * 4);
+    }
+
+    /// MYS-2765 #9/#10：X11 按 RANDR 输出序号选屏。
+    ///
+    /// `open(Some("0"))` 必须连上 `$DISPLAY`（不是把 "0" 当 display 字符串），
+    /// 采集区域/分辨率 = 该输出的 CRTC 矩形，`origin()` = 该 CRTC 原点。
+    /// 越界序号必须返回明确错误（旧实现把它当 DISPLAY 连接，报的是连接失败）。
+    #[cfg(not(windows))]
+    #[test]
+    fn test_x11_open_by_output_index_selects_crtc() {
+        let display = std::env::var("SR_XTEST_DISPLAY").unwrap_or_else(|_| ":99".into());
+        // 先枚举拓扑（同一 display），拿到第 0 个输出的 CRTC 矩形作为期望值。
+        let probe = match X11Source::open(Some(&display)) {
+            Ok(s) => s,
+            Err(e) => {
+                if e.contains("connect") && std::env::var("SR_NO_XTEST").is_ok() {
+                    return;
+                }
+                panic!("x11 open failed: {e}");
+            }
+        };
+        let monitors = probe.list_monitors();
+        assert!(!monitors.is_empty(), "X server must expose ≥1 RANDR output");
+        let m0 = monitors[0].clone();
+        assert!(m0.width > 0 && m0.height > 0, "output #0 must be connected: {m0:?}");
+        drop(probe);
+
+        // 序号选屏：X 连接仍走 SR_XTEST_DISPLAY（测试环境未必有 $DISPLAY）。
+        let src = X11Source::open_with_x_display(Some("0"), Some(&display))
+            .expect("open by output index 0");
+        assert_eq!(src.resolution(), (m0.width as usize, m0.height as usize));
+        assert_eq!(src.origin(), (m0.x, m0.y), "origin 必须等于该输出的 CRTC 原点");
+        // 采集区域 = 该 CRTC 矩形；首帧尺寸随之（GetImage/SHM 都按裁剪取）。
+        let mut src = src;
+        let fr = src.next_frame().expect("frame from selected output");
+        assert_eq!(fr.bgra.len(), m0.width as usize * m0.height as usize * 4);
+
+        // 越界序号：明确报错（而不是连一个叫 "7" 的 display）。
+        let err = match X11Source::open_with_x_display(Some("7"), Some(&display)) {
+            Ok(_) => panic!("out-of-range output index must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("out of range") && err.contains("x11 monitor"),
+            "越界序号应给出明确错误，实际: {err}"
+        );
+    }
+
+    /// `xrandr --setmonitor` 造的第二块"屏"在 Xvfb 上不会变成第二个 RANDR
+    /// output（只拆根窗口），所以序号选屏的第二屏无法用 Xvfb 直接复现。
+    /// 这个测试改为直接验证**裁剪矩形语义**：在 2560x720 的 root 上左右两半
+    /// 涂不同颜色，然后把采集区域裁到右半 `+1280+0`（就是第二块物理屏接在
+    /// 主屏右侧时的几何），断言：
+    /// - `origin() == (1280, 0)`、`resolution() == 1280x720`
+    /// - 裁剪帧的每个像素等于整屏帧对应位置的像素（GetImage 与 SHM 两条路径）
+    ///
+    /// 需要 `SR_SECOND_DISPLAY`（默认 `:94`）上有一个 ≥2560 宽的 X server；
+    /// 没有就跳过并说明。
+    #[cfg(not(windows))]
+    #[test]
+    fn test_x11_crop_region_and_origin() {
+        let display = std::env::var("SR_SECOND_DISPLAY").unwrap_or_else(|_| ":94".into());
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{ConnectionExt as _, Rectangle};
+        let (conn, screen_num) = match x11rb::rust_connection::RustConnection::connect(
+            Some(display.as_str()),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("crop test skipped: cannot connect to {display} ({e})");
+                return;
+            }
+        };
+        let screen = &conn.setup().roots[screen_num];
+        let (root_w, root_h) = (screen.width_in_pixels, screen.height_in_pixels);
+        if root_w < 2560 || root_h < 720 {
+            eprintln!(
+                "crop test skipped: {display} is {root_w}x{root_h}, need ≥2560x720 \
+                 (start Xvfb :94 -screen 0 2560x720x24)"
+            );
+            return;
+        }
+        // 左右两半涂不同颜色（纯色即可判别来源区域）。
+        let gc = conn.generate_id().unwrap();
+        conn.create_gc(gc, screen.root, &x11rb::protocol::xproto::CreateGCAux {
+            foreground: Some(0x00_00_00_ff), // 红（BGRX 低位 = B，高位 = R）
+            ..Default::default()
+        })
+        .unwrap();
+        conn.poly_fill_rectangle(
+            screen.root,
+            gc,
+            &[Rectangle { x: 0, y: 0, width: 1280, height: root_h }],
+        )
+        .unwrap();
+        conn.change_gc(gc, &x11rb::protocol::xproto::ChangeGCAux {
+            foreground: Some(0x00_ff_00_00), // 蓝
+            ..Default::default()
+        })
+        .unwrap();
+        conn.poly_fill_rectangle(
+            screen.root,
+            gc,
+            &[Rectangle { x: 1280, y: 0, width: 1280, height: root_h }],
+        )
+        .unwrap();
+        conn.free_gc(gc).unwrap();
+        conn.flush().unwrap();
+
+        // 整屏（未选屏）参考帧。
+        let mut full = X11Source::open_with_x_display(None, Some(&display)).expect("open full");
+        assert_eq!(full.resolution(), (root_w as usize, root_h as usize));
+        let full_frame = full.next_frame().expect("full frame");
+
+        // 裁剪到右半 +1280+0：apply_crop 正是序号选屏用的那段逻辑。
+        let mut cropped =
+            X11Source::open_with_x_display(None, Some(&display)).expect("open cropped");
+        cropped.apply_crop((1280, 0, 1280, root_h.min(720)));
+        assert_eq!(cropped.origin(), (1280, 0), "第二屏原点必须是 +1280+0");
+        assert_eq!(cropped.resolution(), (1280, root_h.min(720) as usize));
+        let crop_frame = cropped.next_frame().expect("cropped frame");
+        assert_eq!(
+            crop_frame.bgra.len(),
+            1280 * root_h.min(720) as usize * 4,
+            "裁剪帧尺寸必须等于采集区域"
+        );
+        // 逐像素比对：裁剪帧 = 整屏帧在 (x+1280, y) 处的内容。
+        let (cw, ch) = (crop_frame.width, crop_frame.height);
+        let fw_stride = full_frame.width * 4;
+        let mut mismatched = 0usize;
+        for y in 0..ch {
+            for x in 0..cw {
+                let ci = (y * cw + x) * 4;
+                let fi = y * fw_stride + (x + 1280) * 4;
+                if crop_frame.bgra[ci..ci + 3] != full_frame.bgra[fi..fi + 3] {
+                    mismatched += 1;
+                }
+            }
+        }
+        assert_eq!(
+            mismatched, 0,
+            "裁剪区域必须与整屏同一位置逐像素一致（GetImage/SHM 裁剪偏移错位）"
+        );
     }
 
     /// XComposite fallback path (used when the root `GetImage` fails, e.g.

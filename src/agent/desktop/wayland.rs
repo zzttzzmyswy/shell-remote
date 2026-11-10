@@ -46,10 +46,22 @@ pub struct WaylandSource {
     /// 上一帧复用：Wayland 桌面静止时 pipewire 不推帧，next_frame 仍需
     /// 返回帧（编码时钟按 fps 推进；编码器对重复帧输出空帧，被心跳
     /// IDR 路径吸收）。
-    last_frame: Arc<Mutex<Vec<u8>>>,
+    ///
+    /// MYS-2765 #6：缓存帧必须**连同它自己的 `(w, h)` 一起**保存。旧实现
+    /// 只存像素、尺寸取 `self.width/height`：显示器分辨率一变，超时回放的
+    /// 缓存帧被标上新尺寸，`bgra.len()` 与新宽高对不上 → 编码侧断言/整帧
+    /// 被判定无效，画面卡住或流中断。
+    last_frame: Arc<Mutex<Option<CachedFrame>>>,
     /// D-Bus 连接与 fd 必须存活整个会话生命周期（fd 关闭即流终止）。
     _conn: Arc<Connection>,
     _fd: Arc<OwnedFdKeepalive>,
+}
+
+/// 一帧缓存的像素 + 它自己的尺寸（见 [`WaylandSource::last_frame`]）。
+struct CachedFrame {
+    bgra: Vec<u8>,
+    width: usize,
+    height: usize,
 }
 
 /// zvariant OwnedFd 已在 drop 时关闭，这里再包一层（gstreamer 持有的是
@@ -127,7 +139,7 @@ impl WaylandSource {
             appsink,
             width: w,
             height: h,
-            last_frame: Arc::new(Mutex::new(Vec::new())),
+            last_frame: Arc::new(Mutex::new(None)),
             _conn: conn,
             _fd: fd,
         })
@@ -171,7 +183,16 @@ impl FrameSource for WaylandSource {
                     }
                     v
                 };
-                *self.last_frame.lock().unwrap() = bgra.clone();
+                // 缓存帧连尺寸一起存，并同步当前分辨率（MYS-2765 #6）：
+                // portal 侧换分辨率后，`resolution()` 必须跟着变（主循环靠它
+                // 检测 display 变更并重建编码器）。
+                *self.last_frame.lock().unwrap() = Some(CachedFrame {
+                    bgra: bgra.clone(),
+                    width: w,
+                    height: h,
+                });
+                self.width = w;
+                self.height = h;
                 Ok(Frame {
                     bgra,
                     width: w,
@@ -180,15 +201,29 @@ impl FrameSource for WaylandSource {
             }
             None => {
                 // 静止桌面无新帧：复用上一帧。从未取到帧则报错让上层重试。
-                let guard = self.last_frame.lock().unwrap();
-                if guard.is_empty() {
-                    return Err("no frame available yet".to_string());
+                // 用缓存帧**自己的**尺寸（而不是 self.width/height）：分辨率
+                // 变更后旧帧的尺寸才是它像素布局的真值（MYS-2765 #6）。同时
+                // 把 `self.width/height` 跟着更新，让 `resolution()` 与真正
+                // 交给编码器的帧尺寸一致（上层据此检测 display 变更）。缓存
+                // 留在原地，连续静止的每一拍都能重放。
+                let cached = {
+                    let guard = self.last_frame.lock().unwrap();
+                    guard
+                        .as_ref()
+                        .map(|c| (c.bgra.clone(), c.width, c.height))
+                };
+                match cached {
+                    Some((bgra, w, h)) => {
+                        self.width = w;
+                        self.height = h;
+                        Ok(Frame {
+                            bgra,
+                            width: w,
+                            height: h,
+                        })
+                    }
+                    None => Err("no frame available yet".to_string()),
                 }
-                Ok(Frame {
-                    bgra: guard.clone(),
-                    width: self.width,
-                    height: self.height,
-                })
             }
         }
     }
