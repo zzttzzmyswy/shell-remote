@@ -119,6 +119,11 @@ pub trait FrameSource: Send {
 /// `dxgi`, `gdi`/`windows` or `none`; `display` optionally overrides the X11
 /// display (falls back to `DISPLAY` then the X default).
 ///
+/// `x_display`（MYS-2765 #9）是**启动配置里非数字**的 `--desktop-display`
+/// （如 `:0`）。`display` 为序号（`"1"`）时 X 连接串取它——否则浏览器切屏
+/// 会把 `--desktop-display :0` 一起丢掉，在没有 `$DISPLAY` 的 systemd 服务里
+/// 直接连不上。为 `None` 时回落 `$DISPLAY`。
+///
 /// Returns the source plus the **实际生效**的 backend 名（`dxgi` / `gdi` /
 /// `x11` / `wayland`）——`auto` 解析后回退到的后端与请求值可能不同
 /// （例如虚拟显示器上 dxgi 验证失败回退 gdi），浏览器指标面板展示
@@ -126,11 +131,12 @@ pub trait FrameSource: Send {
 pub fn open_source(
     kind: &str,
     display: Option<&str>,
+    x_display: Option<&str>,
 ) -> Result<(Box<dyn FrameSource>, String), String> {
     match kind {
         "none" => Err("desktop capture disabled".to_string()),
         #[cfg(not(windows))]
-        "x11" => ok_backend(X11Source::open(display), "x11"),
+        "x11" => ok_backend(X11Source::open_with_x_display(display, x_display), "x11"),
         #[cfg(windows)]
         "x11" => Err("X11 capture is Linux-only".to_string()),
         #[cfg(all(target_os = "linux", feature = "wayland"))]
@@ -163,7 +169,7 @@ pub fn open_source(
             #[cfg(not(windows))]
             open_gdi().map(|s| (s, "gdi".to_string()))
         }
-        "auto" => open_auto(display),
+        "auto" => open_auto(display, x_display),
         other => Err(format!("unknown capture kind: {}", other)),
     }
 }
@@ -184,9 +190,16 @@ fn parse_monitor_index(display: &str) -> Option<usize> {
 
 /// Platform auto-detect: Windows prefers dxgi (60fps capable) then GDI;
 /// Linux prefers wayland-portal when running under a Wayland session, else X11.
-fn open_auto(display: Option<&str>) -> Result<(Box<dyn FrameSource>, String), String> {
+///
+/// `x_display` 见 [`open_source`]：序号选屏时 X 连接串取它（启动配置里非数字
+/// 的 `--desktop-display`），不因浏览器切屏而丢失。
+fn open_auto(
+    display: Option<&str>,
+    x_display: Option<&str>,
+) -> Result<(Box<dyn FrameSource>, String), String> {
     #[cfg(windows)]
     {
+        let _ = x_display; // Windows 无 X display 语义
         let idx = display.and_then(parse_monitor_index).unwrap_or(0);
         match crate::agent::desktop::dxgi::DxgiSource::open_verified_at(idx) {
             Ok(s) => Ok((Box::new(s) as Box<dyn FrameSource>, "dxgi".to_string())),
@@ -216,10 +229,11 @@ fn open_auto(display: Option<&str>) -> Result<(Box<dyn FrameSource>, String), St
             }
         }
         // MYS-2765 #9：`display` 是纯数字时表示"选第 N 块 X11 输出"，
-        // 此时 X 连接必须走 `$DISPLAY`（把它当 display 字符串连必然失败）。
-        // 非数字（":1"）保持旧语义——显式 X display。
-        if display.is_some() || std::env::var("DISPLAY").is_ok() {
-            ok_backend(X11Source::open(display), "x11")
+        // 此时 X 连接串取 `x_display`（启动配置里的 X display），没有再回落
+        // `$DISPLAY`——把它当 display 字符串连必然失败。
+        // 非数字（":1"）保持旧语义：显式 X display。
+        if display.is_some() || x_display.is_some() || std::env::var("DISPLAY").is_ok() {
+            ok_backend(X11Source::open_with_x_display(display, x_display), "x11")
         } else {
             Err(
                 "no DISPLAY found; desktop capture requires an X11 session (Xvfb works \
@@ -511,14 +525,15 @@ unsafe impl Send for ShmState {}
 
 #[cfg(not(windows))]
 impl X11Source {
-    /// 打开 X11 捕获源。
+    /// 打开 X11 捕获源（不带显式 X display 串；序号选屏时回落 `$DISPLAY`）。
     ///
     /// `display` 有两种语义（MYS-2765 #9）：
     /// - **可解析为 `usize`** → RANDR 输出枚举序号（与 `list_monitors` /
-    ///   `desktop:started.displays` 的数组下标一致）。此时 X 连接仍走
-    ///   `$DISPLAY`（或非数字的 `--desktop-display`，见
-    ///   [`Self::open_with_x_display`]），采集区域裁剪到该输出的 CRTC 矩形。
-    ///   序号越界、或该输出没有活动 CRTC（0x0，未连接的输出）→ 明确报错。
+    ///   `desktop:started.displays` 的数组下标一致）。此时 X 连接走 `$DISPLAY`
+    ///   （需要显式 X display 时用 [`Self::open_with_x_display`]，由
+    ///   `open_source` 传入启动配置的 `--desktop-display`），采集区域裁剪到
+    ///   该输出的 CRTC 矩形。序号越界、或该输出没有活动 CRTC（0x0，未连接的
+    ///   输出）→ 明确报错。
     /// - 其它字符串 → 旧语义：直接当 X display 连（`":1"`、`"host:0"`）。
     pub fn open(display: Option<&str>) -> Result<Self, String> {
         Self::open_with_x_display(display, None)
@@ -1004,6 +1019,14 @@ impl FrameSource for X11Source {
     /// 屏上。整屏采集（未选序号）时为 (0,0)。
     fn origin(&self) -> (i32, i32) {
         (self.crop_x as i32, self.crop_y as i32)
+    }
+
+    /// 远端显示器拓扑（R5#136-146）。**必须在这里转发**：`X11Source` 另有一个
+    /// 同名的固有方法，如果不覆盖 trait 方法，`Box<dyn FrameSource>`（pipeline
+    /// 实际持有的类型）会落到 trait 的默认实现——返回空数组，X11 永远上报不了
+    /// 显示器，浏览器多屏下拉永远是空的（MYS-2765 #9）。
+    fn list_monitors(&self) -> Vec<MonitorInfo> {
+        X11Source::list_monitors(self)
     }
 
     fn next_frame(&mut self) -> Result<Frame, String> {
@@ -1620,18 +1643,18 @@ mod tests {
 
     #[test]
     fn test_open_source_none_errors() {
-        assert!(open_source("none", None).is_err());
+        assert!(open_source("none", None, None).is_err());
     }
 
     #[test]
     fn test_open_source_invalid_kind_errors() {
-        assert!(open_source("bogus", None).is_err());
+        assert!(open_source("bogus", None, None).is_err());
     }
 
     #[test]
     fn test_wayland_reports_actionable_error() {
         // 未启用 wayland feature 的构建必须给出可操作错误（而不是 panic）。
-        match open_source("wayland", None) {
+        match open_source("wayland", None, None) {
             Ok(_) => {
                 // 启用了 feature 且环境恰好可用的构建：允许成功。
             }
@@ -1819,6 +1842,80 @@ mod tests {
             err.contains("out of range") && err.contains("x11 monitor"),
             "越界序号应给出明确错误，实际: {err}"
         );
+    }
+
+    /// **MYS-2765 #9 review 退回项**：序号选屏时不得丢掉启动配置的 X display。
+    ///
+    /// 场景就是 systemd 服务：`--desktop-display :0` 起了 agent，环境里**没有**
+    /// `$DISPLAY`；浏览器显示器下拉发 `desktop:select-display {display:"1"}`
+    /// （枚举序号）。旧实现 `open_source` 只把选屏值传下去、`x_display` 恒为
+    /// `None`，于是序号分支回落 `$DISPLAY`（未设置）→ 连接失败、桌面直接报错。
+    ///
+    /// 这里在**删掉 `DISPLAY`** 的进程环境里调 `open_source("x11", Some("0"),
+    /// Some(SR_XTEST_DISPLAY))`，必须成功。修复前该调用返回
+    /// `x11rb connect: ...` 错误（见交付说明）。
+    ///
+    /// `DISPLAY` 是进程级环境变量，与其它 X 测试互斥：用共享串行锁。
+    #[cfg(not(windows))]
+    #[test]
+    fn test_x11_index_selection_keeps_configured_x_display() {
+        let _serial = super::tests::x11_serial_lock();
+        let x_display = std::env::var("SR_XTEST_DISPLAY").unwrap_or_else(|_| ":99".into());
+        // 确认目标 display 真的可用（否则跳过，避免环境问题伪装成失败）。
+        if x11rb::rust_connection::RustConnection::connect(Some(x_display.as_str())).is_err() {
+            eprintln!("skipped: no X server at {x_display}");
+            return;
+        }
+        // 模拟 systemd 服务：环境里没有 DISPLAY。
+        let saved = std::env::var_os("DISPLAY");
+        std::env::remove_var("DISPLAY");
+        let result = open_source("x11", Some("0"), Some(&x_display));
+        // 无论断言结果如何都要恢复环境，否则会污染同进程的其它测试。
+        if let Some(v) = saved {
+            std::env::set_var("DISPLAY", v);
+        }
+
+        match result {
+            Ok((src, backend)) => {
+                assert_eq!(backend, "x11");
+                let monitors = src.list_monitors();
+                assert!(!monitors.is_empty(), "至少要有一个 RANDR 输出");
+                let m0 = &monitors[0];
+                assert_eq!(
+                    src.resolution(),
+                    (m0.width as usize, m0.height as usize),
+                    "序号 0 应裁到第一个输出的 CRTC"
+                );
+                assert_eq!(src.origin(), (m0.x, m0.y));
+            }
+            Err(e) => panic!(
+                "序号选屏必须复用启动配置的 X display（{x_display}），实际报错: {e}"
+            ),
+        }
+    }
+
+    /// 纯数字的 `--desktop-display` 仍按序号语义（派生出的 X display 为 None，
+    /// 回落 `$DISPLAY`）；非数字才作为 X display 串。
+    #[test]
+    fn test_x_display_from_config_semantics() {
+        use crate::agent::desktop::x_display_from_config;
+        assert_eq!(x_display_from_config(&Some("0".into())), None);
+        assert_eq!(x_display_from_config(&Some("12".into())), None);
+        assert_eq!(x_display_from_config(&Some(":0".into())), Some(":0".into()));
+        assert_eq!(
+            x_display_from_config(&Some("host:1".into())),
+            Some("host:1".into())
+        );
+        assert_eq!(x_display_from_config(&Some("  :2  ".into())), Some(":2".into()));
+        assert_eq!(x_display_from_config(&Some("".into())), None);
+        assert_eq!(x_display_from_config(&None), None);
+    }
+
+    /// X11 相关测试的共享串行锁（`DISPLAY` 是进程级环境变量）。
+    #[cfg(not(windows))]
+    fn x11_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// `xrandr --setmonitor` 造的第二块"屏"在 Xvfb 上不会变成第二个 RANDR

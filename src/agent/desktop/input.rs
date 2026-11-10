@@ -203,9 +203,9 @@ fn key_from_code(code: &str) -> Option<enigo::Key> {
 /// The serial injection worker handle. The platform backend (enigo) is
 /// `!Send` on some platforms, so it only ever lives on the injection thread.
 pub struct InputInjector {
-    /// 事件/信号通道。**只有**本结构体持有发送端——drop 掉它就等于告诉
-    /// worker "没有更多输入了"，worker 排空后退出（测试与 stop 都依赖这点）。
-    tx: mpsc::Sender<QueuedInput>,
+    /// 事件通道。**只有**本结构体持有发送端——drop 掉它就等于告诉 worker
+    /// "没有更多输入了"，worker 排空后退出（测试与 stop 都依赖这点）。
+    tx: mpsc::Sender<InputEvent>,
     shared: Arc<QueueShared>,
 }
 
@@ -229,10 +229,8 @@ impl InputInjector {
 
     /// 建队列 + 返回可发送的句柄（线程由 [`Self::start`] 或测试自行驱动）。
     fn with_queue() -> (Self, Arc<QueueShared>) {
-        let (tx, rx) = mpsc::channel::<QueuedInput>();
+        let (tx, rx) = mpsc::channel::<InputEvent>();
         let shared = Arc::new(QueueShared {
-            pending_move: Mutex::new(None),
-            move_signalled: AtomicBool::new(false),
             rx: Mutex::new(Some(rx)),
             closed: AtomicBool::new(false),
         });
@@ -247,10 +245,20 @@ impl InputInjector {
 
     /// Queue one event.
     ///
-    /// 鼠标移动合并到最新坐标；按下/抬起/滚轮/按键逐个入队，**不会因队列
-    /// 拥塞被丢弃**（MYS-2765 #11——丢一个 KeyUp 远端那个键就永久按住）。
+    /// 所有事件都**按序入队、一个都不丢**（MYS-2765 #11——丢一个 KeyUp 远端
+    /// 那个键就永久按住）。连续的鼠标移动在**消费侧**合并（见
+    /// [`QueueShared::next`]）：发送侧不做任何重排，按下/抬起/滚轮的相对顺序
+    /// 因此天然保持（拖拽不会被压成点击）。
     pub fn send(&self, ev: InputEvent) {
-        self.shared.push(&self.tx, ev);
+        if self.tx.send(ev.clone()).is_err() {
+            // 只有 worker 已退出才会走到这里（无界 channel 不会满）。释放
+            // 事件丢了最致命（远端按键卡住），单独 warn 便于日志定位。
+            if ev.is_release() {
+                tracing::warn!("desktop input worker gone — release event {ev:?} was NOT injected");
+            } else {
+                tracing::debug!("desktop input worker gone — event dropped");
+            }
+        }
     }
 
     /// 注入线程是否还在跑。worker 退出（或后端创建失败）后为 false，调用方
@@ -260,72 +268,51 @@ impl InputInjector {
     }
 }
 
-/// 注入队列里的一条消息。
-#[derive(Debug)]
-enum QueuedInput {
-    /// "把当前最新的鼠标移动注入进去"——坐标放在共享槽 `pending_move` 里，
-    /// 发送侧覆盖式写入，所以队列里最多只有一个这样的信号。
-    LatestMove,
-    /// 离散事件（按下/抬起/滚轮/按键）：按 FIFO 逐个投递。
-    Event(InputEvent),
-}
-
-/// 队列的消费侧状态（发送侧只借用 [`InputInjector::tx`]）。
+/// 队列的消费侧状态（发送侧只持有 [`InputInjector::tx`]）。
 struct QueueShared {
-    /// 待注入的最新鼠标移动（发送侧覆盖写）。
-    pending_move: Mutex<Option<InputEvent>>,
-    /// 已有一个 `LatestMove` 信号在队列里（尚未被消费），无需重复发。
-    move_signalled: AtomicBool,
     /// worker 端接收器（只被取出一次）。
-    rx: Mutex<Option<mpsc::Receiver<QueuedInput>>>,
+    rx: Mutex<Option<mpsc::Receiver<InputEvent>>>,
     /// worker 已退出（后端不可用 / 线程结束）。
     closed: AtomicBool,
 }
 
 impl QueueShared {
-    /// 发送侧入口。
+    /// 取下一条要注入的事件（`None` = 队列关闭，worker 退出）。
     ///
-    /// 浏览器 mousemove 可达 ~120Hz，而注入是串行消费；积压的旧坐标毫无价值
-    /// （远端桌面本来就跟不上），所以 move 只留最新一个。其余事件全部入队。
-    /// channel 无界 + 这些事件都是人有速率产生的，不会把内存吃满。
-    fn push(&self, tx: &mpsc::Sender<QueuedInput>, ev: InputEvent) {
-        if ev.is_move() {
-            *self.pending_move.lock().unwrap() = Some(ev);
-            if !self.move_signalled.swap(true, Ordering::SeqCst) {
-                // 无界 channel：仅在 worker 已退出时才失败（此时队列关闭）。
-                let _ = tx.send(QueuedInput::LatestMove);
-            }
-            return;
-        }
-        if tx.send(QueuedInput::Event(ev.clone())).is_err() {
-            // 只有 worker 已退出才会走到这里（无界 channel 不会满）。释放事件
-            // 丢了最致命（远端按键卡住），单独 warn 以便日志里能定位。
-            if ev.is_release() {
-                tracing::warn!("desktop input worker gone — release event {ev:?} was NOT injected");
-            } else {
-                tracing::debug!("desktop input worker gone — event dropped");
-            }
-        }
-    }
-
-    /// 消费侧取下一条要注入的事件（`None` = 队列关闭，worker 退出）。
+    /// 取出一个事件后**只向后看连续的鼠标移动**：连续的 move 只保留最新
+    /// 坐标（积压的旧坐标对远端毫无价值），一遇到非 move 就停手——它成为
+    /// 屏障，不能与前面的 move 换序。屏障事件通过 `lookahead` 交回调用方，
+    /// 在合并后的 move 注入完再处理。
     ///
-    /// `LatestMove` 是"信号"而不是事件：信号与坐标槽是分开写的，取信号时
-    /// 槽可能已被更新的 move 覆盖又被另一条信号带走（并发发送侧），此时
-    /// 没有坐标可注入——**继续等下一条消息**，不能返回 `None`（那会被当成
-    /// "队列关闭"让 worker 退出）。
-    fn next(&self, rx: &mpsc::Receiver<QueuedInput>) -> Option<InputEvent> {
+    /// 旧实现在**发送侧**合并 move（共享槽 + 信号），信号未消费时后续 move
+    /// 只覆盖槽，于是 `move(A) down move(B) up` 会被注入成
+    /// `move(B) down up`——在 B 点单击而不是从 A 拖到 B，框选/拖窗口/拖文件
+    /// 全部变坏（MYS-2765 #11 review 退回项）。合并只在连续 move 之间进行。
+    fn next(
+        &self,
+        rx: &mpsc::Receiver<InputEvent>,
+        lookahead: &mut Option<InputEvent>,
+    ) -> Option<InputEvent> {
+        // 先取一件：既可能是上一拍留下的屏障事件，也可能是新到达的事件。
+        let first = match lookahead.take() {
+            Some(ev) => ev,
+            None => rx.recv().ok()?,
+        };
+        if !first.is_move() {
+            return Some(first);
+        }
+        // 连续的 move：只留最新坐标，直到撞上非 move（屏障）或队列暂时空。
+        let mut latest = first;
         loop {
-            match rx.recv() {
-                Ok(QueuedInput::LatestMove) => {
-                    self.move_signalled.store(false, Ordering::SeqCst);
-                    if let Some(ev) = self.pending_move.lock().unwrap().take() {
-                        return Some(ev);
-                    }
-                    // 槽已被另一次唤醒取空：继续等（下面还有信号或事件）。
+            match rx.try_recv() {
+                Ok(ev) if ev.is_move() => latest = ev,
+                Ok(ev) => {
+                    // 屏障：留到下一拍处理，绝不越过它。
+                    *lookahead = Some(ev);
+                    return Some(latest);
                 }
-                Ok(QueuedInput::Event(ev)) => return Some(ev),
-                Err(_) => return None,
+                // 队列暂时空（或已关闭）：这段连续 move 到此为止。
+                Err(_) => return Some(latest),
             }
         }
     }
@@ -408,7 +395,8 @@ fn drive_worker(backend: Result<Box<dyn InjectBackend>, String>, shared: &QueueS
         Some(rx) => rx,
         None => return,
     };
-    while let Some(ev) = shared.next(&rx) {
+    let mut lookahead = None;
+    while let Some(ev) = shared.next(&rx, &mut lookahead) {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.inject(&ev)));
         match r {
             Ok(Ok(())) => {}
@@ -530,14 +518,129 @@ mod tests {
         drive_worker(Ok(backend), queue);
     }
 
+    /// 在独立线程里驱动注入，`open_gate` 之前不开始消费——模拟"注入线程落后，
+    /// 浏览器已经把一串事件排进队列"（正是需要合并 move 的场景）。
+    ///
+    /// 后端在**线程内**构造（`InjectBackend` 不要求 `Send`，与
+    /// `InputInjector::start` 里 enigo 只在注入线程创建一致）。
+    fn spawn_gated_worker<F>(
+        queue: Arc<QueueShared>,
+        make_backend: F,
+    ) -> (
+        Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        std::thread::JoinHandle<()>,
+    )
+    where
+        F: FnOnce() -> Box<dyn InjectBackend> + Send + 'static,
+    {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let g2 = gate.clone();
+        let handle = std::thread::spawn(move || {
+            let backend = make_backend();
+            {
+                let (lock, cv) = &*g2;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cv.wait(released).unwrap();
+                }
+            }
+            drive_worker(Ok(backend), &queue);
+        });
+        (gate, handle)
+    }
+
+    fn open_gate(gate: &Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>) {
+        let (lock, cv) = &**gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    /// **MYS-2765 #11 review 退回项**：只合并**连续的** move，任何非 move 都是
+    /// 屏障——`move(A) → down → move(B) → up` 必须注入成
+    /// `move(A), down, move(B), up`，不能变成 `move(B), down, up`（那是在 B 点
+    /// 单击而不是从 A 拖到 B，框选/拖窗口/拖文件全部坏掉）。
+    ///
+    /// worker 先被 gate 挡住不消费，此时浏览器把整串事件排进队列——这正是
+    /// 旧实现（发送侧共享槽 + 单信号）出错的条件：信号未消费时后续 move 只
+    /// 覆盖槽，`move(1,1)` 会被 `move(9,9)` 顶掉，且 down 被排到 move 之前。
+    /// 修复前这条断言得到 `[move(9,9), down, up]`，必然失败。
+    #[test]
+    fn test_move_coalescing_preserves_order_around_buttons() {
+        let (inj, queue) = InputInjector::with_queue();
+        let seen: Arc<Mutex<Vec<InputEvent>>> = Default::default();
+        let seen2 = seen.clone();
+        let (gate, handle) =
+            spawn_gated_worker(queue, move || Box::new(RecordingBackend { seen: seen2 }));
+
+        inj.send(InputEvent::MouseMove { x: 1, y: 1 });
+        inj.send(InputEvent::MouseDown { button: 0 });
+        inj.send(InputEvent::MouseMove { x: 5, y: 5 });
+        inj.send(InputEvent::MouseMove { x: 9, y: 9 });
+        inj.send(InputEvent::MouseUp { button: 0 });
+        drop(inj); // 关队列：worker 排空后退出
+        open_gate(&gate);
+        handle.join().unwrap();
+
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                InputEvent::MouseMove { x: 1, y: 1 },
+                InputEvent::MouseDown { button: 0 },
+                InputEvent::MouseMove { x: 9, y: 9 },
+                InputEvent::MouseUp { button: 0 },
+            ],
+            "move 只能与相邻的连续 move 合并，不得越过 down/up 屏障: {got:?}"
+        );
+    }
+
+    /// 连按/连拖中段的多段 move 各自独立合并：`move,down,move,move,up,move,move`
+    /// → `move,down,move,up,move`。
+    #[test]
+    fn test_move_coalescing_multiple_segments() {
+        let (inj, queue) = InputInjector::with_queue();
+        let seen: Arc<Mutex<Vec<InputEvent>>> = Default::default();
+        let seen2 = seen.clone();
+        let (gate, handle) =
+            spawn_gated_worker(queue, move || Box::new(RecordingBackend { seen: seen2 }));
+        for ev in [
+            InputEvent::MouseMove { x: 1, y: 1 },
+            InputEvent::MouseDown { button: 0 },
+            InputEvent::MouseMove { x: 2, y: 2 },
+            InputEvent::MouseMove { x: 3, y: 3 },
+            InputEvent::MouseUp { button: 0 },
+            InputEvent::MouseMove { x: 8, y: 8 },
+            InputEvent::MouseMove { x: 9, y: 9 },
+        ] {
+            inj.send(ev);
+        }
+        drop(inj);
+        open_gate(&gate);
+        handle.join().unwrap();
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                InputEvent::MouseMove { x: 1, y: 1 },
+                InputEvent::MouseDown { button: 0 },
+                InputEvent::MouseMove { x: 3, y: 3 },
+                InputEvent::MouseUp { button: 0 },
+                InputEvent::MouseMove { x: 9, y: 9 },
+            ]
+        );
+    }
+
     /// 队列里塞爆大量鼠标移动，随后的 KeyUp/MouseUp 仍然必须被投递
     /// （MYS-2765 #11：旧实现队满 `try_send` 丢**新**事件，释放事件会被丢，
     /// 远端按键/鼠标卡住）。
+    ///
+    /// 合并只发生在**连续的** move 之间（见
+    /// [`test_move_coalescing_preserves_order_around_buttons`]），所以这里
+    /// 10k 次连续 move 会塌成 1 条，其后的离散事件顺序不变。
     #[test]
     fn test_release_events_survive_backlog() {
         let (inj, queue) = InputInjector::with_queue();
         let seen: Arc<Mutex<Vec<InputEvent>>> = Default::default();
-        // 先灌 10k 次移动：合并语义下只留最新一个，队列不会"满"。
+        // 先灌 10k 次移动：无界队列不丢，消费侧把这段连续 move 合并成 1 条。
         for i in 0..10_000 {
             inj.send(InputEvent::MouseMove { x: i, y: i });
         }
@@ -549,21 +652,16 @@ mod tests {
         drain_sync(&queue, Box::new(RecordingBackend { seen: seen.clone() }));
 
         let got = seen.lock().unwrap().clone();
-        // 移动合并成一条（最新坐标），释放事件一个不少且保持顺序。
-        let moves = got.iter().filter(|e| e.is_move()).count();
-        assert_eq!(moves, 1, "连续 move 必须合并成一条，实际 {got:?}");
+        // 连续移动合并成一条（最新坐标），释放事件一个不少且保持顺序。
         assert_eq!(
-            got.last(),
-            Some(&InputEvent::MouseUp { button: 0 }),
-            "MouseUp 必须投递且排在最后: {got:?}"
-        );
-        assert!(
-            got.contains(&InputEvent::KeyUp { code: "ControlLeft".into() }),
-            "KeyUp 绝不能因队列拥塞被丢: {got:?}"
-        );
-        assert!(
-            got.contains(&InputEvent::KeyDown { code: "ControlLeft".into() }),
-            "KeyDown 不得被丢: {got:?}"
+            got,
+            vec![
+                InputEvent::MouseMove { x: 9_999, y: 9_999 },
+                InputEvent::KeyDown { code: "ControlLeft".into() },
+                InputEvent::KeyUp { code: "ControlLeft".into() },
+                InputEvent::MouseUp { button: 0 },
+            ],
+            "连续 move 合并为最新一条；KeyDown/KeyUp/MouseUp 一个不丢且保序: {got:?}"
         );
     }
 

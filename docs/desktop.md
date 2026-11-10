@@ -71,7 +71,7 @@ Wayland 支持不进默认构建（`wayland` feature 会引入 zbus / gstreamer�
 选屏协议统一为**枚举序号**，三个平台语义一致：下拉的 value 是 `desktop:started.displays` 的**数组下标**，`"0"` 是第一块、`"1"` 是第二块。
 
 - **Windows**：DXGI 与 GDI 的拓扑上报和选屏走同一份枚举顺序（同一个 `enumerate_outputs` / `list_monitors_gdi`），序号不会错位
-- **X11**：序号 = RANDR 输出顺序；选中后 X 连接仍走 `$DISPLAY`，采集区域裁剪到该输出的 CRTC 矩形（`GetImage`/`ShmGetImage`/XComposite 全部按 `x,y,w,h` 取），鼠标注入加上该 CRTC 原点
+- **X11**：序号 = RANDR 输出顺序；采集区域裁剪到该输出的 CRTC 矩形（`GetImage`/`ShmGetImage`/XComposite 全部按 `x,y,w,h` 取），鼠标注入加上该 CRTC 原点。X 连接串取启动配置里**非数字**的 `--desktop-display`（如 `:0`），没有再回落 `$DISPLAY`——浏览器切屏不会覆盖它，所以 systemd 服务（环境里没有 `$DISPLAY`）里 `--desktop-display :0` + 下拉切屏也能正常工作
 - 未连接/无 CRTC 的输出仍出现在 `displays` 里（尺寸 0），浏览器过滤掉不提供选择；直接按序号选它会拒绝并报错（不会悄悄回落到整屏）
 - 鼠标落点：浏览器上报的坐标是**采集画面内**的，agent 注入前加上所选显示器在虚拟桌面中的原点（如第二屏 `+1280+0`），否则点击会落到主屏
 - 显示器在系统设置里被挪动/换分辨率时，采集区域与注入原点会自动跟随（X11 走 RANDR 事件、GDI/DXGI 每拍重读）

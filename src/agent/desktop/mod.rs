@@ -85,6 +85,11 @@ pub struct DesktopConfig {
     pub min_bps: u64,
     pub max_bps: u64,
     /// Optional X11 display override (`--desktop-display`).
+    ///
+    /// **启动配置的原始值**，运行时选屏（浏览器下拉的枚举序号）不改它——
+    /// 序号选屏时 X 连接串从它派生（MYS-2765 #9：非数字的 `--desktop-display`
+    /// 如 `:0` 不能被浏览器切屏覆盖，否则没有 `$DISPLAY` 的 systemd 服务里
+    /// 一切屏就连不上）。见 [`x_display_from_config`]。
     pub display: Option<String>,
     /// 质量档倍率（speed=0.5 / balanced=0.67 / best=1.5，rustdesk 同款）。
     /// 决定目标码率（base_bitrate × quality）与 QP 区间。
@@ -143,10 +148,24 @@ impl DesktopConfig {
     }
 }
 
-/// 解析 start 用的捕获显示器：运行时选屏覆盖（web 下拉可改）优先，
+/// 解析 start 用的捕获显示器选择值：运行时选屏覆盖（web 下拉可改）优先，
 /// 否则回落启动配置的 --desktop-display（再否则 None = 平台默认屏）。
+///
+/// 注意这只是**选屏值**（X11/Windows 都是枚举序号）。启动配置里的 X display
+/// 串（`--desktop-display :0`）另由 [`x_display_from_config`] 从启动配置派生、
+/// 经 [`RunShared::x_display`] 传下去，不被运行时选择覆盖（MYS-2765 #9）。
 fn resolved_display(runtime: &Option<String>, config: &Option<String>) -> Option<String> {
     runtime.clone().or_else(|| config.clone())
+}
+
+/// 从启动配置的 `--desktop-display` 派生 X display 串：只有**非纯数字**的
+/// 值才是 X display（`":0"`、`"host:0"`）。纯数字是选屏序号（MYS-2765 #9）。
+fn x_display_from_config(display: &Option<String>) -> Option<String> {
+    let d = display.as_deref()?.trim();
+    if d.is_empty() || d.parse::<usize>().is_ok() {
+        return None;
+    }
+    Some(d.to_string())
 }
 
 /// 帧 buffer 池（R5 #127 SIMD 内存池第一块）：预分配复用 `Vec<u8>`，
@@ -873,8 +892,11 @@ impl DesktopManager {
         // 单色是 `gray && codec == av1` 的派生值（MYS-2765 #4），不再独立存储
         // ——否则灰度关而 AV1 仍输出单色的状态可被构造出来。
         cfg.monochrome = self.monochrome_now();
-        // 运行时选屏（web 显示器下拉可改）覆盖启动 --desktop-display。
+        // 运行时选屏（web 显示器下拉可改）覆盖启动 --desktop-display 的**选屏
+        // 值**；X display 串仍取启动配置（MYS-2765 #9：`--desktop-display :0`
+        // 不能被浏览器切屏覆盖，否则无 `$DISPLAY` 的服务里切屏连不上）。
         let disp = self.display.read().map(|d| d.clone()).unwrap_or(None);
+        let x_display = x_display_from_config(&cfg.display);
         cfg.display = resolved_display(&disp, &cfg.display);
         let mb = self.max_bps.read().map(|b| *b).unwrap_or(0);
         if mb > 0 {
@@ -896,6 +918,7 @@ impl DesktopManager {
             last_active_at: self.last_active_at.clone(),
             exit_state: exit_state.clone(),
             capture_origin: self.capture_origin.clone(),
+            x_display,
         };
         let generation = self.generation.clone();
         let guard_post = post.clone();
@@ -1282,6 +1305,10 @@ struct RunShared {
     /// 所选显示器原点（打包 `x << 32 | y`）：循环在打开/重建捕获源后写入，
     /// `handle_mouse` 读它做坐标补偿（MYS-2765 #10）。
     capture_origin: Arc<AtomicI64>,
+    /// 启动配置里的 **X display 串**（`--desktop-display` 非纯数字时才有值，
+    /// 如 `:0`）。序号选屏时用它做 X 连接，避免浏览器切屏把启动配置丢掉
+    /// （MYS-2765 #9：没有 `$DISPLAY` 的 systemd 服务里切屏会连不上）。
+    x_display: Option<String>,
 }
 
 /// 把捕获源原点写进共享原子（MYS-2765 #10）。
@@ -1299,7 +1326,14 @@ async fn run_desktop_loop(
     running: Arc<AtomicBool>,
     shared: RunShared,
 ) {
-    let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
+    // 序号选屏时 X 连接串取启动配置的 `--desktop-display`（非数字），
+    // 不能让浏览器切屏把它丢掉（MYS-2765 #9）。
+    let x_display = shared.x_display.clone();
+    let src = match capture::open_source(
+        &cfg.capture,
+        cfg.display.as_deref(),
+        x_display.as_deref(),
+    ) {
         Ok((src, backend)) => (src, backend),
         Err(e) => {
             tracing::error!("desktop capture open failed: {}", e);
@@ -1340,6 +1374,8 @@ async fn run_desktop_pipeline(
         last_active_at,
         exit_state,
         capture_origin,
+        // 只在 run_desktop_loop（打开捕获源）用到，pipeline 不用。
+        x_display: _,
     } = shared;
     // cfg 需可变：编码器 fallback 后回写实际 codec。
     let mut cfg = cfg;
@@ -2755,6 +2791,7 @@ mod tests {
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
             exit_state: Arc::new(AtomicU8::new(EXIT_NONE)),
             capture_origin: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            x_display: None,
         }
     }
 
