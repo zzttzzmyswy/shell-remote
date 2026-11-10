@@ -233,6 +233,8 @@
     // join 成功后应用降质（若已标记）；并调度 15s 无重连后恢复 best。
     function applyQualityOnJoin() {
         if (!qualityDegraded || !window.shellRemote) return;
+        // 只读会话不参与降质协商（desktop:quality 要求写权限，MYS-2767 #5）。
+        if (isReadOnly()) { qualityDegraded = false; return; }
         window.shellRemote.send('desktop:quality', {
             quality: 'speed', bitrate_kbps: 0,
             seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1)
@@ -244,7 +246,7 @@
             qualityDegraded = false;
             const now2 = Date.now();
             const recent = reconnectTimes.filter(function(t) { return now2 - t < 30000; });
-            if (recent.length < 2 && window.shellRemote) {
+            if (recent.length < 2 && window.shellRemote && !isReadOnly()) {
                 window.shellRemote.send('desktop:quality', {
                     quality: 'best', bitrate_kbps: 0,
                     seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1)
@@ -296,6 +298,41 @@
         const p = window.shellRemote && typeof window.shellRemote.getPermission === 'function'
             ? window.shellRemote.getPermission() : '';
         return p === 'rw' ? 'rw' : 'ro';
+    }
+    function isReadOnly() { return currentPermission() !== 'rw'; }
+
+    /// 只读会话的桌面控件降级（MYS-2767 #5）。
+    ///
+    /// 画质 / 编码 / 灰度 / 显示器 / 剪贴板写入在 agent 侧都要求写权限
+    /// （`src/proto/mod.rs::requires_write`），ro 用户一点就 403 + "权限不足"
+    /// toast。这里直接隐藏这些控件（保留「默认」显示器文本与「远端 → 本机」
+    /// 剪贴板读取——两者是只读操作），只读用户仍可正常观看已开启的桌面。
+    /// 每个 handler 内另有 isReadOnly() 早退，防止控件被外部重新显示后误发。
+    function applyDesktopPermission() {
+        const ro = isReadOnly();
+        // 控制栏容器：只读时仍显示（全屏/指标/只读剪贴板有用）。
+        const qualityLabel = document.getElementById('desktop-quality-label');
+        const codecLabel = document.getElementById('desktop-codec-label');
+        const grayLabel = document.getElementById('desktop-gray-label');
+        const displayGroup = document.getElementById('desktop-display-label');
+        const clipToRemote = document.getElementById('clip-to-remote-btn');
+        const clipText = document.getElementById('desktop-clip-text');
+        if (qualityLabel) qualityLabel.classList.toggle('hidden', ro);
+        if (codecLabel) codecLabel.classList.toggle('hidden', ro);
+        if (grayLabel) grayLabel.classList.toggle('hidden', ro);
+        if (clipToRemote) clipToRemote.classList.toggle('hidden', ro);
+        if (clipText) clipText.readOnly = ro;
+        if (displayGroup) {
+            // 显示器下拉：只读时整组隐藏（选屏要重建流）。加载拓扑后
+            // populateDisplaySelect 会按"多屏才显示"重算，届时再看权限。
+            if (ro) displayGroup.style.display = 'none';
+        }
+        // 桌面按钮：只读也能观看已开启的桌面，但自己开不了。
+        if (ro && toggleDesktopBtn && !toggleDesktopBtn.classList.contains('hidden')) {
+            toggleDesktopBtn.title = '只读访问：可观看已开启的桌面，无法自行开启';
+        } else if (toggleDesktopBtn && desktopEnabled) {
+            toggleDesktopBtn.title = '打开桌面画面（默认关闭）';
+        }
     }
 
     /// 计算并应用当前模式。能力数组变化、token 权限变化、SW 不可用时都会重算。
@@ -606,9 +643,14 @@
         codecSelect.addEventListener('change', function() {
             const codec = this.value;
             if (!desktopEnabled || !window.shellRemote) return;
+            // 只读会话：desktop:codec 要求写权限（MYS-2767 #5），直接拒绝。
+            if (isReadOnly()) { showToast('只读访问：无法切换编码', 'warning'); return; }
             // 切换中标志：agent stop→start 重建流期间, desktop:stopped 不
             // 触发退出桌面视图, 等 desktop:started 到来后自动重连新流。
             armCodecSwitchPending();
+            // 用户手动切编码 = 明确选择，清空自动黑名单（MYS-2767 #9）：否则
+            // 之前因解码报错被拉黑的编码在本次会话里再也切不回去。
+            if (desktopView) desktopView._codecBlacklisted = [];
             window.shellRemote.send('desktop:codec', { codec: codec, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast('切换编码为 ' + codec.toUpperCase() + '…', '');
         });
@@ -619,6 +661,8 @@
     const qualitySelect = document.getElementById('desktop-quality-select');
     if (qualitySelect) {
         qualitySelect.addEventListener('change', async function() {
+            // 只读会话：desktop:quality 要求写权限（MYS-2767 #5）。
+            if (isReadOnly()) { showToast('只读访问：无法调整画质', 'warning'); this.value = 'balanced'; return; }
             let quality = this.value;
             let custom = 0;
             if (quality === 'custom') {
@@ -644,6 +688,8 @@
     if (grayToggle) {
         grayToggle.addEventListener('change', function() {
             if (!desktopEnabled || !window.shellRemote) return;
+            // 只读会话：desktop:gray 要求写权限（MYS-2767 #5）。
+            if (isReadOnly()) { showToast('只读访问：无法切换灰度', 'warning'); this.checked = false; return; }
             armCodecSwitchPending();
             window.shellRemote.send('desktop:gray', { enabled: this.checked, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
             showToast(this.checked ? '已开启灰度模式（省带宽）' : '已关闭灰度模式', '');
@@ -655,34 +701,55 @@
     // 该显示器。"" = 恢复启动默认显示器。
     const displaySelect = document.getElementById('desktop-display-select');
     const displayLabel = document.getElementById('desktop-display-label');
+    // 多显示器选屏（MYS-2767 #4）：option 的 value 用**枚举序号字符串**
+    // （"0"、"1"…），与 desktop:started.displays 数组下标一致——agent 侧按
+    // 该序号选屏（Windows 是显示序号，X11 裁剪到对应 RANDR CRTC）。旧实现用
+    // 输出名（X11 "HDMI-1" / Windows "DISPLAY2"），agent 按 DISPLAY 连接或按
+    // 数字解析失败，两个平台都切不过去。显示文本仍为 `名称 · WxH`。
+    // 未连接输出（X11 会上报 0x0）不进下拉，但其序号仍按数组原下标计算。
     function populateDisplaySelect(displays) {
         if (!displaySelect || !displayLabel) return;
+        const list = displays || [];
         const current = displaySelect.value;
         displaySelect.innerHTML = '';
         const def = document.createElement('option');
         def.value = '';
         def.textContent = '默认';
         displaySelect.appendChild(def);
-        (displays || []).forEach(function(d) {
+        let usable = 0;
+        list.forEach(function(d, idx) {
+            // 0x0 = 未连接的输出（X11 RANDR 会列出）：不提供选择。
+            if (!d || !(Number(d.width) > 0) || !(Number(d.height) > 0)) return;
+            usable += 1;
             const o = document.createElement('option');
-            o.value = d.name || '';
-            const geo = (d.width && d.height) ? (' · ' + d.width + 'x' + d.height) : '';
-            o.textContent = (d.name || '?') + geo;
+            o.value = String(idx); // 序号 = 数组下标（含被过滤项的原位置）
+            o.textContent = (d.name || '?') + ' · ' + d.width + 'x' + d.height;
             displaySelect.appendChild(o);
         });
-        // 单屏/无拓扑时隐藏下拉（选屏无意义），多屏才显示。
-        const n = (displays || []).length;
-        displayLabel.style.display = (n > 1) ? '' : 'none';
-        if (current) displaySelect.value = current;
+        // 单屏/无拓扑时隐藏下拉（选屏无意义），多屏才显示；只读会话一律隐藏
+        // （选屏会重建桌面流，要求写权限）。
+        displayLabel.style.display = (usable > 1 && !isReadOnly()) ? '' : 'none';
+        if (current && Array.from(displaySelect.options).some(function(o) { return o.value === current; })) {
+            displaySelect.value = current;
+        } else {
+            displaySelect.value = '';
+        }
+        return usable;
     }
     if (displaySelect) {
         displaySelect.addEventListener('change', function() {
             if (!desktopEnabled || !window.shellRemote) return;
+            // 只读会话：desktop:select-display 要求写权限（MYS-2767 #5）。
+            if (isReadOnly()) { showToast('只读访问：无法切换显示器', 'warning'); this.value = ''; return; }
+            // value 是枚举序号字符串（见 populateDisplaySelect），直接透传给
+            // agent；toast 用下拉里的可读名称。
             const display = this.value || '';
+            const opt = this.options[this.selectedIndex];
+            const label = opt ? opt.textContent : display;
             // 重建流期间 desktop:stopped 不退出桌面视图，等 started 后重连。
             armCodecSwitchPending();
             window.shellRemote.send('desktop:select-display', { display: display, seq: (window.__cmdSeq = (window.__cmdSeq || 0) + 1) });
-            showToast(display ? ('切换显示器 ' + display) : '恢复默认显示器…', '');
+            showToast(display ? ('切换显示器 ' + label) : '恢复默认显示器…', '');
         });
     }
 
@@ -756,10 +823,10 @@
         // 正在跑而用户临时切到了网页视图，这时点按钮应当是"回去接着看"，不是
         // 把流停掉。
         if (currentView === 'desktop') {
-            // 切回终端：停流
+            // 切回终端：停流（只读会话不发 desktop:stop：它要求写权限，会 403）
             clearDesktopStartTimer();
             desktopView.disconnect();
-            window.shellRemote.send('desktop:stop', {});
+            if (!isReadOnly()) window.shellRemote.send('desktop:stop', {});
             desktopStarting = false;
             showTerminalView();
             return;
@@ -768,6 +835,12 @@
             // 桌面流还在跑（用户从网页/终端切回来）：只恢复显示，不发 desktop:start。
             clearDesktopStartTimer();
             showDesktopView();
+            return;
+        }
+        // 只读会话无法开启桌面（desktop:start 要求写权限）：直接提示，不再
+        // 发命令等 15s 超时（MYS-2767 #5）。
+        if (isReadOnly()) {
+            showToast('只读访问：无法开启桌面', 'warning');
             return;
         }
         if (desktopStarting) return;
@@ -925,6 +998,9 @@
         // `connected` 带出 relay 认定的 token 权限：据此重算网页映射模式
         // （无论它早于还是晚于 session:capabilities 到达，结果都正确）。
         detectAndApplyMode(webCaps);
+        // 权限就绪后立刻按 rw/ro 调整桌面控件（MYS-2767 #5）。桌面按钮在
+        // capabilities 到达前是 disabled 的，这里不改能力判定，只改可写控件。
+        applyDesktopPermission();
         term.focus();
         term.onResize((cols, rows) => {
             window.shellRemote.send('terminal:resize', {
@@ -1052,6 +1128,8 @@
     window.shellRemote.on('desktop:capabilities', function(msg) {
         clearJoinWatchdog();
         setDesktopEnabled(msg.payload && msg.payload.available);
+        // 只读会话的控件降级（隐藏画质/编码/灰度/显示器/剪贴板写入）。
+        applyDesktopPermission();
         // 按 agent 声明的可用编码过滤切换选项（codecs: ["av1","h264"]；
         // MYS-954：VP8/VP9 已移除）。
         const codecs = (msg.payload && msg.payload.codecs) || [];
@@ -1134,7 +1212,9 @@
         // 批次7 选屏：刷新下拉选项；多屏才显示。agent 生效中的显示器
         // （display 字段，"" = 默认）同步到选中值。
         if (typeof populateDisplaySelect === 'function') {
+            // populated 之后再按权限收一次（只读用户不进下拉）。
             populateDisplaySelect(window._srDesktopInfo.displays);
+            applyDesktopPermission();
             const ds = document.getElementById('desktop-display-select');
             if (ds) {
                 const cur = (msg.payload && msg.payload.display) || '';
@@ -1238,6 +1318,8 @@
             clipPanel.classList.toggle('hidden');
         });
         document.getElementById('clip-to-remote-btn').addEventListener('click', async function() {
+            // 只读会话：desktop:clipboard:set 要求写权限（读取是放行的）。
+            if (isReadOnly()) { showToast('只读访问：无法写入远端剪贴板', 'warning'); return; }
             let text = clipText.value;
             if (!text) {
                 try { text = await navigator.clipboard.readText(); clipText.value = text; } catch (e) {}
@@ -1435,7 +1517,8 @@
     // 主动通知 agent 不再发帧。
     function notifyDesktopLeave() {
         if (desktopActive && window.shellRemote && window.shellRemote.send) {
-            try { window.shellRemote.send('desktop:stop', {}); } catch (e) {}
+            // 只读会话不发 desktop:stop（要求写权限）。
+            try { if (!isReadOnly()) window.shellRemote.send('desktop:stop', {}); } catch (e) {}
             if (desktopView) desktopView.disconnect();
             desktopActive = false;
         }

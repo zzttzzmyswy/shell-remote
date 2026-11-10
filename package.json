@@ -3,7 +3,8 @@
   "private": true,
   "description": "Browser-side verification scripts (playwright) for shell-remote.",
   "scripts": {
-    "verify:mys2283-e": "node tools/verify/verify_mys2283_e.js"
+    "verify:mys2283-e": "node tools/verify/verify_mys2283_e.js",
+    "verify:mys2765-web": "node tools/verify/verify_mys2765_web.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"
