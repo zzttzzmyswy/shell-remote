@@ -340,6 +340,23 @@ async function case3(browser) {
     const allowed = all.filter((m) => ['desktop:reqkey', 'desktop:test-delay', 'desktop:clipboard:get'].indexOf(m.type) >= 0);
     check('3.4 只读允许的操作仍可发送（通道存活）', allowed.length > 0,
       allowed.map((m) => m.type).slice(0, 4).join(','));
+
+    // 3.5 ro 切回终端后再点「桌面」：rw 开着的桌面仍在跑，必须能重新观看，
+    // 不能误报「只读访问：无法开启桌面」，也不能发 desktop:start（MYS-2765 验收复核）。
+    await ro.page.click('#toggle-desktop-btn'); // 桌面 → 终端
+    await ro.page.waitForFunction(() => {
+      const c = document.getElementById('desktop-container');
+      return c && c.classList.contains('hidden');
+    }, { timeout: 5000 });
+    await ro.page.click('#toggle-desktop-btn'); // 终端 → 桌面（重新观看）
+    const reDrawn = await ro.page.waitForFunction(() => {
+      const c = document.getElementById('desktop-container');
+      const el = document.getElementById('desktop-loading');
+      return c && !c.classList.contains('hidden') && el && el.classList.contains('hidden');
+    }, { timeout: 20000 }).then(() => true).catch(() => false);
+    check('3.5 ro 切回终端后可再次观看运行中的桌面', reDrawn);
+    const startSent = (await sentOf(ro.page, 'desktop:start')).length;
+    check('3.6 ro 重新观看不发送 desktop:start', startSent === 0, `count=${startSent}`);
   } finally {
     await rw.ctx.close();
     await ro.ctx.close();

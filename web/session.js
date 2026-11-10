@@ -14,6 +14,11 @@
     // Desktop view state. 桌面默认关闭：仅在点击"桌面"按钮后才开启。
     let desktopEnabled = false;   // agent 能力可用
     let desktopActive = false;    // 当前处于桌面视图
+    // agent 侧桌面流是否在跑（与本页是否在看无关）：由 capabilities.running /
+    // desktop:state / started / stopped / error 维护。只读用户切回终端后
+    // desktopActive 已为 false，但流仍在跑——据此允许其点「桌面」重新观看
+    // （MYS-2765 验收复核：此前会误报「无法开启桌面」）。
+    let remoteDesktopRunning = false;
     let desktopStarting = false;  // 已发 desktop:start 等待回复
     // 网页视图状态（MYS-2383-C / MYS-2383-G）：与桌面同级的独立视图，互不覆盖
     // DOM。模式判定只看 `session:capabilities` 里的能力字符串 + 当前 token 权限
@@ -840,6 +845,12 @@
         // 只读会话无法开启桌面（desktop:start 要求写权限）：直接提示，不再
         // 发命令等 15s 超时（MYS-2767 #5）。
         if (isReadOnly()) {
+            if (remoteDesktopRunning) {
+                // 桌面由 rw 用户开着：只读用户重新接入观看，不发 desktop:start。
+                showDesktopView();
+                desktopView.connect(true);
+                return;
+            }
             showToast('只读访问：无法开启桌面', 'warning');
             return;
         }
@@ -1147,6 +1158,7 @@
             }
             sel.value = (codecs.indexOf(cur) >= 0) ? cur : (codecs[0] || 'av1');
         }
+        remoteDesktopRunning = !!(msg.payload && msg.payload.running);
         if (msg.payload && msg.payload.running && !desktopActive && !desktopStarting) {
             // 其它浏览器已开启桌面：把流连上。正在网页视图里时不抢视图。
             desktopActive = true;
@@ -1168,6 +1180,7 @@
         // 断线重连后不再依赖 desktop:capabilities 恰好仍在事件缓冲里——
         // 拿着这个快照即可恢复视图（与 capabilities 的 running 处理一致）。
         const running = !!(msg.payload && msg.payload.running);
+        remoteDesktopRunning = running;
         if (running) {
             if (!desktopActive && !desktopStarting) {
                 // 桌面在跑：接入观看。用户正停在网页视图时不抢视图——只把流连上
@@ -1190,6 +1203,7 @@
         toggleDesktopBtn.disabled = !desktopEnabled;
         // 编码热切换完成：清除 pending 标志。
         clearCodecSwitchPending();
+        remoteDesktopRunning = !(msg.payload && msg.payload.error);
         if (msg.payload && msg.payload.error) {
             showToast('桌面启动失败: ' + msg.payload.error, 'error');
             showTerminalView();
@@ -1350,6 +1364,7 @@
     window.shellRemote.on('desktop:stopped', function(msg) {
         // 编码热切换中的 stop：保持桌面视图, 等 desktop:started 重连新流。
         if (window.__codecSwitchPending) return;
+        remoteDesktopRunning = false;
         if (desktopActive) {
             desktopView.disconnect();
             desktopActive = false;
@@ -1361,6 +1376,7 @@
 
     window.shellRemote.on('desktop:error', function(msg) {
         // 捕获/编码器持续失败（例如 Wayland 下 XWayland root 无法 GetImage）
+        remoteDesktopRunning = false;
         if (desktopActive) {
             desktopView.disconnect();
             desktopActive = false;
