@@ -20,7 +20,9 @@
 
 #![cfg(windows)]
 
-use super::capture::{Frame, FrameSource, MonitorInfo};
+use super::capture::{
+    classify_dxgi_error, Frame, FrameSource, MonitorInfo, CaptureRecovery,
+};
 
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -28,10 +30,51 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::Interface;
 
+/// 一次 DXGI 捕获失败：带 HRESULT 的错误（MYS-2765 #4）。
+///
+/// `windows-result` 的 `Error` 只保留 HRESULT，Display 是本地化的
+/// `消息 (0x887A0026)`——不含常量名，旧实现按字符串匹配 `ACCESS_LOST`
+/// 永假，掉线后永不重建。这里显式携带 HRESULT 交给
+/// [`classify_dxgi_error`] 判定，日志仍保留可读文本。
+#[derive(Debug)]
+pub(crate) struct DxgiError {
+    /// 失败对应的 HRESULT（`windows::core::Error::code().0`；纯字符串错误
+    /// 用 0 表示"无 HRESULT"）。
+    pub hresult: i32,
+    /// 可读上下文（哪个调用失败 + 原始 Display）。
+    pub context: String,
+}
+
+impl DxgiError {
+    fn hr(e: &windows::core::Error, what: &str) -> Self {
+        Self {
+            hresult: e.code().0,
+            context: format!("{what}: {e}"),
+        }
+    }
+
+    fn other(context: impl Into<String>) -> Self {
+        Self {
+            hresult: 0,
+            context: context.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DxgiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (hresult=0x{:08X})", self.context, self.hresult as u32)
+    }
+}
+
 /// Enumerate every desktop output across all adapters (in DXGI enumeration
-/// order). Returns `(adapter_index, output_index, IDXGIOutput1, desc)`.
+/// order). Returns `(adapter_index, output_index, adapter, IDXGIOutput1, desc)`.
 /// 失败的 output（cast 到 IDXGIOutput1 失败）跳过。
-pub(crate) fn enumerate_outputs() -> Vec<(u32, u32, IDXGIOutput1, DXGI_OUTPUT_DESC)> {
+///
+/// [`list_monitors_static`] 与 [`DxgiSource::build`] 都走这一个函数，保证
+/// 上报的显示器数组下标与 `open_at(idx)` 的选屏序号**同源一致**
+/// （MYS-2765 #9）。
+pub(crate) fn enumerate_outputs() -> Vec<(u32, u32, IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC)> {
     let mut out = Vec::new();
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
         return out;
@@ -42,7 +85,7 @@ pub(crate) fn enumerate_outputs() -> Vec<(u32, u32, IDXGIOutput1, DXGI_OUTPUT_DE
         while let Ok(o) = unsafe { a.EnumOutputs(oi) } {
             if let Ok(o1) = o.cast::<IDXGIOutput1>() {
                 if let Ok(desc) = unsafe { o.GetDesc() } {
-                    out.push((ai, oi, o1, desc));
+                    out.push((ai, oi, a.clone(), o1, desc));
                 }
             }
             oi += 1;
@@ -67,10 +110,13 @@ fn desc_to_monitor_name(desc: &DXGI_OUTPUT_DESC, ai: u32, oi: u32) -> String {
 
 /// 静态枚举远端显示器拓扑（无需 duplication）：DXGI 输出名称 + 桌面坐标
 /// 分辨率。`desktop:started.displays` 上报用（MYS-954 Windows 多屏）。
+///
+/// **与 [`DxgiSource::open_at`] 同源**（MYS-2765 #9）：两者都走
+/// [`enumerate_outputs`]，所以 `displays[i]` 就是 `open_at(i)` 打开的那块屏。
 pub(crate) fn list_monitors_static() -> Vec<MonitorInfo> {
     enumerate_outputs()
         .into_iter()
-        .map(|(ai, oi, _o1, desc)| MonitorInfo {
+        .map(|(ai, oi, _a, _o1, desc)| MonitorInfo {
             name: desc_to_monitor_name(&desc, ai, oi),
             width: (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left).max(0) as u32,
             height: (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top).max(0) as u32,
@@ -99,6 +145,10 @@ pub struct DxgiSource {
     staging: ID3D11Texture2D,
     /// 上一帧（静止桌面 WAIT_TIMEOUT 时复用）。
     last_frame: Vec<u8>,
+    /// 所选输出在虚拟桌面坐标系中的原点（`DesktopCoordinates.left/top`），
+    /// 供 `FrameSource::origin()` 给鼠标注入做坐标补偿（MYS-2765 #10）。
+    origin_x: i32,
+    origin_y: i32,
 }
 
 unsafe impl Send for DxgiSource {}
@@ -117,30 +167,18 @@ impl DxgiSource {
 
     unsafe fn build(index: usize) -> Result<Self, String> {
         // 1. DXGI factory → enumerate all outputs → pick the requested one.
+        //    枚举必须与 `list_monitors_static` 完全同源，否则浏览器下发的
+        //    序号会打开另一块屏（MYS-2765 #9）。
         let factory: IDXGIFactory1 =
             CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
-        let mut picked: Option<(IDXGIAdapter1, IDXGIOutput1)> = None;
-        let mut cur: usize = 0;
-        let mut ai: u32 = 0;
-        while let Ok(a) = factory.EnumAdapters1(ai) {
-            let mut oi: u32 = 0;
-            while let Ok(out) = a.EnumOutputs(oi) {
-                if let Ok(o1) = out.cast::<IDXGIOutput1>() {
-                    if cur == index {
-                        picked = Some((a.clone(), o1));
-                        break;
-                    }
-                    cur += 1;
-                }
-                oi += 1;
-            }
-            if picked.is_some() {
-                break;
-            }
-            ai += 1;
-        }
-        let (adapter, output1) =
-            picked.ok_or_else(|| format!("no DXGI output #{index} (only {cur} outputs)"))?;
+        let outputs = enumerate_outputs();
+        let total = outputs.len();
+        let (_, _, adapter, output1, desc) = outputs
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| format!("no DXGI output #{index} (only {total} outputs)"))?;
+        // 原点来自输出描述（DesktopCoordinates），鼠标注入要用它做补偿。
+        let (origin_x, origin_y) = (desc.DesktopCoordinates.left, desc.DesktopCoordinates.top);
 
         // 2. D3D11 device on the duplication adapter (must match, else
         // DuplicateOutput fails with E_INVALIDARG). When creating on an
@@ -244,6 +282,8 @@ impl DxgiSource {
             duplication,
             staging,
             last_frame: Vec::new(),
+            origin_x,
+            origin_y,
         })
     }
 
@@ -255,27 +295,38 @@ impl DxgiSource {
     /// We replay the last frame so the encode clock keeps advancing (the
     /// encoder outputs an empty frame for unchanged content which the
     /// heartbeat-IDR path absorbs), exactly like the Wayland backend.
-    unsafe fn capture_once(&mut self, timeout_ms: u32) -> Result<Vec<u8>, String> {
+    ///
+    /// MYS-2765 #4：错误携带 HRESULT（[`DxgiError`]），`next_frame` 才能据此
+    /// 判定 ACCESS_LOST/DEVICE_REMOVED/DEVICE_RESET 并重建——不再靠
+    /// `Display` 字符串（本地化后是 `消息 (0x887A0026)`，永不匹配常量名）。
+    unsafe fn capture_once(&mut self, timeout_ms: u32) -> Result<Vec<u8>, DxgiError> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        let acquired = self.duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource);
-        match acquired {
+        match self
+            .duplication
+            .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
+        {
             Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                // Static desktop: no new frame in this window.
-                return Ok(Vec::new());
+            Err(e) => {
+                // 超时不是错误：静止桌面在这个窗口里没有新帧。
+                return match classify_dxgi_error(e.code().0) {
+                    CaptureRecovery::WaitTimeout => Ok(Vec::new()),
+                    _ => Err(DxgiError::hr(&e, "AcquireNextFrame")),
+                };
             }
-            Err(e) => return Err(format!("AcquireNextFrame: {e}")),
         }
-        let resource = resource.ok_or("AcquireNextFrame returned no resource")?;
-        let tex: ID3D11Texture2D = resource.cast().map_err(|e| format!("cast: {e}"))?;
+        let resource =
+            resource.ok_or_else(|| DxgiError::other("AcquireNextFrame returned no resource"))?;
+        let tex: ID3D11Texture2D = resource
+            .cast()
+            .map_err(|e| DxgiError::hr(&e, "cast IDXGIResource → ID3D11Texture2D"))?;
         self.context.CopyResource(&self.staging, &tex);
         let _ = self.duplication.ReleaseFrame();
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         self.context
             .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .map_err(|e| format!("Map: {e}"))?;
+            .map_err(|e| DxgiError::hr(&e, "Map staging texture"))?;
 
         let w = self.width;
         let h = self.height;
@@ -307,7 +358,7 @@ impl DxgiSource {
     /// 并验证首帧（MYS-954 Windows 多屏）。
     pub fn open_verified_at(index: usize) -> Result<Self, String> {
         let mut s = Self::open_at(index)?;
-        let first = unsafe { s.capture_once(1500)? };
+        let first = unsafe { s.capture_once(1500).map_err(|e| e.to_string())? };
         if first.is_empty() {
             return Err(
                 "duplication established but no frame within 1.5s (virtual display adapter / \
@@ -325,6 +376,11 @@ impl FrameSource for DxgiSource {
         (self.width, self.height)
     }
 
+    /// 所选输出的桌面原点（MYS-2765 #10）：鼠标注入加它才能落到这块屏。
+    fn origin(&self) -> (i32, i32) {
+        (self.origin_x, self.origin_y)
+    }
+
     fn next_frame(&mut self) -> Result<Frame, String> {
         unsafe {
             match self.capture_once(200) {
@@ -333,7 +389,7 @@ impl FrameSource for DxgiSource {
                 Ok(bgra) if bgra.is_empty() => {
                     if self.last_frame.is_empty() {
                         // 尚未捕获到任何帧: 延长超时再试一次拿首帧。
-                        let first = self.capture_once(1000)?;
+                        let first = self.capture_once(1000).map_err(|e| e.to_string())?;
                         if first.is_empty() {
                             return Err("no frame from desktop duplication yet".to_string());
                         }
@@ -360,33 +416,60 @@ impl FrameSource for DxgiSource {
                     })
                 }
                 Err(e) => {
-                    // Access lost / device removed → rebuild the whole
-                    // duplication once (mode switch, session reconnect).
-                    if e.contains("ACCESS_LOST") || e.contains("DEVICE_REMOVED") {
-                        let (w, h) = (self.width, self.height);
-                        match Self::build(self.output_index) {
-                            Ok(s) => {
-                                *self = s;
-                                tracing::info!("dxgi duplication rebuilt after access loss");
+                    // MYS-2765 #4：按 HRESULT 判定是否重建（锁屏 / UAC 安全
+                    // 桌面 / 会话切换 / 分辨率与拓扑变化都会 ACCESS_LOST；
+                    // 驱动重置则是 DEVICE_REMOVED/RESET）。旧实现字符串匹配
+                    // `Display` 里的常量名，本地化文案下永不命中，掉线后
+                    // 画面直接永久冻结。
+                    match classify_dxgi_error(e.hresult) {
+                        CaptureRecovery::Rebuild => {
+                            let (w, h) = (self.width, self.height);
+                            let keep_last = std::mem::take(&mut self.last_frame);
+                            match Self::build(self.output_index) {
+                                Ok(mut s) => {
+                                    // 重建后沿用上一帧：重建瞬间若桌面静止，
+                                    // 不至于给浏览器送一帧黑屏。
+                                    s.last_frame = keep_last;
+                                    tracing::info!(
+                                        hresult = %format!("0x{:08X}", e.hresult as u32),
+                                        output = self.output_index,
+                                        "dxgi duplication rebuilt after access loss / device reset"
+                                    );
+                                    *self = s;
+                                }
+                                Err(re) => {
+                                    self.width = w;
+                                    self.height = h;
+                                    self.last_frame = keep_last;
+                                    return Err(format!(
+                                        "dxgi rebuild failed after {e}: {re}"
+                                    ));
+                                }
                             }
-                            Err(re) => {
-                                self.width = w;
-                                self.height = h;
-                                return Err(format!("dxgi rebuild failed: {re}"));
+                            match self.capture_once(1000) {
+                                Ok(bgra) if !bgra.is_empty() => {
+                                    self.last_frame = bgra.clone();
+                                    Ok(Frame {
+                                        bgra,
+                                        width: self.width,
+                                        height: self.height,
+                                    })
+                                }
+                                // 重建后仍静止：有上一帧就继续复用（并已广播过
+                                // 新尺寸），没有才算失败。
+                                Ok(_) if !self.last_frame.is_empty() => Ok(Frame {
+                                    bgra: self.last_frame.clone(),
+                                    width: self.width,
+                                    height: self.height,
+                                }),
+                                Ok(_) => Err("no frame after dxgi rebuild".to_string()),
+                                Err(e2) => Err(format!("after dxgi rebuild: {e2}")),
                             }
                         }
-                        let bgra = self.capture_once(1000)?;
-                        if bgra.is_empty() {
-                            return Err("no frame after dxgi rebuild".to_string());
-                        }
-                        self.last_frame = bgra.clone();
-                        return Ok(Frame {
-                            bgra,
-                            width: self.width,
-                            height: self.height,
-                        });
+                        // 其它错误不重建（重建也修不好）：上报让上层计入连续
+                        // 失败并最终回传浏览器。
+                        CaptureRecovery::Fatal | CaptureRecovery::WaitTimeout => Err(e.to_string()),
                     }
-                    Err(e)
                 }
             }
         }

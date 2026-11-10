@@ -35,7 +35,7 @@
 | `--desktop-max-bitrate` | `0`（自动） | 最大编码码率（kbps）。`0` = 按 rustdesk 模型 `base_bitrate(分辨率) × 质量档`，1080p balanced ≈1388kbps；显式设值即硬顶 |
 | `--desktop-min-bitrate` | `80` | 最小编码码率（kbps）。静态桌面足够，动态由 ABR 拉回 |
 | `--desktop-quality` | `balanced` | 质量档：`speed`（0.5）/ `balanced`（0.67）/ `best`（1.5），决定目标码率 |
-| `--desktop-display` | 平台默认 | Linux：X11 display（如 `:1`，默认取 `$DISPLAY`）；Windows：显示器枚举序号（`"0"` = 主屏，`"1"` = 第 2 块屏） |
+| `--desktop-display` | 平台默认 | 显示器**枚举序号**（`"0"` = 第 1 块、`"1"` = 第 2 块，与 `desktop:started.displays` 数组下标一致；Windows 为 DXGI/GDI 枚举顺序，X11 为 RANDR 输出顺序）。非数字值在 X11 上仍按旧语义当作 X display 字符串（如 `:1`，默认取 `$DISPLAY`），且**序号选屏时也复用它做 X 连接串**——浏览器切屏不会覆盖它 |
 | `--desktop-lan-port` | `0` | LAN 直连监听端口。`0` = 不启用；非 0 时在该端口起本地 HTTP 端点供同网段浏览器拉流（需带会话 token，见下文"下行通道"） |
 | `--view` | `auto` | 状态面板视图：`auto` / `window` / `tui` / `headless`。`auto` = 有 `DISPLAY` 或 Windows 开原生窗口，否则有 TTY 开终端面板，都没有则 headless |
 
@@ -66,7 +66,15 @@ Wayland 支持不进默认构建（`wayland` feature 会引入 zbus / gstreamer�
 
 ## 多显示器
 
-`desktop:started` 上报远端显示器拓扑（X11 RANDR 输出 / Windows DXGI 输出 / GDI 显示器枚举），指标面板"远端显示器"行可见。多屏时会话页出现"显示器"下拉，选择后重建桌面流切换到对应屏幕。Windows 上 `"0"` = 主屏，`"1"` = 第 2 块屏，以此类推。
+`desktop:started` 上报远端显示器拓扑（X11 RANDR 输出 / Windows DXGI 输出 / GDI 显示器枚举），指标面板"远端显示器"行可见。多屏时会话页出现"显示器"下拉，选择后重建桌面流切换到对应屏幕。
+
+选屏协议统一为**枚举序号**，三个平台语义一致：下拉的 value 是 `desktop:started.displays` 的**数组下标**，`"0"` 是第一块、`"1"` 是第二块。
+
+- **Windows**：DXGI 与 GDI 的拓扑上报和选屏走同一份枚举顺序（同一个 `enumerate_outputs` / `list_monitors_gdi`），序号不会错位
+- **X11**：序号 = RANDR 输出顺序；采集区域裁剪到该输出的 CRTC 矩形（`GetImage`/`ShmGetImage`/XComposite 全部按 `x,y,w,h` 取），鼠标注入加上该 CRTC 原点。X 连接串取启动配置里**非数字**的 `--desktop-display`（如 `:0`），没有再回落 `$DISPLAY`——浏览器切屏不会覆盖它，所以 systemd 服务（环境里没有 `$DISPLAY`）里 `--desktop-display :0` + 下拉切屏也能正常工作
+- 未连接/无 CRTC 的输出仍出现在 `displays` 里（尺寸 0），浏览器过滤掉不提供选择；直接按序号选它会拒绝并报错（不会悄悄回落到整屏）
+- 鼠标落点：浏览器上报的坐标是**采集画面内**的，agent 注入前加上所选显示器在虚拟桌面中的原点（如第二屏 `+1280+0`），否则点击会落到主屏
+- 显示器在系统设置里被挪动/换分辨率时，采集区域与注入原点会自动跟随（X11 走 RANDR 事件、GDI/DXGI 每拍重读）
 
 ## 下行通道：LAN → P2P → relay
 

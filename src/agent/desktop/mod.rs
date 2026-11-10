@@ -29,7 +29,7 @@ pub mod dxgi;
 pub mod wayland;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,6 +85,11 @@ pub struct DesktopConfig {
     pub min_bps: u64,
     pub max_bps: u64,
     /// Optional X11 display override (`--desktop-display`).
+    ///
+    /// **启动配置的原始值**，运行时选屏（浏览器下拉的枚举序号）不改它——
+    /// 序号选屏时 X 连接串从它派生（MYS-2765 #9：非数字的 `--desktop-display`
+    /// 如 `:0` 不能被浏览器切屏覆盖，否则没有 `$DISPLAY` 的 systemd 服务里
+    /// 一切屏就连不上）。见 [`x_display_from_config`]。
     pub display: Option<String>,
     /// 质量档倍率（speed=0.5 / balanced=0.67 / best=1.5，rustdesk 同款）。
     /// 决定目标码率（base_bitrate × quality）与 QP 区间。
@@ -143,10 +148,24 @@ impl DesktopConfig {
     }
 }
 
-/// 解析 start 用的捕获显示器：运行时选屏覆盖（web 下拉可改）优先，
+/// 解析 start 用的捕获显示器选择值：运行时选屏覆盖（web 下拉可改）优先，
 /// 否则回落启动配置的 --desktop-display（再否则 None = 平台默认屏）。
+///
+/// 注意这只是**选屏值**（X11/Windows 都是枚举序号）。启动配置里的 X display
+/// 串（`--desktop-display :0`）另由 [`x_display_from_config`] 从启动配置派生、
+/// 经 [`RunShared::x_display`] 传下去，不被运行时选择覆盖（MYS-2765 #9）。
 fn resolved_display(runtime: &Option<String>, config: &Option<String>) -> Option<String> {
     runtime.clone().or_else(|| config.clone())
+}
+
+/// 从启动配置的 `--desktop-display` 派生 X display 串：只有**非纯数字**的
+/// 值才是 X display（`":0"`、`"host:0"`）。纯数字是选屏序号（MYS-2765 #9）。
+fn x_display_from_config(display: &Option<String>) -> Option<String> {
+    let d = display.as_deref()?.trim();
+    if d.is_empty() || d.parse::<usize>().is_ok() {
+        return None;
+    }
+    Some(d.to_string())
 }
 
 /// 帧 buffer 池（R5 #127 SIMD 内存池第一块）：预分配复用 `Vec<u8>`，
@@ -273,6 +292,10 @@ pub struct DesktopKpi {
     pub bp_count: u32,
 }
 
+/// 单测输入替身的闭包类型（`handle_mouse`/`handle_key` 把算好的事件交给它）。
+#[cfg(test)]
+type InputSink = Arc<dyn Fn(input::InputEvent) + Send + Sync>;
+
 pub struct DesktopManager {
     config: DesktopConfig,
     running: Arc<AtomicBool>,
@@ -287,6 +310,11 @@ pub struct DesktopManager {
     /// 键鼠注入器。惰性创建：首个输入事件到达时才 spawn 注入线程
     /// （纯观看会话不付这个代价）。
     injector: tokio::sync::Mutex<Option<input::InputInjector>>,
+    /// 单测用的输入替身（生产恒为 `None`）：真机注入要 X/Windows 后端，
+    /// 单测只能验证"算出来的事件是什么"，替身把事件收进 Vec 供断言
+    /// （MYS-2765 #10 `handle_mouse` 原点偏移回归）。
+    #[cfg(test)]
+    input_sink: std::sync::Mutex<Option<InputSink>>,
     /// 剪贴板同步器。同样惰性创建：首个剪贴板命令才 spawn 线程。
     clipboard: tokio::sync::Mutex<Option<clipboard::ClipboardSync>>,
     /// 与 relay 的时钟偏移（relay_epoch - 本地_epoch，ms）。srtc 打点加上
@@ -351,6 +379,11 @@ pub struct DesktopManager {
     /// agent 每收到 `desktop:congested` 递增；qos-ack 回传 `bp_count` 供
     /// 浏览器面板显示"relay 拥塞"计数——传输段拥塞对用户/调试可见。
     backpressure: Arc<std::sync::atomic::AtomicU32>,
+    /// 所选显示器在虚拟桌面坐标系中的原点（打包 `x << 32 | y`，见
+    /// [`capture::pack_origin`]）。采集循环在打开捕获源（及重建）后写入，
+    /// [`Self::handle_mouse`] 给鼠标移动加上它——否则采集副屏时点击落到主屏
+    /// （MYS-2765 #10）。默认 (0,0) = 整屏/单屏采集。
+    capture_origin: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl DesktopManager {
@@ -368,6 +401,8 @@ impl DesktopManager {
             task: tokio::sync::Mutex::new(None),
             bandwidth: Arc::new(std::sync::atomic::AtomicU64::new(bps)),
             injector: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            input_sink: std::sync::Mutex::new(None),
             clipboard: tokio::sync::Mutex::new(None),
             clock_offset: std::sync::atomic::AtomicI64::new(0),
             codec: std::sync::RwLock::new(codec),
@@ -387,6 +422,7 @@ impl DesktopManager {
             idr_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
             backpressure: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            capture_origin: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
@@ -658,9 +694,10 @@ impl DesktopManager {
     }
 
     /// 运行时热切换捕获显示器（rustdesk 对齐的选屏能力）。`""` / 缺失 →
-    /// 恢复启动默认显示器；否则切到同名显示器（X11 RANDR name）。仅当
-    /// 桌面正在运行时重建桌面流（stop 旧流 → start 新流，start 用新 display
-    /// 打开捕获源）。display 不变时是 no-op。
+    /// 恢复启动默认显示器；否则切到 `desktop:started.displays` 中该**枚举
+    /// 序号**对应的显示器（MYS-2765 #9：与前端下发的 `"0"`/`"1"` 协议一致）。
+    /// 仅当桌面正在运行时重建桌面流（stop 旧流 → start 新流，start 用新
+    /// display 打开捕获源）。display 不变时是 no-op。
     pub async fn select_display(&self, display: &str, post: PostFn) -> Result<(), String> {
         let next: Option<String> = if display.trim().is_empty() {
             None
@@ -740,19 +777,59 @@ impl DesktopManager {
     }
 
     /// Handle one `desktop:mouse` payload from a browser (inject locally).
+    ///
+    /// MYS-2765 #10：浏览器发的是**采集画面内**的坐标，注入前要加上所选
+    /// 显示器在虚拟桌面中的原点（采集副屏时 `+1280+0`），否则点击落到主屏。
+    /// 原点由采集循环在打开/重建捕获源后写入 [`Self::capture_origin`]。
     pub async fn handle_mouse(&self, payload: &serde_json::Value) {
         let Some(ev) = input::parse_mouse(payload) else { return };
+        let origin = self.capture_origin();
+        let ev = input::apply_origin(ev, origin);
+        self.deliver_input(ev).await;
+    }
+
+    /// 把已归一化的事件真正送进注入器。单测里若有替身则交给替身（真机注入
+    /// 需要 X/Windows 后端，单测只验证算出来的事件）。
+    async fn deliver_input(&self, ev: input::InputEvent) {
+        #[cfg(test)]
+        {
+            let sink = self.input_sink.lock().unwrap().clone();
+            if let Some(sink) = sink {
+                sink(ev);
+                return;
+            }
+        }
         let mut g = self.injector.lock().await;
+        // 注入线程可能已经退出（后端不可用/panic）：重建，而不是把后续输入
+        // 交给一个死线程（MYS-2765 #11）。
+        if let Some(inj) = g.as_ref() {
+            if !inj.is_alive() {
+                tracing::warn!("desktop input worker exited — respawning injector");
+                *g = None;
+            }
+        }
         let inj = g.get_or_insert_with(input::InputInjector::start);
         inj.send(ev);
+    }
+
+    /// 单测用：安装输入替身，之后 `handle_mouse`/`handle_key` 的事件都交给它。
+    #[cfg(test)]
+    fn set_input_sink(&self, sink: InputSink) {
+        *self.input_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// 当前捕获源原点（`(0,0)` = 整屏/单屏/尚未打开）。
+    pub fn capture_origin(&self) -> (i32, i32) {
+        capture::unpack_origin(
+            self.capture_origin
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Handle one `desktop:key` payload from a browser (inject locally).
     pub async fn handle_key(&self, payload: &serde_json::Value) {
         let Some(ev) = input::parse_key(payload) else { return };
-        let mut g = self.injector.lock().await;
-        let inj = g.get_or_insert_with(input::InputInjector::start);
-        inj.send(ev);
+        self.deliver_input(ev).await;
     }
 
     /// Handle `desktop:clipboard:set` — browser pushed its local clipboard
@@ -815,8 +892,11 @@ impl DesktopManager {
         // 单色是 `gray && codec == av1` 的派生值（MYS-2765 #4），不再独立存储
         // ——否则灰度关而 AV1 仍输出单色的状态可被构造出来。
         cfg.monochrome = self.monochrome_now();
-        // 运行时选屏（web 显示器下拉可改）覆盖启动 --desktop-display。
+        // 运行时选屏（web 显示器下拉可改）覆盖启动 --desktop-display 的**选屏
+        // 值**；X display 串仍取启动配置（MYS-2765 #9：`--desktop-display :0`
+        // 不能被浏览器切屏覆盖，否则无 `$DISPLAY` 的服务里切屏连不上）。
         let disp = self.display.read().map(|d| d.clone()).unwrap_or(None);
+        let x_display = x_display_from_config(&cfg.display);
         cfg.display = resolved_display(&disp, &cfg.display);
         let mb = self.max_bps.read().map(|b| *b).unwrap_or(0);
         if mb > 0 {
@@ -837,6 +917,8 @@ impl DesktopManager {
             reinit_request: self.reinit_request.clone(),
             last_active_at: self.last_active_at.clone(),
             exit_state: exit_state.clone(),
+            capture_origin: self.capture_origin.clone(),
+            x_display,
         };
         let generation = self.generation.clone();
         let guard_post = post.clone();
@@ -1220,6 +1302,18 @@ struct RunShared {
     /// 退出状态（[`EXIT_NONE`]/[`EXIT_STOPPED`]/[`EXIT_STARTED_ERROR`]），
     /// 供 [`RunGuard`] 决定是否补发 `desktop:stopped`。
     exit_state: Arc<AtomicU8>,
+    /// 所选显示器原点（打包 `x << 32 | y`）：循环在打开/重建捕获源后写入，
+    /// `handle_mouse` 读它做坐标补偿（MYS-2765 #10）。
+    capture_origin: Arc<AtomicI64>,
+    /// 启动配置里的 **X display 串**（`--desktop-display` 非纯数字时才有值，
+    /// 如 `:0`）。序号选屏时用它做 X 连接，避免浏览器切屏把启动配置丢掉
+    /// （MYS-2765 #9：没有 `$DISPLAY` 的 systemd 服务里切屏会连不上）。
+    x_display: Option<String>,
+}
+
+/// 把捕获源原点写进共享原子（MYS-2765 #10）。
+fn store_origin(dst: &Arc<AtomicI64>, origin: (i32, i32)) {
+    dst.store(capture::pack_origin(origin.0, origin.1), Ordering::Relaxed);
 }
 
 /// desktops at 200-800 kbps: RC drops nearly every P frame): skipped frames
@@ -1232,7 +1326,14 @@ async fn run_desktop_loop(
     running: Arc<AtomicBool>,
     shared: RunShared,
 ) {
-    let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
+    // 序号选屏时 X 连接串取启动配置的 `--desktop-display`（非数字），
+    // 不能让浏览器切屏把它丢掉（MYS-2765 #9）。
+    let x_display = shared.x_display.clone();
+    let src = match capture::open_source(
+        &cfg.capture,
+        cfg.display.as_deref(),
+        x_display.as_deref(),
+    ) {
         Ok((src, backend)) => (src, backend),
         Err(e) => {
             tracing::error!("desktop capture open failed: {}", e);
@@ -1272,6 +1373,9 @@ async fn run_desktop_pipeline(
         reinit_request,
         last_active_at,
         exit_state,
+        capture_origin,
+        // 只在 run_desktop_loop（打开捕获源）用到，pipeline 不用。
+        x_display: _,
     } = shared;
     // cfg 需可变：编码器 fallback 后回写实际 codec。
     let mut cfg = cfg;
@@ -1289,6 +1393,11 @@ async fn run_desktop_pipeline(
     // desktop:started 上报（浏览器/运维可见远端多屏；X11 实现返回 RANDR
     // 输出，其它后端空）。
     let monitors = src.list_monitors();
+    // 鼠标注入原点（MYS-2765 #10）：序号选屏时捕获画面只是虚拟桌面的一块，
+    // 浏览器发来的坐标是画面内的，注入前必须加上该屏原点。源在被 move 进
+    // 抓帧线程之前先写一次（首帧到达前浏览器就可能发点击），之后由抓帧线程
+    // 每拍同步（显示器被挪动 / DXGI 重建都会改它）。
+    store_origin(&capture_origin, src.origin());
     // R5 #127 内存池：编码循环帧 buffer 池（capture 借出 + 主循环归还环形）。
     let frame_pool = std::sync::Arc::new(FramePool::new(4));
     // 截图线程化（rustdesk capture 线程对齐）：capture 挪到独立线程持续
@@ -1296,10 +1405,14 @@ async fn run_desktop_pipeline(
     // 编码，慢抓帧时跳帧追最新。src 被 move 进抓帧线程。
     // R5 #127 第三块：池注入 capture 线程（next_frame 借出 bgra，主循环归还，
     // 帧 buffer 环形复用）。
-    let threaded = match capture::ThreadedFrameSource::spawn_with_max_fps(
+    //
+    // `spawn_full` 额外把捕获源原点每拍同步进 `capture_origin`（鼠标注入用，
+    // MYS-2765 #10）：源 move 进线程后外部再取 `origin()` 就已不可得。
+    let threaded = match capture::ThreadedFrameSource::spawn_full(
         src,
         cfg.capture_fps,
         Some(frame_pool.clone()),
+        Some(capture_origin.clone()),
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -2677,6 +2790,8 @@ mod tests {
             reinit_request: Arc::new(AtomicBool::new(false)),
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
             exit_state: Arc::new(AtomicU8::new(EXIT_NONE)),
+            capture_origin: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            x_display: None,
         }
     }
 
@@ -3590,6 +3705,86 @@ mod tests {
             q.current_ratio_permille() < healthy,
             "250ms 采样 3s 内必须触发 adjust_ratio 并降码率，got {}‰",
             q.current_ratio_permille()
+        );
+    }
+
+    // ── MYS-2765 #10：鼠标注入原点偏移 ────────────────────────────
+
+    /// 原点 (1280,0)（第二块屏）时，浏览器坐标 (x,y) 必须注入到 (x+1280, y)。
+    ///
+    /// 注入用可测替身接收事件（真机注入需要 X/Windows 后端）：验证
+    /// `handle_mouse` 算出来的**最终注入坐标**，这是点击落错屏的直接原因。
+    #[tokio::test]
+    async fn test_handle_mouse_applies_monitor_origin() {
+        let dm = DesktopManager::new(DesktopConfig::default());
+        let got: Arc<std::sync::Mutex<Vec<input::InputEvent>>> = Default::default();
+        let g2 = got.clone();
+        dm.set_input_sink(Arc::new(move |ev| g2.lock().unwrap().push(ev)));
+
+        // 默认原点 (0,0)：坐标原样注入。
+        dm.handle_mouse(&serde_json::json!({"type":"move","x":10,"y":20}))
+            .await;
+        assert_eq!(
+            got.lock().unwrap().pop(),
+            Some(input::InputEvent::MouseMove { x: 10, y: 20 }),
+            "未选屏时坐标原样注入"
+        );
+
+        // 采集源选定第二块屏（原点 +1280+0）。
+        dm.capture_origin
+            .store(capture::pack_origin(1280, 0), Ordering::Relaxed);
+        assert_eq!(dm.capture_origin(), (1280, 0));
+
+        dm.handle_mouse(&serde_json::json!({"type":"move","x":10,"y":20}))
+            .await;
+        assert_eq!(
+            got.lock().unwrap().pop(),
+            Some(input::InputEvent::MouseMove { x: 1290, y: 20 }),
+            "第二屏：注入坐标必须加上原点偏移（否则点击落到主屏）"
+        );
+
+        // 按下/抬起不带坐标，不能被加上偏移。
+        dm.handle_mouse(&serde_json::json!({"type":"down","button":0}))
+            .await;
+        assert_eq!(
+            got.lock().unwrap().pop(),
+            Some(input::InputEvent::MouseDown { button: 0 }),
+            "按钮事件不得被改写"
+        );
+
+        // 负原点（主屏左侧副屏 -1920+0）也要正确偏移。
+        dm.capture_origin
+            .store(capture::pack_origin(-1920, 0), Ordering::Relaxed);
+        dm.handle_mouse(&serde_json::json!({"type":"move","x":5,"y":5}))
+            .await;
+        assert_eq!(
+            got.lock().unwrap().pop(),
+            Some(input::InputEvent::MouseMove { x: -1915, y: 5 }),
+            "负原点同样要加上"
+        );
+    }
+
+    /// #11 队列拥塞时释放事件（KeyUp/MouseUp）仍被投递——由 input 模块的
+    /// 合并队列保证，这里从 manager 侧确认按键路径走的是同一个队列入口。
+    #[tokio::test]
+    async fn test_handle_key_does_not_drop_release() {
+        let dm = DesktopManager::new(DesktopConfig::default());
+        let got: Arc<std::sync::Mutex<Vec<input::InputEvent>>> = Default::default();
+        let g2 = got.clone();
+        dm.set_input_sink(Arc::new(move |ev| g2.lock().unwrap().push(ev)));
+        for _ in 0..500 {
+            dm.handle_mouse(&serde_json::json!({"type":"move","x":1,"y":1}))
+                .await;
+        }
+        dm.handle_key(&serde_json::json!({"code":"ControlLeft","down":true}))
+            .await;
+        dm.handle_key(&serde_json::json!({"code":"ControlLeft","down":false}))
+            .await;
+        let events = got.lock().unwrap().clone();
+        assert!(
+            events.contains(&input::InputEvent::KeyUp { code: "ControlLeft".into() }),
+            "KeyUp 必须在大量输入后仍被投递: {} 条事件",
+            events.len()
         );
     }
 
