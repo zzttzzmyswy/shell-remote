@@ -212,11 +212,24 @@ impl DesktopStream {
                     // 带宽记账（#152）：init 也是 relay 转发的字节，计入。
                     ctx.bytes += bytes.len() as u64;
                 }
-                Err(_) => {
-                    ctx.drop_count += 1;
-                    if ctx.drop_count >= MAX_CONSECUTIVE_DROPS {
-                        dead.push(id.clone());
-                    }
+                // 投递失败（Full **或** Closed）→ 立即驱逐本 viewer（MYS-2765 #14）。
+                //
+                // init 段不像 frag 可以"丢旧保新"：viewer 漏掉 init 就再也建不起
+                // 解码器（换分辨率/切编码后的新 init 尤其如此），画面永久卡死，
+                // 而它自己并不知道要重连。这里以前只累加 drop_count（要连续
+                // MAX_CONSECUTIVE_DROPS 次才踢），但 init 是低频事件——一次换
+                // 分辨率就是一次，计数永远到不了阈值，viewer 于是永久黑屏。
+                // 直接移除 → 浏览器的 fetch 结束 → 自动重连 → add_viewer 拿到
+                // 新缓存 init 秒级恢复。frag 路径（push_frag）行为不变。
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!(
+                        viewer = %id,
+                        "evicting viewer that could not take the init segment (buffer full)"
+                    );
+                    dead.push(id.clone());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    dead.push(id.clone());
                 }
             }
         }
@@ -1196,5 +1209,70 @@ mod tests {
         );
         ds.push_frag(true, vec![3]).await; // 下一个 IDR：恢复
         assert_eq!(rx.recv().await.unwrap(), vec![3]);
+    }
+
+    // ── init 投递失败驱逐（MYS-2765 #14）─────────────────────────
+
+    #[tokio::test]
+    async fn test_set_init_evicts_viewer_whose_buffer_is_full() {
+        // 换分辨率/切编码后的新 init 是**一次性**事件：漏掉的 viewer 再也
+        // 建不起解码器（画面永久黑屏且它自己不知道要重连）。因此 init 投递
+        // 到满缓冲时必须直接驱逐，不能像 frag 那样"丢旧保新"累计计数。
+        let st = DesktopStream::new();
+        // 卡死的 viewer：channel 容量 16，塞满 16 帧后一次都不消费。
+        let (stuck_id, mut stuck_rx, _init) = st.add_viewer().await;
+        for i in 0..16u8 {
+            st.push_frag(true, vec![i]).await;
+        }
+        // 健康 viewer：一直消费。
+        let (live_id, mut live_rx, _init2) = st.add_viewer().await;
+        assert_eq!(st.stats().await.viewer_count, 2);
+
+        st.set_init(vec![0x1, 0x2, 0x3]).await;
+
+        // 满缓冲的 viewer 被移除（一次投递失败即驱逐）。
+        {
+            let viewers = st.inner.viewers.read().await;
+            assert!(
+                !viewers.contains_key(&stuck_id),
+                "a viewer that cannot take the init segment must be evicted"
+            );
+            assert!(viewers.contains_key(&live_id), "a healthy viewer must stay");
+            assert_eq!(viewers.len(), 1, "exactly the healthy viewer remains");
+        }
+        // 其余 viewer 收到 init。
+        assert_eq!(live_rx.recv().await.unwrap(), vec![0x1, 0x2, 0x3]);
+        // 被驱逐者的接收端还留着 16 个旧 frag（该 viewer 已离场，不再有新投递）。
+        assert!(stuck_rx.try_recv().is_ok(), "旧帧仍在（该 viewer 已离场）");
+    }
+
+    #[tokio::test]
+    async fn test_set_init_eviction_happens_on_first_full_not_after_max_drops() {
+        // 回归护栏：旧实现要连续 MAX_CONSECUTIVE_DROPS 次失败才驱逐，而 init
+        // 是低频事件 → 计数永远到不了阈值 → viewer 永久黑屏。这里断言"一次
+        // 失败即驱逐"，把阈值语义钉死。
+        let st = DesktopStream::new();
+        let (_vid, _rx, _init) = st.add_viewer().await;
+        for i in 0..16u8 {
+            st.push_frag(true, vec![i]).await;
+        }
+        assert_eq!(st.stats().await.viewer_count, 1, "frag 满不驱逐（丢旧保新）");
+        st.set_init(vec![0xff]).await;
+        assert_eq!(
+            st.stats().await.viewer_count,
+            0,
+            "init 投递失败一次就驱逐，不等 MAX_CONSECUTIVE_DROPS"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_init_still_broadcasts_to_viewers_with_room() {
+        // 驱逐不能误伤：缓冲有空位的 viewer 必须原样收到 init。
+        let st = DesktopStream::new();
+        let (vid, mut rx, _init) = st.add_viewer().await;
+        st.set_init(vec![7, 8]).await;
+        assert_eq!(rx.recv().await.unwrap(), vec![7, 8]);
+        assert_eq!(st.stats().await.viewer_count, 1);
+        st.remove_viewer(&vid).await;
     }
 }

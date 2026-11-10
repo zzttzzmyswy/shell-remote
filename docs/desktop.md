@@ -36,7 +36,7 @@
 | `--desktop-min-bitrate` | `80` | 最小编码码率（kbps）。静态桌面足够，动态由 ABR 拉回 |
 | `--desktop-quality` | `balanced` | 质量档：`speed`（0.5）/ `balanced`（0.67）/ `best`（1.5），决定目标码率 |
 | `--desktop-display` | 平台默认 | Linux：X11 display（如 `:1`，默认取 `$DISPLAY`）；Windows：显示器枚举序号（`"0"` = 主屏，`"1"` = 第 2 块屏） |
-| `--desktop-lan-port` | `0` | LAN 直连监听端口。`0` = 不启用；非 0 时在该端口起本地 HTTP 端点供同网段浏览器拉流 |
+| `--desktop-lan-port` | `0` | LAN 直连监听端口。`0` = 不启用；非 0 时在该端口起本地 HTTP 端点供同网段浏览器拉流（需带会话 token，见下文"下行通道"） |
 | `--view` | `auto` | 状态面板视图：`auto` / `window` / `tui` / `headless`。`auto` = 有 `DISPLAY` 或 Windows 开原生窗口，否则有 TTY 开终端面板，都没有则 headless |
 
 ## 编码
@@ -72,7 +72,7 @@ Wayland 支持不进默认构建（`wayland` feature 会引入 zbus / gstreamer�
 
 默认探测顺序全部自动，用户无感；指标面板"下行通道"行显示当前路径（`lan` / `p2p` / `relay`）。
 
-1. **LAN** — agent 带 `--desktop-lan-port` 时，浏览器依次探测 `http://<agent-ip>:<port>/agent/desktop/stream`（单地址探测上限 9s，失败即换下一条）。**已知限制**：该拉流是 `http://` 混合内容，当 relay / 会话页以 HTTPS 提供时浏览器会直接拦截此 fetch——此时 LAN 通道不可用，无挂起、快速回退 P2P/relay，仅在纯 HTTP 部署下生效
+1. **LAN** — agent 带 `--desktop-lan-port` 时，浏览器依次探测 `http://<agent-ip>:<port>/agent/desktop/stream?token=<会话 token>`（单地址探测上限 9s，失败即换下一条）。该端点绑 `0.0.0.0`，同网段任何主机都能访问，因此**必须鉴权**：请求要带本会话当前有效的 token（rw / ro 均可，浏览器用查询参数 `?token=` 携带，避免自定义头触发 CORS 预检；`Authorization: Bearer <token>` 亦支持）。缺失或不匹配返回 `401`（带 CORS 头便于浏览器读取状态码），且未授权请求不占用 viewer 槽位。token 刷新后旧 token 立即失效，LAN 通道自然回退 P2P / relay。**已知限制**：该拉流是 `http://` 混合内容，当 relay / 会话页以 HTTPS 提供时浏览器会直接拦截此 fetch——此时 LAN 通道不可用，无挂起、快速回退 P2P/relay，仅在纯 HTTP 部署下生效
 2. **WebRTC** — 协商经 relay 信令（`desktop:p2p-*`）完成，DataChannel 承载 fMP4 字节（不可靠模式、丢旧保新）
 3. **relay** — 前两者失败时回退到 `/agent/desktop/stream` 转发，功能不劣于只有 relay 的旧版
 

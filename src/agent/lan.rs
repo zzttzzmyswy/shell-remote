@@ -9,22 +9,33 @@
 //! 服务；会话结束 drop 时中止 server/feed 任务（端口释放，重连可重新 bind）。
 //! 默认 0 = 不开任何端口（零对外暴露）。
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use std::convert::Infallible;
 
 use crate::relay::desktop::{DesktopStream, ViewerGuard};
 
-/// LAN 流端点的 axum 共享状态：fan-out + CORS 允许来源。
+/// 当前会话的有效 token 集合（rw / ro 全量）。由 `agent::mod` 在每次注册
+/// 成功 / 重连复用 / 刷新后**整体覆盖**写入；LAN 处理器只读取它做鉴权。
+///
+/// 同步 `RwLock`：处理器在 `await` 之前一次性读完（不跨 await 持锁），
+/// 写入方也只是短暂持锁替换，没必要为了两三个字符串引入 tokio 的异步锁。
+pub type LanTokens = Arc<RwLock<Vec<String>>>;
+
+/// LAN 流端点的 axum 共享状态：fan-out + 有效 token 集合 + CORS 允许来源。
 #[derive(Clone)]
 struct LanState {
     stream: DesktopStream,
+    /// 有效会话 token 集合（rw + ro）。缺失/为空时**一切请求都拒绝**
+    /// （fail-closed：注册成功之前没有任何合法 token）。
+    tokens: LanTokens,
     /// LAN 流响应 `Access-Control-Allow-Origin` 值（Task 6 复审收窄：relay
     /// 同源 `scheme://host[:port]`；relay_url 解析失败时拒绝启动，见
     /// [`LanDesktop::spawn`]——fail-closed，不放行 `*`）。
@@ -68,8 +79,17 @@ impl LanDesktop {
     /// #4）：LAN server 属显式 opt-in，relay_url 解析失败时 serve `*` 是把
     /// 无认证的桌面流端点开放给任意网页的唯一泄漏面，宁可不启。生产 relay_url
     /// 恒为 `http(s)://host[:port]`，本路径常温冷。
-    pub async fn spawn(port: u16, relay_origin: Option<String>) -> std::io::Result<Self> {
-        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    ///
+    /// `tokens` 是**共享的**有效会话 token 集合（rw + ro）：调用方在每次注册
+    /// 成功 / 重连复用缓存 / 刷新 token 后整体覆盖写入，刷新后旧 token 立即
+    /// 失效（这是"吊销即时生效"的唯一保证点）。集合为空时一切请求 401。
+    pub async fn spawn(
+        port: u16,
+        relay_origin: Option<String>,
+        tokens: LanTokens,
+    ) -> std::io::Result<Self> {
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
         let local_port = listener.local_addr()?.port();
 
         let Some(cors_origin) = relay_origin else {
@@ -85,6 +105,7 @@ impl LanDesktop {
         let stream = DesktopStream::new();
         let state = LanState {
             stream: stream.clone(),
+            tokens: tokens.clone(),
             cors_origin: Arc::new(cors_origin.clone()),
         };
 
@@ -104,8 +125,10 @@ impl LanDesktop {
             }
         });
 
-        // LAN 直连是"本机网段直连"，无 relay 会话/无 token 鉴权。服务本身
-        // 由显式 --desktop-lan-port N 开启才有；默认 0 不 spawn（零暴露）。
+        // LAN 直连是"本机网段直连"：端点绑 0.0.0.0，同网段任何主机都能访问，
+        // 因此必须校验会话 token（见 `lan_stream_handler` 的 401 分支）。token
+        // 集合由 `agent::mod` 在注册/刷新时写入；为空时一律拒绝。服务本身由
+        // 显式 --desktop-lan-port N 开启才有；默认 0 不 spawn（零暴露）。
         let router = axum::Router::new()
             .route(
                 "/agent/desktop/stream",
@@ -191,10 +214,34 @@ impl Drop for LanDesktop {
     }
 }
 
-/// LAN 直连流端点：无 token 鉴权（本机网段直连，非 relay 会话），其余与
-/// relay 的 `stream_handler` 同构——首块 init（无则等至多 10s），随后 frag，
-/// 12s 无字节主动收尾，viewer 断开经 [`ViewerGuard`] 清理。
-async fn lan_stream_handler(State(st): State<LanState>) -> Response {
+/// LAN 直连流端点：**必须**带本会话的有效 token（`?token=`，或
+/// `Authorization: Bearer`），否则 401。其余与 relay 的 `stream_handler` 同构
+/// ——首块 init（无则等至多 10s），随后 frag，12s 无字节主动收尾，viewer 断开
+/// 经 [`ViewerGuard`] 清理。
+///
+/// 鉴权放在 `add_viewer` **之前**：未授权请求不得占用 viewer 槽位（否则同网段
+/// 任何人都能靠刷请求把 fan-out 打满 / 挤掉合法 viewer）。比较走
+/// [`crate::relay::auth::constant_time_eq`]（先各自 SHA-256 再逐字节异或累积，
+/// 长度与内容都不产生可观测时序差）。
+async fn lan_stream_handler(
+    State(st): State<LanState>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !lan_token_ok(&st, &headers, params.get("token")) {
+        // 401 也带 CORS 头：浏览器要能读到状态码才好在 LAN → P2P → relay 之间
+        // 回退（缺 ACAO 时 fetch 直接变成网络错误，状态码不可见）。
+        // **不打印 token**（连前缀都不打）：日志会进 systemd journal / 日志文件。
+        tracing::debug!("LAN desktop stream rejected: missing or invalid token");
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .header("Access-Control-Allow-Origin", st.cors_origin.as_str())
+            .header("Vary", "Origin")
+            .body(Body::from("Missing or invalid token"))
+            .unwrap();
+    }
     let ds = st.stream;
     let (vid, mut rx, init) = ds.add_viewer().await;
 
@@ -240,9 +287,49 @@ async fn lan_stream_handler(State(st): State<LanState>) -> Response {
         .unwrap()
 }
 
+/// 校验 LAN 请求携带的 token 是否是本会话当前有效的 token（rw 或 ro）。
+///
+/// - `?token=` 优先（浏览器走这条，避免自定义头的 CORS 预检），其次
+///   `Authorization: Bearer <t>`（curl / 脚本友好）；
+/// - 两端都**不**打印 token：日志会落 journal / 文件；
+/// - 集合为空 → 恒 false（注册成功前 fail-closed）；
+/// - 比较用 [`crate::relay::auth::constant_time_eq`]：它先对两侧做 SHA-256
+///   再逐字节异或累积，长度差异不产生可观测时序差（列表长度本身会泄漏
+///   "有几个 token"，那是固定 1~2 且与会话权限相关，非秘密）。
+fn lan_token_ok(
+    st: &LanState,
+    headers: &axum::http::HeaderMap,
+    query_token: Option<&String>,
+) -> bool {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, rest) = v.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+        })
+        .filter(|t| !t.is_empty());
+    let supplied = query_token
+        .map(String::as_str)
+        .filter(|t| !t.is_empty())
+        .or(bearer);
+    let Some(supplied) = supplied else {
+        return false;
+    };
+    // 锁只在这一小段持有：不跨 await，也不在比较期间阻塞写入方太久。
+    let Ok(valid) = st.tokens.read() else {
+        // 锁中毒（写入方 panic）→ 保守拒绝。
+        return false;
+    };
+    valid
+        .iter()
+        .any(|t| crate::relay::auth::constant_time_eq(t, supplied))
+}
+
 /// CORS 预检：GET+Accept 属 simple request 通常不触发预检；兜底处理 OPTIONS，
 /// 回同样的 ACAO（与 GET 一致，收窄为 relay 同源），避免探测请求加自定义头
-/// 时被预检挡住。
+/// 时被预检挡住。**预检不做鉴权**（不带凭据是预检的本性，且它不产生任何字节
+/// ——viewer 槽位由 GET 的鉴权守住）。
 async fn cors_preflight(State(st): State<LanState>) -> Response {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -259,6 +346,22 @@ async fn cors_preflight(State(st): State<LanState>) -> Response {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// 测试用固定 token 集合（rw + ro）：LAN 端点现在要求鉴权，所有既有
+    /// 用例都要带上其中之一。
+    const TEST_RW: &str = "tok-rw-0123456789";
+    const TEST_RO: &str = "tok-ro-0123456789";
+
+    fn test_tokens() -> LanTokens {
+        Arc::new(RwLock::new(vec![TEST_RW.to_string(), TEST_RO.to_string()]))
+    }
+
+    /// 带 token 的 spawn（等价于生产路径：注册完成后集合已就绪）。
+    async fn spawn_with_tokens(origin: &str) -> LanDesktop {
+        LanDesktop::spawn(0, Some(origin.to_string()), test_tokens())
+            .await
+            .unwrap()
+    }
 
     /// relay_url → CORS origin 提取：常规 http/https、大写 scheme、带路径、
     /// 解析失败（None）。
@@ -283,13 +386,11 @@ mod tests {
     /// `Vary: Origin`。
     #[tokio::test]
     async fn lan_cors_narrowed_to_relay_origin() {
-        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".to_string()))
-            .await
-            .unwrap();
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
         lan.feed(true, true, b"ftyp-cors-ok".to_vec());
         tokio::time::sleep(Duration::from_millis(120)).await;
 
-        let body = http_get_until(&lan, b"ftyp-cors-ok").await;
+        let body = http_get_until(&lan, &rw_query(), b"ftyp-cors-ok").await;
         let head = String::from_utf8_lossy(&body);
         assert!(head.starts_with("HTTP/1.1 200"), "got {head}");
         assert!(
@@ -310,7 +411,7 @@ mod tests {
     /// 启动（返回 Err），绝不 serve `Access-Control-Allow-Origin: *`。
     #[tokio::test]
     async fn lan_cors_fails_closed_when_no_origin() {
-        let err = match LanDesktop::spawn(0, None).await {
+        let err = match LanDesktop::spawn(0, None, test_tokens()).await {
             Ok(_) => panic!(
                 "spawn(relay_origin=None) must refuse to start the LAN server (fail-closed)"
             ),
@@ -326,9 +427,7 @@ mod tests {
     /// OPTIONS 预检回同样的收窄 ACAO + `Vary: Origin`。
     #[tokio::test]
     async fn lan_cors_preflight_echoes_relay_origin() {
-        let lan = LanDesktop::spawn(0, Some("https://relay.example.com".to_string()))
-            .await
-            .unwrap();
+        let lan = spawn_with_tokens("https://relay.example.com").await;
         use tokio::io::AsyncWriteExt;
         let mut sock = tokio::net::TcpStream::connect(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -359,14 +458,12 @@ mod tests {
     /// 迟到 viewer 只回放 init——与 relay fan-out 语义一致）。
     #[tokio::test]
     async fn lan_fanout_init_then_frags_to_viewer() {
-        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".to_string()))
-            .await
-            .unwrap();
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
         lan.feed(true, true, b"ftyp-moov-init-seg".to_vec());
         tokio::time::sleep(Duration::from_millis(120)).await;
 
         // viewer 在线后首块必须是缓存 init。
-        let mut sock = http_connect(&lan).await;
+        let mut sock = http_connect(&lan, &rw_query()).await;
         let first = http_read_until(&mut sock, b"ftyp-moov-init-seg").await;
         assert!(
             first.starts_with(b"HTTP/1.1 200"),
@@ -398,9 +495,7 @@ mod tests {
     /// 之后加入的 viewer 仍拿到缓存 init。
     #[tokio::test]
     async fn lan_feed_with_no_viewer_does_not_panic() {
-        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".to_string()))
-            .await
-            .unwrap();
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
         lan.feed(true, true, b"init-no-viewer".to_vec());
         lan.feed(false, true, b"key".to_vec());
         lan.feed(false, false, b"delta".to_vec());
@@ -408,7 +503,7 @@ mod tests {
         // panic，此处 sleep 后测试即失败）。
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        let body = http_get_until(&lan, b"init-no-viewer").await;
+        let body = http_get_until(&lan, &rw_query(), b"init-no-viewer").await;
         assert!(
             body.windows(14).any(|w| w == b"init-no-viewer"),
             "cached init must still be replayed to a later viewer"
@@ -419,13 +514,11 @@ mod tests {
     /// 最小 HTTP GET，响应必含缓存的 init 字节（fMP4 首段）。
     #[tokio::test]
     async fn http_get_stream_returns_init_bytes() {
-        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".to_string()))
-            .await
-            .unwrap();
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
         lan.feed(true, true, b"ftypmdat-lan-init".to_vec());
         tokio::time::sleep(Duration::from_millis(120)).await;
 
-        let body = http_get_until(&lan, b"ftypmdat-lan-init").await;
+        let body = http_get_until(&lan, &rw_query(), b"ftypmdat-lan-init").await;
         let head = String::from_utf8_lossy(&body);
         assert!(head.starts_with("HTTP/1.1 200"), "expected 200, got: {head}");
         assert!(
@@ -434,8 +527,23 @@ mod tests {
         );
     }
 
-    /// 建立到 LAN stream 端的裸 HTTP GET 连接。
-    async fn http_connect(lan: &LanDesktop) -> tokio::net::TcpStream {
+    /// 带 token 的 GET 查询串（浏览器路径：token 走查询参数，无 CORS 预检）。
+    fn rw_query() -> String {
+        format!("?token={}", TEST_RW)
+    }
+
+    /// 建立到 LAN stream 端的裸 HTTP GET 连接，`query` 形如 `"?token=..."`
+    /// 或空串（不带 token → 预期 401）。
+    async fn http_connect(lan: &LanDesktop, query: &str) -> tokio::net::TcpStream {
+        http_connect_with(lan, query, &[]).await
+    }
+
+    /// 同上，但可附加额外请求头（`("authorization", "Bearer ...")`）。
+    async fn http_connect_with(
+        lan: &LanDesktop,
+        query: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> tokio::net::TcpStream {
         use tokio::io::AsyncWriteExt;
         let mut sock = tokio::net::TcpStream::connect(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -443,11 +551,14 @@ mod tests {
         ))
         .await
         .expect("connect to LAN stream server");
-        sock.write_all(
-            b"GET /agent/desktop/stream HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-        )
-        .await
-        .unwrap();
+        let mut req = format!(
+            "GET /agent/desktop/stream{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+        );
+        for (k, v) in extra_headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        sock.write_all(req.as_bytes()).await.unwrap();
         sock
     }
 
@@ -473,8 +584,219 @@ mod tests {
     }
 
     /// 最小 HTTP GET helper：连接 → 读到 `needle` 出现。
-    async fn http_get_until(lan: &LanDesktop, needle: &[u8]) -> Vec<u8> {
-        let mut sock = http_connect(lan).await;
+    async fn http_get_until(lan: &LanDesktop, query: &str, needle: &[u8]) -> Vec<u8> {
+        let mut sock = http_connect(lan, query).await;
         http_read_until(&mut sock, needle).await
+    }
+
+    /// 读到 EOF 的全部响应字节（401 之类无响应体的短响应：`Connection: close`
+    /// 后 server 主动关连接，读到 0 字节即结束）。
+    async fn http_read_all(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(3), sock.read(&mut chunk))
+                .await
+                .expect("read response timed out")
+                .expect("read error");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf
+    }
+
+    /// GET 一次并读完整响应（401 用例用：无 body，连接会被 server 关闭）。
+    async fn http_get_all(lan: &LanDesktop, query: &str, extra: &[(&str, &str)]) -> String {
+        let mut sock = http_connect_with(lan, query, extra).await;
+        String::from_utf8_lossy(&http_read_all(&mut sock).await).into_owned()
+    }
+
+    /// 未授权请求后 viewer 数必须不变（鉴权在 `add_viewer` 之前）。
+    async fn viewer_count(lan: &LanDesktop) -> usize {
+        lan.stream.stats().await.viewer_count
+    }
+
+    // ── LAN token 鉴权（MYS-2765 #5）────────────────────────────
+
+    /// 无 token → 401，且带 CORS 头（浏览器要能读到状态码才好在
+    /// LAN → P2P → relay 之间回退）。
+    #[tokio::test]
+    async fn lan_stream_without_token_is_401() {
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
+        lan.feed(true, true, b"ftyp-init".to_vec());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let resp = http_get_all(&lan, "", &[]).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "missing token must be 401, got: {resp}"
+        );
+        assert!(
+            !resp.contains("ftyp-init"),
+            "401 must not leak any stream bytes, got: {resp}"
+        );
+        assert!(
+            resp.contains("access-control-allow-origin: http://127.0.0.1:3130"),
+            "401 must still carry ACAO so the browser can read the status, got: {resp}"
+        );
+        assert_eq!(
+            viewer_count(&lan).await,
+            0,
+            "an unauthenticated request must not occupy a viewer slot"
+        );
+    }
+
+    /// 错误 token → 401（且不占 viewer 槽位）。
+    #[tokio::test]
+    async fn lan_stream_with_wrong_token_is_401() {
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
+        lan.feed(true, true, b"ftyp-init".to_vec());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let resp = http_get_all(&lan, "?token=not-a-real-token", &[]).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "wrong token must be 401, got: {resp}"
+        );
+
+        // 空 token 参数等价于"没带"。
+        let resp = http_get_all(&lan, "?token=", &[]).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "empty token must be 401, got: {resp}"
+        );
+
+        // Authorization: Bearer 带错误 token 同样拒绝。
+        let resp = http_get_all(&lan, "", &[("authorization", "Bearer nope")]).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "wrong bearer token must be 401, got: {resp}"
+        );
+        assert_eq!(viewer_count(&lan).await, 0);
+    }
+
+    /// 正确 rw 或 ro token → 200 并收到 init（两种权限都能看桌面流，
+    /// 与 relay 侧一致：ro 只读仍可观看）。
+    #[tokio::test]
+    async fn lan_stream_accepts_rw_and_ro_token() {
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
+        lan.feed(true, true, b"ftyp-rw-ro-init".to_vec());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        for token in [TEST_RW, TEST_RO] {
+            let query = format!("?token={token}");
+            let body = http_get_until(&lan, &query, b"ftyp-rw-ro-init").await;
+            let head = String::from_utf8_lossy(&body);
+            assert!(
+                head.starts_with("HTTP/1.1 200"),
+                "token {token:?} must be accepted, got: {head}"
+            );
+            assert!(
+                head.contains("ftyp-rw-ro-init"),
+                "accepted viewer must receive the cached init for token {token:?}"
+            );
+        }
+    }
+
+    /// `Authorization: Bearer` 也可用（curl / 脚本友好；浏览器仍走查询参数）。
+    #[tokio::test]
+    async fn lan_stream_accepts_bearer_header() {
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
+        lan.feed(true, true, b"ftyp-bearer-init".to_vec());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let mut sock =
+            http_connect_with(&lan, "", &[("authorization", "Bearer tok-ro-0123456789")]).await;
+        let body = http_read_until(&mut sock, b"ftyp-bearer-init").await;
+        let head = String::from_utf8_lossy(&body);
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+    }
+
+    /// 刷新 token：集合被整体覆盖后，旧 token **立即** 401，新 token 200。
+    /// 这是"吊销即时生效"的核心断言（浏览器 LAN 拉流不能靠旧 token 续命）。
+    #[tokio::test]
+    async fn lan_stream_old_token_rejected_after_refresh() {
+        let tokens = test_tokens();
+        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".into()), tokens.clone())
+            .await
+            .unwrap();
+        lan.feed(true, true, b"ftyp-refresh-init".to_vec());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // 刷新前：旧 token 可用。
+        let body = http_get_until(&lan, &rw_query(), b"ftyp-refresh-init").await;
+        assert!(body.starts_with(b"HTTP/1.1 200"));
+
+        // agent 侧刷新：整体覆盖集合（旧 token 从集合里消失）。
+        *tokens.write().unwrap() = vec!["tok-rw-after-refresh".to_string()];
+
+        let resp = http_get_all(&lan, &rw_query(), &[]).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "the old token must be rejected immediately after a refresh, got: {resp}"
+        );
+        let body = http_get_until(&lan, "?token=tok-rw-after-refresh", b"ftyp-refresh-init").await;
+        assert!(
+            body.starts_with(b"HTTP/1.1 200"),
+            "the new token must be accepted after a refresh"
+        );
+    }
+
+    /// token 集合为空（注册成功前）→ 一切请求 401（fail-closed），
+    /// 包含带 Authorization 头的请求。
+    #[tokio::test]
+    async fn lan_stream_empty_token_set_fails_closed() {
+        let empty: LanTokens = Arc::new(RwLock::new(Vec::new()));
+        let lan = LanDesktop::spawn(0, Some("http://127.0.0.1:3130".into()), empty)
+            .await
+            .unwrap();
+        lan.feed(true, true, b"ftyp-init".to_vec());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        for (query, extra) in [
+            ("?token=anything", &[][..]),
+            ("", &[("authorization", "Bearer anything")][..]),
+        ] {
+            let resp = http_get_all(&lan, query, extra).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 401"),
+                "an empty token set must reject everything, got: {resp}"
+            );
+        }
+        assert_eq!(viewer_count(&lan).await, 0);
+    }
+
+    /// 未授权请求不得占用 viewer 槽位：连打若干次 401 之后，带正确 token 的
+    /// viewer 仍是第一个（viewer 计数从 0 → 1）。
+    #[tokio::test]
+    async fn lan_unauthorized_requests_do_not_take_viewer_slots() {
+        let lan = spawn_with_tokens("http://127.0.0.1:3130").await;
+        lan.feed(true, true, b"ftyp-slot-init".to_vec());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        for _ in 0..5 {
+            let resp = http_get_all(&lan, "", &[]).await;
+            assert!(resp.starts_with("HTTP/1.1 401"), "got: {resp}");
+        }
+        assert_eq!(
+            viewer_count(&lan).await,
+            0,
+            "rejected requests must never reach add_viewer"
+        );
+
+        let mut sock = http_connect(&lan, &rw_query()).await;
+        let body = http_read_until(&mut sock, b"ftyp-slot-init").await;
+        assert!(body.starts_with(b"HTTP/1.1 200"));
+        // 400ms 内 viewer 应稳定为 1（没有 5 个僵尸槽位残留）。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            viewer_count(&lan).await,
+            1,
+            "only the authenticated viewer may hold a slot"
+        );
+        drop(sock);
     }
 }

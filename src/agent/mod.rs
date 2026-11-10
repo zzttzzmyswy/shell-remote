@@ -1330,6 +1330,21 @@ async fn run_session(
         );
     }
 
+    // LAN 直连端点的鉴权集合（MYS-2765 #5）：`LanDesktop` 绑 0.0.0.0，同网段
+    // 任意主机都能访问它的 /agent/desktop/stream，因此必须校验会话 token。
+    //
+    // 集合**起始为空**（注册成功前一切请求 401，fail-closed），只在注册成功
+    // 之后用 `client.tokens` 整体覆盖写入：
+    // - 重连复用缓存 token → 注册成功时写回同一批（同一集合）；
+    // - TUI 手动刷新 token → 上层清 `cached_tokens` 并结束本会话，LAN server
+    //   随本次 run_session 一起 drop，下一次注册拿全新集合——旧 token 不会
+    //   经由本集合续命（这是"吊销即时生效"的关键）；
+    // - 不预填 `cached_tokens`：relay 可能已经吊销它们（admin 刷新），预填会
+    //   让被吊销的 token 在注册重试期间仍能拉流。
+    #[cfg(feature = "desktop")]
+    let lan_tokens: crate::agent::lan::LanTokens =
+        std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+
     // Task 4（阶段2 LAN 直连基础）：agent 本地 HTTP server 暴露与 relay 同构的
     // /agent/desktop/stream，同局域网浏览器直连 agent 拉桌面流、绕开中转。
     // 仅显式 --desktop-lan-port N（lan_port != 0）开启；默认 0 不开任何端口。
@@ -1338,16 +1353,22 @@ async fn run_session(
     // 后才知道，注册消息的 lan_addr 与 desktop:capabilities.lan_addrs 都要它。
     #[cfg(feature = "desktop")]
     let lan_desktop = std::sync::Arc::new(if desktop_cfg.lan_port != 0 {
-        // Task 6 CORS 收窄 + final-review #4 fail-closed：LAN 无认证端点只放行
-        // relay 同源页面读流。relay_url 解析失败 → LanDesktop::spawn 拒绝启动
+        // Task 6 CORS 收窄 + final-review #4 fail-closed：LAN 端点只放行 relay
+        // 同源页面读流。relay_url 解析失败 → LanDesktop::spawn 拒绝启动
         //（不 serve 通配），这里走到 Err 分支记日志、不开服务。
         let relay_origin = crate::agent::lan::relay_origin(relay_url);
-        match crate::agent::lan::LanDesktop::spawn(desktop_cfg.lan_port, relay_origin).await {
+        match crate::agent::lan::LanDesktop::spawn(
+            desktop_cfg.lan_port,
+            relay_origin,
+            lan_tokens.clone(),
+        )
+        .await
+        {
             Ok(lan) => {
                 tracing::info!(
                     addr = %lan.addr_report(),
                     cors_origin = %lan.cors_origin(),
-                    "LAN desktop stream server up (--desktop-lan-port)"
+                    "LAN desktop stream server up (--desktop-lan-port, session token required)"
                 );
                 Some(lan)
             }
@@ -1390,6 +1411,19 @@ async fn run_session(
     *cached_tokens = Some(client.tokens.clone());
 
     tracing::info!(session = %client.session_id, "agent session established");
+    // LAN 直连鉴权集合（MYS-2765 #5）：注册/重连复用/刷新都在这里落地——
+    // `client.tokens` 就是本会话此刻有效的全量 token（rw + ro），整体覆盖写入。
+    // 刷新 token 后旧 token 从这里消失 → LAN 端点立即 401（浏览器回退 P2P/relay）。
+    // 只记数量，绝不打印 token 本身。
+    #[cfg(feature = "desktop")]
+    {
+        let count = client.tokens.len();
+        let mut w = lan_tokens.write().unwrap_or_else(|e| e.into_inner());
+        w.clear();
+        w.extend(client.tokens.iter().map(|(t, _)| t.clone()));
+        drop(w);
+        tracing::debug!(tokens = count, "LAN desktop auth token set updated");
+    }
     for (token, perm) in &client.tokens {
         tracing::info!(session = %client.session_id, permission = %perm, "token: {}", token);
     }
