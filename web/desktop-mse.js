@@ -27,9 +27,35 @@
       this._bpsBytes = 0;
       this._bpsTs = 0;
       this._inputBound = false;
+      // 连接代际（MYS-2767 #1）：connect()/disconnect() 都自增，所有异步续体
+      // （sourceopen→时钟校准→拉流、拉流中断重连定时器）在继续前比对代际，
+      // 过期即放弃——切回终端后不会被残留回调把流重新拉起。
+      this._connGen = 0;
+      // 自动重连定时器（disconnect() 必须能取消）。
+      this._reconnectTimer = null;
+      // 当前按下的键 / 鼠标键（断开时在 connected=false 之前补发释放）。
+      this._pressedKeys = new Set();
+      this._pressedButtons = new Map();
       // 浏览器与 relay 的时钟偏移（relay_epoch - 本地_epoch）。agent 的 srtc
       // 已校准到 relay 时基，e2e 用 本地now+偏移 与 srtc 对齐。
       this._clockOffset = 0;
+    }
+
+    // 自动重连退避延时（各重连路径共用）。
+    _reconnectDelay() {
+      return Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
+    }
+
+    // 受跟踪的自动重连：disconnect() 首先 clear；回调内再校验代际。
+    _scheduleReconnect(delay) {
+      const self = this;
+      if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+      const gen = this._connGen;
+      this._reconnectTimer = setTimeout(function() {
+        self._reconnectTimer = null;
+        if (gen !== self._connGen) return;
+        self.connect();
+      }, delay);
     }
 
     // relay 预建桌面流的时机略晚于 desktop:started 广播; 遇到 404 时重试
@@ -39,10 +65,8 @@
     _retryDesktopStream() {
       if (this._streamRetries >= 10) return false;
       this._streamRetries += 1;
-      const self = this;
       this.setStatus('等待桌面流就绪… (' + this._streamRetries + ')', false);
-      const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
-      setTimeout(function() { self.connect(); }, delay);
+      this._scheduleReconnect(this._reconnectDelay());
       return true;
     }
 
@@ -114,7 +138,8 @@
         } else {
           this._peakKbps = kbps;
         }
-        if (this._peakKbps > 0 && window.shellRemote && window.shellRemote.send) {
+        // 只读会话不发 desktop:bitrate（requires_write，会 403 + toast）。
+        if (this._peakKbps > 0 && this._canWrite() && window.shellRemote && window.shellRemote.send) {
           window.shellRemote.send('desktop:bitrate', { kbps: this._peakKbps });
         }
       }
@@ -122,6 +147,8 @@
 
     connect() {
       this.disconnect(false); // 重试保留 _streamRetries 计数; 主动断开才清零
+      // disconnect() 已自增代际，这里再自增一次，作废上一周期仍在飞的续体。
+      const gen = ++this._connGen;
       if (typeof MediaSource === 'undefined') {
         this.setStatus('当前浏览器不支持 MediaSource', true);
         return;
@@ -132,8 +159,12 @@
       const self = this;
       ms.addEventListener('sourceopen', function onOpen() {
         ms.removeEventListener('sourceopen', onOpen);
+        if (gen !== self._connGen) return; // 已断开/已换连接周期
         // 先校准时钟再拉流（校准失败也继续）
-        self._calibrateClock().then(function() { self._startFetch(); });
+        self._calibrateClock().then(function() {
+          if (gen !== self._connGen) return;
+          self._startFetch();
+        });
         return;
         // 不在这里用预设 codec 建 SourceBuffer：必须先拿到 init 段、解析
         // SPS 的真实 profile/level 再建。用 avc1.42E01E(level 3.0) 建而实际
@@ -271,10 +302,11 @@
       this.pendingChunks = [];
 
       const self = this;
+      const gen = this._connGen;
       fetch('/agent/desktop/stream', {
         headers: window.shellRemoteAuthHeaders({ 'Authorization': 'Bearer ' + token })
       }).then(function(resp) {
-        if (controller.signal.aborted) return null;
+        if (controller.signal.aborted || gen !== self._connGen) return null;
         if (!resp.ok || !resp.body) {
           // relay 在 desktop:started 预建流、首个 init 分片随后到达;
           // 若本请求赶在 init 之前打到 relay, 会得到 404。短暂重试等待
@@ -286,7 +318,8 @@
           self.disconnect();
           return null;
         }
-        self._streamRetries = 0;
+        // 不在连上时清零 _streamRetries（MYS-2767 #1）：只有真正加入 SourceBuffer
+        // 的首个分片（_drain 成功 append）才算流可用，否则"连上即断"会无限重连。
         self.connected = true;
         self._bindInput(); // 流就绪后开始采集键鼠事件
         self._startMetrics(); // 性能指标面板
@@ -295,8 +328,9 @@
         self.reader = reader;
 
         function pump() {
-          if (controller.signal.aborted) return Promise.resolve();
+          if (controller.signal.aborted || gen !== self._connGen) return Promise.resolve();
           return reader.read().then(function(result) {
+            if (controller.signal.aborted || gen !== self._connGen) return;
             if (result.done) {
               // relay 可能在 init 长时间未收到/流空闲超时后主动结束本
               // viewer 流; 视图仍激活则自动重连(MSE 重新从 init 建流),
@@ -305,8 +339,7 @@
                 self._streamRetries += 1;
                 self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
                 self.disconnect(false);
-                const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
-                setTimeout(function() { self.connect(); }, delay);
+                self._scheduleReconnect(self._reconnectDelay());
               } else {
                 self.setStatus('桌面流已结束', true);
               }
@@ -371,6 +404,8 @@
       const next = this.pendingChunks.shift();
       try {
         sb.appendBuffer(next);
+        // 真正有分片进入 SourceBuffer = 流有效，此处才清零重连计数（MYS-2767 #1）。
+        this._streamRetries = 0;
       } catch (e) {
         // SourceBuffer 被移除/更换(如 codec 重建)时: 丢弃该队列并下次重连重建。
         if (e && e.name === 'InvalidStateError') {
@@ -382,6 +417,13 @@
     }
 
     disconnect(resetRetries) {
+      // 代际自增最先做（MYS-2767 #1）：作废在飞的 sourceopen/校准/拉流续体。
+      this._connGen += 1;
+      // 取消待执行的自动重连定时器。
+      if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+      // 释放按键/鼠标键必须早于 connected=false（否则 send() 早退，
+      // 远端会一直认为键按着，MYS-2767 #2）。
+      this._releaseInputState();
       if (this.controller) { this.controller.abort(); this.controller = null; }
       if (this.reader) { this.reader.cancel().catch(function() {}); this.reader = null; }
       this.connected = false;
@@ -505,17 +547,16 @@
     _bindInput() {
       if (this._inputBound) return;
       this._inputBound = true;
-      // 当前按住的键（C11）：窗口失焦那一刻浏览器不再派发 keyup。
+      // 当前按住的键/鼠标键（C11 / MYS-2767）：窗口失焦那一刻浏览器不再派发
+      // keyup；断开时来不及补发。两者都在 disconnect() 与失焦时释放。
       if (!this._pressedKeys) this._pressedKeys = new Set();
+      if (!this._pressedButtons) this._pressedButtons = new Map();
+      this._inputGen = this._connGen;
       const v = this.video;
       const self = this;
 
-      const send = function(type, payload) {
-        if (!self.connected) return;
-        if (window.shellRemote && window.shellRemote.send) {
-          window.shellRemote.send(type, payload);
-        }
-      };
+      // 统一发送入口：带 connected + 只读权限校验（MYS-2767 #5）。
+      const send = function(type, payload) { self._sendInput(type, payload); };
 
       // 视频渲染坐标 → 桌面像素坐标（object-fit: contain —— 完整画面可见,
       // 等比缩放铺满一条边, 另一条边最多两条黑边; 与 cover 的裁切不同,
@@ -543,15 +584,33 @@
         if (!p) return;
         send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
         send('desktop:mouse', { type: 'down', button: e.button });
-        v.setPointerCapture(e.pointerId);
+        self._pressedButtons.set(e.pointerId, e.button);
+        try { v.setPointerCapture(e.pointerId); } catch (err) {}
         // preventDefault 阻止 mousedown 默认聚焦 → 键盘收不到事件。
         // 显式 focus 补回（键盘无反应的根因修复）。
         if (v.focus) v.focus();
         e.preventDefault();
       };
       this._onPointerUp = function(e) {
-        send('desktop:mouse', { type: 'up', button: e.button });
+        if (self._pressedButtons.delete(e.pointerId)) {
+          send('desktop:mouse', { type: 'up', button: e.button });
+        }
+        try { v.releasePointerCapture(e.pointerId); } catch (err) {}
         e.preventDefault();
+      };
+      // pointercancel / lostpointercapture 之后不会再派发 pointerup：按记录的
+      // 键补发 up，避免远端鼠标卡在按下态（MYS-2767 #2）。
+      this._onPointerCancel = function(e) {
+        const btn = self._pressedButtons.get(e.pointerId);
+        if (btn === undefined) return;
+        self._pressedButtons.delete(e.pointerId);
+        send('desktop:mouse', { type: 'up', button: btn });
+      };
+      this._onLostPointerCapture = function(e) {
+        const btn = self._pressedButtons.get(e.pointerId);
+        if (btn === undefined) return;
+        self._pressedButtons.delete(e.pointerId);
+        send('desktop:mouse', { type: 'up', button: btn });
       };
       this._onWheel = function(e) {
         // 浏览器 deltaY 正=向下。enigo scroll 单位是"格"(1 格 = Windows
@@ -562,13 +621,19 @@
         var unit = 100;
         if (e.deltaMode === 1) unit = 33; // 行模式: 3 行/格
         else if (e.deltaMode === 2) unit = 100; // 页模式按 1 格处理
-        var clicks = Math.round(Math.abs(e.deltaY) / unit) || 1;
-        var dy = e.deltaY > 0 ? clicks : -clicks;
+        // 横向滚动（MYS-2767 #7）：deltaY 为 0 时不得凭空发一格垂直滚动，
+        // 只发 dx（agent 的 parse_mouse 已支持 dx）。
+        var dy = 0;
+        if (e.deltaY) {
+          var clicks = Math.round(Math.abs(e.deltaY) / unit) || 1;
+          dy = e.deltaY > 0 ? clicks : -clicks;
+        }
         var dx = 0;
         if (e.deltaX) {
           var c2 = Math.round(Math.abs(e.deltaX) / unit) || 1;
           dx = e.deltaX > 0 ? c2 : -c2;
         }
+        if (!dx && !dy) return;
         send('desktop:mouse', { type: 'wheel', dx: dx, dy: dy });
         e.preventDefault();
       };
@@ -576,38 +641,39 @@
       // 键盘挂 window（焦点管理脆弱：Alt+Tab/点工具栏后焦点在 body,
       // video 上的 keydown 依赖焦点落位）。桌面视图激活期间全局转发;
       // 输入框聚焦时不拦截。
+      // 过滤（MYS-2767 #6）：表单控件/桌面控制栏内的事件不注入；桌面视图
+      // 不可见（终端视图/网页视图/连接周期已过期）时不注入。
       this._onKeyWin = function(down) {
         return function(e) {
-          if (!self._inputBound) return;
-          const t = e.target;
-          if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-          // 跟踪按下的键：失焦后 keyup 丢失会让远端键位卡住（C11）。
-          if (down) self._pressedKeys.add(e.code);
-          else self._pressedKeys.delete(e.code);
-          send('desktop:key', { code: e.code, down: down });
+          if (!self._inputBound || self._inputGen !== self._connGen) return;
+          const filtered = self._shouldIgnoreKeyTarget(e.target) || !self._viewVisible();
+          if (down) {
+            if (filtered) return;
+            // 跟踪按下的键：失焦后 keyup 丢失会让远端键位卡住（C11）。
+            self._pressedKeys.add(e.code);
+            send('desktop:key', { code: e.code, down: true });
+          } else {
+            const wasPressed = self._pressedKeys.delete(e.code);
+            if (filtered && !wasPressed) return;
+            send('desktop:key', { code: e.code, down: false });
+          }
           if (['F5', 'F12'].indexOf(e.code) < 0) e.preventDefault();
         };
       };
       this._onKeyDown = this._onKeyWin(true);
       this._onKeyUp = this._onKeyWin(false);
 
-      // 失焦 / 页面隐藏：把仍按住的键补发 keyup。
-      this._releasePressedKeys = function() {
-        if (!self._inputBound) return;
-        const codes = Array.from(self._pressedKeys);
-        self._pressedKeys.clear();
-        for (const code of codes) {
-          send('desktop:key', { code: code, down: false });
-        }
-      };
-      this._onWindowBlur = function() { self._releasePressedKeys(); };
+      // 失焦 / 页面隐藏：把仍按住的键与鼠标键全部补发释放。
+      this._onWindowBlur = function() { self._releaseInputState(); };
       this._onVisibilityChange = function() {
-        if (document.visibilityState === 'hidden') self._releasePressedKeys();
+        if (document.visibilityState === 'hidden') self._releaseInputState();
       };
 
       v.addEventListener('pointermove', this._onPointerMove);
       v.addEventListener('pointerdown', this._onPointerDown);
       v.addEventListener('pointerup', this._onPointerUp);
+      v.addEventListener('pointercancel', this._onPointerCancel);
+      v.addEventListener('lostpointercapture', this._onLostPointerCapture);
       v.addEventListener('wheel', this._onWheel, { passive: false });
       v.addEventListener('contextmenu', this._onContextMenu);
       window.addEventListener('keydown', this._onKeyDown);
@@ -617,14 +683,79 @@
       v.tabIndex = 0;
     }
 
+    // 与 desktop.js 同名实现保持一致（见其注释）：表单控件/桌面控制栏内的
+    // 键盘事件不注入远端。
+    _shouldIgnoreKeyTarget(t) {
+      if (!t) return false;
+      const tag = (t.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') return true;
+      if (t.isContentEditable) return true;
+      if (typeof t.closest === 'function') {
+        if (t.closest('#desktop-ctrl-bar')) return true;
+        if (t.closest('button, select, option, textarea, input')) return true;
+      }
+      return false;
+    }
+
+    // 桌面视图当前是否真的可见（终端/网页视图下不可见）。
+    _viewVisible() {
+      if (!this._inputBound) return false;
+      const el = document.getElementById('desktop-container');
+      if (!el) return true;
+      if (el.classList.contains('hidden')) return false;
+      if (typeof el.getClientRects === 'function' && el.getClientRects().length === 0) return false;
+      return true;
+    }
+
+    // 会话是否 rw（键鼠/码率上报都要求写权限）。
+    _canWrite() {
+      return !!(window.shellRemote && typeof window.shellRemote.getPermission === 'function'
+        && window.shellRemote.getPermission() === 'rw');
+    }
+
+    // 释放所有已按下状态（键 + 鼠标键）。必须在 connected=false 之前调用。
+    _releaseInputState() {
+      this._releasePressedKeys();
+      this._releasePressedButtons();
+    }
+
+    _releasePressedKeys() {
+      if (!this._pressedKeys || this._pressedKeys.size === 0) return;
+      const codes = Array.from(this._pressedKeys);
+      this._pressedKeys.clear();
+      for (const code of codes) {
+        this._sendInput('desktop:key', { code: code, down: false });
+      }
+    }
+
+    _releasePressedButtons() {
+      if (!this._pressedButtons || this._pressedButtons.size === 0) return;
+      const buttons = Array.from(this._pressedButtons.values());
+      this._pressedButtons.clear();
+      for (const b of buttons) {
+        this._sendInput('desktop:mouse', { type: 'up', button: b });
+      }
+    }
+
+    _sendInput(type, payload) {
+      if (!this.connected) return;
+      // 只读会话不注入键鼠（relay 会 403 + 弹权限提示）。MYS-2767 #5。
+      if (!this._canWrite()) return;
+      if (window.shellRemote && window.shellRemote.send) {
+        window.shellRemote.send(type, payload);
+      }
+    }
+
     _unbindInput() {
       if (!this._inputBound) return;
-      if (this._releasePressedKeys) this._releasePressedKeys();
+      this._releaseInputState();
       this._inputBound = false;
       const v = this.video;
       v.removeEventListener('pointermove', this._onPointerMove);
       v.removeEventListener('pointerdown', this._onPointerDown);
       v.removeEventListener('pointerup', this._onPointerUp);
+      v.removeEventListener('pointercancel', this._onPointerCancel);
+      v.removeEventListener('lostpointercapture', this._onLostPointerCapture);
       v.removeEventListener('wheel', this._onWheel);
       v.removeEventListener('contextmenu', this._onContextMenu);
       window.removeEventListener('keydown', this._onKeyDown);

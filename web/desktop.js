@@ -38,6 +38,18 @@
       this.reader = null;
       this.connected = false;
       this._streamRetries = 0;
+      // 连接代际（MYS-2767）：每次 connect()/disconnect() 自增。所有异步续体
+      // （时钟校准、LAN 探测、WS/fetch/P2P 回调）在继续前比对代际，过期即放弃
+      // ——否则切回终端后，在飞的探测/协商仍会把流重新拉起并绑定 window 级
+      // 键盘监听（残留流/键盘劫持）。
+      this._connGen = 0;
+      // 自动重连定时器句柄（setTimeout(connect)）：disconnect() 必须能取消，
+      // 否则断开后定时器到点又把流连回来。
+      this._reconnectTimer = null;
+      // 当前按下的键 / 指针（MYS-2767）：断开时由 disconnect() 在置
+      // connected=false 之前补发 keyup/mouse up，避免远端键鼠卡在按下态。
+      this._pressedKeys = new Set();
+      this._pressedButtons = new Map(); // pointerId → button
       this._bpsBytes = 0;
       this._bpsTs = 0;
       this._inputBound = false;
@@ -209,15 +221,32 @@
       });
     }
 
+    // 自动重连退避延时（各重连路径共用）——上限 5s，带随机抖动避免多 viewer
+    // 同步重连。
+    _reconnectDelay() {
+      return Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
+    }
+
+    // 受跟踪的自动重连（MYS-2767）：定时器句柄存 _reconnectTimer，disconnect()
+    // 首先取消；回调内再校验连接代际，把"断开后才到点"的定时器一并作废。
+    _scheduleReconnect(delay) {
+      const self = this;
+      if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+      const gen = this._connGen;
+      this._reconnectTimer = setTimeout(function() {
+        self._reconnectTimer = null;
+        if (gen !== self._connGen) return; // 期间已被 disconnect/connect 取代
+        self.connect();
+      }, delay);
+    }
+
     // relay 预建桌面流的时机略晚于 desktop:started 广播; 404 时指数退避重试
     // （上限 10 次），返回 true 表示已接管重试。
     _retryDesktopStream() {
       if (this._streamRetries >= 10) return false;
       this._streamRetries += 1;
-      const self = this;
       this.setStatus('等待桌面流就绪… (' + this._streamRetries + ')', false);
-      const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
-      setTimeout(function() { self.connect(); }, delay);
+      this._scheduleReconnect(this._reconnectDelay());
       return true;
     }
 
@@ -293,7 +322,7 @@
         self.disconnect(false);
         self._codecKind = null; // 强制重新解析新流的 init 段
         self._decErr = false;
-        setTimeout(function() { self.connect(); }, 800);
+        self._scheduleReconnect(800);
       }, 1500);
     }
 
@@ -328,6 +357,9 @@
     connect(resetP2pRejected) {
       if (this._decRecoverTimer) { clearTimeout(this._decRecoverTimer); this._decRecoverTimer = null; }
       this.disconnect(false);
+      // disconnect() 已自增代际；本次 connect 再自增一次，令"上一个连接周期内
+      // 发起、仍在飞"的异步续体（时钟校准/LAN 探测/WS 回调）全部作废。
+      const gen = ++this._connGen;
       // final-review #2：用户主动切换（终端↔桌面）/新流接入开启全新连接周期时
       // 清除 P2P 被拒标记，允许重新尝试 P2P（竞争消失后恢复直连）；内部自动
       // 重连（_onP2pLost/_startFeeding/ws.onclose 等）不传参，冷却期内保持
@@ -335,16 +367,6 @@
       if (resetP2pRejected) { this._p2pRejected = false; this._p2pRejectedAt = 0; }
       this._showLoading();
       const self = this;
-      // MSE 模式首帧信号：video loadeddata（WebCodecs 已走 _onDecoded）。
-      if (this._mse && this.video) {
-        this._mseFirstFrame = function() {
-          self._hideLoading();
-          self._gotFirstFrame = true;
-          self._lastNewFrameAt = Date.now();
-          if (self.video) self.video.removeEventListener('loadeddata', self._mseFirstFrame);
-        };
-        this.video.addEventListener('loadeddata', this._mseFirstFrame);
-      }
       this._ttfvStart = Date.now(); // TTFV 打点起点（对齐 R2 乙60）
       this._ttfvMs = null;
       // 能力探测缓存（R3 己195 / R5#65）：第一次探测后把解码路径
@@ -365,8 +387,10 @@
         // 先校准时钟到 relay 时基，再拉流（不阻塞重连：校准失败也继续）。
         // Task 5：下行优先 LAN（agent 上报的同网段直连地址），全部不可达 →
         // _startP2p()（Task 3 WebRTC，其内部失败再回退 _startWs）。
-        const self = this;
-        this._calibrateClock().then(function() { self._startLan(); });
+        this._calibrateClock().then(function() {
+          if (gen !== self._connGen) return; // 断开/重连后过期：不再拉起流
+          self._startLan();
+        });
         return;
       }
       // 回退：MSE 播放器（旧浏览器）。
@@ -375,6 +399,20 @@
       if (this.video) this.video.classList.remove('hidden');
       if (window.DesktopViewMse) {
         this._mse = new window.DesktopViewMse();
+        // MSE 首帧信号（MYS-2767 #13）：监听必须挂在 this._mse **创建之后** ——
+        // 旧写法在此前用 `if (this._mse && this.video)` 判断，而 _mse 刚被
+        // disconnect() 置空，监听永远挂不上，"正在连接桌面…" 遮罩永久覆盖画面。
+        // WebCodecs 路径已由 _onDecoded 隐藏遮罩，这里只管 MSE。
+        if (this.video) {
+          const videoEl = this.video;
+          this._mseFirstFrame = function() {
+            self._hideLoading();
+            self._gotFirstFrame = true;
+            self._lastNewFrameAt = Date.now();
+            videoEl.removeEventListener('loadeddata', self._mseFirstFrame);
+          };
+          videoEl.addEventListener('loadeddata', this._mseFirstFrame);
+        }
         this._mse.connect();
       } else {
         this.setStatus('当前浏览器不支持 WebCodecs/MSE', true);
@@ -396,10 +434,17 @@
       const addrs = this._lanAddrs || [];
       if (!addrs.length || this._transport === 'lan') { this._startP2p(); return; }
       const self = this;
+      const gen = this._connGen;
       this._lanCancelled = false;
+      // LAN 鉴权（MYS-2767 #10）：agent 侧校验会话 token，浏览器用 **查询参数**
+      // 携带（`?token=`）。不加 Authorization 头——自定义头会触发 CORS 预检，
+      // 而 LAN 端点是跨源（http://<agent-ip>:<port>），预检失败会连旧 agent
+      // 一起打死；查询参数旧 agent 直接忽略，天然向后兼容。
+      const token = (typeof sessionStorage !== 'undefined'
+        ? sessionStorage.getItem('shell-remote-token') : '') || '';
       let i = 0;
       const tryNext = function() {
-        if (self._lanCancelled) return; // 已显式断开，不再启动 fallback
+        if (self._lanCancelled || gen !== self._connGen) return; // 已断开/已换周期
         if (i >= addrs.length) { self._startP2p(); return; } // 全部失败 → P2P
         const a = addrs[i++];
         const controller = new AbortController();
@@ -411,17 +456,19 @@
         // 黑洞地址的 TCP connect 挂在 OS 超时（数十秒），9s 的 probeTimer.abort()
         // 无效、tryNext() 走不下去，整条 lan→p2p→relay 回退被拖住（P2P 失败
         // 不黑屏）。挂上 signal 后 9s 必 abort → fetch 立即 reject → catch → tryNext。
-        fetch('http://' + a + '/agent/desktop/stream', {
+        fetch('http://' + a + '/agent/desktop/stream?token=' + encodeURIComponent(token), {
           headers: { 'Accept': 'video/mp4' },
           signal: controller.signal
         }).then(function(resp) {
           if (controller.signal.aborted) { clearTimeout(probeTimer); tryNext(); return null; }
+          // 401/403 = agent 侧 token 校验拒绝（token 过期/吊销/不匹配）→ 与
+          // "不可达"同等处理，继续下一个地址，最终回退 P2P/relay。
           if (!resp.ok || !resp.body) { clearTimeout(probeTimer); tryNext(); return null; }
           const reader = resp.body.getReader();
           // 读首个 chunk：必须是 fMP4 init（agent 的 init 段以 ftyp 开头，
           // lan.rs 缓存的首块即 init）。未成功前不把字节喂进 demux。
           return reader.read().then(function(result) {
-            if (controller.signal.aborted) { tryNext(); return null; }
+            if (controller.signal.aborted || gen !== self._connGen) { tryNext(); return null; }
             clearTimeout(probeTimer);
             if (result.done) { tryNext(); return null; }
             const v = result.value;
@@ -453,7 +500,9 @@
     // 拉取（_startFetch 与 _startLan 复用）。`initial` = LAN 探测已读出的首
     // 个 chunk（探测成功后接着同一 reader 消费，不二次 fetch）。
     _startFeeding(controller, reader, initial, statusText) {
-      this._streamRetries = 0;
+      // 注意：这里**不**清零 _streamRetries。旧实现每次连上就清零，导致
+      // "连上→立刻断→重试计数归零→无限重连"（MYS-2767 #1）。计数改为收到
+      // 首个有效媒体帧（init 之后的 moof/mdat，见 _handleMdat）才清零。
       this.connected = true;
       this._bindInput();
       this._startMetrics();
@@ -461,21 +510,22 @@
       this._buf = new Uint8Array(0); // demux 缓冲（新流重开）
       this.reader = reader;
       const self = this;
+      const gen = this._connGen;
       // 首块先入 demux（LAN 探测已读、未喂过），再进入 read 循环。
       if (initial && initial.byteLength) {
         self._trackBandwidth(initial.byteLength);
         self._feed(initial);
       }
       function pump() {
-        if (controller.signal.aborted) return Promise.resolve();
+        if (controller.signal.aborted || gen !== self._connGen) return Promise.resolve();
         return reader.read().then(function(result) {
+          if (controller.signal.aborted || gen !== self._connGen) return;
           if (result.done) {
             if (self.connected && self._streamRetries < 10) {
               self._streamRetries += 1;
               self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
               self.disconnect(false);
-              const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
-              setTimeout(function() { self.connect(); }, delay);
+              self._scheduleReconnect(self._reconnectDelay());
             } else {
               self.setStatus('桌面流已结束', true);
             }
@@ -518,8 +568,10 @@
       this._emitProgress('p2p', 'P2P 直连协商中（3 秒后开始）…');
       this._p2pStartAt = Date.now();
       this._p2pCandidateCount = 0;
+      const gen = this._connGen;
       this._p2pWaitTimer = setTimeout(function() {
         self._p2pWaitTimer = null;
+        if (gen !== self._connGen) return; // 已断开/已换连接周期
         if (self._p2pRejectedActive() || self.connected) { self._startWs(); return; }
         self._beginP2pNegotiation();
       }, 3000);
@@ -529,6 +581,7 @@
     // skipP2P 在等待期干净地取消——直接 return 掉 _beginP2pNegotiation 调用）。
     _beginP2pNegotiation() {
       const self = this;
+      const gen = this._connGen;
       if (this._p2pRejectedActive() || this.connected) { this._startWs(); return; }
       this._emitProgress('p2p', 'P2P 直连协商中…');
       try {
@@ -547,11 +600,15 @@
       }
       this._p2pDc.binaryType = 'arraybuffer';
       this._p2pDc.onmessage = function(ev) {
+        if (gen !== self._connGen) return; // 过期连接周期的残留回调
         if (typeof ev.data === 'string') return; // 控制帧忽略
         self._trackBandwidth(ev.data.byteLength);
         self._feed(new Uint8Array(ev.data));
       };
-      this._p2pDc.onclose = function() { self._onP2pLost(); };
+      this._p2pDc.onclose = function() {
+        if (gen !== self._connGen) return;
+        self._onP2pLost();
+      };
       this._p2pPc.onicecandidate = function(ev) {
         if (ev.candidate && typeof window.sendDesktopP2p === 'function') {
           self._p2pCandidateCount += 1;
@@ -570,6 +627,7 @@
         }
       };
       this._p2pPc.onconnectionstatechange = function() {
+        if (gen !== self._connGen) return; // 过期连接周期：不再建连/重连
         const st = self._p2pPc && self._p2pPc.connectionState;
         if (st === 'connecting') {
           self._emitProgress('p2p', 'P2P：正在建立数据通道…');
@@ -577,7 +635,8 @@
           if (self._p2pTimeout) { clearTimeout(self._p2pTimeout); self._p2pTimeout = null; }
           self._transport = 'p2p';
           self.connected = true;
-          self._streamRetries = 0;
+          // _streamRetries 不在此清零：连上但收不到有效帧会形成"连上即断"的
+          // 无限重连（MYS-2767 #1）。计数改由首个有效媒体帧清零。
           self._bindInput();
           self._startMetrics();
           self._emitProgress('p2p-connected', 'P2P 直连已建立');
@@ -595,11 +654,12 @@
       window.__p2pTransport = this;
       // 协商 5s 超时 → 回退 relay（期间未连上 p2p）。
       this._p2pTimeout = setTimeout(function() {
+        if (gen !== self._connGen) return;
         if (self._transport !== 'p2p') self._onP2pFailed();
       }, 5000);
       try {
         this._p2pPc.createOffer().then(function(offer) {
-          if (!self._p2pPc) return;
+          if (!self._p2pPc || gen !== self._connGen) return;
           // setLocalDescription 是异步 Promise：拒绝（如协商中途 pc 关闭）不得
           // 变未处理 rejection——随外层链一并 log+回退（对齐 _addRemoteCandidate）。
           self._p2pPc.setLocalDescription(offer).catch(function(e) {
@@ -664,7 +724,6 @@
       // 此时 dc.onclose 撞进来不再重复回退。
       if (!this._p2pPc && !this.connected) return;
       if (this._p2pTimeout) { clearTimeout(this._p2pTimeout); this._p2pTimeout = null; }
-      const self = this;
       const wasConnected = this.connected && this._transport === 'p2p';
       if (this._p2pPc) { try { this._p2pPc.close(); } catch (e) {} }
       this._p2pPc = null;
@@ -676,13 +735,13 @@
       // 冷却期内直走 _startWs，从根上打断并发 viewer 的互踢循环。
       this._markP2pRejected();
       if (wasConnected) {
-        // 建连后中断：走统一重连（复用 _streamRetries 退避）。
+        // 建连后中断：走统一重连（复用 _streamRetries 退避，定时器受跟踪，
+        // disconnect() 可取消）。
         if (this._streamRetries < 10) {
           this._streamRetries += 1;
           this.setStatus('桌面流重启… (' + this._streamRetries + ')', false);
           this.disconnect(false);
-          const delay = Math.min(700 * Math.pow(1.5, this._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
-          setTimeout(function() { self.connect(); }, delay);
+          this._scheduleReconnect(this._reconnectDelay());
         } else {
           this.setStatus('桌面流已结束', true);
           this.connected = false;
@@ -766,6 +825,7 @@
         return;
       }
       const self = this;
+      const gen = this._connGen;
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const url = proto + '//' + location.host + '/agent/desktop/ws?token=' + encodeURIComponent(token)
         + '&auth=' + encodeURIComponent(sessionStorage.getItem('shell-remote-auth') || '');
@@ -776,13 +836,16 @@
       }
       const sessionTimeout = setTimeout(function() {
         try { ws.close(); } catch (e) {}
+        if (gen !== self._connGen) return;
         self._onWsFailed();
       }, 4000);
       this._ws = ws;
       ws.binaryType = 'arraybuffer';
       ws.onopen = function() {
         clearTimeout(sessionTimeout);
-        self._streamRetries = 0;
+        if (gen !== self._connGen) { try { ws.close(); } catch (e) {} return; }
+        // _streamRetries 不在此清零：只有收到首个有效媒体帧才算真正连上
+        // （MYS-2767 #1，见 _handleMdat）。
         self.connected = true;
         self._bindInput();
         self._startMetrics();
@@ -795,6 +858,7 @@
         }, 1500);
       };
       ws.onmessage = function(ev) {
+        if (gen !== self._connGen) return;
         if (typeof ev.data === 'string') return; // 控制帧（如 ping 文本）
         const v = new Uint8Array(ev.data);
         if (v.byteLength) {
@@ -802,15 +866,20 @@
           self._feed(v);
         }
       };
-      ws.onerror = function() { self._onWsFailed(); };
+      ws.onerror = function() {
+        if (gen !== self._connGen) return;
+        self._onWsFailed();
+      };
       ws.onclose = function() {
         if (self._ws === ws) self._ws = null;
+        // 过期连接周期（disconnect 已自增代际）不再重连——否则切回终端后
+        // 残留 WS 的 onclose 会把流重新拉起。
+        if (gen !== self._connGen) return;
         if (self.connected && self._streamRetries < 10) {
           self._streamRetries += 1;
           self.setStatus('桌面流重启… (' + self._streamRetries + ')', false);
           self.disconnect(false);
-          const delay = Math.min(700 * Math.pow(1.5, self._streamRetries - 1), 5000) * (0.5 + Math.random() * 0.5);
-          setTimeout(function() { self.connect(); }, delay);
+          self._scheduleReconnect(self._reconnectDelay());
         } else if (self.connected) {
           self.setStatus('桌面流已结束', true);
           self.connected = false;
@@ -819,7 +888,14 @@
     }
 
     _onWsFailed() {
-      if (this._ws) { try { this._ws.onclose = null; this._ws.close(); } catch (e) {} this._ws = null; }
+      if (this._ws) {
+        // 清空全部回调再 close（MYS-2767 #1）：close() 一个 CONNECTING 的 WS 会
+        // 触发 onerror → _onWsFailed → _startFetch 的连锁，且旧回调可能作用在
+        // 已经作废的连接周期上。
+        try { this._ws.onclose = null; this._ws.onerror = null; this._ws.onmessage = null; this._ws.onopen = null; } catch (e) {}
+        try { this._ws.close(); } catch (e) {}
+        this._ws = null;
+      }
       // WS 不可用 → HTTP fetch 兜底
       this._startFetch();
     }
@@ -834,11 +910,12 @@
       const controller = new AbortController();
       this.controller = controller;
       const self = this;
+      const gen = this._connGen;
 
       fetch('/agent/desktop/stream', {
         headers: window.shellRemoteAuthHeaders({ 'Authorization': 'Bearer ' + token })
       }).then(function(resp) {
-        if (controller.signal.aborted) return null;
+        if (controller.signal.aborted || gen !== self._connGen) return null;
         if (!resp.ok || !resp.body) {
           if (resp.status === 404 && self._retryDesktopStream()) return null;
           self.setStatus('桌面流不可用 (HTTP ' + resp.status + ')，请重试', true);
@@ -850,7 +927,7 @@
         // 与 LAN 直连共用同一连接后拉取循环（_feed demux 同构）。
         return self._startFeeding(controller, reader, null, '桌面已连接');
       }).catch(function(e) {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && gen === self._connGen) {
           self.setStatus('无法连接桌面: ' + e.message, true);
         }
       });
@@ -1007,6 +1084,10 @@
             optimizeForLatency: true
           });
         } catch (e) {
+          // configure 抛错后解码器不可用：置空，让 _handleMdat 在下个关键帧
+          // 重建（MYS-2767 #9；否则 state 仍是 unconfigured 却挡在自愈判定外）。
+          try { this._dec.close(); } catch (e2) {}
+          this._dec = null;
           // 部分 Chrome 对非法/不支持的 codec 串在 configure 同步抛错（而非
           // 异步 error 事件），不接住会变成 uncaught error 且页面无提示。
           console.error('[desktop-decode] AV1 configure failed:', e.message,
@@ -1043,6 +1124,9 @@
           optimizeForLatency: true
         });
       } catch (e) {
+        // 同上：configure 失败即置空解码器，避免"看似存在但不可用"。
+        try { this._dec.close(); } catch (e2) {}
+        this._dec = null;
         console.error('[desktop-decode] H264 configure failed:', e.message,
           '| codec=', codec,
           '| desc=', this._desc ? Array.from(this._desc).map(b=>b.toString(16).padStart(2,'0')).join('') : 'null',
@@ -1057,7 +1141,10 @@
 
     // moof: 提取 tfdt(pts)、trun(size+flags)、srtc(captureMs)、seqn(帧号)
     _handleMoof(body) {
-      if (!this._dec) return; // 尚无 init
+      // 判据用 _codecKind（是否已收到 init）而非 _dec：configure 失败后 _dec
+      // 被置空，若仍以 _dec 为准则 moof 一律早退、_pending 永不设置，
+      // _handleMdat 的关键帧重建分支就永远走不到（MYS-2767 #9）。
+      if (!this._codecKind) return; // 尚无 init
       // 遍历 traf 子 box
       let pos = 0;
       let ptsUs = 0, sampleSize = 0, isKey = false, captureMs = 0, frameSeq = 0;
@@ -1123,7 +1210,17 @@
     _handleMdat(body) {
       const p = this._pending;
       this._pending = null;
-      if (!p || !this._dec || this._dec.state === 'closed') return;
+      if (!p) return;
+      // 解码器已被关闭（configure 失败 / 内部出错）时，旧实现直接 return，
+      // 后续帧全部丢弃，"下个关键帧重建解码器"的自愈分支永远走不到
+      // （MYS-2767 #9）。这里若当前包是关键帧就先重建解码器再解码；非关键帧
+      // 丢弃并请求关键帧（参考链已断，等到 IDR 才能恢复）。
+      if (!this._dec || this._dec.state === 'closed') {
+        if (!this._codecKind) return; // 尚无 init，无解码上下文
+        if (!p.isKey) { this._requestKey(); return; }
+        this._initDecoder();
+        if (!this._dec || this._dec.state === 'closed') return; // 重建失败，等下一帧
+      }
       // 帧到达 jitter：相邻帧到达时刻差（R2 乙58/R4 丁157 面板项）
       const now = Date.now();
       if (this._lastArrival) {
@@ -1159,6 +1256,10 @@
         const firstKey = this._captureByPts.keys().next().value;
         this._captureByPts.delete(firstKey);
       }
+      // 首个有效媒体帧（init 之后的 moof+mdat 成功入队）= 流真的通了，此时才
+      // 清零重连计数（MYS-2767 #1）。在 onopen/_startFeeding 里清零会让
+      // "连上→立刻断"的失败路径永不计次，形成无限重连。
+      this._streamRetries = 0;
       try {
         this._dec.decode(chunk);
       } catch (e) {
@@ -1281,7 +1382,8 @@
         } else {
           this._peakKbps = kbps;
         }
-        if (this._peakKbps > 0 && window.shellRemote && window.shellRemote.send) {
+        // 只读会话不发 desktop:bitrate（requires_write，会产生 403 + toast）。
+        if (this._peakKbps > 0 && this._canWrite() && window.shellRemote && window.shellRemote.send) {
           window.shellRemote.send('desktop:bitrate', { kbps: this._peakKbps });
         }
       }
@@ -1289,6 +1391,18 @@
 
     disconnect(resetRetries) {
       this._emitProgress('stopped', '已断开');
+      // 代际自增必须最先做（MYS-2767 #1）：之后所有在飞的异步续体（时钟校准、
+      // LAN 探测、WS/fetch/P2P 回调、自动重连定时器）一经比对即刻作废，不会再
+      // 把流拉起来。
+      this._connGen += 1;
+      // 取消待执行的自动重连定时器——否则断开后它到点又把流连回来。
+      if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+      if (this._firstFrameTimer) { clearTimeout(this._firstFrameTimer); this._firstFrameTimer = null; }
+      // 按键/鼠标释放（MYS-2767 #2）必须发生在 connected=false **之前**：
+      // _releasePressedKeys/_releasePressedButtons 走 send()，而 send() 在
+      // !connected 时早退——旧顺序（先置 false 再 _unbindInput）会让远端一直
+      // 认为键/鼠标键还按着（按住 Ctrl 切回终端 → 远端 Ctrl 卡住）。
+      this._releaseInputState();
       if (this._mse) {
         this._mse.disconnect(resetRetries);
         this._mse = null;
@@ -1301,7 +1415,18 @@
       if (this.reader) { this.reader.cancel().catch(function() {}); this.reader = null; }
       // relay WS 兜底同闭：断连即关（否则残留 WS 继续 feed 已断开的视图，且
       // 重连 _startWs 的 `if (this._ws) return` 会误认为已有连接在途）。
-      if (this._ws) { try { this._ws.onclose = null; this._ws.close(); } catch (e) {} this._ws = null; }
+      // 回调全部置空：close() 一个 CONNECTING 的 WS 会同步触发 onerror，若不
+      // 清空会走 _onWsFailed → _startFetch 把刚断开的流又拉回来（MYS-2767 #1）。
+      if (this._ws) {
+        try {
+          this._ws.onclose = null;
+          this._ws.onerror = null;
+          this._ws.onmessage = null;
+          this._ws.onopen = null;
+          this._ws.close();
+        } catch (e) {}
+        this._ws = null;
+      }
       // LAN 探测/拉流在途时被显式断开：_startLan 的 fallback 连锁据此停住。
       this._lanCancelled = true;
       // P2P 会话清理（Task 3）：关 pc/dc、清协商超时、解除 __p2pTransport。
@@ -1463,10 +1588,17 @@
         }
         this._cursorEl = el;
       }
+      // 与 _toDesktopXY 完全一致的 contain 映射（MYS-2767 #8）：视频按
+      // object-fit: contain 等比缩放并居中，两侧（或上下）有 letterbox 黑边。
+      // 旧实现直接把 x/srcW 乘渲染区域宽高，忽略黑边与缩放较慢的轴 → 光标
+      // 与实际指针位置偏离（窗口比例与桌面分辨率不一致时最明显）。
+      const scale = Math.min(dispW / srcW, dispH / srcH);
+      const offX = (dispW - srcW * scale) / 2;
+      const offY = (dispH - srcH * scale) / 2;
       const cont = el.parentElement;
       const contRect = cont ? cont.getBoundingClientRect() : { left: 0, top: 0 };
-      const left = (rect.left - contRect.left) + (x / srcW) * dispW;
-      const top = (rect.top - contRect.top) + (y / srcH) * dispH;
+      const left = (rect.left - contRect.left) + offX + x * scale;
+      const top = (rect.top - contRect.top) + offY + y * scale;
       el.style.left = Math.max(0, Math.round(left)) + 'px';
       el.style.top = Math.max(0, Math.round(top)) + 'px';
       el.style.display = 'block';
@@ -1494,7 +1626,8 @@
           const dfps = self._decodeCount;
           self._decodeCount = 0;
           self._qosDfps = dfps * 4; // 250ms 窗口 → 每秒
-          if (self._e2eMs !== undefined && window.shellRemote && window.shellRemote.send) {
+          // 只读会话不上报 desktop:qos（requires_write）。
+          if (self._e2eMs !== undefined && self._canWrite() && window.shellRemote && window.shellRemote.send) {
             // 上报值 = min(绝对 e2e, 序列陈旧度+RTT)。绝对 e2e 依赖三方时钟
             // 校准链，校准失效时恒为数秒假读数（agent 会据此判 Critical 并
             // 压码率）；序列陈旧度（最近解码帧 srtc − 已渲染帧 srtc）时钟
@@ -1741,17 +1874,18 @@
     _bindInput() {
       if (this._inputBound) return;
       this._inputBound = true;
-      // 当前按住的键（C11）：窗口失焦那一刻浏览器不再派发 keyup。
+      // 当前按住的键/鼠标键（C11 / MYS-2767）：窗口失焦那一刻浏览器不再派发
+      // keyup，断开时也来不及；两者都在 disconnect() 与失焦时补发释放事件。
       if (!this._pressedKeys) this._pressedKeys = new Set();
+      if (!this._pressedButtons) this._pressedButtons = new Map();
+      // 窗口级监听（keydown/keyup）每次绑定都要拿到最新代际：断开后再到达的
+      // 事件一律丢弃（见 _onKeyWin）。
+      this._inputGen = this._connGen;
       const v = this._targetEl();
       const self = this;
 
-      const send = function(type, payload) {
-        if (!self.connected) return;
-        if (window.shellRemote && window.shellRemote.send) {
-          window.shellRemote.send(type, payload);
-        }
-      };
+      // 发送统一走 _sendInput：它带 connected + 只读权限校验（MYS-2767 #5）。
+      const send = function(type, payload) { self._sendInput(type, payload); };
 
       this._toDesktopXY = function(e) {
         const vw = self._videoW(), vh = self._videoH();
@@ -1815,27 +1949,54 @@
         if (!p) return;
         send('desktop:mouse', { type: 'move', x: p.x, y: p.y });
         send('desktop:mouse', { type: 'down', button: e.button });
-        v.setPointerCapture(e.pointerId);
+        // 跟踪按下的鼠标键（MYS-2767 #2）：断开/指针取消时补发 up，否则远端
+        // 一直认为键按着（拖动/选区状态卡死）。
+        self._pressedButtons.set(e.pointerId, e.button);
+        try { v.setPointerCapture(e.pointerId); } catch (err) {}
         // preventDefault 会阻止 mousedown 的默认聚焦 → canvas 拿不到焦点
         // → keydown 永远不触发（键盘完全无反应的根因）。显式 focus 补回。
         if (v.focus) v.focus();
         e.preventDefault();
       };
       this._onPointerUp = function(e) {
-        send('desktop:mouse', { type: 'up', button: e.button });
+        if (self._pressedButtons.delete(e.pointerId)) {
+          send('desktop:mouse', { type: 'up', button: e.button });
+        }
+        try { v.releasePointerCapture(e.pointerId); } catch (err) {}
         e.preventDefault();
+      };
+      // pointercancel（触摸被系统/滚动接管）与 lostpointercapture（捕获被夺走）
+      // 都不会再派发 pointerup —— 这里按已记录的键补发 up。
+      this._onPointerCancel = function(e) {
+        const btn = self._pressedButtons.get(e.pointerId);
+        if (btn === undefined) return;
+        self._pressedButtons.delete(e.pointerId);
+        send('desktop:mouse', { type: 'up', button: btn });
+      };
+      this._onLostPointerCapture = function(e) {
+        const btn = self._pressedButtons.get(e.pointerId);
+        if (btn === undefined) return;
+        self._pressedButtons.delete(e.pointerId);
+        send('desktop:mouse', { type: 'up', button: btn });
       };
       this._onWheel = function(e) {
         var unit = 100;
         if (e.deltaMode === 1) unit = 33;
         else if (e.deltaMode === 2) unit = 100;
-        var clicks = Math.round(Math.abs(e.deltaY) / unit) || 1;
-        var dy = e.deltaY > 0 ? clicks : -clicks;
+        // 横向滚动（MYS-2767 #7）：deltaY 为 0 时不能凭空发一格垂直滚动
+        // （触控板横向滑动/Shift+滚轮会被误判成向下滚），只发 dx；
+        // agent 的 parse_mouse 已支持 dx。
+        var dy = 0;
+        if (e.deltaY) {
+          var clicks = Math.round(Math.abs(e.deltaY) / unit) || 1;
+          dy = e.deltaY > 0 ? clicks : -clicks;
+        }
         var dx = 0;
         if (e.deltaX) {
           var c2 = Math.round(Math.abs(e.deltaX) / unit) || 1;
           dx = e.deltaX > 0 ? c2 : -c2;
         }
+        if (!dx && !dy) return; // 无有效位移：不发空滚动
         send('desktop:mouse', { type: 'wheel', dx: dx, dy: dy });
         e.preventDefault();
       };
@@ -1843,40 +2004,46 @@
       // 键盘挂 window 而非 canvas：焦点管理在浏览器里很脆弱（点工具栏、
       // Alt+Tab 回来后焦点在 body），canvas 上的 keydown 依赖焦点正确落位。
       // 桌面视图激活期间（_inputBound）全局转发，终端此时是隐藏的，无冲突。
-      // 输入框聚焦时（文件抽屉重命名等）不拦截。
+      //
+      // 过滤（MYS-2767 #6）：
+      //   - 表单控件（INPUT/TEXTAREA/SELECT/BUTTON、contenteditable）与桌面
+      //     控制栏（#desktop-ctrl-bar）内的事件不注入——否则在下拉框里按
+      //     方向键/空格会被发到远端桌面；
+      //   - 桌面视图不可见（终端视图 / 网页视图 / 连接已过期）时不注入。
+      // keydown 被过滤的键不会被记入 _pressedKeys；但 keyup 只要该键曾被记录
+      // 就仍然补发（避免"按下时有效、抬起时落在控件上"导致远端卡键）。
       this._onKeyWin = function(down) {
         return function(e) {
-          if (!self._inputBound) return;
-          const t = e.target;
-          if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-          // 跟踪按下的键：窗口失焦后 keyup 永远收不到，远端会一直认为键按住
-          // （典型症状：Alt+Tab 回来远端 Ctrl 卡住，鼠标一点就全选）。
-          if (down) self._pressedKeys.add(e.code);
-          else self._pressedKeys.delete(e.code);
-          send('desktop:key', { code: e.code, down: down });
+          if (!self._inputBound || self._inputGen !== self._connGen) return;
+          const filtered = self._shouldIgnoreKeyTarget(e.target) || !self._viewVisible();
+          if (down) {
+            if (filtered) return;
+            // 跟踪按下的键：窗口失焦后 keyup 永远收不到，远端会一直认为键按住
+            // （典型症状：Alt+Tab 回来远端 Ctrl 卡住，鼠标一点就全选）。
+            self._pressedKeys.add(e.code);
+            send('desktop:key', { code: e.code, down: true });
+          } else {
+            const wasPressed = self._pressedKeys.delete(e.code);
+            if (filtered && !wasPressed) return;
+            send('desktop:key', { code: e.code, down: false });
+          }
           if (['F5', 'F12'].indexOf(e.code) < 0) e.preventDefault();
         };
       };
       this._onKeyDown = this._onKeyWin(true);
       this._onKeyUp = this._onKeyWin(false);
 
-      // 失焦 / 页面隐藏：把仍按住的键全部补发 keyup。
-      this._releasePressedKeys = function() {
-        if (!self._inputBound) return;
-        const codes = Array.from(self._pressedKeys);
-        self._pressedKeys.clear();
-        for (const code of codes) {
-          send('desktop:key', { code: code, down: false });
-        }
-      };
-      this._onWindowBlur = function() { self._releasePressedKeys(); };
+      // 失焦 / 页面隐藏：把仍按住的键与鼠标键全部补发释放。
+      this._onWindowBlur = function() { self._releaseInputState(); };
       this._onVisibilityChange = function() {
-        if (document.visibilityState === 'hidden') self._releasePressedKeys();
+        if (document.visibilityState === 'hidden') self._releaseInputState();
       };
 
       v.addEventListener('pointermove', this._onPointerMove);
       v.addEventListener('pointerdown', this._onPointerDown);
       v.addEventListener('pointerup', this._onPointerUp);
+      v.addEventListener('pointercancel', this._onPointerCancel);
+      v.addEventListener('lostpointercapture', this._onLostPointerCapture);
       v.addEventListener('wheel', this._onWheel, { passive: false });
       v.addEventListener('contextmenu', this._onContextMenu);
       window.addEventListener('keydown', this._onKeyDown);
@@ -1886,19 +2053,89 @@
       v.tabIndex = 0;
     }
 
+    // 键盘事件的目标是否应被忽略（表单控件 / 桌面控制栏）。
+    _shouldIgnoreKeyTarget(t) {
+      if (!t) return false;
+      const tag = (t.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') return true;
+      if (t.isContentEditable) return true;
+      if (typeof t.closest === 'function') {
+        // 桌面控制栏容器（画质/编码/灰度/显示器等下拉与按钮都在里面）。
+        if (t.closest('#desktop-ctrl-bar')) return true;
+        // 兜底：任何按钮/下拉祖先（不同皮肤可能换容器 id）。
+        if (t.closest('button, select, option, textarea, input')) return true;
+      }
+      return false;
+    }
+
+    // 桌面视图当前是否真的可见（终端视图 / 网页视图 / 连接断开时不可见）。
+    _viewVisible() {
+      if (!this._inputBound) return false;
+      const el = document.getElementById('desktop-container');
+      if (!el) return true; // 无容器（单测/嵌入场景）不额外设限
+      if (el.classList.contains('hidden')) return false;
+      if (typeof el.getClientRects === 'function' && el.getClientRects().length === 0) return false;
+      return true;
+    }
+
+    // 释放所有已按下状态（键 + 鼠标键）。必须在 connected=false 之前调用，
+    // 否则 send() 早退、远端收不到 up（MYS-2767 #2）。
+    _releaseInputState() {
+      this._releasePressedKeys();
+      this._releasePressedButtons();
+    }
+
+    _releasePressedKeys() {
+      if (!this._pressedKeys || this._pressedKeys.size === 0) return;
+      const codes = Array.from(this._pressedKeys);
+      this._pressedKeys.clear();
+      for (const code of codes) {
+        this._sendInput('desktop:key', { code: code, down: false });
+      }
+    }
+
+    _releasePressedButtons() {
+      if (!this._pressedButtons || this._pressedButtons.size === 0) return;
+      const buttons = Array.from(this._pressedButtons.values());
+      this._pressedButtons.clear();
+      for (const b of buttons) {
+        this._sendInput('desktop:mouse', { type: 'up', button: b });
+      }
+    }
+
+    // 当前会话是否 rw（`desktop:mouse` / `desktop:key` / `desktop:bitrate` /
+    // `desktop:qos` 都要求写权限，见 src/proto/mod.rs requires_write）。
+    // ro 会话只保留观看与只读操作（reqkey / test-delay / clipboard:get）。
+    _canWrite() {
+      return !!(window.shellRemote && typeof window.shellRemote.getPermission === 'function'
+        && window.shellRemote.getPermission() === 'rw');
+    }
+
+    _sendInput(type, payload) {
+      if (!this.connected) return;
+      // 只读会话：不注入键鼠（relay 会 403 并弹"权限不足"，把控制权交回用户
+      // 的操作体验更差）。MYS-2767 #5。
+      if (!this._canWrite()) return;
+      if (window.shellRemote && window.shellRemote.send) {
+        window.shellRemote.send(type, payload);
+      }
+    }
+
     _targetEl() { return this.canvas || this.video; }
     _videoW() { return this.canvas ? this.canvas.width : this.video.videoWidth; }
     _videoH() { return this.canvas ? this.canvas.height : this.video.videoHeight; }
 
     _unbindInput() {
       if (!this._inputBound) return;
-      // 视图关闭/切走：同样补发 keyup，别让远端留着一个"按住"的键。
-      if (this._releasePressedKeys) this._releasePressedKeys();
+      // 视图关闭/切走：同样补发 keyup/up，别让远端留着一个"按住"的键。
+      this._releaseInputState();
       this._inputBound = false;
       const v = this._targetEl();
       v.removeEventListener('pointermove', this._onPointerMove);
       v.removeEventListener('pointerdown', this._onPointerDown);
       v.removeEventListener('pointerup', this._onPointerUp);
+      v.removeEventListener('pointercancel', this._onPointerCancel);
+      v.removeEventListener('lostpointercapture', this._onLostPointerCapture);
       v.removeEventListener('wheel', this._onWheel);
       v.removeEventListener('contextmenu', this._onContextMenu);
       window.removeEventListener('keydown', this._onKeyDown);

@@ -72,7 +72,7 @@
             <div id="desktop-loading" class="desktop-loading hidden">正在连接桌面…</div>
             <div id="desktop-ctrl-bar" class="desktop-ctrl-bar hidden">
                 <span class="ctrl-group-label">基础</span>
-                <label class="desktop-ctrl-item" title="码率档：越低越省带宽、越不容易卡">画质
+                <label class="desktop-ctrl-item" id="desktop-quality-label" title="码率档：越低越省带宽、越不容易卡">画质
                     <select id="desktop-quality-select" title="码率档（rustdesk 三档 + 自定义）">
                         <option value="speed">极速 (低码率)</option>
                         <option value="balanced" selected>均衡 (默认)</option>
@@ -92,13 +92,13 @@
                 <button type="button" id="ctrl-advanced-toggle" class="ctrl-advanced-toggle"
                         aria-expanded="false" aria-controls="ctrl-advanced">高级</button>
                 <span id="ctrl-advanced" class="ctrl-advanced" hidden>
-                    <label class="desktop-ctrl-item">编码
+                    <label class="desktop-ctrl-item" id="desktop-codec-label">编码
                         <select id="desktop-codec-select" title="编码方案（切换后自动重建画面）">
                             <option value="av1">AV1</option>
                             <option value="h264">H264</option>
                         </select>
                     </label>
-                    <label class="desktop-ctrl-item" title="灰度模式：弱网下省带宽（去除色度，画面变灰但更流畅）">
+                    <label class="desktop-ctrl-item" id="desktop-gray-label" title="灰度模式：弱网下省带宽（去除色度，画面变灰但更流畅）">
                         <input type="checkbox" id="desktop-gray-toggle"> 灰度
                     </label>
                     <button type="button" id="desktop-metrics-btn" class="ctrl-btn" title="性能指标面板">指标</button>
