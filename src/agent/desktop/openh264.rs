@@ -256,7 +256,22 @@ impl H264Encoder {
     /// not a bare `c_int*` — passing the wrong shape makes OpenH264 read past
     /// the pointer and reject the update (observed as
     /// `SetOption():ENCODER_OPTION_BITRATE, iBitrate = <garbage>`).
+    ///
+    /// MYS-2765 #9：这是**外部**入口（ABR/QoS 调码率），必须同步更新 guard 的
+    /// 基准——否则 guard 收紧后回到 level 0 时恢复的是**初始**码率（构造时的
+    /// max_bps），把 ABR 刚压低的目标顶回去，弱网下形成"guard 释放即超预算 →
+    /// 再收紧"的振荡。guard 内部改码率走 [`Self::apply_bitrate`]，不回来改基准。
     pub fn set_bitrate(&mut self, bps: u64) {
+        if bps == 0 {
+            return;
+        }
+        self.base_bitrate_bps = bps;
+        self.apply_bitrate(bps);
+    }
+
+    /// 码率下发的内部实现：只写编码器 + 缓存，不动 guard 基准。
+    /// guard 的 level 收紧/恢复都走这里（[`Self::set_overshoot_qp`]）。
+    fn apply_bitrate(&mut self, bps: u64) {
         if bps == 0 {
             return;
         }
@@ -278,16 +293,19 @@ impl H264Encoder {
     /// 用 `ENCODER_OPTION_BITRATE` SetOption 压目标码率（官方支持的运行时
     /// 接口，非 aom/vpx 的 config_set 崩溃路径）。每档压到 base×(1-0.15×level)
     /// （6 档最低 ~10%），iMaxQp=42 恒定约束单帧上界。0 档回 base。
+    ///
+    /// `base` 是**当前 ABR 目标码率**（由 [`Self::set_bitrate`] 同步维护），
+    /// 不是构造时的初始码率——level 0 恢复到 ABR 当前值，交回码率控制。
     pub fn set_overshoot_qp(&mut self, level: u32) {
         let level = level.min(super::BitrateGuard::MAX_LEVEL);
         if level == 0 {
             let base = self.base_bitrate_bps;
-            self.set_bitrate(base);
+            self.apply_bitrate(base);
             return;
         }
         let target = self.base_bitrate_bps.saturating_mul(100 - 15 * level as u64) / 100;
         let target = target.max(50_000);
-        self.set_bitrate(target);
+        self.apply_bitrate(target);
     }
 
     /// Read back the current target bitrate from the encoder.
@@ -451,6 +469,40 @@ mod tests {
         assert!(
             (700_000..=900_000).contains(&rb),
             "bitrate readback after raise outside range: {rb}"
+        );
+    }
+
+    /// MYS-2765 #9：`set_bitrate`（ABR 外部入口）必须同步更新 guard 基准，
+    /// 使 guard 回到 level 0 时恢复的是**当前 ABR 码率**而不是初始码率。
+    /// 否则弱网下 ABR 压低目标 → guard 释放瞬间顶回初始满档 → 立即再超预算
+    /// → 收紧，形成码率振荡。
+    #[test]
+    fn test_guard_level0_restores_current_abr_bitrate() {
+        let mut enc = H264Encoder::new(320, 240, 800_000, 15.0).unwrap();
+        // ABR 把目标压到 300k（外部入口）。
+        enc.set_bitrate(300_000);
+        // guard 收紧到 level 2（内部改码率，不得反过来改基准）。
+        enc.set_overshoot_qp(2);
+        let tightened = enc.bitrate_bps();
+        assert!(
+            tightened < 300_000,
+            "level 2 必须低于当前 ABR 码率，got {tightened}"
+        );
+        // guard 释放：回到 ABR 当前码率 300k，而不是构造时的 800k。
+        enc.set_overshoot_qp(0);
+        let released = enc.bitrate_bps();
+        assert!(
+            (250_000..=350_000).contains(&released),
+            "level 0 必须回到 ABR 当前码率(~300k)，got {released}"
+        );
+        // 再确认基准没被 guard 内部改动带偏：ABR 升到 600k 后释放仍是 600k。
+        enc.set_bitrate(600_000);
+        enc.set_overshoot_qp(3);
+        enc.set_overshoot_qp(0);
+        let released2 = enc.bitrate_bps();
+        assert!(
+            (550_000..=650_000).contains(&released2),
+            "guard 内部改码率不得污染基准，期望 ~600k，got {released2}"
         );
     }
 

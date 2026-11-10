@@ -29,7 +29,7 @@ pub mod dxgi;
 pub mod wayland;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -256,6 +256,10 @@ pub struct DesktopKpi {
 pub struct DesktopManager {
     config: DesktopConfig,
     running: Arc<AtomicBool>,
+    /// 代际号（MYS-2765 #1）：每次 `start()` 自增，并连同 running 一起交给
+    /// 本次运行的任务。循环退出时只有「自己仍是当前代」才允许清 `running`
+    /// ——旧代任务（stop 超时/新代已启动）退出不会误清新代状态。
+    generation: Arc<AtomicU64>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 最近一次浏览器实测的可用带宽(bps), 用于弱网下把码率天花板压回
     /// 网络可承受的范围; 从未上报时保持配置上限。
@@ -300,14 +304,20 @@ pub struct DesktopManager {
     /// 编码器当前目标码率（bps，由 pipeline 每次建/重建编码器时同步）。
     /// QoS ratio 的 150kbps 限幅与 1Mbps 基线用它（rustdesk store_bitrate）。
     qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
+    /// 当前**实际编码分辨率**打包成 `w << 32 | h`（pipeline 建/重建编码器时
+    /// 同步）。QoS 的码率基准必须按真实编码尺寸算——用配置或硬编码 1920x1080
+    /// 会在 720p 屏/降级分辨率下把 `base_bitrate` 算高 2-3 倍，qos-ack 回传的
+    /// 码率与浏览器看到的实际画质对不上，ratio 的 1Mbps 保底也失真。
+    qos_encode_dims: Arc<std::sync::atomic::AtomicU64>,
     /// 灰度模式（web 端可切）：编码前把 UV 平面置中性 128，色度≈0。
     /// 弱网下带宽占用显著下降（亮度是主观关键），画质降为灰度可接受。
     /// 运行时即时生效，不重建编码器/不重启流。
     gray: Arc<std::sync::atomic::AtomicBool>,
-    /// 单色编码（MYS-954 灰度增强）：AV1 时随灰度开关切换，重建桌面流生效
-    /// （libaom monochrome 码流）。与 gray flag 独立存储——H264 下
-    /// gray 只翻 flag，monochrome 恒 false。
-    monochrome: std::sync::RwLock<bool>,
+    /// 浏览器请求重发 init（`desktop:reqkey {reinit:true}`，MYS-2765 #6）：
+    /// token 吊销 / 流被重建后浏览器手里的 init 已失效，下一次编码必带新的
+    /// 参数集 init 段。与 [`Self::idr_request`] 分开：reqkey 只要 IDR，reinit
+    /// 还要重发 `desktop:video{kind:init}`。
+    reinit_request: Arc<std::sync::atomic::AtomicBool>,
     /// 浏览器关键帧请求（desktop:reqkey → 本 flag → 编码循环 force_idr）。
     /// 接入/参考链断裂/解码错误时即时重同步，不再等周期 IDR（对齐 rustdesk
     /// 控制端 refresh_video 语义，MYS-886）。
@@ -334,6 +344,7 @@ impl DesktopManager {
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
             task: tokio::sync::Mutex::new(None),
             bandwidth: Arc::new(std::sync::atomic::AtomicU64::new(bps)),
             injector: tokio::sync::Mutex::new(None),
@@ -350,8 +361,9 @@ impl DesktopManager {
             qos_last_sample: std::sync::atomic::AtomicU64::new(0),
             qos_last_bp: std::sync::atomic::AtomicU32::new(0),
             qos_bitrate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            qos_encode_dims: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gray: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            monochrome: std::sync::RwLock::new(false),
+            reinit_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idr_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
             backpressure: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -383,39 +395,46 @@ impl DesktopManager {
     }
 
     /// 灰度模式开关（web 端 `desktop:gray`）。两层实现（MYS-954 增强）：
-    /// - AV1：切换 cfg.monochrome 并**重建桌面流**（libaom 原生 monochrome
-    ///   码流不含色度平面，全部比特给亮度——比"UV 填 128 再压缩"省更多
-    ///   码率；且 AV1 是默认 codec，弱网省带宽主要走这条）。重建为低频
-    ///   操作可接受（set_codec/set_quality 同机制）。
+    /// - AV1：切换单色编码并**重建桌面流**（libaom 原生 monochrome 码流不含
+    ///   色度平面，全部比特给亮度——比"UV 填 128 再压缩"省更多码率；且 AV1
+    ///   是默认 codec，弱网省带宽主要走这条）。重建为低频操作可接受
+    ///   （set_codec/set_quality 同机制）。
     /// - H264：无 monochrome 能力，翻转编码前 UV 置 128 的像素级灰度
-    ///   flag（下一帧即时生效，不重建）。AV1 上该 flag 同时保留——monochrome
-    ///   下编码器忽略色度，无副作用。
+    ///   flag（下一帧即时生效，不重建）。
+    ///
+    /// MYS-2765 #4：单色不再是独立状态，而是 `gray && codec == av1` 的派生值
+    /// （见 [`Self::monochrome_now`]）。此前独立字段在"AV1 开灰度 → 切 H264 →
+    /// 关灰度"后残留 true，切回 AV1 就输出单色而灰度显示为关——派生后该状态
+    /// 组合不可表达。因此这里只在**运行中 AV1 且派生值确有变化**时重建流，
+    /// 状态不变时是纯 no-op（不打断正在看的流）。
     pub async fn set_gray(&self, enabled: bool, post: PostFn) -> Result<(), String> {
         use std::sync::atomic::Ordering as O;
+        let was = self.monochrome_now();
         self.gray.store(enabled, O::Relaxed);
-        tracing::info!(enabled, "desktop gray mode {}", if enabled { "ON" } else { "OFF" });
-        let is_av1 = self
-            .codec
-            .read()
-            .map(|c| c.eq_ignore_ascii_case("av1"))
-            .unwrap_or(false);
-        let monochrome_changed = {
-            let mut cur = self
-                .monochrome
-                .write()
-                .map_err(|_| "monochrome lock poisoned".to_string())?;
-            if *cur != enabled && is_av1 {
-                *cur = enabled;
-                true
-            } else {
-                false
-            }
-        };
-        if monochrome_changed && self.is_running() {
+        let now = self.monochrome_now();
+        tracing::info!(
+            enabled,
+            monochrome = now,
+            "desktop gray mode {}",
+            if enabled { "ON" } else { "OFF" }
+        );
+        if was != now && self.is_running() {
             self.stop(post.clone()).await;
             self.start(post).await;
         }
         Ok(())
+    }
+
+    /// 当前单色编码派生值：**只有** 灰度开启且 codec 为 AV1 时为真。
+    /// H264 没有 monochrome 码流能力（走像素级 UV 置 128），此时恒 false。
+    fn monochrome_now(&self) -> bool {
+        use std::sync::atomic::Ordering as O;
+        self.gray.load(O::Relaxed)
+            && self
+                .codec
+                .read()
+                .map(|c| c.eq_ignore_ascii_case("av1"))
+                .unwrap_or(false)
     }
 
     pub fn gray_enabled(&self) -> bool {
@@ -451,6 +470,20 @@ impl DesktopManager {
         use std::sync::atomic::Ordering as O;
         self.idr_request.store(true, O::Relaxed);
         tracing::info!("desktop IDR requested (reqkey)");
+    }
+
+    /// 请求重发 init 段（`desktop:reqkey {reinit:true}`，MYS-2765 #6）。
+    ///
+    /// token 吊销 / 流被 relay 重建后，浏览器手里的 init（codec 参数集）已
+    /// 失效，但流本身还在跑：只补 IDR 不够，必须让下一个关键帧重新携带
+    /// 参数集并重发 `desktop:video{kind:init}`。置标志后编码循环下一拍把
+    /// `mp4_cfg` 清空 + force IDR，走与"分辨率变更重配"完全相同的重发路径。
+    /// 同时置 IDR 请求，保证即使本拍没到关键帧节拍也立即出关键帧。
+    pub fn request_reinit(&self) {
+        use std::sync::atomic::Ordering as O;
+        self.reinit_request.store(true, O::Relaxed);
+        self.idr_request.store(true, O::Relaxed);
+        tracing::info!("desktop init requested (reqkey reinit)");
     }
 
     /// 编码循环每帧调用：为 QoS DYNAMIC_SCREEN 统计编码帧数。
@@ -490,8 +523,18 @@ impl DesktopManager {
         let last_bp = self.qos_last_bp.swap(bp_total, O::Relaxed);
         let relay_congest_delta = bp_total.saturating_sub(last_bp);
         let bitrate_bps = self.qos_bitrate.load(O::Relaxed);
+        // 运行时档位与真实编码分辨率（MYS-2765 #7）：web 码率/质量下拉可改，
+        // 编码器也可能在降级/换屏后换尺寸——QoS 的 quality_ratio 与码率基准
+        // 必须取运行时值，不能用启动 config + 硬编码 1920x1080。
+        let runtime_quality = self
+            .quality
+            .read()
+            .map(|q| *q)
+            .unwrap_or(self.config.quality)
+            .clamp(QOS_BR_SPEED, QOS_BR_BEST);
+        let (run_w, run_h) = self.encode_dims();
         let ctx = QosSampleCtx {
-            quality_ratio: self.config.quality.clamp(QOS_BR_SPEED, QOS_BR_BEST),
+            quality_ratio: runtime_quality,
             highest_fps: cap,
             bitrate_kbps: (bitrate_bps / 1000).max(1) as u32,
             decode_fps_hint: decode_fps,
@@ -509,11 +552,8 @@ impl DesktopManager {
         self.qos_scale.store(permille, O::Relaxed);
         // 当前生效目标码率（对齐 rustdesk TestDelay 携带 target_bitrate 回传，
         // MYS-886 #153）：用户硬顶 >0 用其值×缩放；否则按 abr ceiling×缩放。
-        let base_bps = if self.config.max_bps > 0 {
-            self.config.max_bps.max(self.config.min_bps)
-        } else {
-            encoder::target_bitrate(1920, 1080, 0, self.config.quality).max(self.config.min_bps)
-        };
+        // 基准分辨率取**实际编码尺寸**（未启动时回落到 1080p 基准）。
+        let base_bps = self.qos_base_bps(run_w, run_h, runtime_quality);
         let bitrate_kbps = base_bps * (permille as u64) / 1000 / 1000;
         // QoS 五态质量状态（R4 甲A0/A2）：on_delay 已更新，读取供日志与
         // qos-ack 回传浏览器（面板"QoS 状态"行）。
@@ -635,6 +675,32 @@ impl DesktopManager {
         self.bandwidth.store(bps.max(1), O::Relaxed);
     }
 
+    /// 当前编码分辨率（pipeline 每次建/重建编码器时同步）。未启动过 → None。
+    pub fn encode_dims(&self) -> (Option<u32>, Option<u32>) {
+        use std::sync::atomic::Ordering as O;
+        let packed = self.qos_encode_dims.load(O::Relaxed);
+        if packed == 0 {
+            (None, None)
+        } else {
+            (Some((packed >> 32) as u32), Some((packed & 0xffff_ffff) as u32))
+        }
+    }
+
+    /// QoS 码率基准（bps）：用户硬顶优先，否则按**实际编码分辨率** × 运行时
+    /// 质量档（rustdesk base_bitrate 模型）。编码尺寸未知（尚未启动过）时回落
+    /// 1080p 基准——那只是面板数值，不参与编码决策。
+    fn qos_base_bps(&self, w: Option<u32>, h: Option<u32>, quality: f32) -> u64 {
+        let hard = self.max_bps.read().map(|b| *b).unwrap_or(0);
+        if hard > 0 {
+            return hard.max(self.config.min_bps);
+        }
+        let (w, h) = match (w, h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+            _ => (1920, 1080),
+        };
+        encoder::target_bitrate(w, h, 0, quality).max(self.config.min_bps)
+    }
+
     /// 心跳扩展 KPI 快照（R3 丙140 / R5#150）：agent 心跳里附带当前桌面
     /// 运行态，relay/admin 侧可观测不依赖浏览器面板。字段全部读自原子，
     /// 无锁；`encode_ms` 暂缺（编码耗时未做跨线程累计，见 #84 预算降级），
@@ -717,14 +783,18 @@ impl DesktopManager {
             self.post_started_error(&post, &format!("unsupported codec {codec}"));
             return;
         }
+        // 代际号：本次运行的身份证。循环退出（含 panic）用它判断自己是否
+        // 仍是当前代，只有当前代退出才允许清 `running`。
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let mut cfg = self.config.clone();
         cfg.codec = codec;
         // 运行时档位（web 码率/质量下拉可改）覆盖启动默认值。
         cfg.quality = self.quality.read().map(|q| *q).unwrap_or(cfg.quality);
-        // 运行时单色（灰度开关在 AV1 下触发）。
-        cfg.monochrome = self.monochrome.read().map(|m| *m).unwrap_or(false);
+        // 单色是 `gray && codec == av1` 的派生值（MYS-2765 #4），不再独立存储
+        // ——否则灰度关而 AV1 仍输出单色的状态可被构造出来。
+        cfg.monochrome = self.monochrome_now();
         // 运行时选屏（web 显示器下拉可改）覆盖启动 --desktop-display。
         let disp = self.display.read().map(|d| d.clone()).unwrap_or(None);
         cfg.display = resolved_display(&disp, &cfg.display);
@@ -732,27 +802,59 @@ impl DesktopManager {
         if mb > 0 {
             cfg.max_bps = mb;
         }
-        let bandwidth = self.bandwidth.clone();
-        let clock_offset = self.clock_offset.load(std::sync::atomic::Ordering::Relaxed);
-        let last_active_at = self.last_active_at.clone();
-        let fps_ctl = self.fps.clone();
-        let qos_scale = self.qos_scale.clone();
-        let qos_frames = self.qos_frames.clone();
-        let qos_bitrate = self.qos_bitrate.clone();
-        let gray = self.gray.clone();
-        let idr_request = self.idr_request.clone();
+        let exit_state = Arc::new(AtomicU8::new(EXIT_NONE));
+        let shared = RunShared {
+            post: post.clone(),
+            bandwidth: self.bandwidth.clone(),
+            clock_offset_ms: self.clock_offset.load(std::sync::atomic::Ordering::Relaxed),
+            fps_ctl: self.fps.clone(),
+            qos_scale: self.qos_scale.clone(),
+            qos_frames: self.qos_frames.clone(),
+            qos_bitrate: self.qos_bitrate.clone(),
+            qos_encode_dims: self.qos_encode_dims.clone(),
+            gray: self.gray.clone(),
+            idr_request: self.idr_request.clone(),
+            reinit_request: self.reinit_request.clone(),
+            last_active_at: self.last_active_at.clone(),
+            exit_state: exit_state.clone(),
+        };
+        let generation = self.generation.clone();
+        let guard_post = post.clone();
         let task = tokio::task::spawn(async move {
-            run_desktop_loop(cfg, running, post, bandwidth, clock_offset, fps_ctl, qos_scale, qos_frames, qos_bitrate, gray, idr_request, last_active_at).await;
+            // 生命周期 guard（MYS-2765 #1）：无论循环是正常退出、早退（捕获源
+            // 打不开/奇数分辨率/编码器初始化失败/连续采集错误）还是 task panic
+            // 展开，都经 Drop 收尾——旧实现在这些路径上把 `running` 永久留在
+            // true，`start()` 从此直接 return，桌面再也开不起来。
+            let _guard = RunGuard {
+                generation,
+                mine: gen,
+                running: running.clone(),
+                post: guard_post,
+                exit_state,
+            };
+            run_desktop_loop(cfg, running, shared).await;
         });
         *self.task.lock().await = Some(task);
     }
 
-    /// Ask the loop to stop (best-effort; the task sets `running=false`),
-    /// then wait briefly for it to notice `running=false`.
+    /// Ask the loop to stop, then wait briefly for it to notice.
+    ///
+    /// MYS-2765 #1：2s 超时后必须 `abort()` 掉任务——只把 timeout 的 Err 丢掉
+    /// 会让那个任务继续跑下去（继续抓屏/编码/向 relay 发帧），成为游离任务。
+    /// abort 后清 `running` 由 guard 在代际号匹配时完成；这里不无条件清，
+    /// 避免把"刚启动的新代"标记误清（stop→start 重建路径）。
     pub async fn stop(&self, post: PostFn) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(task) = self.task.lock().await.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            let mut task = task;
+            if tokio::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                tracing::warn!("desktop loop did not stop within 2s — aborting task");
+                task.abort();
+                let _ = task.await;
+            }
         }
         // 停用广播（若循环因其它原因结束则跳过）
         self.broadcast_stopped(&post);
@@ -808,6 +910,72 @@ impl Drop for DesktopManager {
         if let Some(task) = self.task.get_mut().take() {
             task.abort();
         }
+    }
+}
+
+/// 退出路径已广播给浏览器的消息种类（[`RunGuard`] 据此决定是否补发
+/// `desktop:stopped`）。浏览器侧：`desktop:started{error}` 与
+/// `desktop:stopped` 都会把桌面视图退回终端（`web/session.js`），
+/// 二者择一即可，不能都发（会多一次"桌面已关闭"toast）。
+const EXIT_NONE: u8 = 0;
+/// 循环已自行广播 `desktop:stopped`（正常退出路径）。
+const EXIT_STOPPED: u8 = 1;
+/// 循环已广播 `desktop:started{error}`（捕获源打不开/编码器初始化失败等早退）。
+const EXIT_STARTED_ERROR: u8 = 2;
+
+/// 一次桌面运行的收尾 guard（MYS-2765 #1）：Drop 里保证 `running` 归零并把
+/// 停用状态广播给浏览器，任务 `panic` 展开时同样执行（Drop 在 unwind 中运行）。
+///
+/// 两个关键约束：
+/// 1. **只有当前代**才能清 `running`。stop 超时 abort / 旧任务慢退出时新代
+///    已经在跑，旧代退出若也清 `running`，会把新流标记成未运行，下一次
+///    `start()` 就会重复拉起第二个编码循环。
+/// 2. 循环已自行广播过 `desktop:stopped`（正常退出）或 `desktop:started{error}`
+///    （早退）时不再补发，避免浏览器收到重复的"桌面已关闭"。
+struct RunGuard {
+    generation: Arc<AtomicU64>,
+    mine: u64,
+    running: Arc<AtomicBool>,
+    post: PostFn,
+    /// 与循环共享的退出状态（[`EXIT_NONE`]/[`EXIT_STOPPED`]/[`EXIT_STARTED_ERROR`]）。
+    exit_state: Arc<AtomicU8>,
+}
+
+impl RunGuard {
+    /// 仍在当前代（`running` 归零不应由本代负责的情况返回 false）。
+    fn is_current(&self) -> bool {
+        self.generation.load(Ordering::SeqCst) == self.mine
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if !self.is_current() {
+            // 旧代任务退出：新代已接管 running 语义，什么都不要动。
+            tracing::debug!(
+                generation = self.mine,
+                current = self.generation.load(Ordering::SeqCst),
+                "desktop loop of superseded generation exited"
+            );
+            return;
+        }
+        let was_running = self.running.load(Ordering::SeqCst);
+        // 循环早退/panic：`running` 还是 true 说明浏览器那侧仍认为流在跑，
+        // 必须补一条 `desktop:stopped` 让面板状态一致。已广播过 stopped 或
+        // started-error 的路径跳过（浏览器已拿到终态）。
+        //
+        // 先广播再清 `running`：`running=false` 是"可以再次 start"的信号，
+        // 若先清再发，并发的 `start()` 可能已经拉起新流，这条 stopped 就会
+        // 把新流误关掉。
+        if was_running && self.exit_state.load(Ordering::SeqCst) == EXIT_NONE {
+            (self.post)(serde_json::json!({ "type": "desktop:stopped", "payload": {} }));
+        }
+        self.running.store(false, Ordering::SeqCst);
+        tracing::debug!(
+            generation = self.mine,
+            was_running,
+            "desktop loop exited — running cleared"
+        );
     }
 }
 
@@ -998,6 +1166,42 @@ async fn rebuild_encoder_degrade(
     Ok(actual)
 }
 
+/// 一次桌面运行的共享句柄：`DesktopManager` 克隆出的原子量 + 回传函数。
+///
+/// 这些句柄在抓帧/编码循环里被反复读写（QoS 缩放、目标 fps、灰度开关、
+/// 浏览器 reqkey），全部无锁原子，循环内不持有任何 manager 借用——stop 与
+/// 编码可以真正并发。收成一个结构避免十几个位置参数（顺序错了编译器不会
+/// 报错，之前正是这样埋过 bug）。
+struct RunShared {
+    /// 回传 relay/浏览器（`desktop:*` 消息）。
+    post: PostFn,
+    /// 浏览器实测可用带宽（bps，0 = 未上报）。
+    bandwidth: Arc<AtomicU64>,
+    /// relay 时钟偏移（relay_epoch − 本地_epoch，ms）。
+    clock_offset_ms: i64,
+    /// 运行时目标帧率（由 QoS 写入，循环按它定编码最小间隔）。
+    fps_ctl: Arc<std::sync::atomic::AtomicU32>,
+    /// QoS 码率缩放（千分比）。
+    qos_scale: Arc<std::sync::atomic::AtomicU32>,
+    /// 距上次 QoS 采样的编码帧数（供 DYNAMIC_SCREEN 判定）。
+    qos_frames: Arc<AtomicU64>,
+    /// 编码器当前目标码率（bps，供 QoS ratio 限幅）。
+    qos_bitrate: Arc<AtomicU64>,
+    /// 实际编码分辨率（打包 `w << 32 | h`），供 QoS 码率基准与面板数值。
+    qos_encode_dims: Arc<AtomicU64>,
+    /// 灰度像素级开关（H264 走 UV 置 128）。
+    gray: Arc<AtomicBool>,
+    /// 浏览器 reqkey：下一个编码帧强制 IDR。
+    idr_request: Arc<AtomicBool>,
+    /// 浏览器 reqkey {reinit:true}：下一个关键帧重发 init 段。
+    reinit_request: Arc<AtomicBool>,
+    /// 最近一次真实新帧墙钟（ms）。
+    last_active_at: Arc<std::sync::atomic::AtomicI64>,
+    /// 退出状态（[`EXIT_NONE`]/[`EXIT_STOPPED`]/[`EXIT_STARTED_ERROR`]），
+    /// 供 [`RunGuard`] 决定是否补发 `desktop:stopped`。
+    exit_state: Arc<AtomicU8>,
+}
+
 /// desktops at 200-800 kbps: RC drops nearly every P frame): skipped frames
 /// are never POSTed, the bitrate is pinned to the ceiling while skipping, and
 /// a persistently high skip ratio degrades the encode resolution until the
@@ -1006,30 +1210,23 @@ async fn rebuild_encoder_degrade(
 async fn run_desktop_loop(
     cfg: DesktopConfig,
     running: Arc<AtomicBool>,
-    post: PostFn,
-    bandwidth: Arc<std::sync::atomic::AtomicU64>,
-    clock_offset_ms: i64,
-    fps_ctl: Arc<std::sync::atomic::AtomicU32>,
-    qos_scale: Arc<std::sync::atomic::AtomicU32>,
-    qos_frames: Arc<std::sync::atomic::AtomicU64>,
-    qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
-    gray: Arc<std::sync::atomic::AtomicBool>,
-    idr_request: Arc<std::sync::atomic::AtomicBool>,
-    last_active_at: Arc<std::sync::atomic::AtomicI64>,
+    shared: RunShared,
 ) {
-        let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
+    let src = match capture::open_source(&cfg.capture, cfg.display.as_deref()) {
         Ok((src, backend)) => (src, backend),
         Err(e) => {
             tracing::error!("desktop capture open failed: {}", e);
-            (post)(serde_json::json!({
+            (shared.post)(serde_json::json!({
                 "type": "desktop:started",
                 "payload": { "codec": cfg.codec, "error": format!("capture unavailable: {e}") }
             }));
+            // 已广播终态（started{error}）：guard 不再补 stopped。
+            shared.exit_state.store(EXIT_STARTED_ERROR, Ordering::SeqCst);
             return;
         }
     };
     let (src, backend) = src;
-    run_desktop_pipeline(cfg, running, post, src, bandwidth, backend, clock_offset_ms, fps_ctl, qos_scale, qos_frames, qos_bitrate, gray, idr_request, last_active_at).await;
+    run_desktop_pipeline(cfg, running, shared, src, backend).await;
 }
 
 /// The capture → convert → encode → mux → post pipeline. Split from
@@ -1037,18 +1234,25 @@ async fn run_desktop_loop(
 async fn run_desktop_pipeline(
     cfg: DesktopConfig,
     running: Arc<AtomicBool>,
-    post: PostFn,
+    shared: RunShared,
     mut src: Box<dyn capture::FrameSource>,
-    bandwidth: Arc<std::sync::atomic::AtomicU64>,
     backend: String,
-    clock_offset_ms: i64,    fps_ctl: Arc<std::sync::atomic::AtomicU32>,
-    qos_scale: Arc<std::sync::atomic::AtomicU32>,
-    qos_frames: Arc<std::sync::atomic::AtomicU64>,
-    qos_bitrate: Arc<std::sync::atomic::AtomicU64>,
-    gray: Arc<std::sync::atomic::AtomicBool>,
-    idr_request: Arc<std::sync::atomic::AtomicBool>,
-    last_active_at: Arc<std::sync::atomic::AtomicI64>,
 ) {
+    let RunShared {
+        post,
+        bandwidth,
+        clock_offset_ms,
+        fps_ctl,
+        qos_scale,
+        qos_frames,
+        qos_bitrate,
+        qos_encode_dims,
+        gray,
+        idr_request,
+        reinit_request,
+        last_active_at,
+        exit_state,
+    } = shared;
     // cfg 需可变：编码器 fallback 后回写实际 codec。
     let mut cfg = cfg;
     // 光标独立通道（R5#64）：X11 GetImage 不含光标层，远程用户看不到鼠标
@@ -1083,18 +1287,31 @@ async fn run_desktop_pipeline(
                 "type": "desktop:started",
                 "payload": { "codec": cfg.codec, "error": format!("capture thread failed: {e}") }
             }));
+            exit_state.store(EXIT_STARTED_ERROR, Ordering::SeqCst);
             return;
         }
     };
-    let (mut w0, mut h0) = threaded.resolution();
+    let (w0_raw, h0_raw) = threaded.resolution();
+    // MYS-2765 #5：奇数分辨率不再拒绝启动（真实存在 1366x767 / 1919x1079
+    // 这类屏），统一裁剪到偶数后进入转换/编码。奇数行/列本身就无法进 4:2:0，
+    // 裁掉最后一行一列是唯一无损选择（不是缩放、不改变其余像素）。
+    let (mut w0, mut h0) = (w0_raw & !1, h0_raw & !1);
     // R5 #127 启动摊分：预分配 cfg 尺寸 buffer（后续借出复用）。
-    frame_pool.prealloc(2, w0 as usize * h0 as usize * 4);
-    if w0 < 2 || h0 < 2 || w0 % 2 != 0 || h0 % 2 != 0 {
+    frame_pool.prealloc(2, w0_raw * h0_raw * 4);
+    if w0 < 2 || h0 < 2 {
         (post)(serde_json::json!({
             "type": "desktop:started",
-            "payload": { "codec": cfg.codec, "error": format!("resolution {w0}x{h0} must be even") }
+            "payload": { "codec": cfg.codec, "error": format!("resolution {w0_raw}x{h0_raw} too small") }
         }));
+        exit_state.store(EXIT_STARTED_ERROR, Ordering::SeqCst);
         return;
+    }
+    if (w0, h0) != (w0_raw, h0_raw) {
+        tracing::info!(
+            captured = %format!("{w0_raw}x{h0_raw}"),
+            encode = %format!("{w0}x{h0}"),
+            "desktop: odd capture resolution trimmed to even for 4:2:0"
+        );
     }
 
     let (mut enc, actual_codec) = match encoder::create_encoder_fallback(
@@ -1112,6 +1329,7 @@ async fn run_desktop_pipeline(
                 "type": "desktop:started",
                 "payload": { "codec": cfg.codec, "error": format!("encoder init failed: {e}") }
             }));
+            exit_state.store(EXIT_STARTED_ERROR, Ordering::SeqCst);
             return;
         }
     };
@@ -1131,6 +1349,8 @@ async fn run_desktop_pipeline(
     let mut abr = rate::Abr::new(cfg.min_bps, abr_ceiling);
     // QoS ratio 的 current_bitrate 基准：同步编码器当前目标码率（bps）。
     qos_bitrate.store(abr_ceiling, std::sync::atomic::Ordering::Relaxed);
+    // 实际编码分辨率同步给 QoS（码率基准 / 面板数值必须按真实尺寸算）。
+    store_encode_dims(&qos_encode_dims, w0 as u32, h0 as u32);
 
     // fMP4 config is final once the first IDR carries SPS/PPS at the *current*
     // encode resolution; a resolution change rebuilds both.
@@ -1311,27 +1531,61 @@ async fn run_desktop_pipeline(
             Some(f) => f,
             None => continue,
         };
+        // 浏览器 reqkey {reinit:true}（MYS-2765 #6）：token 吊销 / 流被 relay
+        // 重建后浏览器手里的 init 段已失效。清 `mp4_cfg` 让下一个关键帧重新
+        // 携带参数集并发 `desktop:video{kind:init}`（与分辨率变更重配同路径），
+        // force IDR 保证不用等到关键帧节拍。
+        if reinit_request.swap(false, Ordering::SeqCst) {
+            tracing::info!("desktop reinit requested (reqkey) — next key frame resends init");
+            mp4_cfg = None;
+            seq = 1;
+            enc.force_idr();
+            last_kf_wall = wall_ms;
+        }
         // IDR 决策（仅在确有帧可编时）：首帧 / 周期到期 / reqkey 请求。
         if frame_idx == 0 || last_kf_wall + kf_ms <= wall_ms || idr_request.swap(false, Ordering::SeqCst) {
             enc.force_idr();
             last_kf_wall = wall_ms;
         }
         // 有新帧：fps 是两次编码的最小间隔（上限节奏）。间隔已满足 → 立即
-        // 编码；未满足 → 等余量再编（期间 try_latest 追最新帧，跳过中间帧）。
-        // 静止转动态：间隔通常早已满足，首帧立即编码（不整拍等）。
+        // 编码；未满足 → 等余量再编。
+        //
+        // MYS-2765 #2：等余量时**不能**直接 `continue`——`try_latest()` 是 take
+        // 语义，已经取出的 `fr` 一旦 continue 就永久丢失（没人会再取回来），
+        // 表现为每拍白丢一帧：低 fps（QoS 静态 1fps / 背压 15fps）时丢帧比例
+        // 极高，交互首帧被推迟一整拍。正确做法：等够余量后先看有没有更新的
+        // 帧，有则替换（追最新，缓冲归还池），否则就编码手上这一帧。
         let gap = last_encode.elapsed();
         if gap < min_gap {
             tokio::time::sleep(min_gap - gap).await;
-            continue;
+            match pace_next_frame(threaded.try_latest(), fr) {
+                Paced::Keep(f) => fr = f,
+                Paced::Replace { dropped, keep } => {
+                    frame_pool.release(dropped);
+                    fr = keep;
+                    // 替换进来的是真实内容帧：不再算"静态心跳重编"。
+                    synthetic = false;
+                    last_active_at.store(unix_ms_now(), std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
         last_encode = std::time::Instant::now();
-        let w = fr.width;
-        let h = fr.height;
+        // 原始行跨度（含奇数宽度时的最后一列）：裁剪只改尺寸，不改 stride。
+        let stride = fr.width * 4;
+        // MYS-2765 #5：4:2:0 要求宽高为偶数，把捕获尺寸裁剪到偶数进入
+        // 转换/编码（裁掉最后一列/行，其余像素不动——不缩放、不重采样）。
+        // 运行中尺寸变为奇数时也同样走这条路径并重建编码器。
+        let (w, h) = (fr.width & !1, fr.height & !1);
+        if w < 2 || h < 2 {
+            tracing::warn!(width = fr.width, height = fr.height, "desktop frame too small to encode — skipping");
+            frame_pool.release(std::mem::take(&mut fr.bgra));
+            continue;
+        }
         // display 变更检测（rustdesk 对齐）：捕获源尺寸变了（X11/GDI 轮询、
         // DXGI mode-change）→ 重建编码器到新尺寸 + 重置分辨率阶梯 + 强制
         // IDR 重发 init（mp4_cfg=None 让下个 IDR 携带新参数集广播给所有
         // viewer）。重建失败则保持旧编码器（缩放到新尺寸）不中断流。
-        if (w != w0 || h != h0) && w % 2 == 0 && h % 2 == 0 && w >= 2 && h >= 2 {
+        if w != w0 || h != h0 {
             tracing::warn!(old = %format!("{w0}x{h0}"), new = %format!("{w}x{h}"), "display resolution changed — rebuilding encoder");
             w0 = w;
             h0 = h;
@@ -1361,6 +1615,7 @@ async fn run_desktop_pipeline(
                     };
                     abr = rate::Abr::new(cfg.min_bps, ceiling);
                     qos_bitrate.store(ceiling, std::sync::atomic::Ordering::Relaxed);
+                    store_encode_dims(&qos_encode_dims, w0 as u32, h0 as u32);
                     mp4_cfg = None;
                     seq = 1;
                     byte_win.clear();
@@ -1388,10 +1643,22 @@ async fn run_desktop_pipeline(
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let capture_ms = (cap_local + clock_offset_ms).max(0) as u64;
+        // 编码尺寸守卫（MYS-2765 #5，热路径不得 panic）：编码器重建失败或新帧
+        // 比当前编码尺寸小时，转换侧的 `upscale unsupported` 断言会直接冲掉
+        // 整个桌面流。此时跳过本帧并留日志，下一拍的尺寸变更检测会重试重建。
+        if frame_below_encode_size(w, h, enc_w, enc_h) {
+            tracing::warn!(
+                frame = %format!("{w}x{h}"),
+                encode = %format!("{enc_w}x{enc_h}"),
+                "desktop frame smaller than encode size — skipping (encoder rebuild pending)"
+            );
+            frame_pool.release(std::mem::take(&mut fr.bgra));
+            continue;
+        }
         let mut i420 = if w == enc_w && h == enc_h {
-            color::bgra_to_i420(&fr.bgra, w, h, w * 4)
+            color::bgra_to_i420(&fr.bgra, w, h, stride)
         } else {
-            color::bgra_to_i420_scaled(&fr.bgra, w, h, w * 4, enc_w, enc_h)
+            color::bgra_to_i420_scaled(&fr.bgra, w, h, stride, enc_w, enc_h)
         };
         // R5 #127：帧 bgra 已消耗（转换完成），buffer 归还池复用（cap 保留）。
         frame_pool.release(std::mem::take(&mut fr.bgra));
@@ -1630,6 +1897,7 @@ async fn run_desktop_pipeline(
 
     tracing::info!("desktop capture stopped");
     (post)(serde_json::json!({ "type": "desktop:stopped", "payload": {} }));
+    exit_state.store(EXIT_STOPPED, Ordering::SeqCst);
 }
 
 fn avg_frame_bytes(byte_win: &VecDeque<u32>) -> f64 {
@@ -1637,6 +1905,40 @@ fn avg_frame_bytes(byte_win: &VecDeque<u32>) -> f64 {
         return 0.0;
     }
     byte_win.iter().map(|&b| b as f64).sum::<f64>() / byte_win.len() as f64
+}
+
+/// 编码节拍（min_gap）未满足时，等够余量之后该编码哪一帧。
+///
+/// MYS-2765 #2：`ThreadedFrameSource::try_latest()` 是 **take 语义**——取出来的
+/// 帧一 `continue` 就再也没人取回来，等于白丢一帧。旧实现「等余量 → continue」
+/// 在低 fps 节拍下（QoS 静态 1fps / 解码背压 15fps）丢帧比例极高：每一拍都把
+/// 已经拿到的内容帧扔掉，只有"不用等"的那一拍才真正编码，用户操作后的首帧
+/// 被推迟一整拍。
+///
+/// 正确语义：等够余量后重新看一眼抓帧线程，**有更新的帧就换成更新的**（追最新，
+/// 手上那帧归还 buffer 池），没有就编码手上这一帧——无论如何不能丢。
+fn pace_next_frame(
+    newer: Option<capture::Frame>,
+    current: capture::Frame,
+) -> Paced {
+    match newer {
+        Some(keep) => Paced::Replace {
+            dropped: current.bgra,
+            keep,
+        },
+        None => Paced::Keep(current),
+    }
+}
+
+/// [`pace_next_frame`] 的结果。
+enum Paced {
+    /// 没有更新的帧：编码手上这一帧。
+    Keep(capture::Frame),
+    /// 有更新的帧：编码新帧，`dropped` 是手上旧帧的 buffer（归还池）。
+    Replace {
+        dropped: Vec<u8>,
+        keep: capture::Frame,
+    },
 }
 
 /// ABR 天花板的基准码率（bps）：结合浏览器实测可用带宽 `bw`、编码器天花板
@@ -1714,7 +2016,12 @@ pub struct QosAdaptive {
     /// 首个 delay 样本后的用户 fps（None = 未收过样本）。
     delay_fps: Option<u32>,
     /// 距上次 ratio 调整的秒数累计（ADJUST_RATIO_INTERVAL=3s）。
-    ratio_elapsed_s: u32,
+    ///
+    /// MYS-2765 #3：必须是 **f32**。以前是 `u32` 且按
+    /// `elapsed_s.max(0.0) as u32` 累加——`elapsed_s` 是浏览器 250ms 采样间
+    /// 隔（0.25），`as u32` 每次都截断成 0，`ratio_elapsed_s` 永远到不了 3，
+    /// `adjust_ratio` 只在首样本那次跑过一次，整条比例环等于失效。
+    ratio_elapsed_s: f32,
     /// 本窗口编码帧数累计（DYNAMIC_SCREEN 判定，3s 一清）。
     frame_count_s: u32,
     /// 最近一次采样的动态屏判定（字节帧率 ≥ 2 帧/秒）。fps 决策用——动态
@@ -1770,7 +2077,10 @@ pub const QOS_BR_MIN: f32 = 0.2;
 pub const QOS_BR_MIN_HIGH_RESOLUTION: f32 = 0.1;
 /// MAX_BR_MULTIPLE=1.0：ratio 上限 = 当前质量档。
 pub const QOS_MAX_BR_MULTIPLE: f32 = 1.0;
-const QOS_ADJUST_RATIO_INTERVAL: u32 = 3; // 秒
+const QOS_ADJUST_RATIO_INTERVAL: f32 = 3.0; // 秒（f32：与 ratio_elapsed_s 同类型累加）
+/// 同一窗口的整数秒数，用于 DYNAMIC_SCREEN 的整窗帧数下限（见
+/// [`QosAdaptive::on_delay`]）。
+const QOS_ADJUST_RATIO_INTERVAL_SECS: u32 = 3; // 秒
 const QOS_DYNAMIC_SCREEN_THRESHOLD: u32 = 2; // 帧/秒
 const QOS_HISTORY_DELAY_LEN: usize = 2;
 /// 动态屏 fps 下限（用户铁律：动态画面永不因网络降帧；唯一允许降帧的信号
@@ -1823,7 +2133,7 @@ impl QosAdaptive {
             median_window: std::collections::VecDeque::new(),
             probe_window: std::collections::VecDeque::new(),
             delay_fps: None,
-            ratio_elapsed_s: 0,
+            ratio_elapsed_s: 0.0,
             frame_count_s: 0,
             dynamic: false,
             last_content_us: None,
@@ -2042,14 +2352,17 @@ impl QosAdaptive {
 
         // ── ratio（rustdesk update_display_data：send_counter 每秒累计，
         //    每 3s 调 adjust_ratio；首次样本也调一次）──
+        // MYS-2765 #3：秒数按 f32 累加。浏览器 250ms 上报一次，旧实现用
+        // `as u32` 累加每次都截断成 0，比例环 3s 阈值永远不达——只有首样本
+        // 那次 adjust_ratio 生效过。阈值比较也必须是 f32，否则同样被截断。
         self.frame_count_s += frame_count;
-        self.ratio_elapsed_s += elapsed_s.max(0.0) as u32;
+        self.ratio_elapsed_s += elapsed_s.max(0.0);
         if self.ratio_elapsed_s >= QOS_ADJUST_RATIO_INTERVAL {
-            self.ratio_elapsed_s = 0;
+            self.ratio_elapsed_s = 0.0;
             // DYNAMIC_SCREEN：3s 内编码 ≥ ADJUST_RATIO_INTERVAL×阈值 帧
             // （=每秒 ≥2 帧）才视为动态屏。
             let dynamic =
-                self.frame_count_s >= QOS_ADJUST_RATIO_INTERVAL * QOS_DYNAMIC_SCREEN_THRESHOLD;
+                self.frame_count_s >= QOS_ADJUST_RATIO_INTERVAL_SECS * QOS_DYNAMIC_SCREEN_THRESHOLD;
             self.frame_count_s = 0;
             self.adjust_ratio(dynamic);
         } else if first {
@@ -2304,6 +2617,21 @@ fn maybe_rescale(
     }
 }
 
+/// 新帧是否小于当前编码尺寸（MYS-2765 #5 热路径守卫的判定）。
+///
+/// 转换侧 [`color::bgra_to_i420_scaled`] 有 `upscale unsupported` 断言：编码器
+/// 重建失败（或换屏后新尺寸更小、重建还在重试）时，拿更小的帧进去会直接
+/// panic，把整个桌面流冲掉。这种情况必须跳过该帧并留日志，等下一拍的尺寸
+/// 变更检测重建编码器——丢一帧远好过整条流产。
+fn frame_below_encode_size(w: usize, h: usize, enc_w: usize, enc_h: usize) -> bool {
+    enc_w > w || enc_h > h
+}
+
+/// 实际编码分辨率打包写入共享原子（`w << 32 | h`，0 = 未知）。
+fn store_encode_dims(slot: &AtomicU64, w: u32, h: u32) {
+    slot.store(((w as u64) << 32) | (h as u64 & 0xffff_ffff), Ordering::Relaxed);
+}
+
 fn base64(data: &[u8]) -> String {
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     B64.encode(data)
@@ -2312,6 +2640,26 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用运行句柄：默认值等价旧版的直接参数（带宽=cfg.max_bps、fps=30、
+    /// QoS 1000‰、灰度/reqkey 关闭）。
+    fn test_shared(post: PostFn, bw: u64) -> RunShared {
+        RunShared {
+            post,
+            bandwidth: Arc::new(AtomicU64::new(bw)),
+            clock_offset_ms: 0,
+            fps_ctl: Arc::new(std::sync::atomic::AtomicU32::new(30)),
+            qos_scale: Arc::new(std::sync::atomic::AtomicU32::new(1000)),
+            qos_frames: Arc::new(AtomicU64::new(0)),
+            qos_bitrate: Arc::new(AtomicU64::new(0)),
+            qos_encode_dims: Arc::new(AtomicU64::new(0)),
+            gray: Arc::new(AtomicBool::new(false)),
+            idr_request: Arc::new(AtomicBool::new(false)),
+            reinit_request: Arc::new(AtomicBool::new(false)),
+            last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
+            exit_state: Arc::new(AtomicU8::new(EXIT_NONE)),
+        }
+    }
 
     /// BitrateGuard 状态机（MYS-886 瞬时码率爆发修复）：1s 滑窗实测字节率
     /// 超预算 → 收紧 QP 档（帧级快环）；低于预算 60% 且稳住 → 逐档恢复。
@@ -2974,19 +3322,393 @@ mod tests {
         let dm = DesktopManager::new(DesktopConfig::default());
         let post: PostFn = std::sync::Arc::new(|_| {});
         assert!(!dm.gray_enabled(), "gray defaults off");
-        assert!(!*dm.monochrome.read().unwrap(), "monochrome defaults off");
+        assert!(!dm.monochrome_now(), "monochrome defaults off (gray off)");
         dm.set_gray(true, post.clone()).await.unwrap();
         assert!(dm.gray_enabled());
-        // AV1 默认 codec：灰度开启 → monochrome 同步置位（重建流在 start 后）。
-        assert!(*dm.monochrome.read().unwrap());
+        // AV1 默认 codec：灰度开启 → 派生 monochrome 为真（重建流在 start 后）。
+        assert!(dm.monochrome_now());
         dm.set_gray(false, post).await.unwrap();
         assert!(!dm.gray_enabled());
-        assert!(!*dm.monochrome.read().unwrap());
+        assert!(!dm.monochrome_now());
     }
 
     fn budget(fps: f64) -> f64 {
         let cfg = DesktopConfig::default();
         cfg.max_bps as f64 / 8.0 / fps
+    }
+
+    // ── MYS-2765 修复回归 ─────────────────────────────────────────
+
+    /// #1 早退后 running 必须归零，且能再次 start 拉起（旧实现把 running
+    /// 永久留在 true，`start()` 直接 return，桌面再也开不起来）。
+    ///
+    /// 用 `capture=x11` 指向不存在的 DISPLAY 让 `capture::open_source` 失败
+    /// ——这就是旧实现里最典型的一条早退路径。
+    #[test]
+    fn test_start_after_early_exit_restarts() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dm = DesktopManager::new(DesktopConfig {
+                capture: "x11".to_string(),
+                // 大概率不存在的 display：open_source 必然返回 Err。
+                display: Some(":4899".to_string()),
+                ..DesktopConfig::default()
+            });
+            let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+            let p2 = posted.clone();
+            let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+
+            dm.start(post.clone()).await;
+            assert!(dm.is_running(), "start 后立即处于 running");
+
+            // 等早退发生：guard 必须清 running（最多 5s，X11 连接失败是立即的）。
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while dm.is_running() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                !dm.is_running(),
+                "循环早退后 running 必须归零，否则 start() 永远直接 return"
+            );
+
+            // 失败路径已广播 `desktop:started{error}`，浏览器知道原因。
+            {
+                let list = posted.lock().unwrap();
+                assert!(
+                    list.iter().any(|v| v["type"] == "desktop:started"
+                        && v["payload"]["error"].as_str().is_some()),
+                    "early exit must report started{{error}}, got {list:?}"
+                );
+            }
+
+            // 再次 start 必须真的重新拉起（不是被 running 卡住返回）。
+            dm.start(post.clone()).await;
+            assert!(dm.is_running(), "早退后再次 start 必须能重新拉起流");
+            dm.stop(post).await;
+            assert!(!dm.is_running(), "stop 后 running 归零");
+        });
+    }
+
+    /// #1 旧代任务退出不得清除新代的 running（否则新流被误标未运行，
+    /// 下一次 start 会拉起第二个编码循环）。
+    #[test]
+    fn test_superseded_generation_does_not_clear_running() {
+        let running = Arc::new(AtomicBool::new(true));
+        let generation = Arc::new(AtomicU64::new(2)); // 当前是第 2 代
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        {
+            // 第 1 代（已被取代）的任务收尾。
+            let _old = RunGuard {
+                generation: generation.clone(),
+                mine: 1,
+                running: running.clone(),
+                post: post.clone(),
+                exit_state: Arc::new(AtomicU8::new(EXIT_NONE)),
+            };
+        }
+        assert!(
+            running.load(Ordering::SeqCst),
+            "旧代退出必须保留新代的 running"
+        );
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "旧代退出不得广播 desktop:stopped（会误关新流）"
+        );
+        // 当前代退出才清 running，并补发 stopped。
+        {
+            let _cur = RunGuard {
+                generation: generation.clone(),
+                mine: 2,
+                running: running.clone(),
+                post: post.clone(),
+                exit_state: Arc::new(AtomicU8::new(EXIT_NONE)),
+            };
+        }
+        assert!(!running.load(Ordering::SeqCst), "当前代退出清 running");
+        let list = posted.lock().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["type"], "desktop:stopped");
+    }
+
+    /// #1 早退已广播 `desktop:started{error}` 时，guard 不再补一条
+    /// `desktop:stopped`（浏览器会对两者都退回终端，重复会多一次 toast）。
+    #[test]
+    fn test_guard_does_not_double_broadcast_after_started_error() {
+        let running = Arc::new(AtomicBool::new(true));
+        let generation = Arc::new(AtomicU64::new(1));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let exit_state = Arc::new(AtomicU8::new(EXIT_STARTED_ERROR));
+        {
+            let _g = RunGuard {
+                generation,
+                mine: 1,
+                running: running.clone(),
+                post,
+                exit_state,
+            };
+        }
+        assert!(!running.load(Ordering::SeqCst), "running 仍必须归零");
+        assert!(posted.lock().unwrap().is_empty(), "已报过错就不再补 stopped");
+    }
+
+    /// 编码尺寸未知（尚未启动过）时 encode_dims 返回 None，QoS 基准回落
+    /// 1080p——那是面板数值，不参与编码决策。
+    #[test]
+    fn test_encode_dims_unknown_before_start() {
+        let dm = DesktopManager::new(DesktopConfig::default());
+        assert_eq!(dm.encode_dims(), (None, None));
+    }
+
+    /// #7 QoS 用运行时档位与**实际编码分辨率**：`on_qos_delay` 回传的
+    /// `bitrate_kbps` 必须按真实编码尺寸 × 运行时质量档算，而不是启动 config
+    /// 与硬编码 1920x1080。720p 屏下按 1080p 算会把码率报高 2-3 倍。
+    #[test]
+    fn test_qos_uses_runtime_quality_and_encode_dims() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dm = DesktopManager::new(DesktopConfig::default()); // balanced
+            let post: PostFn = Arc::new(|_| {});
+            // 编码器在实际 1280x720 上跑起来（pipeline 会写这个值）。
+            store_encode_dims(&dm.qos_encode_dims, 1280, 720);
+            assert_eq!(dm.encode_dims(), (Some(1280), Some(720)));
+            let balanced = dm.qos_base_bps(Some(1280), Some(720), encoder::QUALITY_BALANCED);
+            let expected = encoder::target_bitrate(1280, 720, 0, encoder::QUALITY_BALANCED);
+            assert_eq!(balanced, expected.max(dm.config.min_bps), "基准按实际 720p 尺寸算");
+            let wrong_1080p = encoder::target_bitrate(1920, 1080, 0, encoder::QUALITY_BALANCED);
+            assert!(balanced < wrong_1080p, "不能按 1080p 报码率");
+
+            // 运行时切到 best 档：qos-ack 回传的码率必须恰好按
+            // 实际 720p × best 档算出。旧实现用启动 config(balanced) +
+            // 硬编码 1080p → 回传 ≈1389kbps，与这里期望的 1500 对不上。
+            dm.set_quality("best", 0, post.clone()).await.unwrap();
+            let (fps, scale, kbps, _) = dm.on_qos_delay(40, 40, 30, 0, 1).await;
+            assert!(fps >= 1 && scale >= 100);
+            let best = dm.qos_base_bps(Some(1280), Some(720), encoder::QUALITY_BEST);
+            assert!(best > balanced, "best 档基准高于 balanced");
+            // on_qos_delay 的回传值 = base_bps × 生效缩放‰ / 1000 / 1000。
+            let expected_kbps = best * (scale as u64) / 1000 / 1000;
+            assert!(
+                kbps.abs_diff(expected_kbps) <= 1,
+                "qos-ack 码率必须按运行时 best 档 × 实际 1280x720 算出：\
+                 got {kbps}, expected {expected_kbps}"
+            );
+            let stale_1080p_balanced =
+                encoder::target_bitrate(1920, 1080, 0, encoder::QUALITY_BALANCED) / 1000;
+            assert_ne!(
+                expected_kbps, stale_1080p_balanced,
+                "该用例必须能区分新旧基准（否则断言无意义）"
+            );
+
+            // 用户自定义硬顶优先于分辨率模型。
+            dm.set_quality("balanced", 2000, post).await.unwrap();
+            assert_eq!(
+                dm.qos_base_bps(Some(1280), Some(720), encoder::QUALITY_BALANCED),
+                2_000_000,
+                "自定义 kbps 硬顶优先"
+            );
+        });
+    }
+
+    /// #3 QoS 比例环：250ms 采样下 3s（12 次样本）内必须至少触发一次
+    /// `adjust_ratio`。旧实现用 `elapsed_s as u32` 累加，每次都截断成 0，
+    /// 阈值永远不达——比例环等于失效。用"拥塞后 ratio 是否真的下降"观测。
+    #[test]
+    fn test_qos_ratio_loop_triggers_on_250ms_samples() {
+        let mut q = QosAdaptive::new(QOS_BR_BALANCED);
+        let mut now = 5_000_000u64;
+        // 先建立健康基线并走满一个 3s 窗口（12 × 0.25s），让累加器归零。
+        for _ in 0..12 {
+            q.on_delay(40, 40, 30, 0.25, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            now += 250_000;
+        }
+        let healthy = q.current_ratio_permille();
+        assert_eq!(healthy, 1000, "健康期满档");
+        // 拥塞：e2e 与 probe 同步抬到 800ms，再喂 12 次 0.25s 样本（=3s）。
+        // 旧实现累加 `elapsed_s as u32` 每次截断成 0，这个窗口永不触发
+        // adjust_ratio，ratio 会一直停在 1000‰。
+        for _ in 0..12 {
+            q.on_delay(800, 800, 30, 0.25, &qos_ctx(QOS_BR_BALANCED, 600, now));
+            now += 250_000;
+        }
+        assert!(
+            q.current_ratio_permille() < healthy,
+            "250ms 采样 3s 内必须触发 adjust_ratio 并降码率，got {}‰",
+            q.current_ratio_permille()
+        );
+    }
+
+    /// #4 灰度/单色不得失步：AV1 开灰度 → 切 h264 → 关灰度 → 切回 av1，
+    /// 派生出的 monochrome 必须是 false。旧实现把 monochrome 存成独立字段，
+    /// 这条路径会残留 true——切回 AV1 后输出单色而 UI 显示灰度已关。
+    #[tokio::test]
+    async fn test_monochrome_derived_never_desyncs_from_gray() {
+        let dm = DesktopManager::new(DesktopConfig::default()); // codec=av1
+        let post: PostFn = Arc::new(|_| {});
+        dm.set_gray(true, post.clone()).await.unwrap();
+        assert!(dm.monochrome_now(), "AV1 + 灰度 → 单色");
+        dm.set_codec("h264", post.clone()).await.unwrap();
+        assert!(!dm.monochrome_now(), "H264 无 monochrome 能力 → 恒 false");
+        dm.set_gray(false, post.clone()).await.unwrap();
+        assert!(!dm.monochrome_now());
+        dm.set_codec("av1", post.clone()).await.unwrap();
+        assert!(
+            !dm.monochrome_now(),
+            "灰度已关，切回 AV1 不得输出单色（旧实现在这里失步）"
+        );
+        // 反向再验一次：AV1 + 灰度开启 → 派生为真。
+        dm.set_gray(true, post).await.unwrap();
+        assert!(dm.monochrome_now());
+    }
+
+    /// #5 奇数分辨率不再拒绝启动/不得 panic：1919x1079 的 BGRA 帧按偶数裁剪
+    /// （1918x1078）后必须能转换 + 编码出帧。裁剪只丢最后一列/行，其余像素
+    /// 不动——不是缩放。
+    #[test]
+    fn test_odd_resolution_frame_encodes_without_panic() {
+        let cfg = DesktopConfig {
+            fps: 15.0,
+            ..DesktopConfig::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let r2 = running.clone();
+        let src: Box<dyn capture::FrameSource> = Box::new(ModerateSource {
+            w: 1919,
+            h: 1079,
+            t: 0,
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let bw = cfg.max_bps;
+            let handle = tokio::spawn(run_desktop_pipeline(
+                cfg, r2, test_shared(post, bw), src, "test".to_string(),
+            ));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            running.store(false, Ordering::SeqCst);
+            let _ = handle.await;
+        });
+        let list = posted.lock().unwrap();
+        let started = list
+            .iter()
+            .find(|v| v["type"] == "desktop:started")
+            .expect("奇数分辨率必须能启动（旧实现直接报 must be even 退出）");
+        assert!(
+            started["payload"]["error"].is_null(),
+            "奇数分辨率不应报错，got {started:?}"
+        );
+        assert_eq!(started["payload"]["width"], 1918, "宽度裁剪到偶数");
+        assert_eq!(started["payload"]["height"], 1078, "高度裁剪到偶数");
+        let frags = list
+            .iter()
+            .filter(|v| v["type"] == "desktop:video" && v["payload"]["kind"] == "frag")
+            .count();
+        assert!(frags > 0, "裁剪后必须正常出帧，got {frags}");
+    }
+
+    /// #5 热路径守卫：新帧比当前编码尺寸小时必须跳过该帧，而不是撞上转换侧的
+    /// `upscale unsupported` 断言把整条流冲掉（`bgra_to_i420_scaled` 对
+    /// `w1 > w0` 直接 panic，panic 会终结整个编码任务）。
+    #[test]
+    fn test_frame_smaller_than_encode_size_is_skipped_not_panicked() {
+        // 编码器在 1920x1080（换屏前/重建前），新帧 1280x720 → 必须判定为跳过。
+        assert!(frame_below_encode_size(1280, 720, 1920, 1080), "更小的帧必须跳过");
+        assert!(frame_below_encode_size(1920, 1079, 1920, 1080), "单边更小也必须跳过");
+        // 同尺寸 / 更大尺寸 → 正常编码（更大尺寸由尺寸变更检测重建，不进这条守卫）。
+        assert!(!frame_below_encode_size(1920, 1080, 1920, 1080));
+        assert!(!frame_below_encode_size(2560, 1440, 1920, 1080));
+        // 断言本身确实会 panic（说明这个守卫不是多余的防御）。
+        let src = vec![0u8; 4 * 4 * 4];
+        let caught = std::panic::catch_unwind(|| {
+            color::bgra_to_i420_scaled(&src, 4, 4, 16, 8, 8)
+        });
+        assert!(caught.is_err(), "转换侧的 upscale 断言确实会 panic —— 守卫必须挡在前面");
+    }
+
+    /// #6 reqkey {reinit:true}：置标志后下一个编码帧必须重新携带 init 段
+    /// （`desktop:video{kind:init}`）。只补 IDR 不够——浏览器手里的参数集
+    /// 在流重建/token 吊销后已失效。
+    #[test]
+    fn test_reinit_request_resends_init_segment() {
+        let cfg = DesktopConfig {
+            fps: 15.0,
+            capture: "x11".to_string(), // 仅用于 config，下面直接注入 src
+            ..DesktopConfig::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let r2 = running.clone();
+        let shared = test_shared(post, cfg.max_bps);
+        let reinit = shared.reinit_request.clone();
+        let src: Box<dyn capture::FrameSource> = Box::new(ModerateSource {
+            w: 320,
+            h: 180,
+            t: 0,
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = tokio::spawn(run_desktop_pipeline(
+                cfg, r2, shared, src, "test".to_string(),
+            ));
+            // 等首个 init + 若干帧。
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let inits_before = count_inits(&posted);
+            assert_eq!(inits_before, 1, "启动只应有一个 init");
+            // 浏览器 reqkey {reinit:true}
+            reinit.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let inits_after = count_inits(&posted);
+            running.store(false, Ordering::SeqCst);
+            let _ = handle.await;
+            assert!(
+                inits_after > inits_before,
+                "reinit 后必须重发 init 段，before={inits_before} after={inits_after}"
+            );
+        });
+    }
+
+    fn count_inits(posted: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> usize {
+        posted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v["type"] == "desktop:video" && v["payload"]["kind"] == "init")
+            .count()
+    }
+
+    /// #2 min_gap 不丢帧：等编码余量时已经 `try_latest()` 取出的帧不能被丢弃
+    /// ——`try_latest` 是 take 语义，丢掉就再也没人取回来。旧实现在这里
+    /// `continue`，低 fps 节拍（QoS 静态 1fps / 背压 15fps）下每拍白丢一帧。
+    ///
+    /// 决策点已抽成 [`pace_next_frame`]，这里直接核对两种结果：无更新帧时
+    /// 必须**保留**手上帧（旧实现丢弃），有更新帧时换成新帧并归还旧 buffer。
+    #[test]
+    fn test_min_gap_does_not_drop_fetched_frame() {
+        let frame = |w: usize, tag: u8| capture::Frame {
+            bgra: vec![tag; w * 2 * 4],
+            width: w,
+            height: 2,
+        };
+        // 没有更新的帧：手上这帧必须被保留（旧实现在这一支直接丢弃）。
+        match pace_next_frame(None, frame(4, 1)) {
+            Paced::Keep(f) => assert_eq!(f.bgra[0], 1, "必须保留已取出的帧"),
+            Paced::Replace { .. } => panic!("没有新帧时不得丢弃手上这一帧"),
+        }
+        // 有更新的帧：换成新帧，旧帧 buffer 交回池（不泄漏、不误用旧内容）。
+        match pace_next_frame(Some(frame(4, 9)), frame(4, 1)) {
+            Paced::Keep(_) => panic!("有更新帧时应追最新"),
+            Paced::Replace { dropped, keep } => {
+                assert_eq!(keep.bgra[0], 9, "编码的是更新的那一帧");
+                assert_eq!(dropped[0], 1, "旧帧 buffer 归还池");
+            }
+        }
     }
 
     #[test]
@@ -3371,18 +4093,9 @@ mod tests {
             let handle = tokio::spawn(run_desktop_pipeline(
                 cfg,
                 running,
-                post,
+                test_shared(post, bw),
                 src,
-                Arc::new(std::sync::atomic::AtomicU64::new(bw)),
                 "test".to_string(),
-                0,
-                Arc::new(std::sync::atomic::AtomicU32::new(30)),
-                Arc::new(std::sync::atomic::AtomicU32::new(1000)),
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
             ));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
@@ -3422,9 +4135,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now()))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, test_shared(post, bw), src, "test".to_string()));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -3461,9 +4172,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(15)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now()))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, test_shared(post, bw), src, "test".to_string()));
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;
@@ -3508,9 +4217,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let bw = cfg.max_bps;
-            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, post, src, Arc::new(std::sync::atomic::AtomicU64::new(bw)), "test".to_string(), 0, Arc::new(std::sync::atomic::AtomicU32::new(30)), Arc::new(std::sync::atomic::AtomicU32::new(1000)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now()))));
+            let handle = tokio::spawn(run_desktop_pipeline(cfg, r2, test_shared(post, bw), src, "test".to_string()));
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             running.store(false, Ordering::SeqCst);
             let _ = handle.await;

@@ -2837,7 +2837,22 @@ async fn run_session(
                                     // 浏览器请求关键帧（接入/参考链断裂/解码错误，
                                     // 对齐 rustdesk 控制端 refresh_video）：置 flag，
                                     // 编码循环下一拍 force_idr 即时重同步。
-                                    desktop.request_idr();
+                                    //
+                                    // MYS-2765 #6：`{reinit:true}`（token 吊销 / 流
+                                    // 被 relay 重建后浏览器手里的 init 已失效，
+                                    // web/desktop.js 会带这个字段）还要重发 init 段
+                                    // ——只补 IDR 不足以让浏览器重建解码器。payload
+                                    // 无 reinit 时行为不变（仅 IDR）。
+                                    let reinit = msg
+                                        .payload
+                                        .get("reinit")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    if reinit {
+                                        desktop.request_reinit();
+                                    } else {
+                                        desktop.request_idr();
+                                    }
                                 }
 
                                 #[cfg(feature = "desktop")]
