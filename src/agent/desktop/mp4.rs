@@ -253,24 +253,28 @@ fn av1_level_to_idx(level: u8) -> u8 {
 ///   seq_tier_0(1) high_bitdepth(1) twelve_bit(1) monochrome(1)
 ///     chroma_subsampling_x(1) chroma_subsampling_y(1) chroma_sample_position(2)
 ///   reserved(3) initial_presentation_delay_present(1) reserved(4)
+///
+/// 第三字节位序（MSB→LSB）:
+///   bit7 tier · bit6 high_bitdepth · bit5 twelve_bit · bit4 monochrome
+///   bit3 chroma_subsampling_x · bit2 chroma_subsampling_y · bit1-0 sample_position
 fn av1c(profile: u8, level: u8, monochrome: bool) -> Vec<u8> {
     let mut p = Vec::new();
     p.push(0x81); // marker=1, version=1
     p.push((profile << 5) | av1_level_to_idx(level)); // profile + level_idx
-    // 8-bit 4:2:0: tier=0 high=0 twelve=0 mono=? x=1 y=1 pos=2（colocated）。
-    // chroma_sample_position=2 与编码端 2x2 左上采样一致（color.rs step_by(2)），
-    // 也与 AV1 序列头的 chroma_sample_position（AOM_CSP_COLOCATED=2）同步——
-    // 两侧信令一致，解码端按 colocated 重建，避免半像素色度偏移。
-    // mono=1（MYS-954 灰度）：码流无色度平面，av1C mono 位必须置 1 与
-    // 序列头一致，否则解码器按彩色 I420 输出 → 色度平面无数据 → 全屏色噪。
-    let mut flags = 0b0000_1010u8; // x=1 y=1 pos=2(10)
-    if monochrome {
-        flags |= 0b0001_0000; // monochrome=1
-        // mono 时 chroma_subsampling_x/y 与 sample_position 都应清 0
-        // （无色度可言）。布局：tier(1) high(1) twelve(1) mono(1)
-        // x(1) y(1) pos(2)→ x/y 是位 2-3，pos 是位 0-1。
-        flags &= !0b0000_1111;
-    }
+    // MYS-2765 #8：位值按 AV1 规范填，此前两个分支都少算了一位——
+    // - 彩色 8-bit 4:2:0，chroma_sample_position=2（colocated，与编码端 2x2
+    //   左上采样 color.rs step_by(2) 及序列头 AOM_CSP_COLOCATED 一致）：
+    //   x=1 y=1 pos=2 → 0b0000_1110 = 0x0E
+    // - 单色（MYS-954 灰度，码流无色度平面）：mono=1，且 AV1 规范规定单色时
+    //   subsampling_x/y **恒为 1**、sample_position 恒为 0（UNKNOWN）：
+    //   → 0b0001_1100 = 0x1C
+    // 旧值 0x0A / 0x10 把 x/y 写成了 0/1，解码端按错误的色度几何重建 →
+    // 半像素色度偏移 / 单色流色度越界色噪。
+    let flags = if monochrome {
+        0b0001_1100u8 // mono=1, x=1, y=1, pos=0
+    } else {
+        0b0000_1110u8 // mono=0, x=1, y=1, pos=2 (colocated)
+    };
     p.push(flags);
     p.push(0); // no initial_presentation_delay
     box_of(b"av1C", &p)
@@ -720,11 +724,37 @@ mod tests {
         let pos = init.windows(4).position(|w| w == b"av1C").unwrap();
         assert_eq!(init[pos + 4], 0x81);
         assert_eq!(init[pos + 5], (0u8 << 5) | 4u8, "profile0 level30 -> seq_level_idx 4");
-        assert_eq!(init[pos + 6], 0b0000_1010, "彩色 4:2:0 8-bit, chroma colocated(2)");
-        // mono 变体（MYS-954 灰度）：av1C mono 位必须置 1、chroma 位清 0。
+        assert_eq!(init[pos + 6], 0b0000_1110, "彩色 4:2:0 8-bit, x=1 y=1 chroma colocated(2)");
+        // mono 变体（MYS-954 灰度）：av1C mono 位必须置 1；AV1 规范规定单色时
+        // chroma_subsampling_x/y 恒为 1、sample_position 恒为 0（MYS-2765 #8）。
         let mono_init = mp4_init_segment(&av1_mono_cfg());
         let mpos = mono_init.windows(4).position(|w| w == b"av1C").unwrap();
-        assert_eq!(mono_init[mpos + 6], 0b0001_0000, "mono=1, chroma_x/y=0");
+        assert_eq!(mono_init[mpos + 6], 0b0001_1100, "mono=1, chroma_x/y=1, pos=0");
+    }
+
+    /// MYS-2765 #8：av1C 第三字节（fmt flags）逐位核对——彩色 4:2:0 colocated
+    /// 是 `0b0000_1110`（x=1 y=1 pos=2），单色是 `0b0001_1100`（mono=1 x=1
+    /// y=1 pos=0，AV1 规范单色时 subsampling 恒为 1）。旧值 0x0A/0x10 把色度
+    /// 几何写错一位，解码端按错误采样位置重建。
+    #[test]
+    fn test_av1c_chroma_flags_bytes() {
+        // 直接核对 box 内容：av1C payload = [0x81, profile|level, flags, 0]。
+        let color = av1c(0, 30, false);
+        // box: size(4) + "av1C"(4) + payload
+        assert_eq!(&color[4..8], b"av1C");
+        assert_eq!(color[8], 0x81, "marker+version");
+        assert_eq!(color[10], 0x0E, "彩色 4:2:0 colocated: x=1 y=1 pos=2");
+        let mono = av1c(0, 30, true);
+        assert_eq!(mono[10], 0x1C, "单色: mono=1 x=1 y=1 pos=0");
+        // 位级拆解再确认一遍，避免"改对了数值但注释写错"。
+        assert_eq!(color[10] >> 4 & 1, 0, "彩色 mono 位为 0");
+        assert_eq!(mono[10] >> 4 & 1, 1, "单色 mono 位为 1");
+        assert_eq!(color[10] >> 3 & 1, 1, "彩色 subsampling_x=1");
+        assert_eq!(color[10] >> 2 & 1, 1, "彩色 subsampling_y=1");
+        assert_eq!(color[10] & 0b11, 2, "彩色 sample_position=2(colocated)");
+        assert_eq!(mono[10] >> 3 & 1, 1, "单色 subsampling_x 恒为 1");
+        assert_eq!(mono[10] >> 2 & 1, 1, "单色 subsampling_y 恒为 1");
+        assert_eq!(mono[10] & 0b11, 0, "单色 sample_position=0");
     }
 
     #[test]
