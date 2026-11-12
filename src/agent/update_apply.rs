@@ -2940,45 +2940,18 @@ fn await_registration_receipt(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // 管道 EOF = 进程退出（或关掉了 stderr）。先把缓冲里可能还没取的
-                // 回执排空（`complete()` 之后立刻 exit 是正常路径），再下结论。
-                while let Ok(line) = rx.try_recv() {
-                    if let Some(version) = parse_registered_marker(&line, expected_upgrade_id) {
-                        result = Ok(version);
-                        break;
-                    }
-                }
-                if result.is_err() {
-                    result = Err(match child.try_wait() {
-                        Ok(Some(status)) => format!(
-                            "the restarted process exited early ({status}) before reporting \
-                             registration"
-                        ),
-                        // 管道被关但进程还在：可能只是重定向了 stderr，继续等超时。
-                        _ => format!(
-                            "the restarted process closed stderr without reporting registration \
-                             within {timeout:?}"
-                        ),
-                    });
-                }
+                // Disconnected is delivered only after all queued lines have been read.
+                // Keep every receipt on the same validation path above, including receipts
+                // buffered before the child exited. try_wait/try_recv cannot synchronize
+                // with the pump: it may still be reading the kernel pipe.
+                result = Err(match child.try_wait() {
+                    Ok(Some(status)) => format!(
+                        "the restarted process exited early ({status}) before reporting registration"
+                    ),
+                    _ => "the restarted process closed stderr without reporting registration".into(),
+                });
                 break;
             }
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            // 进程已经退出：管道里可能还有没读到的回执（`complete()` 之后
-            // 立刻 exit），先把缓冲排空再下结论。
-            while let Ok(line) = rx.try_recv() {
-                if let Some(version) = parse_registered_marker(&line, expected_upgrade_id) {
-                    result = Ok(version);
-                    break;
-                }
-            }
-            if result.is_err() {
-                result = Err(format!(
-                    "the restarted process exited early ({status}) before reporting registration"
-                ));
-            }
-            break;
         }
     }
     drop(reader);

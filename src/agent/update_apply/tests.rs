@@ -4517,3 +4517,40 @@ mod coordinated_early_consume {
         );
     }
 }
+
+
+#[cfg(unix)]
+#[test]
+fn test_buffered_receipt_after_exit_requires_consumed_handoff() {
+    check_buffered_receipt_after_exit(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_buffered_receipt_after_exit_accepts_consumed_handoff() {
+    check_buffered_receipt_after_exit(true);
+}
+
+#[cfg(unix)]
+fn check_buffered_receipt_after_exit(consumed: bool) {
+    let dir = TmpDir::new("receipt-exited");
+    let handoff = dir.join("handoff.json");
+    if !consumed {
+        std::fs::write(&handoff, b"{}").unwrap();
+    }
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "echo startup >&2; echo 'shell-remote: upgrade-registered upgrade_id=exited version=1 session=test' >&2"])
+        .stderr(std::process::Stdio::piped())
+        .spawn().unwrap();
+    // Exit before the reader starts: both lines remain buffered in the kernel pipe.
+    child.wait().unwrap();
+    let result = await_registration_receipt(
+        &mut child, &handoff, "exited", &dir.join("helper.log"), Duration::from_secs(3),
+    );
+    if consumed {
+        assert_eq!(result.unwrap(), "1");
+    } else {
+        assert!(result.unwrap_err().contains("not consumed"));
+        assert!(handoff.exists());
+    }
+}
