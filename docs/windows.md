@@ -75,4 +75,4 @@ cargo build --release --bin shell-remote-ui --target x86_64-pc-windows-gnu
 | 登录 shell 环境（`/etc/profile`） | ✅ | 不适用（无该概念） |
 | 命令日志的密码输入过滤 | ✅（termios + 前台进程组） | ❌ 记录全部输入 |
 | 升级的 `--version` 冒烟测试 | ✅ | 跳过（以 SHA-256 为准） |
-| 换机助手（原子自升级） | ✅ | ✅ 交叉编译验证，`OpenProcess` / DACL 路径未在实机跑过 |
+| 换机助手（原子自升级） | ✅ | ⚠️ wine 下走通了下载/校验/替换/注册链路；交接文件的私有 DACL 用 SDK 类型构造并 readback 验证，Win10 真机仍待复验 |

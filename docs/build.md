@@ -1,22 +1,46 @@
 # 编译与交叉编译
 
-本仓库发布 4 个平台的 musl 静态单文件二进制：`x86_64` / `aarch64` / `armv7`（Linux musl）与 `x86_64`（Windows GNU）。每个平台产出 CLI 与 UI 两个二进制。
+本仓库发布 4 个平台的**两种链接形态**，每个平台各产出 CLI 与 UI 两个二进制：
+
+| 制品 | 平台 | 链接形态 |
+|---|---|---|
+| CLI `shell-remote-<arch>` | Linux x86_64 / aarch64 / armv7 | **musl 静态**（任何发行版直接跑，含 Alpine） |
+| CLI `shell-remote-x86_64.exe` | Windows x86_64 | GNU/mingw，静态 C++ |
+| UI `shell-remote-ui-<arch>` | Linux x86_64 / aarch64 / armv7 | **GNU/glibc 动态**（Ubuntu 22.04 / glibc 2.35 基线） |
+| UI `shell-remote-ui-x86_64.exe` | Windows x86_64 | GNU/mingw，GUI subsystem，静态 C++ |
+
+**Linux UI 为什么不能是 musl 静态**（MYS-2821）：窗口 GUI 走
+`eframe→winit→x11-dl`，在运行时 `dlopen` libX11 / libxkbcommon / libGL。
+musl 静态二进制不支持加载共享对象，窗口必定失败：
+
+```text
+Error: 窗口初始化失败: ... Failed to load one of xlib's shared libraries
+```
+
+同一份代码用 glibc 动态链接构建就能正常开窗。因此 Linux UI 必须动态链接
+glibc，代价是需要 glibc ≥ 2.35 与 X11/GL/XKB 运行库，**不能在 Alpine/musl 上
+直接运行**。CLI 不受影响。
 
 ## 前置依赖
 
 自 v0.19.0 起 agent 通过 `openh264-sys2` 的 `source` feature 内联编译 OpenH264 的 C++ 源码，因此 UI 构建需要：
 
 1. 可用的 C++ 编译器（`g++` / `clang++`）
-2. 目标平台的 C 链接器（Linux 用 `musl-gcc`，Windows 用 `x86_64-w64-mingw32-g++`）
-3. **不需要** NASM / yasm
+2. 目标平台的 C 链接器（Linux CLI 用 `musl-gcc`；Linux UI 用对应的 GNU
+   `gcc`，在基线容器里；Windows 用 `x86_64-w64-mingw32-g++`）
+3. **不需要** NASM / yasm（libaom 构建才需要 nasm）
+4. **Linux UI 需要 docker**：构建在固定基线的 Ubuntu 22.04 容器里跑，保证
+   产物的 GLIBC 要求不超过 2.35
 
 ```bash
 sudo apt install g++
 rustup target add x86_64-unknown-linux-musl
 rustup target add aarch64-unknown-linux-musl
 rustup target add armv7-unknown-linux-musleabihf
+rustup target add x86_64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
+rustup target add armv7-unknown-linux-gnueabihf
 sudo apt install musl-tools
-sudo apt install gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 ```
 
 Fedora 用 `sudo dnf install musl-gcc`，Alpine 用 `apk add musl-dev`。

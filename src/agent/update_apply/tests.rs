@@ -4554,3 +4554,101 @@ fn check_buffered_receipt_after_exit(consumed: bool) {
         assert!(handoff.exists());
     }
 }
+
+// ── Windows 交接文件 DACL（MYS-2821 修复的回归）────────────────────
+//
+// 修复前这里是一个 `#[repr(C, align(8))] struct SecDesc([u8; 32])`：
+// x64 的 SECURITY_DESCRIPTOR 是 40 字节、Dacl 偏移 32，于是
+// `InitializeSecurityDescriptor` 把末尾 8 字节写到缓冲区之外，踩坏栈上相邻
+// 数据，后续 `SetFileSecurityW` 报 998（ERROR_NOACCESS）。
+//
+// 这几个用例只断言**结构尺寸**与**真实 readback 出来的 DACL**，不看 API 返回
+// 值——返回值成功但权限没落地，正是最容易漏掉的那类缺陷。
+#[cfg(windows)]
+mod windows_handoff_dacl {
+    use super::*;
+    use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
+
+    /// SDK 类型必须是 x64 上的 40 字节、Dacl 在偏移 32。手写长度的那版是 32，
+    /// 正好少一个指针——这条断言就是防止有人再把长度写死。
+    #[test]
+    fn security_descriptor_layout_matches_sdk() {
+        assert_eq!(
+            core::mem::size_of::<SECURITY_DESCRIPTOR>(),
+            if cfg!(target_pointer_width = "64") { 40 } else { 20 },
+            "SECURITY_DESCRIPTOR 尺寸必须由 SDK 类型决定，不能手写"
+        );
+        assert_eq!(
+            core::mem::offset_of!(SECURITY_DESCRIPTOR, Dacl),
+            if cfg!(target_pointer_width = "64") { 32 } else { 16 },
+            "Dacl 偏移必须是 SDK 的真实布局"
+        );
+    }
+
+    /// 交接文件写出来之后：DACL 只含当前用户（父目录继承被断开），
+    /// 文件确实可读回。用 GetNamedSecurityInfo 现场读，不信 SetFileSecurity 的返回值。
+    #[test]
+    fn handoff_file_dacl_is_private_and_protected() {
+        use windows_sys::Win32::Security::Authorization::{
+            GetNamedSecurityInfoW, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            GetAclInformation, GetSecurityDescriptorControl, ACL_SIZE_INFORMATION, AclSizeInformation,
+            DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+
+        let dir = TmpDir::new("win-dacl");
+        let dir = dir.path();
+        let path = dir.join("handoff-dacl.json");
+        write_private_new(&path, b"{}").expect("write handoff");
+
+        let wide: Vec<u16> = {
+            use std::os::windows::ffi::OsStrExt;
+            path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        };
+        unsafe {
+            let mut acl = std::ptr::null_mut();
+            let mut sd = std::ptr::null_mut();
+            let rc = GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut acl,
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            assert_eq!(rc, 0, "GetNamedSecurityInfoW rc={rc}");
+
+            // 1) 继承必须断开：这是"其它用户读不到"的前提。
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            assert_ne!(
+                GetSecurityDescriptorControl(sd, &mut control, &mut revision),
+                0
+            );
+            assert_ne!(
+                control & SE_DACL_PROTECTED,
+                0,
+                "交接文件的 DACL 必须是受保护的（父目录 ACE 不再继承）"
+            );
+
+            // 2) 必须恰好一个 ACE，且就是当前用户。
+            let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+            assert_ne!(
+                GetAclInformation(acl.cast(), (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    core::mem::size_of::<ACL_SIZE_INFORMATION>() as u32, AclSizeInformation),
+                0
+            );
+            assert_eq!(info.AceCount, 1, "只应有当前用户一个 ACE");
+
+            windows_sys::Win32::Foundation::LocalFree(sd.cast());
+        }
+
+        // 3) 文件内容仍能读回（收紧权限不能把所有者自己锁在外面）。
+        let back = std::fs::read(&path).expect("read back handoff");
+        assert_eq!(back, b"{}");
+        let _ = std::fs::remove_file(&path);
+    }
+}

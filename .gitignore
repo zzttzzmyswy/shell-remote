@@ -2,6 +2,9 @@ target/
 # 构建产物：发布二进制（tools/build-dist.sh 输出）与 Windows manifest 中间
 # 产物（windres 输出），均由脚本生成，不进版本库。
 dist/
+# GNU/glibc UI 的构建产物与独立 target 目录（MYS-2821：Linux UI 改 GNU 形态）
+dist-gnu/
+target-gnu/
 build/
 .superpowers/
 releases/
