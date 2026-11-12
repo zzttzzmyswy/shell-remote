@@ -1,7 +1,9 @@
-// UI 二进制：仅 agent 模式（终端 + 桌面转发）。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+// UI 二进制：无参数打开配置窗口；保留内部助手及旧 agent 调用。
 //
 // 与 CLI 二进制（shell-remote）的差别：
-// - 只提供 agent 子命令；带全部 --desktop-* 参数（capture/codec/fps/码率/
+// - 配置窗口带全部桌面选项；旧 agent 调用保留 --desktop-* 参数（capture/codec/fps/码率/
 //   选屏/灰度/LAN 直连等），供带桌面转发需求的设备 agent 使用。
 // - 构建必须启用 desktop feature（`cargo build --bin shell-remote-ui` 或
 //   默认 features）；lean 构建（--no-default-features）时该 bin 被跳过。
@@ -13,6 +15,9 @@ use shell_remote::{agent, proto::TokenType};
 #[derive(Parser)]
 #[command(name = "shell-remote-ui", about = "shell-remote UI agent (terminal + desktop sharing)", version)]
 struct Cli {
+    /// Internal restore intent for an argument-less GUI upgrade.
+    #[arg(long, hide = true)]
+    upgrade_restore: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -191,7 +196,7 @@ fn main() -> anyhow::Result<()> {
         }
         shell_remote::install_panic_hook();
         let _log_guard = shell_remote::init_logging();
-        return shell_remote::gui::configure();
+        return shell_remote::gui::configure(cli.upgrade_restore.as_deref());
     };
 
     // 换机助手必须在这里分流，**先于任何 tracing 初始化与版本打印**。
@@ -422,6 +427,15 @@ mod startup_tests {
     #[test]
     fn no_arguments_selects_configuration_window() {
         assert!(Cli::try_parse_from(["shell-remote-ui"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn internal_restore_selects_configuration_window() {
+        let parsed = Cli::try_parse_from([
+            "shell-remote-ui", "--upgrade-restore", "handoff.json",
+        ]).unwrap();
+        assert!(parsed.command.is_none());
+        assert_eq!(parsed.upgrade_restore.as_deref(), Some("handoff.json"));
     }
 
     #[test]

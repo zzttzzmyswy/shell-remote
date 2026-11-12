@@ -2,18 +2,19 @@
 use crate::{status::Phase, ui_config::UiConfig, ui_controller::UiController};
 use eframe::egui::{self, Color32, RichText};
 
-pub fn configure() -> anyhow::Result<()> {
+pub fn configure(restore_flag: Option<&str>) -> anyhow::Result<()> {
+    let resume = crate::ui_resume::resolve_gui_resume(restore_flag)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("shell-remote · 连接设置")
-            .with_inner_size([720.0, 740.0])
+            .with_inner_size([720.0, 660.0])
             .with_min_inner_size([480.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
         "shell-remote",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             super::install_cjk_font(&cc.egui_ctx);
             cc.egui_ctx.all_styles_mut(|style| {
                 style
@@ -36,7 +37,7 @@ pub fn configure() -> anyhow::Result<()> {
                     Color32::from_gray(40)
                 };
             });
-            Ok(Box::new(ConfigApp::new()))
+            Ok(Box::new(ConfigApp::new(resume)?))
         }),
     )
     .map_err(|e| anyhow::anyhow!("窗口初始化失败：{e}"))
@@ -55,22 +56,29 @@ struct ConfigApp {
 }
 
 impl ConfigApp {
-    fn new() -> Self {
-        let (draft, error) = match UiConfig::load(&UiConfig::default_path()) {
-            Ok(config) => (config, None),
-            Err(e) => (UiConfig::default(), Some(format!("{e:#}"))),
+    fn new(resume: Option<crate::ui_resume::GuiResume>) -> anyhow::Result<Self> {
+        let mut controller = UiController::new();
+        let (draft, error, notice) = if let Some(resume) = resume {
+            let config = resume.config_with_key();
+            controller.connect_restored(config.clone(), resume.identity)?;
+            (config, None, Some("正在恢复升级前的连接…".into()))
+        } else {
+            match UiConfig::load(&UiConfig::default_path()) {
+                Ok(config) => (config, None, None),
+                Err(e) => (UiConfig::default(), Some(format!("{e:#}")), None),
+            }
         };
-        Self {
+        Ok(Self {
             load_failed: error.is_some(),
             draft,
             error,
-            controller: UiController::new(),
-            notice: None,
+            controller,
+            notice,
             show_key: false,
             show_tokens: false,
             stopping: false,
             closing: false,
-        }
+        })
     }
 
     fn message(&mut self, result: anyhow::Result<()>, success: &str) {
@@ -276,6 +284,14 @@ impl eframe::App for ConfigApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.controller.poll();
         let running = self.controller.is_running();
+        if self.controller.status().map(|s| s.phase()) == Some(Phase::Connected)
+            && matches!(
+                self.notice.as_deref(),
+                Some("正在连接，请稍候…" | "正在恢复升级前的连接…")
+            )
+        {
+            self.notice = None;
+        }
         if !running {
             self.stopping = false;
         }
@@ -380,7 +396,10 @@ impl eframe::App for ConfigApp {
                     }
                 });
                 ui.add_space(6.0);
-                ui.small(format!("v{} · 启动时不自动连接", env!("CARGO_PKG_VERSION")));
+                ui.small(format!(
+                    "v{} · 普通启动不自动连接",
+                    env!("CARGO_PKG_VERSION")
+                ));
                 ui.add_space(6.0);
             });
         egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24)).show(ctx, |ui| {

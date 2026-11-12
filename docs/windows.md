@@ -20,6 +20,12 @@ irm http://your-relay:3000/agent/install.ps1 | iex
 
 ## 启动
 
+带界面的版本 `shell-remote-ui-x86_64.exe` 直接双击启动，无需命令行参数。在窗口中填写 Relay 地址、可选固定密钥和会话 ID；Shell、文件根目录、命令日志和桌面参数位于“高级设置”。点击“连接”开始，断开后可以修改设置再连接。
+
+“保存设置”写入用户目录下的 `.shell-remote\ui-config.json`（优先使用 `HOME`，否则使用 `%USERPROFILE%`），不保存固定密钥。普通启动只加载设置，不自动连接；由自升级或回滚触发的重启会恢复升级前的活动配置与身份。关闭窗口会断开并清理本次连接。
+
+不带界面的 CLI 版本继续使用：
+
 ```powershell
 shell-remote.exe agent --relay-url http://your-relay:3000 --key YourFixedKey
 ```
