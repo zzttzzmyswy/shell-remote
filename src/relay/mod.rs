@@ -546,6 +546,29 @@ impl SharedState {
     }
 }
 
+/// Recheck a candidate after waiting for registration or another cleanup.
+async fn reap_idle_session(state: &SharedState, sid: &str, now: Instant) -> bool {
+    let _register_guard = state.register_tx.lock().await;
+    if !state.sessions.is_temporary(sid).await {
+        return false;
+    }
+    let still_idle = state.last_activity.read().await.get(sid).is_some_and(|last| {
+        now.saturating_duration_since(*last) > Duration::from_secs(1800)
+    });
+    if !still_idle {
+        return false;
+    }
+    tracing::info!("Idle timeout: removing session {}", sid);
+    state.pending_mcp.write().await.retain(|_, (owner, _)| owner != sid);
+    state.sessions.remove(sid).await;
+    state.agent_broadcast.write().await.remove(sid);
+    remove_session_state(state, sid).await;
+    if let Some(rec) = &state.recorder {
+        rec.close(sid);
+    }
+    true
+}
+
 /// 统一清理某个 sid 在**所有** per-session map 中的条目。
 ///
 /// 会话消失（空闲回收 / admin kick / 注册驱逐旧会话）时必须走这里：单个
@@ -648,6 +671,37 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, Request};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_idle_reaper_preserves_refreshed_temporary_session() {
+        let state = SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None);
+        let registered = state.sessions.register(None, "rw", Some("reap01".into())).await.unwrap();
+        let scan_time = Instant::now();
+        state.last_activity.write().await.insert("reap01".into(), scan_time - Duration::from_secs(1900));
+        // The scan picked this sid, but the cached-token reconnect completed first.
+        state.sessions.register_existing(registered.tokens, Some("reap01".into())).await.unwrap();
+        state.last_activity.write().await.insert("reap01".into(), Instant::now());
+        assert!(state.sessions.is_temporary("reap01").await);
+        assert!(!reap_idle_session(&state, "reap01", scan_time).await,
+            "a stale idle candidate must not delete a freshly reconnected temporary session");
+        assert!(state.sessions.get("reap01").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_idle_reaper_removes_only_expired_temporary_sessions() {
+        let state = SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None);
+        let now = Instant::now();
+        state.sessions.register(None, "rw", Some("reap02".into())).await.unwrap();
+        state.sessions.register(Some("fixed-key".into()), "rw", Some("reap03".into())).await.unwrap();
+        for sid in ["reap02", "reap03"] {
+            state.last_activity.write().await.insert(sid.into(), now - Duration::from_secs(1900));
+        }
+        assert!(reap_idle_session(&state, "reap02", now).await);
+        assert!(state.sessions.get("reap02").await.is_none());
+        assert!(!state.last_activity.read().await.contains_key("reap02"));
+        assert!(!reap_idle_session(&state, "reap03", now).await);
+        assert!(state.sessions.get("reap03").await.is_some());
+    }
 
     #[test]
     fn test_rate_limiter_namespaced_keys_do_not_interfere() {
@@ -2787,37 +2841,7 @@ pub async fn start(
                     }
                 }
                 for session_id in to_remove {
-                    if !state_clone.sessions.is_temporary(&session_id).await {
-                        continue;
-                    }
-                    // 与注册事务互斥（MYS-2806 review 1/2）：空闲回收同样会
-                    // 「删会话 → 清多张表」，必须与注册串行，否则会在注册
-                    // 过程中抹掉刚写入的新会话状态。锁在逐个会话内取，避免
-                    // 长时间独占阻塞注册。
-                    let _register_guard = state_clone.register_tx.lock().await;
-                    // 拿到锁后重判：期间可能已被重新注册成新 incarnation，
-                    // 那就不再是「空闲可回收」的会话。
-                    if !state_clone.sessions.is_temporary(&session_id).await {
-                        continue;
-                    }
-                    tracing::info!("Idle timeout: removing session {}", session_id);
-                    {
-                        let mut pending = state_clone.pending_mcp.write().await;
-                        pending.retain(|_rid, (sid, _tx)| sid != &session_id);
-                    }
-                    state_clone.sessions.remove(&session_id).await;
-                    state_clone
-                        .agent_broadcast
-                        .write()
-                        .await
-                        .remove(&session_id);
-                    // 所有按 sid 索引的状态表统一清理（遥测/桌面/事件缓冲等），
-                    // 否则漏掉的表会随会话数单调增长。
-                    remove_session_state(&state_clone, &session_id).await;
-                    // Flush + close the recording file, if any.
-                    if let Some(rec) = &state_clone.recorder {
-                        rec.close(&session_id);
-                    }
+                    reap_idle_session(&state_clone, &session_id, now).await;
                 }
 
                 // Reap stale download sinks (>5min no activity).

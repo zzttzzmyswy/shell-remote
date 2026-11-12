@@ -179,7 +179,7 @@ fetch_old_binary() { # $1 版本（形如 0.59.8）→ stdout 打印路径
 
 # 全局：DIR VER COMBO PORT BASE PW KEY SID RELAY_BIN AGENT_BIN RELAY_ARGS AGENT_ARGS
 start_relay() { # $1 日志文件
-  env HOME="$DIR/relay-home" "$RELAY_BIN" "${RELAY_ARGS[@]}" > "$1" 2>&1 &
+  env SR_LOG_DIR='' "$RELAY_BIN" "${RELAY_ARGS[@]}" > "$1" 2>&1 &
   RELAY_PID=$!
   LIVE_PIDS+=("$RELAY_PID")
   local n
@@ -193,7 +193,7 @@ start_relay() { # $1 日志文件
 }
 
 start_agent() { # $1 日志文件
-  env HOME="$DIR/agent-home" "$AGENT_BIN" "${AGENT_ARGS[@]}" > "$1" 2>&1 &
+  env SR_LOG_DIR='' "$AGENT_BIN" "${AGENT_ARGS[@]}" > "$1" 2>&1 &
   AGENT_PID=$!
   LIVE_PIDS+=("$AGENT_PID")
 }
@@ -333,7 +333,7 @@ run_combo() { # $1 版本 $2 组合 A|B $3 relay 二进制 $4 agent 二进制
   MCP_EXPECT="compat-中文-ok"
   TERM_MARKER="term-ok"
   DIR="$WORK_ROOT/v$ver/$combo"
-  mkdir -p "$DIR/relay-home" "$DIR/agent-home" "$DIR/xfer"
+  mkdir -p "$DIR/xfer"
 
   # relay 参数：只传该版本 --help 里确实存在的开关。
   ADMIN_ENABLED=0
@@ -348,11 +348,8 @@ run_combo() { # $1 版本 $2 组合 A|B $3 relay 二进制 $4 agent 二进制
     RELAY_ARGS+=(--admin-path "$ADMIN_PATH" --admin-pass "$ADMIN_PASS")
     ADMIN_ENABLED=1
   fi
-  # 隔离（任务卡第 7 条 / MYS-2806 review 4）：显式指定 settings 文件，不靠
-  # 覆盖 HOME 兜底——旧版只 `env HOME=...`，真实的 ~/.shell-remote 虽未被写到，
-  # 但语义上是"靠改 HOME 间接隔离"，且老版本没有 --settings-file 时仍会落到
-  # HOME 推导路径。两道都做：能显式就显式，HOME 仍然隔离给不需要该开关的
-  # 老二进制（自签证书缓存等也走 HOME）。
+  # Explicit paths isolate settings, logs and transfers without changing HOME.
+  # v0.53.0 predates persisted relay settings; --no-tls avoids certificate writes.
   if has_opt "$RELAY_BIN" relay "--settings-file"; then
     RELAY_ARGS+=(--settings-file "$DIR/relay-settings.json")
   fi

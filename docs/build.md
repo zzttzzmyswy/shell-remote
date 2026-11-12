@@ -98,7 +98,7 @@ tools/release.sh
 - 本地与远端都不得已存在同名 tag（脚本绝不 `tag -f` / `push -f`：强推已发布 tag 会让"某版本的字节"与 tag 指向的源码永久失配）；
 - 不得已存在同名 release。
 
-要重发某个版本，正确做法是 bump `Cargo.toml` 的 `version` 再发布；不要覆盖既有 tag/release。`gh release create` 失败时脚本会回滚本地与远端 tag，可以直接重跑。
+要重发某个版本，应 bump `Cargo.toml` 的 `version` 后发布；不要覆盖既有 tag/release。推送 tag 或创建 release 未成功确认时，脚本保留已有引用并停止。先核实远端 tag、release 和资产的实际状态；仅补传缺失且已校验的资产，不使用 `--clobber`。结果未知时不要重跑发布脚本。
 
 `tools/release_sh_test.sh` 用隔离沙箱（本地 bare 仓库当 origin + 假的 `gh` 与 `build-dist`）覆盖上述每一条断言，不接触真实仓库或 GitHub：
 

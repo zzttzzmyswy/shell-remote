@@ -85,6 +85,10 @@ BD
 {
   for a in "$@"; do printf 'ARG %s\n' "$a"; done
 } >> "$GH_LOG"
+if [ "$1" = "api" ] && [ "${GH_REPO_ERROR:-0}" = "1" ]; then
+  echo 'HTTP 404: Not Found (repository inaccessible)' >&2
+  exit 1
+fi
 if [ "$1" = "release" ] && [ "$2" = "view" ]; then
   echo "CALL release-view" >> "$CALLS_LOG"
   # GH_VIEW_ERROR=1：网络/认证失败（**不是** 404），不能当作"不存在"
@@ -135,6 +139,7 @@ run_release() { # $1 = box, rest = args
       GH_EXISTING_RELEASE="${GH_EXISTING_RELEASE:-0}" \
       GH_FAIL_CREATE="${GH_FAIL_CREATE:-0}" \
       GH_VIEW_ERROR="${GH_VIEW_ERROR:-0}" \
+      GH_REPO_ERROR="${GH_REPO_ERROR:-0}" \
       GH_UNKNOWN_REMOTE="${GH_UNKNOWN_REMOTE:-0}" \
       bash tools/release.sh "$@"
   ) > "$box/out.log" 2>&1
@@ -336,6 +341,8 @@ echo "── release.sh 隔离测试（$WORKROOT）──"
     || bad "9. 没给出恢复方法"
   grep -qi "不要.*重跑\|不覆盖\|不重发" "$box/out.log" && ok "9. 明确禁止盲目重跑" \
     || bad "9. 没警告不要重跑"
+  grep -q -- '--clobber' "$box/out.log" && bad "9. 恢复提示要求覆盖已发布资产" \
+    || ok "9. 恢复提示不覆盖已发布资产"
 }
 
 # ── 10. 远端结果未知（网络中断）→ 保留 tag 并报告，不猜 ──────────
@@ -377,6 +384,18 @@ echo "── release.sh 隔离测试（$WORKROOT）──"
     || ok "11b. 查询失败时未创建 release"
   grep -q "查询失败\|无法确认" "$box/out.log" && ok "11b. 明确区分查询失败与确实不存在" \
     || bad "11b. 把 gh 查询失败当成"release 不存在""
+  [ -z "$(git -C "$box/repo" status --porcelain)" ] \
+    && ok "11b. 查询失败不污染工作树" || bad "11b. 查询失败留下未跟踪文件"
+  rc="$(run_release "$box" --skip-build)"
+  [ "$rc" -eq 0 ] && ok "11b. 查询恢复后可正常发布" || bad "11b. 查询错误残留阻止下一次发布"
+}
+{
+  box="$(new_box inaccessible-repo)"
+  seed_assets "$box/repo"
+  rc="$(GH_REPO_ERROR=1 run_release "$box" --skip-build)"
+  [ "$rc" -ne 0 ] && ok "11c. 仓库不可访问时停止" || bad "11c. 仓库不可访问仍发布"
+  no_side_effects "$box" && ok "11c. 仓库 404 不被误认为 release 不存在" \
+    || bad "11c. 仓库访问失败后仍有发布副作用"
 }
 
 # ── 12. 元测试：证明「是否调用 gh release create」这类断言真的有效 ──

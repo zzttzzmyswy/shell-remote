@@ -5,11 +5,8 @@
 # drift apart — the tag is derived from Cargo.toml, and every built binary carries
 # exactly that version, so admin panel, agent logs and release assets always agree.
 #
-# 顺序是**先验证、后动手**：所有会留下外部痕迹的步骤（打 tag / 强推 tag /
-# 建 release）都排在全部前置检查之后。任何一项前置检查失败都在动手之前退出，
-# 因此失败不会留下"tag 已经指向新 commit、release 却没建出来"的半成品状态
-# （旧版把 tag 强推放在 `gh release create` 之前，release 失败时远端 tag 已经
-# 被改掉了，重跑还会因为同名 release 已存在而继续失败）。
+# 前置检查完成后才创建 tag / release。发布请求失败时保留 tag，
+# 因为远端可能已经创建 release，须核实实际状态后恢复。
 #
 # Usage:  tools/release.sh [--skip-build]
 #   --skip-build   用已构建的 dist/ 直接打 tag + 发布（不触发四平台重建）
@@ -20,7 +17,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-usage() { sed -n '8,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { echo 'Usage: tools/release.sh [--skip-build]'; }
 
 SKIP_BUILD=0
 while [ $# -gt 0 ]; do
@@ -72,23 +69,29 @@ if [ -n "$ls_out" ]; then
   exit 1
 fi
 
-REPO_SLUG="$(git remote get-url origin | sed -E 's#.*[:/]([^/]+/[^/]+?)(\.git)?$#\1#')"
+REPO_SLUG="$(git remote get-url origin | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')"
 
 # 3) 已有同名 release → 停止（`gh release create` 会 422，但那时 tag 已经推出去了）。
 #    同样必须区分「确实不存在」与「查询失败」：`gh release view` 对"不存在"和
 #    "没登录/网络不通"都会非零退出，后者当作不存在会让发布在未知状态下继续。
 #    查询与创建必须针对**同一个仓库**，所以两者都显式带 `--repo`。
-if gh release view "$TAG" --repo "$REPO_SLUG" >/dev/null 2>"$ROOT/.release-view.err"; then
+VIEW_ERROR="$(mktemp "${TMPDIR:-/tmp}/sr-release-view.XXXXXX")"
+trap 'rm -f "$VIEW_ERROR"' EXIT
+if ! gh api "repos/$REPO_SLUG" --silent 2>"$VIEW_ERROR"; then
+  echo "无法确认仓库访问权限，停止发布：" >&2
+  cat "$VIEW_ERROR" >&2
+  exit 1
+fi
+if gh release view "$TAG" --repo "$REPO_SLUG" >/dev/null 2>"$VIEW_ERROR"; then
   echo "已存在 release $TAG，拒绝重复发布。发新版本请先 bump Cargo.toml 的 version。" >&2
   exit 1
 fi
-if ! grep -qiE 'not found|could not find|release not found|HTTP 404' "$ROOT/.release-view.err"; then
+if ! grep -qiE '^release not found$|HTTP 404' "$VIEW_ERROR"; then
   echo "无法确认 $TAG 的 release 状态（网络/认证/权限失败），停止发布：" >&2
-  sed 's/^/  /' "$ROOT/.release-view.err" >&2
+  sed 's/^/  /' "$VIEW_ERROR" >&2
   echo "这是**查询失败**，不能据此判断该 release 不存在。" >&2
   exit 1
 fi
-rm -f "$ROOT/.release-view.err"
 
 # ── 构建（可跳过）────────────────────────────────────────────────────
 #
@@ -132,13 +135,7 @@ echo "目标 commit: $COMMIT"
 # ── 副作用从这里开始 ────────────────────────────────────────────────
 TITLE="${GH_TITLE:-v$VERSION — shell-remote}"
 
-# NOTES 先构造好再作为**单个参数**传入。
-#
-# 更正（MYS-2806 review 3）：此前这里写着"旧版把资产路径拼进了 notes"，
-# 那是**错的**——原脚本的 heredoc 写在 `$( )` 里，是正确的。我当时用
-# `echo "gh $*"` 记录 mock 调用，多行 notes 被压成一行后看起来像资产路径
-# 落在 notes 里，属于测量方法的假象。资产一直是 8 个独立参数。
-# 这里保留"先构造后传参"的写法只是可读性选择，不是缺陷修复。
+# Release notes are one argument, followed by eight independent asset arguments.
 NOTES="$(cat <<EOF
 ## $TAG
 
@@ -157,8 +154,7 @@ EOF
 # `git rev-parse` 对账，不依赖 gh 的隐式行为。
 git tag -a "$TAG" -m "release $TAG" "$COMMIT"
 if ! git push origin "refs/tags/$TAG"; then
-  echo "推送 tag $TAG 失败，回滚本地 tag" >&2
-  git tag -d "$TAG" >/dev/null 2>&1 || true
+  echo "推送 tag $TAG 未成功确认；保留本地 tag，请先核对远端状态，不要盲目重跑。" >&2
   exit 1
 fi
 
@@ -187,11 +183,9 @@ if ! gh release create "$TAG" \
   echo "   1) release 已创建、仅资产上传/草稿清理失败（最常见）" >&2
   echo "      → 先确认实际状态：gh release view $TAG --repo $REPO_SLUG" >&2
   echo "      → 若 release 存在，直接补传缺失资产（不要重建同版本）：" >&2
-  echo "        gh release upload $TAG ${ASSETS[*]} --repo $REPO_SLUG --clobber" >&2
+  echo "        gh release upload $TAG <仅缺失且已验证的资产> --repo $REPO_SLUG" >&2
   echo "   2) release 未创建，但 tag 已推送" >&2
-  echo "      → 确认后二选一：删除远端 tag 重来" >&2
-  echo "          git push origin :refs/tags/$TAG && git tag -d $TAG" >&2
-  echo "        或保留 tag 直接补建 release" >&2
+  echo "      → 确认 tag 指向本次 commit 且确实没有 release 后，保留 tag 补建 release" >&2
   echo "          gh release create $TAG --repo $REPO_SLUG --verify-tag --title \"\$GH_TITLE\" --notes-file <file> ${ASSETS[*]}" >&2
   echo "   3) 结果未知（网络中断/超时）" >&2
   echo "      → **不要**重跑本脚本；先 git ls-remote --tags origin 与" >&2
