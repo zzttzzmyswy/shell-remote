@@ -27,21 +27,28 @@
 //! # 入口层怎么用
 //!
 //! ```no_run
-//! # fn main() -> anyhow::Result<()> {
 //! use shell_remote::ui_controller::UiController;
 //! use shell_remote::ui_resume::resolve_gui_resume;
 //!
-//! // 无参数启动：没有 --upgrade-restore 参数（顶层参数解析由入口负责，
-//! // 它只需要把 Option<&str> 原样传进来）。
-//! let mut ctl = UiController::new();
-//! match resolve_gui_resume(None)? {
-//!     // 升级交接：直接恢复同配置、同身份，不弹配置窗、不等用户点击。
-//!     Some(resume) => ctl.connect_restored(resume.config, resume.identity)?,
-//!     // 普通启动：只显示配置窗，绝不自动连接。
-//!     None => {}
+//! /// **控制器必须由窗口/持续事件循环持有**：它是 agent 线程的所有者，
+//! /// `Drop` 会请求停机并在有界时间内 join。把它留在 `main` 的栈上，
+//! /// 恢复出来的连接会在窗口出现之前就被断掉。
+//! struct App {
+//!     ctl: UiController,
 //! }
-//! # Ok(())
-//! # }
+//!
+//! fn start() -> anyhow::Result<App> {
+//!     let mut ctl = UiController::new();
+//!     // 无参数启动：没有 --upgrade-restore 参数（顶层参数解析由入口负责，
+//!     // 它只需要把 Option<&str> 原样传进来）。
+//!     if let Some(resume) = resolve_gui_resume(None)? {
+//!         // 升级交接：恢复同配置、同身份，不弹配置窗、不等用户点击。
+//!         // 用 `config_with_key()`——密钥来自交接，不在 `config` 里。
+//!         ctl.connect_restored(resume.config_with_key(), resume.identity)?;
+//!     }
+//!     // 普通启动：只显示配置窗，绝不自动连接。
+//!     Ok(App { ctl })
+//! }
 //! ```
 
 use anyhow::{anyhow, Context as _};

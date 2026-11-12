@@ -607,16 +607,16 @@ mod tests {
 
     /// 非 Linux：没有 `/proc/<pid>/cmdline` 充当"这就是本次那个 PTY"的证据。
     ///
-    /// 这里**显式跳过并说清楚原因**，而不是让某个"恒返回空集"的实现把断言变成
-    /// 永远成立的空话——那正是本次要修的坏味道（MYS-2819 复查项）。Windows 要
-    /// 覆盖这条，需要补一个按 PID/命令行查子进程的实现。
+    /// 用 `#[ignore]` 表达未覆盖，而**不是**一个只 `eprintln` 就返回的空测试：
+    /// 后者在测试框架里仍计 PASS，Windows 上会报告"PTY 泄漏已验证"这种虚假
+    /// 结论（MYS-2819 验收 #3）。带 `#[ignore]` 的用例会进 "ignored" 计数，
+    /// 一眼看得出这块没有证据。要覆盖它需要在 Windows 上补一个按 PID/命令行
+    /// 查子进程的实现，再把 Linux 那份的断言搬过去。
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
+    #[ignore = "PTY 泄漏断言需要 /proc/<pid>/cmdline；Windows 需先补对应进程查询"]
     async fn test_ui_controller_releases_lan_port_and_pty_children_on_disconnect() {
-        eprintln!(
-            "跳过 PTY 泄漏断言：本平台没有 /proc/<pid>/cmdline 证据；\
-             需要在 Linux 上跑这条用例（Windows 需补对应进程查询）"
-        );
+        unreachable!("ignored on this platform — see the #[ignore] reason");
     }
 
     /// 端口是否被本进程监听（连上去能成功即视为在监听）。

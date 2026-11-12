@@ -3412,9 +3412,19 @@ mod gui_process_level {
 
     /// 无参数 GUI 版 agent 脚本：只从交接文件读配置与身份。
     ///
-    /// 脚本模拟"健康的无参数 GUI agent"：从交接文件读出配置与身份后向 relay
-    /// 注册，打印换机回执并常驻。回滚用例把它当作**旧版**（target），另配一个
-    /// 立刻退出的坏新版来触发回滚。
+    /// 脚本模拟真实的无参数 GUI agent：
+    ///
+    /// - argv 必须为空（多一个参数就说明有人在往空 argv 里补东西）；
+    /// - 配置与身份只能来自 `SR_UPGRADE_RESTORE` 指向的私有交接文件；
+    /// - 没有交接文件时**不许注册**（那等于静默变成一台新设备）；
+    /// - 注册时把交接里的 tokens 以 **JSON 数组** 回放（与真实 agent 一致），
+    ///   并且逐项核对 **relay 返回** 的 session_id 与 tokens/权限；任一项不符
+    ///   就**不删交接文件、不报回执**，让助手判定失败。
+    ///
+    /// 早期版本的脚本把 tokens 编码成 JSON 字符串再拼进 body，relay 的
+    /// `body["tokens"].as_array()` 拿到 `None`，于是静默走了 fresh 注册——
+    /// 身份其实没恢复，脚本却只看 `agent:registered` 就宣布成功（MYS-2819
+    /// 验收 #1）。现在脚本自己核对返回身份，助手再核对回执，两道都看得见。
     fn gui_agent_script(dir: &Path, name: &str) -> PathBuf {
         let p = dir.join(name);
         let body = r#"#!/bin/sh
@@ -3436,37 +3446,74 @@ if [ -z "$H" ] || [ ! -f "$H" ]; then
   exit 1
 fi
 
+# 交接里的身份与配置。tokens 只序列化**一次**，直接拼进 body：再编码一次会
+# 变成 JSON 字符串，而 relay 只认数组（`as_array()`）。
 CFG="$(python3 - "$H" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
 g=d.get("gui") or {}
-toks=json.dumps([{"token":t["token"],"permission":t["permission"]} for t in d["tokens"]])
 print(json.dumps({
   "sid": d.get("session_id",""),
   "relay": g.get("relay_url",""),
   "lan_port": g.get("desktop_lan_port",0),
   "fps": g.get("desktop_fps",0),
-  "token_type": g.get("token_type",""),
-  "tokens": toks,
+  "token_type": d.get("token_type",""),
+  "fixed_key": d.get("fixed_key") or "",
+  "tokens": [{"token":t["token"],"permission":t["permission"]} for t in d["tokens"]],
 }))
 PY
 )"
+SID="$(printf '%s' "$CFG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["sid"])')"
 echo "cfg=$CFG" >> "$OUT"
 
-SID="$(printf '%s' "$CFG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["sid"])')"
-TOKENS="$(printf '%s' "$CFG" | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["tokens"]))')"
-
-BODY="{\"type\":\"agent:register\",\"session_id\":\"$SID\",\"tokens\":$TOKENS,\"agent_version\":\"$VER\"}"
+# 请求体用 python 组装：避免 shell 里的引号拼接把 JSON 弄坏。
+BODY="$(printf '%s' "$CFG" | python3 -c '
+import json,sys
+c=json.load(sys.stdin)
+print(json.dumps({
+  "type":"agent:register",
+  "session_id":c["sid"],
+  "tokens":c["tokens"],
+  "agent_version":sys.argv[1],
+}))' "$VER")"
 RESP="$(curl -s -X POST "$RELAY/agent/send" -H 'Content-Type: application/json' -d "$BODY")"
 echo "resp=$RESP" >> "$OUT"
-case "$RESP" in
-  *'"type":"agent:registered"'*)
-    echo "registered pid=$$ sid=$SID version=$VER" >> "$OUT"
+
+# 逐项核对 relay **返回**的原身份：sid、token 集合、每个 token 的权限。
+# 任一不符即视为恢复失败（不删交接、不回执），让助手如实判定。
+VERDICT="$(printf '%s\n%s' "$CFG" "$RESP" | python3 -c '
+import json,sys
+raw=sys.stdin.read().split("\n",1)
+want=json.loads(raw[0])
+try:
+    got=json.loads(raw[1])
+except Exception:
+    print("unparsable-response"); raise SystemExit
+if got.get("type")!="agent:registered":
+    print("not-registered:"+str(got.get("error",""))); raise SystemExit
+toks=(got.get("payload") or {}).get("tokens") or []
+norm=lambda ts: sorted((t.get("token",""),t.get("permission","")) for t in ts)
+problems=[]
+if got.get("session_id")!=want["sid"]:
+    problems.append("sid=%s!=%s"%(got.get("session_id"),want["sid"]))
+if norm(toks)!=norm(want["tokens"]):
+    problems.append("tokens=%s!=%s"%(norm(toks),norm(want["tokens"])))
+print("ok" if not problems else "mismatch:"+";".join(problems))
+')"
+echo "verdict=$VERDICT" >> "$OUT"
+
+case "$VERDICT" in
+  ok)
     rm -f "$H"
+    # 回执必须带**本轮** upgrade_id：助手靠它认出这是本次换机的注册。
     echo "shell-remote: upgrade-registered upgrade_id=$SR_TEST_UPGRADE_ID version=$VER session=$SID" >&2
     sleep 5
     ;;
-  *) exit 1 ;;
+  *)
+    # 身份没恢复：保留交接文件，用非零退出让助手判失败。
+    echo "restore-failed $VERDICT" >&2
+    exit 3
+    ;;
 esac
 "#;
         write_executable(&p, body);
@@ -3510,14 +3557,53 @@ esac
     }
 
     /// 造一份无参数 GUI 的完整现场：真 relay + 已注册身份 + GUI 交接。
-    async fn gui_fixture(tag: &str) -> Option<(TmpDir, super::process_level::TestRelay, String, RestartContext, PathBuf)> {
-        let relay = std::sync::Arc::new(super::process_level::TestRelay::start().await?);
+    ///
+    /// `token_type` 决定身份形态：`"rw"` = 纯临时设备；`"both"` = 带一个 ro
+    /// Token（升级/回滚都必须一个不多一个不少）。`fixed_key` 非空时用固定 key
+    /// 注册，此时 rw Token 由 key 派生。
+    async fn gui_fixture_with(
+        tag: &str,
+        token_type: &str,
+        fixed_key: Option<&str>,
+    ) -> Option<(TmpDir, super::process_level::TestRelay, String, RestartContext, PathBuf)> {
+        let relay = super::process_level::TestRelay::start().await?;
         let dir = TmpDir::new(tag);
         let client = reqwest::Client::new();
         let sid = "guiag0001";
-        let tokens =
-            super::process_level::register(&client, &relay.base, sid).await;
-        let _ = tag;
+
+        // 用**真实**注册拿到身份（含权限），这就是要保住的那份。
+        let mut body = serde_json::json!({
+            "type": "agent:register",
+            "session_id": sid,
+            "agent_version": "0.0.0-origin",
+        });
+        if let Some(k) = fixed_key {
+            body["key"] = serde_json::json!(k);
+        }
+        body["token_type"] = serde_json::json!(token_type);
+        let reg: serde_json::Value = client
+            .post(format!("{}/agent/send", relay.base))
+            .json(&body)
+            .send()
+            .await
+            .expect("原身份注册必须成功")
+            .json()
+            .await
+            .expect("注册响应必须是 JSON");
+        assert_eq!(reg["type"], "agent:registered", "{reg}");
+        let tokens: Vec<(String, String)> = reg["payload"]["tokens"]
+            .as_array()
+            .expect("注册响应必须带 tokens 数组")
+            .iter()
+            .map(|t| {
+                (
+                    t["token"].as_str().unwrap().to_string(),
+                    t["permission"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(!tokens.is_empty());
+
         let target = dir.join("shell-remote");
         let old_bin = gui_agent_script(dir.path(), "gui-agent-old");
         std::fs::copy(&old_bin, &target).unwrap();
@@ -3526,14 +3612,13 @@ esac
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let new_bin = gui_agent_script(dir.path(), "gui-agent-new");
+        let mut snap = gui_snapshot(sid, &relay.base);
+        snap.token_type = token_type.to_string();
         let ctx = RestartContext {
             session_id: sid.to_string(),
-            tokens: tokens
-                .iter()
-                .map(|t| (t.clone(), "rw".to_string()))
-                .collect(),
-            fixed_key: None,
-            token_type: "rw".to_string(),
+            tokens: tokens.clone(),
+            fixed_key: fixed_key.map(|k| k.to_string()),
+            token_type: token_type.to_string(),
             relay_base: Some(relay.base.clone()),
             relay_insecure: false,
             // 无参数启动：argv 就是空的。
@@ -3549,15 +3634,49 @@ esac
             service_restart_policy: None,
             managed_plan: None,
             overlay: false,
-            gui: Some(gui_snapshot(sid, &relay.base)),
+            gui: Some(snap),
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
-        // 解开 Arc：调用方只需要一个能活到用例结束的 relay。
-        let relay = std::sync::Arc::try_unwrap(relay).map_err(|_| ()).ok()?;
         Some((dir, relay, sid.to_string(), ctx, handoff))
     }
 
+    /// 纯临时设备（`--token-type rw`）的现场。
+    async fn gui_fixture(
+        tag: &str,
+    ) -> Option<(TmpDir, super::process_level::TestRelay, String, RestartContext, PathBuf)> {
+        gui_fixture_with(tag, "rw", None).await
+    }
+
+    /// 从脚本日志里取出某一类带前缀的行（`cfg=` / `resp=` / `verdict=`）。
+    fn logged<'a>(log: &'a str, prefix: &str) -> Option<&'a str> {
+        log.lines()
+            .find_map(|l| l.strip_prefix(prefix))
+            .map(|v| v.trim())
+    }
+
+    /// 断言脚本核对过 relay **返回**的身份，且结论是 ok。
+    ///
+    /// 这是 MYS-2819 验收 #1 的核心：以前脚本只看响应里有 `agent:registered`
+    /// 就宣布成功，而 tokens 被编码成字符串时 relay 会静默走 fresh 注册、
+    /// 返回的是一套**新** Token。现在脚本必须核对返回的 sid 与 tokens/权限。
+    fn assert_identity_verified(log: &str) {
+        let verdict = logged(log, "verdict=")
+            .unwrap_or_else(|| panic!("脚本必须给出身份核对结论: {log}"));
+        assert_eq!(
+            verdict, "ok",
+            "脚本必须核对 relay 返回的原 sid/tokens/权限并全部相符: {log}"
+        );
+        // 回执/失败都必须来自脚本自己的判定，而不是只看到 200。
+        assert!(
+            logged(log, "resp=").is_some(),
+            "脚本必须记录 relay 的原始响应便于排查: {log}"
+        );
+    }
+
     /// 升级成功：新进程 PID 变了、argv 仍为空、配置与身份都来自交接。
+    ///
+    /// 身份不是"看响应里有 agent:registered"就算数：脚本会逐项核对 relay
+    /// **返回**的 session_id 与 tokens/权限，助手再核对回执里的 upgrade_id。
     #[tokio::test]
     async fn test_gui_upgrade_restores_config_and_identity_with_empty_argv() {
         let _g = serial().await;
@@ -3579,7 +3698,7 @@ esac
             matches!(outcome, HelperOutcome::Registered { .. }),
             "无参数 GUI 升级必须成功注册，实际 {outcome:?}；日志: {log}"
         );
-        // 新版字节在换机时被 rename 到 target，new_binary 本身已经不在了 ——
+        // 新版字节在换机时被 rename 到 target，new_binary 本身已经不在了——
         // 所以要在跑助手之前就把它的摘要记下来。
         assert_eq!(
             file_sha(&ctx.target_path),
@@ -3589,30 +3708,142 @@ esac
         // argv 必须为空：无参数 GUI 的契约就是"一个参数都没有"。
         assert!(log.contains("ARGC=0"), "新进程必须收到空 argv: {log}");
         assert!(!log.contains("ARG=--session-id"), "{log}");
-        // 配置与身份都来自交接文件，且一字不差。
+
+        // ① 配置来自交接快照，不是磁盘草稿。
         let cfg_line = log
             .lines()
             .find(|l| l.starts_with("cfg="))
             .unwrap_or_else(|| panic!("新进程没有读到交接配置: {log}"));
         let cfg: serde_json::Value =
             serde_json::from_str(cfg_line.trim_start_matches("cfg=")).unwrap();
-        assert_eq!(cfg["sid"], sid, "必须沿用原 session id: {cfg}");
-        assert_eq!(
-            cfg["relay"], relay.base,
-            "relay 必须是连接时那份，不是磁盘草稿: {cfg}"
-        );
+        assert_eq!(cfg["relay"], relay.base, "relay 必须是连接时那份: {cfg}");
         assert_eq!(cfg["lan_port"], 39616, "活跃 LAN 端口必须恢复: {cfg}");
         assert_eq!(cfg["fps"], 24.0, "桌面参数必须恢复: {cfg}");
-        assert_eq!(cfg["token_type"], "rw");
-        let registered = log
-            .lines()
-            .find(|l| l.starts_with("registered "))
-            .unwrap_or_else(|| panic!("新进程没有注册: {log}"));
-        assert!(registered.contains(&format!("sid={sid}")), "{registered}");
+
+        // ② 身份逐项核对：relay **返回**的 sid 与 tokens/权限必须与交接一致。
+        assert_identity_verified(&log);
+        let resp: serde_json::Value =
+            serde_json::from_str(logged(&log, "resp=").unwrap()).expect("响应必须是 JSON");
+        assert_eq!(resp["session_id"], sid, "服务端必须回到原会话: {resp}");
+        let returned: Vec<(String, String)> = resp["payload"]["tokens"]
+            .as_array()
+            .expect("服务端必须返回 tokens 数组")
+            .iter()
+            .map(|t| {
+                (
+                    t["token"].as_str().unwrap_or("").to_string(),
+                    t["permission"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        let mut want = ctx.tokens.clone();
+        let mut got = returned.clone();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "服务端返回的 tokens/权限必须原样: {resp}");
+
         assert!(
             !handoff.exists(),
-            "注册成功后交接文件必须被消费（否则身份会一直留在磁盘上）"
+            "身份确认后才允许消费交接文件（否则身份会一直留在磁盘上）"
         );
+    }
+
+    /// `--token-type both`：升级后 rw + ro 两个 Token 必须**一个不多一个不少**。
+    ///
+    /// 只交 rw 会让设备悄悄丢掉 ro 权限，只交 ro 等于降权。这条用例把权限集合
+    /// 当成身份的一部分来核对（服务端返回的 permission 也要对上）。
+    #[tokio::test]
+    async fn test_gui_upgrade_preserves_both_token_permissions() {
+        let _g = serial().await;
+        let Some((dir, relay, sid, ctx, handoff)) = gui_fixture_with("gui-both", "both", None).await
+        else {
+            eprintln!("跳过：无法启动真 relay 二进制");
+            return;
+        };
+        assert_eq!(ctx.tokens.len(), 2, "both 必须有 rw + ro 两个 Token");
+        let mut perms: Vec<&str> = ctx.tokens.iter().map(|(_, p)| p.as_str()).collect();
+        perms.sort();
+        assert_eq!(perms, vec!["ro", "rw"], "原身份必须是 rw + ro");
+
+        let out = dir.join("gui.log");
+        let _env = ScriptEnv::install(&out, &relay.base, "9.9.9", "gui-up-1");
+        let h = handoff.clone();
+        let outcome = tokio::task::spawn_blocking(move || helper_main(&h, false))
+            .await
+            .expect("helper task must not panic");
+        let log = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(
+            matches!(outcome, HelperOutcome::Registered { .. }),
+            "both 设备升级必须成功，实际 {outcome:?}；日志: {log}"
+        );
+        assert_identity_verified(&log);
+        let resp: serde_json::Value =
+            serde_json::from_str(logged(&log, "resp=").unwrap()).expect("响应必须是 JSON");
+        assert_eq!(resp["session_id"], sid);
+        let mut returned: Vec<String> = resp["payload"]["tokens"]
+            .as_array()
+            .expect("服务端必须返回 tokens 数组")
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}:{}",
+                    t["permission"].as_str().unwrap_or(""),
+                    t["token"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        let mut want: Vec<String> = ctx
+            .tokens
+            .iter()
+            .map(|(t, p)| format!("{p}:{t}"))
+            .collect();
+        returned.sort();
+        want.sort();
+        assert_eq!(returned, want, "rw/ro 两个 Token 都必须原样恢复: {resp}");
+    }
+
+    /// 固定 key 设备：rw Token 由 `--key` 派生，恢复后必须仍是同一个 key。
+    ///
+    /// 脚本另外核对 `fixed_key` 随交接传到（回滚路径要用它重建身份）。
+    #[tokio::test]
+    async fn test_gui_upgrade_preserves_a_fixed_key_identity() {
+        let _g = serial().await;
+        let key = "GUI-FIXED-KEY-a1b2";
+        let Some((dir, relay, sid, ctx, handoff)) =
+            gui_fixture_with("gui-key", "rw", Some(key)).await
+        else {
+            eprintln!("跳过：无法启动真 relay 二进制");
+            return;
+        };
+        assert_eq!(
+            ctx.tokens,
+            vec![(key.to_string(), "rw".to_string())],
+            "固定 key 设备的 rw Token 就是 key 本身"
+        );
+        assert_eq!(ctx.fixed_key.as_deref(), Some(key));
+
+        let out = dir.join("gui.log");
+        let _env = ScriptEnv::install(&out, &relay.base, "9.9.9", "gui-up-1");
+        let h = handoff.clone();
+        let outcome = tokio::task::spawn_blocking(move || helper_main(&h, false))
+            .await
+            .expect("helper task must not panic");
+        let log = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(
+            matches!(outcome, HelperOutcome::Registered { .. }),
+            "固定 key 设备升级必须成功，实际 {outcome:?}；日志: {log}"
+        );
+        assert_identity_verified(&log);
+        // 交接里的固定密钥仍然只走受保护字段（脚本读到了，说明通道没断）。
+        let cfg: serde_json::Value = serde_json::from_str(
+            log.lines()
+                .find_map(|l| l.strip_prefix("cfg="))
+                .unwrap_or_else(|| panic!("没有 cfg 行: {log}"))
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(cfg["fixed_key"], key, "固定密钥必须经受保护字段交接");
+        assert_eq!(cfg["sid"], sid);
     }
 
     /// 升级失败回滚：旧版被拉起，**同样是空 argv**，且照样拿到同配置/同身份。
@@ -3647,8 +3878,8 @@ esac
         .await
         .expect("helper task must not panic");
 
-        // 回滚成功 = 旧版真的以**原身份**重新上线。助手判定依据是"交接文件被
-        // 消费"（只有 `restore_verdict` 确认身份对上之后才会删）。
+        // 回滚成功 = 旧版真的以**原身份**重新上线。助手判定依据是本轮 upgrade_id
+        // 的注册回执 + 交接文件已被消费，两者缺一不可。
         match &outcome {
             HelperOutcome::RolledBack { identity, reason } => {
                 assert!(
@@ -3665,7 +3896,6 @@ esac
             }
             other => panic!("新版起不来必须回滚，实际 {other:?}"),
         }
-        // 交接文件必须已被旧版消费（身份已进内存，文件不再有用途）。
         assert!(
             !handoff.exists(),
             "回滚后旧版必须消费交接文件（证明它按原身份注册成功）"
@@ -3690,22 +3920,331 @@ esac
             !log.contains("no-handoff"),
             "回滚进程必须拿到交接文件，否则会以新设备注册: {log}"
         );
-        let cfg_line = log
-            .lines()
-            .find(|l| l.starts_with("cfg="))
-            .unwrap_or_else(|| panic!("回滚进程没有读到交接配置: {log}"));
-        let cfg: serde_json::Value =
-            serde_json::from_str(cfg_line.trim_start_matches("cfg=")).unwrap();
-        assert_eq!(cfg["sid"], sid, "回滚后身份必须不变: {cfg}");
+        // 回滚路径同样要核对 relay 返回的身份（不只是"有响应"）。
+        assert_identity_verified(&log);
+        let resp: serde_json::Value =
+            serde_json::from_str(logged(&log, "resp=").unwrap()).expect("响应必须是 JSON");
+        assert_eq!(resp["session_id"], sid, "回滚后必须回到原会话: {resp}");
+        let mut returned: Vec<String> = resp["payload"]["tokens"]
+            .as_array()
+            .expect("服务端必须返回 tokens 数组")
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}:{}",
+                    t["permission"].as_str().unwrap_or(""),
+                    t["token"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        let mut want: Vec<String> = ctx.tokens.iter().map(|(t, p)| format!("{p}:{t}")).collect();
+        returned.sort();
+        want.sort();
+        assert_eq!(returned, want, "回滚后 tokens/权限必须原样: {resp}");
+        let cfg: serde_json::Value = serde_json::from_str(
+            log.lines()
+                .find_map(|l| l.strip_prefix("cfg="))
+                .unwrap_or_else(|| panic!("回滚进程没有读到交接配置: {log}"))
+                .trim(),
+        )
+        .unwrap();
         assert_eq!(cfg["relay"], relay.base, "回滚后 relay 必须不变: {cfg}");
         assert_eq!(cfg["lan_port"], 39616, "回滚后配置必须不变: {cfg}");
         assert_eq!(cfg["fps"], 24.0, "回滚后桌面参数必须不变: {cfg}");
-        let registered = log
-            .lines()
-            .find(|l| l.starts_with("registered "))
-            .unwrap_or_else(|| panic!("回滚后的旧版必须能注册: {log}"));
-        assert!(registered.contains(&format!("sid={sid}")), "{registered}");
     }
+
+    /// 早到回执：子进程在助手开始观察之前就注册完、删完交接文件。
+    ///
+    /// 这是验收 #2 的确定性复现。旧实现用"先看到文件存在、再看到消失"判断成功，
+    /// 这种"早到"情形下永远看不到前者，会把一次成功报成
+    /// `the handoff file was never there` 的失败。
+    ///
+    /// 构造方式就是把整个消费过程**同步做完**（注册 + 删文件 + 写回执都在助手
+    /// 拿到子进程句柄之前完成），再让一个只剩 `sleep` 的进程冒充"已经恢复好的
+    /// 旧版"。判据只能来自回执，而不能来自文件观察。
+    #[tokio::test]
+    async fn test_gui_rollback_survives_an_early_handoff_consumption() {
+        let _g = serial().await;
+
+        // 一个"跑完就常驻"的旧版：它已经在启动瞬间消费了交接（模拟早到）。
+        let dir = TmpDir::new("gui-early");
+        let script = dir.join("agent-early");
+        let marker = dir.join("consumed.txt");
+        write_executable(
+            &script,
+            &format!(
+                "#!/bin/sh\nrm -f \"$SR_UPGRADE_RESTORE\"\ntouch '{}'\n\
+                 echo \"shell-remote: upgrade-registered upgrade_id=$SR_TEST_UPGRADE_ID \
+                 version=$SR_TEST_VER session=early01\" >&2\nsleep 5\n",
+                marker.display()
+            ),
+        );
+        let target = dir.join("shell-remote");
+        std::fs::copy(&script, &target).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let new_binary = dir.join("artifact");
+        std::fs::write(&new_binary, b"#!/bin/sh\n# new\n").unwrap();
+        // 交接文件由**测试自己**在拉起前删掉：助手拿到的磁盘状态就是"文件已经
+        // 不在了"，与"子进程抢先消费"完全等价，且是确定性的（不靠时序运气）。
+        let mut ctx = RestartContext::new(
+            "early01".to_string(),
+            vec![("early-tok".to_string(), "rw".to_string())],
+            None,
+            "rw".to_string(),
+            Some("http://127.0.0.1:1".to_string()),
+            false,
+            Vec::new(),
+            target.clone(),
+            new_binary,
+            sha256_of(b"#!/bin/sh\n# new\n"),
+            "early-up".to_string(),
+            "9.9.9".to_string(),
+            None,
+            None,
+            None,
+            false,
+        );
+        ctx = ctx.with_gui_snapshot(gui_snapshot("early01", "http://127.0.0.1:1"));
+        let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+        // 助手只会在 spawn 之后才开始观察；这里先把文件删掉，模拟"早就被消费"。
+        std::fs::remove_file(&handoff).unwrap();
+        assert!(!handoff.exists(), "前置条件：文件已经不在");
+
+        std::env::set_var("SR_TEST_UPGRADE_ID", "early-up");
+        std::env::set_var("SR_TEST_VER", "9.9.9");
+        let mut log = HelperLog::open(&handoff);
+        let backup = dir.join("backup.bin");
+        std::fs::copy(&target, &backup).unwrap();
+        let outcome = rollback(
+            &ctx,
+            &handoff,
+            &backup,
+            &mut log,
+            "test: early consumption".to_string(),
+            None,
+            HelperTimeouts {
+                old_exit: Duration::from_secs(1),
+                register: Duration::from_secs(8),
+            },
+        );
+        std::env::remove_var("SR_TEST_UPGRADE_ID");
+        std::env::remove_var("SR_TEST_VER");
+
+        match outcome {
+            HelperOutcome::RolledBack { identity, .. } => assert_eq!(
+                identity,
+                RollbackIdentity::Preserved,
+                "早到的注册回执必须被认成成功，而不是'文件从未出现'的失败"
+            ),
+            other => panic!("应判定为已回滚，实际 {other:?}"),
+        }
+        assert!(marker.exists(), "旧版确实跑过");
+    }
+
+    /// 负例①：没有回执（进程活着但不报注册）⇒ 超时判失败，不报成功。
+    ///
+    /// 交接文件**不存在**，所以这条同时守住"别把任何文件缺失当成功"。
+    #[tokio::test]
+    async fn test_gui_rollback_without_a_receipt_reports_lost_identity() {
+        let _g = serial().await;
+        let dir = TmpDir::new("gui-noreceipt");
+        let script = dir.join("agent-silent");
+        // 活着、不报回执、也不删文件以外的任何动作。
+        write_executable(&script, "#!/bin/sh\nexec sleep 30\n");
+        let target = dir.join("shell-remote");
+        std::fs::copy(&script, &target).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let new_binary = dir.join("artifact");
+        std::fs::write(&new_binary, b"#!/bin/sh\n# new\n").unwrap();
+        let mut ctx = RestartContext::new(
+            "silent01".to_string(),
+            vec![("silent-tok".to_string(), "rw".to_string())],
+            None,
+            "rw".to_string(),
+            Some("http://127.0.0.1:1".to_string()),
+            false,
+            Vec::new(),
+            target.clone(),
+            new_binary,
+            sha256_of(b"#!/bin/sh\n# new\n"),
+            "silent-up".to_string(),
+            "9.9.9".to_string(),
+            None,
+            None,
+            None,
+            false,
+        );
+        ctx = ctx.with_gui_snapshot(gui_snapshot("silent01", "http://127.0.0.1:1"));
+        let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+        let mut log = HelperLog::open(&handoff);
+        let outcome = rollback(
+            &ctx,
+            &handoff,
+            &target,
+            &mut log,
+            "test: silent".to_string(),
+            None,
+            HelperTimeouts {
+                old_exit: Duration::from_secs(1),
+                register: Duration::from_secs(2),
+            },
+        );
+        match outcome {
+            HelperOutcome::RolledBack { identity, .. } => {
+                assert!(
+                    matches!(identity, RollbackIdentity::Lost { .. }),
+                    "没有回执必须判为身份未恢复，实际 {identity:?}"
+                );
+            }
+            other => panic!("应判定为已回滚，实际 {other:?}"),
+        }
+        assert!(
+            handoff.exists(),
+            "身份没确认时**不得**消费/删除交接文件"
+        );
+    }
+
+    /// 负例②：回执的 upgrade_id 不属于本轮 ⇒ 不认（防上一轮残留进程冒充）。
+    #[tokio::test]
+    async fn test_gui_rollback_ignores_a_receipt_from_another_upgrade() {
+        let _g = serial().await;
+        let dir = TmpDir::new("gui-wrongid");
+        let script = dir.join("agent-wrongid");
+        write_executable(
+            &script,
+            "#!/bin/sh\nrm -f \"$SR_UPGRADE_RESTORE\"\n\
+             echo \"shell-remote: upgrade-registered upgrade_id=previous-round \
+             version=1.0.0 session=old01\" >&2\nsleep 30\n",
+        );
+        let target = dir.join("shell-remote");
+        std::fs::copy(&script, &target).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let new_binary = dir.join("artifact");
+        std::fs::write(&new_binary, b"#!/bin/sh\n# new\n").unwrap();
+        let mut ctx = RestartContext::new(
+            "wrongid01".to_string(),
+            vec![("wrong-tok".to_string(), "rw".to_string())],
+            None,
+            "rw".to_string(),
+            Some("http://127.0.0.1:1".to_string()),
+            false,
+            Vec::new(),
+            target.clone(),
+            new_binary,
+            sha256_of(b"#!/bin/sh\n# new\n"),
+            "this-round".to_string(),
+            "9.9.9".to_string(),
+            None,
+            None,
+            None,
+            false,
+        );
+        ctx = ctx.with_gui_snapshot(gui_snapshot("wrongid01", "http://127.0.0.1:1"));
+        let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+        let mut log = HelperLog::open(&handoff);
+        let outcome = rollback(
+            &ctx,
+            &handoff,
+            &target,
+            &mut log,
+            "test: wrong upgrade id".to_string(),
+            None,
+            HelperTimeouts {
+                old_exit: Duration::from_secs(1),
+                register: Duration::from_secs(2),
+            },
+        );
+        match outcome {
+            HelperOutcome::RolledBack { identity, .. } => assert!(
+                matches!(identity, RollbackIdentity::Lost { .. }),
+                "别的轮次的回执绝不能被当成本轮成功，实际 {identity:?}"
+            ),
+            other => panic!("应判定为已回滚，实际 {other:?}"),
+        }
+    }
+
+    /// 负例③：进程提前退出（注册都没走完）⇒ 立刻判失败，不空等满超时。
+    #[tokio::test]
+    async fn test_gui_rollback_reports_an_early_exit() {
+        let _g = serial().await;
+        let dir = TmpDir::new("gui-exit");
+        let script = dir.join("agent-dies");
+        write_executable(&script, "#!/bin/sh\nexit 7\n");
+        let target = dir.join("shell-remote");
+        std::fs::copy(&script, &target).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let new_binary = dir.join("artifact");
+        std::fs::write(&new_binary, b"#!/bin/sh\n# new\n").unwrap();
+        let mut ctx = RestartContext::new(
+            "dies01".to_string(),
+            vec![("dies-tok".to_string(), "rw".to_string())],
+            None,
+            "rw".to_string(),
+            Some("http://127.0.0.1:1".to_string()),
+            false,
+            Vec::new(),
+            target.clone(),
+            new_binary,
+            sha256_of(b"#!/bin/sh\n# new\n"),
+            "dies-up".to_string(),
+            "9.9.9".to_string(),
+            None,
+            None,
+            None,
+            false,
+        );
+        ctx = ctx.with_gui_snapshot(gui_snapshot("dies01", "http://127.0.0.1:1"));
+        let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+        let mut log = HelperLog::open(&handoff);
+        let t0 = Instant::now();
+        let outcome = rollback(
+            &ctx,
+            &handoff,
+            &target,
+            &mut log,
+            "test: early exit".to_string(),
+            None,
+            HelperTimeouts {
+                old_exit: Duration::from_secs(1),
+                // 给足超时：若实现靠超时才发现，下面"很快返回"的断言会失败。
+                register: Duration::from_secs(20),
+            },
+        );
+        let elapsed = t0.elapsed();
+        match outcome {
+            HelperOutcome::RolledBack { identity, .. } => {
+                assert!(
+                    matches!(identity, RollbackIdentity::Lost { .. }),
+                    "提前退出必须判为身份未恢复，实际 {identity:?}"
+                );
+            }
+            other => panic!("应判定为已回滚，实际 {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "进程已退出应立即给结论，而不是空等满 20s，实际 {elapsed:?}"
+        );
+        // 失败原因要指向"提前退出"，而不是一句含糊的超时。
+        let text = std::fs::read_to_string(dir.join("update-apply.log")).unwrap_or_default();
+        assert!(
+            text.contains("exited early"),
+            "日志要说清是提前退出，而不是超时: {text}"
+        );
+        assert!(handoff.exists(), "身份没确认时不得删除交接文件");
+    }
+
 }
 
 // ── 12. GUI 回滚不得再"重绑"一次身份（MYS-2819）─────────────────
@@ -3816,6 +4355,165 @@ mod gui_rollback_no_rebind {
         assert!(
             !log_mentions_rebind(&text),
             "GUI 回滚不得再 register_existing：那会驱逐旧版刚恢复的会话: {text}"
+        );
+    }
+}
+
+// ── 13. 协调换机：早到的交接消费同样不能被误判（MYS-2819 #2）──
+
+/// `Coordinated` 换机也是"先摆文件、再让 systemd 拉起新 agent"。新 agent 可能
+/// 在助手第一次轮询之前就注册完并删掉交接文件——旧实现（先看到存在、再看到
+/// 消失）会把这种成功判成 `the handoff file was never there`。
+///
+/// 现在改为在 `start` **之前**取证（文件确认在盘上），之后只看它何时消失。
+#[cfg(unix)]
+mod coordinated_early_consume {
+    use super::*;
+
+    /// 一个"拉起即马上消费交接"的假 systemd：`start` 时立刻删掉交接文件，
+    /// 模拟新 agent 抢在第一次轮询之前完成注册。
+    struct InstantConsumeSystemd {
+        handoff: PathBuf,
+    }
+
+    impl super::SystemdOps for InstantConsumeSystemd {
+        fn stop(&self, _unit: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn start(&self, _unit: &str) -> Result<(), String> {
+            // 这就是"新 agent 已经消费掉它"的那一刻。
+            let _ = std::fs::remove_file(&self.handoff);
+            Ok(())
+        }
+        fn wait_empty(&self, _unit: &str, _timeout: Duration) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_coordinated_swap_accepts_an_instantly_consumed_handoff() {
+        let dir = TmpDir::new("coord-early");
+        let target = dir.join("shell-remote");
+        let new_bytes = b"#!/bin/sh\n# new version\n";
+        // 协调路径进入时磁盘上已经是新版、backup 是旧版。
+        write_executable(&target, "#!/bin/sh\n# new version\n");
+        let backup = dir.join("shell-remote.sr-old-coordearly");
+        write_executable(&backup, "#!/bin/sh\n# old version\n");
+        let artifact = dir.join("artifact.part");
+        std::fs::write(&artifact, new_bytes).unwrap();
+        let ctx = RestartContext {
+            session_id: "coordearly1".to_string(),
+            tokens: vec![("ct".to_string(), "rw".to_string())],
+            fixed_key: None,
+            token_type: "rw".to_string(),
+            relay_base: None,
+            relay_insecure: false,
+            argv: Vec::new(),
+            old_pid: 0,
+            old_start: None,
+            upgrade_id: "coord-early".to_string(),
+            target_version: "9.9.9".to_string(),
+            target_path: target.clone(),
+            new_binary: artifact,
+            new_sha256: sha256_of(new_bytes),
+            service_cgroup: None,
+            service_restart_policy: None,
+            managed_plan: Some(crate::agent::systemd_helper::ManagedPlan::Coordinated {
+                unit: "test.service".to_string(),
+            }),
+            overlay: false,
+            gui: None,
+        };
+        let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+
+        let ops = InstantConsumeSystemd {
+            handoff: handoff.clone(),
+        };
+        let mut log = super::HelperLog::open(&handoff);
+        let outcome = super::coordinated_swap_with(
+            &ops,
+            &ctx,
+            "test.service",
+            &handoff,
+            &backup,
+            dir.path(),
+            &mut log,
+            super::HelperTimeouts {
+                old_exit: Duration::from_millis(10),
+                register: Duration::from_secs(5),
+            },
+        );
+        assert!(
+            matches!(outcome, super::HelperOutcome::Registered { .. }),
+            "交接被立刻消费必须判成功，实际 {outcome:?}"
+        );
+        assert!(!handoff.exists(), "交接文件已被消费");
+        assert!(!backup.exists(), "成功路径要清掉备份");
+    }
+
+    /// 负例：交接文件在 `start` 之前就不在 ⇒ 立刻如实失败，不空等超时。
+    #[test]
+    fn test_coordinated_swap_fails_fast_when_the_handoff_was_never_there() {
+        let dir = TmpDir::new("coord-missing");
+        let target = dir.join("shell-remote");
+        let new_bytes = b"#!/bin/sh\n# new version\n";
+        write_executable(&target, "#!/bin/sh\n# new version\n");
+        let backup = dir.join("shell-remote.sr-old-coordmiss");
+        write_executable(&backup, "#!/bin/sh\n# old version\n");
+        let artifact = dir.join("artifact.part");
+        std::fs::write(&artifact, new_bytes).unwrap();
+        let ctx = RestartContext {
+            session_id: "coordmiss1".to_string(),
+            tokens: vec![("ct".to_string(), "rw".to_string())],
+            fixed_key: None,
+            token_type: "rw".to_string(),
+            relay_base: None,
+            relay_insecure: false,
+            argv: Vec::new(),
+            old_pid: 0,
+            old_start: None,
+            upgrade_id: "coord-miss".to_string(),
+            target_version: "9.9.9".to_string(),
+            target_path: target.clone(),
+            new_binary: artifact,
+            new_sha256: sha256_of(new_bytes),
+            service_cgroup: None,
+            service_restart_policy: None,
+            managed_plan: Some(crate::agent::systemd_helper::ManagedPlan::Coordinated {
+                unit: "test.service".to_string(),
+            }),
+            overlay: false,
+            gui: None,
+        };
+        // 刻意不写交接文件：`start` 之前就已经不存在。
+        let handoff = dir.join("never-written.json");
+        let ops = InstantConsumeSystemd {
+            handoff: handoff.clone(),
+        };
+        let mut log = super::HelperLog::open(&handoff);
+        let t0 = Instant::now();
+        let outcome = super::coordinated_swap_with(
+            &ops,
+            &ctx,
+            "test.service",
+            &handoff,
+            &backup,
+            dir.path(),
+            &mut log,
+            super::HelperTimeouts {
+                old_exit: Duration::from_millis(10),
+                // 给足超时：若实现靠超时才发现，下面的耗时断言会失败。
+                register: Duration::from_secs(20),
+            },
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            matches!(outcome, super::HelperOutcome::RolledBack { .. }),
+            "没有交接文件必须判失败并回滚，实际 {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "文件本来就不在时应立刻给结论，实际 {elapsed:?}"
         );
     }
 }

@@ -122,7 +122,9 @@ argv"。两者叠加会出现一个不报错的退化：升级后新进程拿到
 只能按默认值注册成**另一台设备**；回滚助手还会往空 argv 里补
 `--session-id`——无参数入口不认识它，旧版启动即失败，设备彻底失联。
 
-`ui_resume` 把"活跃配置快照"接进既有交接协议，**入口层只需要两行**：
+`ui_resume` 把"活跃配置快照"接进既有交接协议，入口层只多一个分支。**控制器必须
+由窗口/持续事件循环持有**——它是 agent 线程的所有者，`Drop` 会请求停机并在有界
+时间内 join（见「二」的语义要点）：
 
 ```rust
 use shell_remote::ui_controller::UiController;
@@ -130,16 +132,31 @@ use shell_remote::ui_resume::resolve_gui_resume;
 
 // 无参数启动（bin/shell-remote-ui.rs 的 `None` 分支）。
 // `flag` = 顶层从隐藏参数 --upgrade-restore 拿到的值；没有就是 None。
-let mut ctl = UiController::new();
-if let Some(resume) = resolve_gui_resume(upgrade_restore_flag)? {
-    // 有效交接：直接恢复同配置、同身份，不弹配置窗、不等用户点连接。
-    ctl.connect_restored(resume.config_with_key(), resume.identity)?;
-} else {
-    // 普通启动：只显示配置窗口，绝不自动连接。
-    shell_remote::gui::configure()?;
+struct App {
+    // 关键：控制器活在整个窗口生命周期里，不能是 main 里的局部变量。
+    ctl: UiController,
+}
+
+fn main() -> anyhow::Result<()> {
+    let mut ctl = UiController::new();
+    if let Some(resume) = resolve_gui_resume(upgrade_restore_flag)? {
+        // 有效交接：直接恢复同配置、同身份，不弹配置窗、不等用户点连接。
+        ctl.connect_restored(resume.config_with_key(), resume.identity)?;
+    } else {
+        // 普通启动：只显示配置窗口，绝不自动连接。
+    }
+    // 把 ctl 交给窗口（egui 的 App 持有它），由事件循环驱动：
+    //   - 每帧 ctl.poll() 刷新状态/错误；
+    //   - 退出时随 App 一起 drop，由 Drop 完成停机。
+    // 千万不要在这里就让 ctl 落出作用域：Drop 会立刻 disconnect，
+    // 恢复出来的连接会在窗口出现之前就被断掉。
+    shell_remote::gui::run_with(ctl)
 }
 ```
 
+> 上面最后一行是示意——`gui::run` 的签名与窗口接线由负责人决定；要点只有一个：
+> **`UiController` 的所有权要交到窗口状态里**，而不是留在 `main` 的栈上。
+>
 > 顶层参数解析与窗口接线由负责人做；`bin/shell-remote-ui.rs` 里已有的隐藏参数
 > `--upgrade-restore` 原样传给 `resolve_gui_resume` 即可，**不需要新增任何参数**。
 > 回滚路径由助手设 `SR_UPGRADE_RESTORE`，`resolve_gui_resume(None)` 同样能认出来。
