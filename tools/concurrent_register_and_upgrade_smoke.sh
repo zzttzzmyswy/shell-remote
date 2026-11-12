@@ -356,7 +356,11 @@ ART_SIZE="$(stat -c %s "$ART_DIR/$ART_NAME" 2>/dev/null || stat -f %z "$ART_DIR/
 # - `download_url` 指向官方 release 路径，配合下面 `--upgrade-cdn` 指向一个
 #   关闭的本地端口，agent 会先试 CDN（快速失败）再回源 relay 镜像——正好把
 #   阶段2 的"CDN 优先 → relay 兜底"也顺带压了一遍；
-# - 不联网、不改 relay 代码：只提供它本来就会读的缓存文件。
+# - **不联网**：`--manifest-api-base` 也指向同一个关闭端口，relay 抓官方清单
+#   会立即失败，于是回落到本文件这份缓存清单。旧版脚本没传这个参数，relay
+#   会真的访问 api.github.com：一旦拿到真实的 v0.59.2 资产 digest，就会与本
+#   fixture 冲突（HashConflict），整条换机用例直接 FAIL——测试结果取决于
+#   GitHub 当时能不能连上，这本身就是缺陷（测试不是隔离的）。
 mkdir -p "$ART_DIR/.metadata/manifests"
 cat > "$ART_DIR/.metadata/manifests/v0.59.2.json" <<JSON
 {
@@ -386,6 +390,7 @@ start_relay_with_artifacts() {
     --admin-path "$ADMIN_PATH" --admin-user admin --admin-pass cspass \
     --download-dir "$ART_DIR" --allow-custom-upgrade \
     --upgrade-cdn "http://127.0.0.1:1" \
+    --manifest-api-base "http://127.0.0.1:1" \
     >> "$WORKDIR/relay.log" 2>&1 &
   RELAY_PID=$!
   for _ in $(seq 1 60); do curl -s -o /dev/null "$BASE/" && break; sleep 0.2; done
@@ -576,4 +581,17 @@ panics=$(grep -l 'panicked' "$WORKDIR"/*.log 2>/dev/null | wc -l)
 kill -0 "$RELAY_PID" 2>/dev/null && ok "relay 存活" || bad "relay 已退出"
 
 [ $fail -eq 0 ] && echo "PASS" || echo "FAIL（日志保留在 $WORKDIR）"
+# 明确区分两种 PASS：真换过机 vs 全程 fail-closed。
+#
+# 两者都是合法结论（fail-closed 是 MYS-2425-D 的设计决定），但含义完全不同：
+# 后者**没有验证**"新 PID + 磁盘 hash 变化"，只验证了"拒绝得干净、身份没丢、
+# 磁盘没动"。不写出来，读日志的人会把 fail-closed 的 PASS 当成换机验证通过。
+if [ $fail -eq 0 ] && [ "${FAIL_CLOSED:-0}" = "1" ]; then
+  echo "注意: 本轮全部为 fail-closed（本机 agent 共享一个 service，不是它自己的 MainPID），"
+  echo "      已验证「明确拒绝 + 磁盘未动 + 身份保持」，**未**验证真实二进制替换。"
+  echo "      要验证真实换机请让每台 agent 拥有独立 unit（Restart=always 且自己是 MainPID）。"
+fi
+if [ $fail -eq 0 ] && [ "${FAIL_CLOSED:-0}" != "1" ]; then
+  echo "已验证真实换机：新 PID + 磁盘 hash 变化 + 身份保持。"
+fi
 exit $fail
