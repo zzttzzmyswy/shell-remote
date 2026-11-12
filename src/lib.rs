@@ -20,6 +20,11 @@ pub mod tui;
 pub mod ui_config;
 #[cfg(feature = "gui")]
 pub mod ui_controller;
+// MYS-2819：无参数 GUI 的升级/回滚交接与身份恢复。同样只在 GUI 构建里编译
+// ——它把 `UiConfig` 与 `RestoredIdentity` 拼在一起，而这两者分属 GUI 与换机
+// 两条线。
+#[cfg(feature = "gui")]
+pub mod ui_resume;
 pub mod web;
 pub mod tlsutil;
 

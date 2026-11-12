@@ -10,6 +10,9 @@
 pub mod ui_config;
 #[cfg(feature = "gui")]
 pub mod ui_controller;
+// MYS-2819：无参数 GUI 的升级/回滚交接与身份恢复。
+#[cfg(feature = "gui")]
+pub mod ui_resume;
 ```
 
 ## 一、`ui_config::UiConfig`
@@ -112,7 +115,113 @@ self.ctl.poll();
 // 展示：ctl.last_error()（异步连接错误）或 ctl_error（同步校验错误）
 ```
 
-## 三、`AgentStatus` 新增方法
+## 三、无参数 GUI 的升级/回滚恢复（MYS-2819）
+
+无参数启动的窗口进程**没有 argv**，而既有自升级交接协议是"原样重启同一份
+argv"。两者叠加会出现一个不报错的退化：升级后新进程拿到空 argv、配置无处可去，
+只能按默认值注册成**另一台设备**；回滚助手还会往空 argv 里补
+`--session-id`——无参数入口不认识它，旧版启动即失败，设备彻底失联。
+
+`ui_resume` 把"活跃配置快照"接进既有交接协议，入口层只多一个分支。**控制器必须
+由窗口/持续事件循环持有**——它是 agent 线程的所有者，`Drop` 会请求停机并在有界
+时间内 join（见「二」的语义要点）：
+
+```rust
+use shell_remote::ui_controller::UiController;
+use shell_remote::ui_resume::resolve_gui_resume;
+
+// 无参数启动（bin/shell-remote-ui.rs 的 `None` 分支）。
+// `flag` = 顶层从隐藏参数 --upgrade-restore 拿到的值；没有就是 None。
+struct App {
+    // 关键：控制器活在整个窗口生命周期里，不能是 main 里的局部变量。
+    ctl: UiController,
+}
+
+fn main() -> anyhow::Result<()> {
+    let mut ctl = UiController::new();
+    if let Some(resume) = resolve_gui_resume(upgrade_restore_flag)? {
+        // 有效交接：直接恢复同配置、同身份，不弹配置窗、不等用户点连接。
+        ctl.connect_restored(resume.config_with_key(), resume.identity)?;
+    } else {
+        // 普通启动：只显示配置窗口，绝不自动连接。
+    }
+    // 把 ctl 交给窗口（egui 的 App 持有它），由事件循环驱动：
+    //   - 每帧 ctl.poll() 刷新状态/错误；
+    //   - 退出时随 App 一起 drop，由 Drop 完成停机。
+    // 千万不要在这里就让 ctl 落出作用域：Drop 会立刻 disconnect，
+    // 恢复出来的连接会在窗口出现之前就被断掉。
+    shell_remote::gui::run_with(ctl)
+}
+```
+
+> 上面最后一行是示意——`gui::run` 的签名与窗口接线由负责人决定；要点只有一个：
+> **`UiController` 的所有权要交到窗口状态里**，而不是留在 `main` 的栈上。
+>
+> 顶层参数解析与窗口接线由负责人做；`bin/shell-remote-ui.rs` 里已有的隐藏参数
+> `--upgrade-restore` 原样传给 `resolve_gui_resume` 即可，**不需要新增任何参数**。
+> 回滚路径由助手设 `SR_UPGRADE_RESTORE`，`resolve_gui_resume(None)` 同样能认出来。
+
+### API
+
+```rust
+pub struct GuiResume {
+    pub config: UiConfig,             // 连接时那份快照，key 恒为 None
+    pub identity: RestoredIdentity,   // 实际 session id + 完整 tokens + fixed_key
+}
+impl GuiResume {
+    pub fn key(&self) -> Option<&str>;          // 交接来的固定密钥
+    pub fn config_with_key(&self) -> UiConfig;  // 交给 connect_restored 的那份
+}
+
+pub fn resolve_gui_resume(flag: Option<&str>) -> anyhow::Result<Option<GuiResume>>;
+
+impl UiController {
+    pub fn connect_restored(&mut self, config: UiConfig, identity: RestoredIdentity)
+        -> anyhow::Result<()>;
+}
+```
+
+`resolve_gui_resume` 的三种结果（与既有 `resolve_restore` 同一套识别顺序：显式
+参数 → 环境变量 → 换机指针）：
+
+| 返回 | 含义 | 入口应当 |
+|---|---|---|
+| `Ok(None)` | 没有任何恢复意图 | 显示配置窗，**不**自动连接 |
+| `Ok(Some(_))` | 一次有效交接 | `connect_restored` 直接恢复并连接 |
+| `Err(_)` | 明确要求恢复但内容缺失/损坏/不一致 | 让启动失败（助手据此回滚），**绝不**退化成新设备 |
+
+### 语义要点
+
+- **活跃快照，不是磁盘草稿**：快照在 `connect()` 时由连接参数写入
+  `AgentStatus`（`set_gui_snapshot`），界面之后怎么改草稿都不影响它。绝不去读
+  `ui-config.json`——那可能是用户后来改过的、或者上个世纪的内容。
+- **session id 取实际值**：GUI 留空时由 relay 随机分配，`AgentStatus::set_connected`
+  会在注册成功那一刻把实际 id 补进快照。升级交接再取一次 `client.session_id`
+  覆盖，保证恢复后回到同一个会话。
+- **有效交接是唯一的自动重连授权**：磁盘上存在普通配置文件、或者出现未知参数，
+  都不构成恢复意图。普通 `connect()` 永远不带恢复语义（有回归用例）。
+- **密钥不进快照**：`GuiHandoffConfig` 刻意没有 key 字段；固定密钥继续只在
+  0600/当前用户 ACL 的私有交接文件里由 `fixed_key` 承载，不进 argv、不进环境
+  变量、不进日志。
+- **空 argv 的回滚**：无参数 GUI 的回滚**不往 argv 里补任何参数**，只设
+  `SR_UPGRADE_RESTORE` 指向那份私有交接文件——旧 GUI 版靠它认回同配置、同身份。
+  命令行启动的回滚行为一字未改（仍补 `--session-id`、仍不设该环境变量）。
+- **跨代次可读**：交接文件新增的 `gui` 字段是纯加法（`serde(default)` +
+  `skip_serializing_if`）。旧版读到它不存在 = 命令行启动；新版读到旧文件同样
+  按命令行处理。交接内的快照与身份必须自洽（relay / session id / token-type），
+  否则整份交接被拒绝。
+
+### 未覆盖（待负责人在真实环境集成验证）
+
+- **正式 Win10 交互**：本模块只有单元/进程级验证；Windows 上的窗口启动、
+  `--key` 输入、升级弹窗与回滚后的窗口行为仍需真机走查。
+- **真实二进制自升级**：进程级用例用真助手 + 真 relay + 脚本 agent 验证了
+  "空 argv + 同配置同身份 + 回滚"，但**没有**用发布制品跑完整的
+  "下载 → 校验 → 换盘 → 新版本注册"链路。发版前需要在 Win10/Linux 各做一次
+  真实自升级与失败回滚。
+- aarch64/armv7 的窗口与自升级同样未实跑。
+
+## 四、`AgentStatus` 新增方法
 
 `status.rs` 里补了错误通道（TUI 不用它，行为不变）：
 
@@ -122,7 +231,7 @@ pub fn last_error(&self) -> Option<String>;
 pub fn clear_error(&self);
 ```
 
-## 四、核心取消支持改动（`src/agent/`，最小面）
+## 五、核心取消支持改动（`src/agent/`，最小面）
 
 | 改动 | 原因 |
 |---|---|
@@ -135,7 +244,7 @@ pub fn clear_error(&self);
 CLI / TUI 行为不变：不传 `on_error` 时完全走原路径；lean 构建（无 tui feature）
 下两个 helper 直接转发，不额外唤醒。
 
-## 五、验收命令
+## 六、验收命令
 
 ```bash
 git diff --check

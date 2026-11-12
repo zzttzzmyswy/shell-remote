@@ -57,6 +57,16 @@ struct StatusInner {
     /// （任务卡：错误留在窗口中，不闪退）。只存一条，新错误覆盖旧错误，连接
     /// 成功即由 [`AgentStatus::clear_error`] 清掉。
     last_error: Mutex<Option<String>>,
+    /// 本次连接的**活跃配置快照**（MYS-2819）。
+    ///
+    /// 只由 GUI 控制层在 `connect()` 时写入一次，且写的是**当次连接实际使用的
+    /// 那份配置**——界面之后怎么改草稿都与它无关。自升级交接用它，而不是去读
+    /// 磁盘上的普通 `ui-config.json`：那份文件可能是用户后来改过的草稿，也可能是
+    /// 上个世纪的内容。
+    ///
+    /// 放在这里而不是某个进程级静态量：一个 `AgentStatus` 对应一个连接实例，
+    /// 多个控制器（测试里并行跑的那些）互不干扰。
+    gui_snapshot: Mutex<Option<crate::agent::update_apply::GuiHandoffConfig>>,
 }
 
 /// 与 agent 核心共享的只读状态句柄（Arc 克隆廉价，Send+Sync）。
@@ -89,6 +99,20 @@ impl AgentStatus {
         *self.inner.tokens.lock().unwrap() = tokens;
         *self.inner.connected_at.lock().unwrap() = Some(Instant::now());
         *self.inner.phase.lock().unwrap() = Phase::Connected;
+        // 活跃配置快照里的 session id 跟着**实际** id 走（MYS-2819）。
+        //
+        // `connect()` 时写入的是用户那份草稿：GUI 留空时它没有 id，真正的 id
+        // 由 relay 分配、只有这里才知道。不在这里同步，快照就会带着空 id 进入
+        // 升级交接，新进程恢复时便无处可回——那正是"静默变成另一台设备"。
+        if let Some(snapshot) = self
+            .inner
+            .gui_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            snapshot.session_id = Some(session_id.to_string());
+        }
     }
 
     pub fn session_id(&self) -> String {
@@ -169,6 +193,30 @@ impl AgentStatus {
     /// 连接成功 / 重新开始连接时清掉旧错误（旧原因已不再成立）。
     pub fn clear_error(&self) {
         *self.inner.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 记下**本次连接实际使用的**配置快照（MYS-2819）。
+    ///
+    /// GUI 控制层在 `connect()` 里写入一次；之后界面怎么改草稿都不会影响它。
+    /// 自升级交接读的就是这份，而不是磁盘上的 `ui-config.json`。
+    ///
+    /// 快照里没有固定密钥：密钥继续走既有受保护通道（交接文件的 `fixed_key`），
+    /// 不放进这个可以被随手 `{:?}` 打印的结构。
+    pub fn set_gui_snapshot(&self, snapshot: crate::agent::update_apply::GuiHandoffConfig) {
+        *self
+            .inner
+            .gui_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+    }
+
+    /// 本次连接的活动配置快照；非 GUI 连接恒为 `None`。
+    pub fn gui_snapshot(&self) -> Option<crate::agent::update_apply::GuiHandoffConfig> {
+        self.inner
+            .gui_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
