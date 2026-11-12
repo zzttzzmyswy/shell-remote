@@ -113,6 +113,43 @@ impl UiController {
     /// `poll()` 回收时，这里顺手收掉它再继续——界面即使漏调了一次 `poll()`
     /// 也不会被"假运行中"卡住。
     pub fn connect(&mut self, config: UiConfig) -> anyhow::Result<()> {
+        self.start(config, None)
+    }
+
+    /// 升级交接后的恢复连接（MYS-2819）：以交接来的**配置快照 + 身份**启动。
+    ///
+    /// 与 [`Self::connect`] 的差别只有两点，其余（单实例、校验先行、快照隔离、
+    /// 有界停止、错误脱敏）完全相同：
+    ///
+    /// 1. 身份来自交接——首次注册回放原 tokens、沿原 session id，注册成功后由
+    ///    [`RestoredIdentity::complete`] 删交接文件并向助手回执。这一条**只**在
+    ///    升级路径上生效：普通 `connect()` 永远传 `None`，不会因为磁盘上恰好有
+    ///    交接文件就顺手恢复。
+    /// 2. 交给 agent 的配置带着交接来的固定密钥（`identity.restore.fixed_key`），
+    ///    使回滚/重连后 `--key` 派生的身份也能续上。密钥仍然只在内存与私有交接
+    ///    文件里，不进 argv、不进日志。
+    ///
+    /// 校验失败时与 `connect()` 一样**不起线程**：调用方拿到的错误可直接展示。
+    pub fn connect_restored(
+        &mut self,
+        config: UiConfig,
+        identity: crate::agent::update_apply::RestoredIdentity,
+    ) -> anyhow::Result<()> {
+        // 身份里的固定密钥是唯一来源：调用方传进来的 config 即使带了 key 也
+        // 以交接为准（交接是受保护通道，用户草稿不是）。
+        let mut config = config;
+        if let Some(key) = identity.restore.fixed_key.clone() {
+            config.key = Some(key);
+        }
+        self.start(config, Some(identity))
+    }
+
+    /// 共用的启动体。`restored` 为 `None` = 普通连接（既有路径，行为不变）。
+    fn start(
+        &mut self,
+        config: UiConfig,
+        restored: Option<crate::agent::update_apply::RestoredIdentity>,
+    ) -> anyhow::Result<()> {
         if self.is_running() {
             return Err(anyhow!(
                 "已有连接在运行或正在停止：请先断开并等待停止完成，再连接新的配置"
@@ -127,6 +164,19 @@ impl UiController {
         crate::agent::cmd_log::set_enabled(!config.no_cmd_log);
 
         let status = AgentStatus::new(config.relay_url.clone());
+        // 活跃配置快照：自升级交接取这一份（**连接时**的那份），不读磁盘草稿。
+        // 来源是连接参数而不是"当前草稿"，界面之后怎么改都影响不到它。
+        //
+        // session id 取"这次连接实际要用的那个"：恢复连接时有交接来的实际 id
+        // （GUI 留空时 relay 随机分配过），普通连接则是用户填的那个。真值还会
+        // 在升级那一刻由 `client.session_id` 覆盖一次，因为随机分配要等注册。
+        let active_sid = restored
+            .as_ref()
+            .map(|r| r.restore.session_id.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| config.session_id.clone())
+            .unwrap_or_default();
+        status.set_gui_snapshot(config.to_handoff_snapshot(&active_sid));
         let relay_url = config.relay_url.clone();
         let key = config.key.clone();
         let root = config.root.clone().unwrap_or_else(crate::agent::home_dir);
@@ -137,6 +187,13 @@ impl UiController {
         // 桌面参数在起线程前就映射好（与 UI 二进制的字段映射逐项一致）。
         #[cfg(feature = "desktop")]
         let desktop_cfg = config.to_desktop_config();
+
+        // 自回滚看门狗：只有交接带来 `self_rollback` 时才有（`SystemdRestart`
+        // 换机没有外部监督者）。必须在进程启动后的第一时间挂上，所以在这里
+        // 就起——而不是等线程跑到某个点。
+        if let Some(r) = restored.as_ref() {
+            r.spawn_self_rollback_watchdog(|code| std::process::exit(code));
+        }
 
         let thread_status = status.clone();
         let live = LiveGuard::acquire();
@@ -163,7 +220,7 @@ impl UiController {
                             desktop_cfg,
                             Some(thread_status),
                             insecure,
-                            None,
+                            restored,
                         )
                         .await
                     }
@@ -178,7 +235,7 @@ impl UiController {
                             session_id,
                             Some(thread_status),
                             insecure,
-                            None,
+                            restored,
                         )
                         .await
                     }
@@ -423,6 +480,17 @@ mod tests {
         LIVE_SESSIONS.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// 断开后必须释放 LAN 端口、回收**本次连接自己那个** PTY 子进程。
+    ///
+    /// 这条用例修正了 MYS-2816 留下的一个自欺：原实现先在连接后采集
+    /// `children_before`，再断言"不在该集合里的子进程为空"。若 PTY 恰好在那次
+    /// 采集之前就已起好（常见），它会被整个排除在泄漏检查之外——测试通过，泄漏
+    /// 照样没人发现。
+    ///
+    /// 现在改成**按身份认领**：给本次连接一个独一无二的 shell 路径，再从
+    /// `/proc/<pid>/cmdline` 里认出发起它的那个子进程。这样既不会漏掉本次 PTY，
+    /// 也不会把并行跑的其它测试起的子进程误判成泄漏。
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_ui_controller_releases_lan_port_and_pty_children_on_disconnect() {
         let _g = serial();
@@ -432,8 +500,37 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
+        // 独一无二的 shell 路径：shebang 脚本的 cmdline 里会带上脚本路径，用它
+        // 认领"本次连接起的那个 PTY"。脚本必须**自己常驻**：`exec` 会把 cmdline
+        // 整个换掉，标记随之消失，认领就永远落空。
+        //
+        // 它还要回答登录模式探测（agent 启动前会先跑一次
+        // `<shell> -l -c "echo <sentinel>"`），否则被判定为"不支持 -l"。
+        let shell_dir = private_tmpdir("pty");
+        let shell_path = shell_dir.join(format!(
+            "sr-pty-marker-{}-{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::write(
+            &shell_path,
+            b"#!/bin/sh\ncase \"$*\" in\n  *__shell_remote_login_probe_ok__*) echo __shell_remote_login_probe_ok__; exit 0;;\nesac\nsleep 600\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shell_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let marker = shell_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
         let mut cfg = test_config(&relay);
         cfg.desktop_lan_port = port;
+        cfg.shell = shell_path.to_string_lossy().into_owned();
         let mut c = UiController::new();
         c.connect(cfg).expect("connect");
         assert!(
@@ -449,10 +546,19 @@ mod tests {
             wait_until(|| port_in_use(port), Duration::from_secs(10)).await,
             "配置了 LAN 端口就必须真的监听"
         );
-        let children_before = child_pids();
+
+        // 认领本次 PTY：记下这些 pid，断开后逐个确认已经退出。
+        let mut pty_pids: Vec<u32> = Vec::new();
         assert!(
-            wait_until(|| !child_pids().is_empty(), Duration::from_secs(10)).await,
-            "已连接的会话应持有 PTY 子进程"
+            wait_until(
+                || {
+                    pty_pids = children_matching(&marker);
+                    !pty_pids.is_empty()
+                },
+                Duration::from_secs(10)
+            )
+            .await,
+            "已连接的会话应持有本次连接自己的 PTY 子进程（marker={marker}）"
         );
 
         c.disconnect();
@@ -471,14 +577,45 @@ mod tests {
             wait_until(|| !port_in_use(port), Duration::from_secs(5)).await,
             "断开后 LAN 监听端口必须释放"
         );
-        // PTY 子进程必须被回收（Shell::drop 会 kill+wait）。
-        let leaked: Vec<u32> = child_pids()
-            .into_iter()
-            .filter(|pid| !children_before.contains(pid))
-            .collect();
+        // **认领过的那些 PTY** 必须真的退出（`Shell::drop` 会 kill + wait）。
+        // 等它们消失，而不是只看"有没有别的进程冒出来"。
         assert!(
-            leaked.is_empty(),
-            "断开后不得遗留 PTY 子进程: {leaked:?}"
+            wait_until(
+                || {
+                    pty_pids
+                        .iter()
+                        .copied()
+                        .all(|pid| !process_alive(pid))
+                },
+                Duration::from_secs(5)
+            )
+            .await,
+            "断开后本次 PTY 子进程必须退出，仍在运行: {:?}",
+            pty_pids
+                .iter()
+                .copied()
+                .filter(|pid| process_alive(*pid))
+                .collect::<Vec<_>>()
+        );
+        // 也不能有同名的新化身残留（例如 shell 被重新拉起）。
+        assert!(
+            children_matching(&marker).is_empty(),
+            "断开后不得遗留本次连接的 PTY 子进程: {:?}",
+            children_matching(&marker)
+        );
+    }
+
+    /// 非 Linux：没有 `/proc/<pid>/cmdline` 充当"这就是本次那个 PTY"的证据。
+    ///
+    /// 这里**显式跳过并说清楚原因**，而不是让某个"恒返回空集"的实现把断言变成
+    /// 永远成立的空话——那正是本次要修的坏味道（MYS-2819 复查项）。Windows 要
+    /// 覆盖这条，需要补一个按 PID/命令行查子进程的实现。
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn test_ui_controller_releases_lan_port_and_pty_children_on_disconnect() {
+        eprintln!(
+            "跳过 PTY 泄漏断言：本平台没有 /proc/<pid>/cmdline 证据；\
+             需要在 Linux 上跑这条用例（Windows 需补对应进程查询）"
         );
     }
 
@@ -489,6 +626,30 @@ mod tests {
             Duration::from_millis(200),
         )
         .is_ok()
+    }
+
+    /// 本进程的、cmdline 里带 `marker` 的直接子进程（即"本次连接起的那个 PTY"）。
+    ///
+    /// 只在 Linux 上有意义：别的平台 `child_pids()` 恒为空，按标记认领会得到
+    /// 空集合——所以非 Linux 上这条用例**显式跳过**（见用例内的平台分支），
+    /// 绝不用空集合假装"验证通过"。
+    #[cfg(target_os = "linux")]
+    fn children_matching(marker: &str) -> Vec<u32> {
+        child_pids()
+            .into_iter()
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .map(|raw| String::from_utf8_lossy(&raw).contains(marker))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// 进程是否还活着（`kill(pid, 0)`）。
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        // SAFETY: 信号 0 只做存在性/权限检查，不投递任何信号。
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
     /// 本进程当前的直接子进程 pid（Linux：扫 /proc/<pid>/stat 的 ppid）。
@@ -838,4 +999,306 @@ mod tests {
         assert!(!c.is_running());
         assert!(c.status().is_none());
     }
+    // ── MYS-2819：活跃配置快照 + 升级交接恢复 ──────────────────────
+
+    /// 交接文件必须落在 0700 目录里（`RestartContext` 会校验）：`tempfile`
+    /// 的默认目录是 0755，直接用会被拒。
+    fn private_tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sr-uil-{tag}-{}-{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        dir
+    }
+
+    /// 造一份可用的交接文件（身份 + 可选 GUI 快照）。
+    fn write_gui_handoff(
+        dir: &std::path::Path,
+        relay: &str,
+        sid: &str,
+        gui: Option<crate::agent::update_apply::GuiHandoffConfig>,
+        fixed_key: Option<&str>,
+    ) -> std::path::PathBuf {
+        let target = dir.join("shell-remote");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        let new_binary = dir.join("artifact");
+        std::fs::write(&new_binary, b"#!/bin/sh\n# new\n").unwrap();
+        let sha = crate::agent::upgrade::sha256_hex_file(&new_binary).unwrap();
+        let mut ctx = crate::agent::update_apply::RestartContext::new(
+            sid.to_string(),
+            vec![("restored-rw-token".to_string(), "rw".to_string())],
+            fixed_key.map(|k| k.to_string()),
+            "rw".to_string(),
+            Some(relay.to_string()),
+            false,
+            Vec::new(),
+            target,
+            new_binary,
+            sha,
+            "up-ui".to_string(),
+            "9.9.9".to_string(),
+            None,
+            None,
+            None,
+            false,
+        );
+        if let Some(snap) = gui {
+            ctx = ctx.with_gui_snapshot(snap);
+        }
+        ctx.write_handoff_into(dir).unwrap()
+    }
+
+    fn gui_snapshot(relay: &str, sid: &str) -> crate::agent::update_apply::GuiHandoffConfig {
+        crate::agent::update_apply::GuiHandoffConfig {
+            relay_url: relay.to_string(),
+            relay_insecure: false,
+            root: None,
+            token_type: "rw".to_string(),
+            shell: "/bin/sh".to_string(),
+            session_id: Some(sid.to_string()),
+            no_cmd_log: false,
+            desktop_capture: "none".to_string(),
+            desktop_codec: "h264".to_string(),
+            desktop_fps: 22.0,
+            desktop_capture_fps: 0.0,
+            desktop_max_bitrate: 1500,
+            desktop_quality: "balanced".to_string(),
+            desktop_min_bitrate: 90,
+            desktop_display: None,
+            desktop_lan_port: 39616,
+        }
+    }
+
+    /// 连上之后 `AgentStatus` 里必须有一份**连接时**的活跃配置快照：自升级
+    /// 交接读的是它，而不是磁盘上的 ui-config.json（那可能是用户后来改的草稿）。
+    #[tokio::test]
+    async fn test_ui_controller_records_the_active_config_snapshot() {
+        let _g = serial();
+        let relay = spawn_relay().await;
+        let mut cfg = test_config(&relay);
+        cfg.desktop_lan_port = 39616;
+        cfg.desktop_fps = 22.0;
+        let mut c = UiController::new();
+        c.connect(cfg.clone()).expect("connect");
+        assert!(
+            wait_until(
+                || c.status().map(|s| s.phase()) == Some(Phase::Connected),
+                Duration::from_secs(10)
+            )
+            .await
+        );
+
+        let st = c.status().expect("status");
+        let snap = st.gui_snapshot().expect("连接后必须有活跃配置快照");
+        assert_eq!(snap.relay_url, relay);
+        assert_eq!(snap.desktop_lan_port, 39616, "LAN 端口要进快照");
+        assert_eq!(snap.desktop_fps, 22.0, "桌面参数要进快照");
+        // session id 必须是**实际**在跑的那个，而不是草稿里的 Option。
+        let actual = st.session_id();
+        assert!(!actual.is_empty(), "注册成功后应有实际 session id");
+        assert_eq!(
+            snap.session_id.as_deref(),
+            Some(actual.as_str()),
+            "快照里的 session id 必须能用来恢复同一个会话"
+        );
+        // 快照里没有密钥字段（密钥只走交接的 fixed_key）。
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("\"key\""), "快照不得带 key 字段: {json}");
+
+        c.disconnect();
+        assert!(wait_until(
+            || {
+                c.poll();
+                !c.is_running()
+            },
+            STOP_DEADLINE
+        )
+        .await);
+    }
+
+    /// 普通 `connect()` 绝不带恢复语义：即使磁盘上恰好有一份交接文件，
+    /// 也不会顺手把身份恢复进来（有效交接才是唯一的自动重连授权）。
+    #[tokio::test]
+    async fn test_plain_connect_never_restores_an_identity() {
+        let _g = serial();
+        let relay = spawn_relay().await;
+        let dir = private_tmpdir("plain");
+        // 造一个"看起来正当"的交接文件放在磁盘上。
+        let _handoff = write_gui_handoff(
+            &dir,
+            &relay,
+            "shouldnotused",
+            Some(gui_snapshot(&relay, "shouldnotused")),
+            None,
+        );
+        let mut c = UiController::new();
+        c.connect(test_config(&relay)).expect("connect");
+        assert!(
+            wait_until(
+                || c.status().map(|s| s.phase()) == Some(Phase::Connected),
+                Duration::from_secs(10)
+            )
+            .await
+        );
+        let st = c.status().expect("status");
+        assert_ne!(
+            st.session_id(),
+            "shouldnotused",
+            "普通 connect 不得因为磁盘上有交接文件就恢复身份"
+        );
+        c.disconnect();
+        assert!(wait_until(
+            || {
+                c.poll();
+                !c.is_running()
+            },
+            STOP_DEADLINE
+        )
+        .await);
+    }
+
+    /// `connect_restored`：用交接来的配置 + 身份连上，实际回的必须是原会话，
+    /// 且注册成功后交接文件被消费。
+    #[tokio::test]
+    async fn test_connect_restored_uses_the_handed_over_identity() {
+        let _g = serial();
+        let relay = spawn_relay().await;
+        let dir = private_tmpdir("restored");
+
+        // 先按"原会话"注册一次，拿到真实 tokens（这是要保住的身份）。
+        let client = reqwest::Client::new();
+        let reg: serde_json::Value = client
+            .post(format!("{relay}/agent/send"))
+            .json(&serde_json::json!({
+                "type": "agent:register",
+                "session_id": "uirestore1",
+                "token_type": "rw",
+                "agent_version": "0.0.0-test",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tokens: Vec<(String, String)> = reg["payload"]["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["token"].as_str().unwrap().to_string(),
+                    t["permission"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(!tokens.is_empty());
+
+        // 用这份真实身份造交接文件 + 从快照还原的配置。
+        let handoff = {
+            let target = dir.join("shell-remote");
+            std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+            let new_binary = dir.join("artifact");
+            std::fs::write(&new_binary, b"#!/bin/sh\n# new\n").unwrap();
+            let sha = crate::agent::upgrade::sha256_hex_file(&new_binary).unwrap();
+            let mut ctx = crate::agent::update_apply::RestartContext::new(
+                "uirestore1".to_string(),
+                tokens.clone(),
+                Some("RESTORE-FIXED-KEY-9".to_string()),
+                "rw".to_string(),
+                Some(relay.clone()),
+                false,
+                Vec::new(),
+                target,
+                new_binary,
+                sha,
+                "up-ui2".to_string(),
+                "9.9.9".to_string(),
+                None,
+                None,
+                None,
+                false,
+            );
+            ctx = ctx.with_gui_snapshot(gui_snapshot(&relay, "uirestore1"));
+            ctx.write_handoff_into(&dir).unwrap()
+        };
+
+        let resume = crate::ui_resume::resolve_gui_resume(Some(&handoff.to_string_lossy()))
+            .expect("交接可解析")
+            .expect("必须返回恢复");
+        let mut c = UiController::new();
+        c.connect_restored(resume.config_with_key(), resume.identity)
+            .expect("恢复连接必须能启动");
+        assert!(
+            wait_until(
+                || c.status().map(|s| s.phase()) == Some(Phase::Connected),
+                Duration::from_secs(15)
+            )
+            .await,
+            "恢复连接应在 15 秒内注册成功"
+        );
+
+        let st = c.status().expect("status");
+        assert_eq!(
+            st.session_id(),
+            "uirestore1",
+            "必须回到原会话，不能变成另一台设备"
+        );
+        assert_eq!(
+            st.tokens(), tokens,
+            "必须沿用手上那份完整 tokens（含权限）"
+        );
+        // 交接文件在注册成功后由 agent 侧消费掉。
+        assert!(
+            wait_until(|| !handoff.exists(), Duration::from_secs(5)).await,
+            "注册成功后交接文件必须被删除"
+        );
+
+        c.disconnect();
+        assert!(wait_until(
+            || {
+                c.poll();
+                !c.is_running()
+            },
+            STOP_DEADLINE
+        )
+        .await);
+    }
+
+    /// 恢复连接的配置校验与普通连接一致：坏配置不起线程、不产生副作用。
+    #[tokio::test]
+    async fn test_connect_restored_validates_before_starting() {
+        let _g = serial();
+        let dir = private_tmpdir("badcfg");
+        let relay = dead_relay().await;
+        let handoff = write_gui_handoff(
+            &dir,
+            &relay,
+            "uisessbad",
+            Some(gui_snapshot(&relay, "uisessbad")),
+            None,
+        );
+        let resume = crate::ui_resume::resolve_gui_resume(Some(&handoff.to_string_lossy()))
+            .unwrap()
+            .unwrap();
+        let mut cfg = resume.config_with_key();
+        cfg.desktop_fps = 999.0; // 非法
+
+        let baseline = live_sessions();
+        let mut c = UiController::new();
+        assert!(
+            c.connect_restored(cfg, resume.identity).is_err(),
+            "非法配置必须被拦下"
+        );
+        assert!(!c.is_running(), "校验失败不得起线程");
+        assert_eq!(live_sessions(), baseline, "校验失败不得留下线程");
+    }
+
 }

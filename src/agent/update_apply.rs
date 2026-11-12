@@ -136,7 +136,11 @@ pub const EXIT_ROLLED_BACK: i32 = 3;
 ///
 /// `argv` 是**原始参数**（去掉 argv[0] 和隐藏恢复参数），助手用它原样拉起
 /// 新旧两个进程；tokens 只用于新进程的一次性注册。
-#[derive(Clone, PartialEq, Eq)]
+///
+/// 不再 `derive(Eq)`（MYS-2819）：GUI 快照里有 `f64` 帧率，`Eq` 在 NaN 上的
+/// 语义是错的（`NaN != NaN` 却又要"自反"）。这里只需按值比较/克隆，`PartialEq`
+/// 就够——仓库里没有任何以 `RestartContext` 为 map/set 键的用法。
+#[derive(Clone, PartialEq)]
 pub struct RestartContext {
     pub session_id: String,
     pub tokens: Vec<(String, String)>,
@@ -195,6 +199,76 @@ pub struct RestartContext {
     /// 为什么不让助手直接拉起 overlay：那样就把启动校验绕过去了——base 才是
     /// "读指针 → 校验属主/权限/sha256 → exec" 的那一环，绕过它等于没有回滚。
     pub overlay: bool,
+    /// **无参数 GUI 的活跃连接快照**（MYS-2819）。`Some` 同时表示"这是无参数
+    /// GUI 启动"（`argv` 为空），两条含义都必须成立才能自洽：
+    ///
+    /// - 有快照 ⇒ 新进程是无参数 GUI，配置只能从交接文件恢复（argv 里什么都没有）；
+    /// - 无快照 ⇒ 命令行启动（CLI / UI `agent` 子命令），配置本来就在 argv 里。
+    ///
+    /// 它**不含**固定密钥：key 继续只走 [`Self::fixed_key`] 这个受保护字段，
+    /// 与既有 token 同一条纪律（不进 argv、不进日志）。
+    pub gui: Option<GuiHandoffConfig>,
+}
+
+/// 无参数 GUI 交接的配置快照（MYS-2819）。
+///
+/// 为什么是一个独立的、与 feature 无关的结构，而不是直接序列化 `UiConfig`：
+///
+/// 1. 交接文件由**旧版**写、由**新版**读，新版还可能是不带 `gui` feature 的
+///    lean 构建（`update-apply` 助手就在同一个二进制里）。要保证任何构型都能
+///    读懂并原样搬移这段内容，它的类型就不能挂在 `gui` feature 下。
+/// 2. `UiConfig` 的 `key` 是 `#[serde(skip)]` 的内存字段。放在这里会诱导后来
+///    的人"顺手把 key 也存进去"——这个结构**故意没有** key 字段，密钥只有
+///    [`RestartContext::fixed_key`] 一条通道。
+///
+/// 字段与 `ui_config::UiConfig` 一一对应（`desktop_min_bitrate` 等仍是 UI 侧的
+/// kbps，换算由 GUI 侧负责）。全部字段 `serde(default)`：新版写、更旧的读，
+/// 或者反过来，都不会因为多了/少了一个字段而整份交接读不出来。
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
+pub struct GuiHandoffConfig {
+    #[serde(default)]
+    pub relay_url: String,
+    #[serde(default)]
+    pub relay_insecure: bool,
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub token_type: String,
+    #[serde(default)]
+    pub shell: String,
+    /// 连接时生效的会话 id。GUI 留空时由 relay 随机分配，因此这里带的是
+    /// **实际** id（与 [`RestartContext::session_id`] 同源），保证恢复后重连
+    /// 不会换号。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub no_cmd_log: bool,
+    #[serde(default)]
+    pub desktop_capture: String,
+    #[serde(default)]
+    pub desktop_codec: String,
+    #[serde(default)]
+    pub desktop_fps: f64,
+    #[serde(default)]
+    pub desktop_capture_fps: f64,
+    #[serde(default)]
+    pub desktop_max_bitrate: u64,
+    #[serde(default)]
+    pub desktop_quality: String,
+    #[serde(default)]
+    pub desktop_min_bitrate: u64,
+    #[serde(default)]
+    pub desktop_display: Option<String>,
+    #[serde(default)]
+    pub desktop_lan_port: u16,
+}
+
+impl GuiHandoffConfig {
+    /// 活动 relay 地址（去掉尾斜杠，与 `client` 的规范化一致），用于和
+    /// 交接里的 `relay_base` 比对。
+    pub fn relay(&self) -> &str {
+        self.relay_url.trim_end_matches('/')
+    }
 }
 
 impl std::fmt::Debug for RestartContext {
@@ -220,6 +294,14 @@ impl std::fmt::Debug for RestartContext {
             .field("managed_plan", &self.managed_plan)
             .field("service_restart_policy", &self.service_restart_policy)
             .field("overlay", &self.overlay)
+            // 只报"有没有"与 relay：配置本身（尤其 key）不是日志内容。
+            .field(
+                "gui",
+                &self
+                    .gui
+                    .as_ref()
+                    .map(|g| format!("<snapshot for {}>", g.relay())),
+            )
             .finish()
     }
 }
@@ -267,6 +349,12 @@ struct HandoffFile {
     /// 老助手读不到这个字段时默认 `false`（既有行为），所以它是一个纯加法。
     #[serde(default)]
     overlay: bool,
+    /// **无参数 GUI 的活跃连接快照**（MYS-2819）。缺省 = 命令行启动。
+    ///
+    /// 老助手/老 agent 读不到它时是 `None`，那正是"命令行启动、配置在 argv 里"
+    /// 的既有语义，所以这也是一个纯加法字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gui: Option<GuiHandoffConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -451,7 +539,45 @@ impl RestartContext {
             service_restart_policy,
             managed_plan,
             overlay,
+            // 命令行启动没有 GUI 快照：`gui_snapshot` 由调用方从**活跃连接
+            // 上下文**注入（见 [`Self::with_gui_snapshot`]），不从 argv 猜。
+            gui: None,
         }
+    }
+
+    /// 注入无参数 GUI 的活跃连接快照（MYS-2819）。
+    ///
+    /// 为什么是显式注入而不是从 `argv` 推断：无参数 GUI 启动时 argv **就是空
+    /// 的**，而 `argv` 为空也可能是"操作员手工起了个裸进程"。把两者混为一谈
+    /// 会让一次普通启动被当成恢复意图。所以"这是 GUI 启动"必须由**知道答案
+    /// 的那一层**（GUI 控制层）明确告知。
+    ///
+    /// 快照与交接的其余部分必须自洽：relay 与 session id 直接以快照为准写入
+    /// 交接的同名字段，避免出现"身份按 A、配置按 B"的分裂状态。
+    pub fn with_gui_snapshot(mut self, snapshot: GuiHandoffConfig) -> Self {
+        // 交接的 session id / relay 以快照为准：新进程要用它们恢复身份，
+        // 两边不一致时只能有一个赢家，而 GUI 快照才是"用户实际在跑的那份"。
+        //
+        // 快照没带 session id 时**保留**交接里已有的值：那说明这是一份不完整
+        // 的输入，而把确定的值抹成空串只会让后续校验失效（空 id 反而通不过
+        // `is_usable`，报出来的原因还会指向错误的方向）。
+        if let Some(sid) = snapshot.session_id.clone().filter(|s| !s.is_empty()) {
+            self.session_id = sid;
+        }
+        self.relay_base = Some(snapshot.relay().to_string());
+        self.token_type = snapshot.token_type.clone();
+        self.gui = Some(snapshot);
+        self
+    }
+
+    /// 本次换机是无参数 GUI 启动（新进程的配置只能从交接文件恢复）。
+    pub fn is_gui_resume(&self) -> bool {
+        self.gui.is_some()
+    }
+
+    /// 本次交接携带的无参数 GUI 配置快照；命令行启动为 `None`。
+    pub fn gui_snapshot(&self) -> Option<&GuiHandoffConfig> {
+        self.gui.as_ref()
     }
 
     fn to_file(&self) -> HandoffFile {
@@ -483,6 +609,7 @@ impl RestartContext {
             service_restart_policy: self.service_restart_policy.clone(),
             managed_plan: self.managed_plan.as_ref().map(encode_plan),
             overlay: self.overlay,
+            gui: self.gui.clone(),
         }
     }
 
@@ -514,6 +641,32 @@ impl RestartContext {
         if f.tokens.is_empty() {
             return Err("handoff carries no tokens".to_string());
         }
+        // GUI 快照必须与交接的其余部分自洽：三者都来自同一个运行实例，
+        // 任何一处对不上都只可能是文件损坏或被改过——按 fail-closed 拒绝，
+        // 绝不用"恢复默认值"把不一致掩盖过去。
+        if let Some(gui) = f.gui.as_ref() {
+            if gui.relay().is_empty() {
+                return Err("the GUI snapshot carries no relay URL".to_string());
+            }
+            if let Some(base) = f.relay_base.as_deref() {
+                if gui.relay() != base.trim_end_matches('/') {
+                    return Err(
+                        "the GUI snapshot relay does not match the handoff relay".to_string()
+                    );
+                }
+            }
+            if gui.session_id.as_deref().unwrap_or("") != f.session_id {
+                return Err(
+                    "the GUI snapshot session id does not match the handoff session id"
+                        .to_string(),
+                );
+            }
+            if gui.token_type != f.token_type {
+                return Err(
+                    "the GUI snapshot token type does not match the handoff token type".to_string(),
+                );
+            }
+        }
         Ok(Self {
             session_id: f.session_id,
             tokens: f
@@ -541,6 +694,7 @@ impl RestartContext {
             service_restart_policy: f.service_restart_policy,
             managed_plan: f.managed_plan.as_deref().and_then(decode_plan),
             overlay: f.overlay,
+            gui: f.gui,
         })
     }
 
@@ -1099,6 +1253,9 @@ pub struct RestoredIdentity {
     ///
     /// `None` = 这条路径上有人替我们回滚（助手 / 普通启动），本进程不必自己动手。
     pub self_rollback: Option<SelfRollback>,
+    /// 无参数 GUI 的活跃连接快照（MYS-2819）。`None` = 命令行启动的升级，
+    /// 配置本来就在 argv 里，调用方不需要也**不应该**从交接里推断配置。
+    gui: Option<GuiHandoffConfig>,
 }
 
 impl std::fmt::Debug for RestoredIdentity {
@@ -1156,7 +1313,13 @@ impl RestoredIdentity {
             service_cgroup: ctx.service_cgroup.clone(),
             consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             self_rollback: None,
+            gui: ctx.gui.clone(),
         })
+    }
+
+    /// 本次交接携带的无参数 GUI 配置快照（MYS-2819）；命令行升级为 `None`。
+    pub fn gui_snapshot(&self) -> Option<&GuiHandoffConfig> {
+        self.gui.as_ref()
     }
 
     /// 已经消费过（交接文件删了、助手已收到回执）。
@@ -2656,6 +2819,36 @@ fn systemd_restart_swap_with(
     Ok(())
 }
 
+/// 把子进程 stderr 排空到助手日志（后台线程，读到 EOF 自行结束）。
+///
+/// 只用于"不看内容、但必须把管道读掉"的场景：管道写满（64KB）会让子进程阻塞
+/// 在 write 上，卡住它后面的所有工作。
+fn drain_stderr_into_log(
+    child: &mut std::process::Child,
+    log_path: &Path,
+) -> Option<std::thread::JoinHandle<()>> {
+    let stderr = child.stderr.take()?;
+    // 助手日志句柄本身不跨线程共享：这里按路径重新打开一份追加写；打不开就
+    // 退化成纯排空（绝不让日志问题影响回滚本身）。
+    let path = log_path.to_path_buf();
+    Some(std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        let mut sink = std::fs::OpenOptions::new().append(true).open(&path).ok();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Some(f) = sink.as_mut() {
+                        let _ = writeln!(f, "rolled-back-agent| {}", line.trim_end());
+                    }
+                }
+            }
+        }
+    }))
+}
+
 /// 交接文件被消费（新 agent 注册成功后删除）即成功。
 fn await_handoff_consumed(handoff: &Path, timeout: Duration) -> Result<(), String> {
     // 必须**先看到它存在**再看到它消失。
@@ -2763,6 +2956,52 @@ fn rollback(
         }
     };
     log.line(&format!("previous agent restarted (pid {})", child.id()));
+
+    // ── 无参数 GUI 的回滚：它自己就会恢复身份，不必也无须我们再绑一次 ──
+    //
+    // 被回滚的 GUI 版拿到的是 `SR_UPGRADE_RESTORE`（见
+    // [`spawn_agent_for_rollback`]），它会照既有恢复协议回放原 tokens、沿原
+    // session id 注册，**并在 `restore_verdict` 判定身份真的对上之后**才消费交接
+    // 文件（`RestoredIdentity::complete`）。所以"交接文件消失"就是"身份已恢复"
+    // 的权威证据，比 grep 日志可靠得多（GUI 的记录走日志文件，未必打到 stderr）。
+    //
+    // 这里**不再调 `bind_identity`**：它会用缓存 tokens 再 `register_existing` 一次，
+    // 把旧 GUI 刚建好的会话顶替掉（relay 的 register_existing 会驱逐同 id 会话），
+    // 于是一个**已经正常上线**的进程会在 relay 侧失去自己的会话。命令行路径保持
+    // 原样（那边的旧版不认识交接文件，只能靠助手替它绑）。
+    if ctx.is_gui_resume() {
+        // 子进程的 stderr 是管道：没人读的话，写满 64KB 它就阻塞在 write 上，
+        // 永远走不到"删交接文件"那一步。这里只排空、不解读（真正的证据是交接
+        // 文件本身），顺便把内容转进助手日志便于排查。
+        let helper_log = handoff
+            .parent()
+            .map(|d| d.join("update-apply.log"))
+            .unwrap_or_default();
+        drain_stderr_into_log(&mut child, &helper_log);
+        let consumed = await_handoff_consumed(handoff, timeouts.register);
+        let identity = match &consumed {
+            Ok(()) => {
+                log.line(
+                    "the rolled-back GUI agent consumed the handoff: it registered with the \
+                     original identity",
+                );
+                RollbackIdentity::Preserved
+            }
+            Err(e) => {
+                log.line(&format!(
+                    "the rolled-back GUI agent did not register with the original identity: {e}"
+                ));
+                // 它可能已经上线但没消费交接（例如 relay 重签了 Token）：如实
+                // 说"身份没保住"，不下结论说设备失联——那要等人工确认。
+                RollbackIdentity::Lost {
+                    detail: format!(
+                        "the rolled-back GUI agent did not report a restored identity: {e}"
+                    ),
+                }
+            }
+        };
+        return HelperOutcome::rolled_back(reason, identity);
+    }
 
     // 等旧版自己完成注册（它不认识交接文件，只能靠自己）。
     let self_registered = await_rollback_registration(&mut child, log, timeouts.register);
@@ -3085,18 +3324,29 @@ impl RollbackLogScan {
 ///
 /// 与 [`spawn_agent`] 的差别：
 ///
-/// - 不设 `SR_UPGRADE_RESTORE`（旧版不读它，留着只会让日志误导排查）；
-/// - 不传 `--upgrade-restore`；
-/// - 若交接里没有 `--session-id` 但 relay 上已有同名会话，补上
-///   `--session-id <原 id>`——这是存量参数，用来让旧版回到**同一个**会话，
-///   否则临时设备每次都会拿到新 ID。补的参数只是旧版本来就该有的身份。
+/// - **命令行启动**：不设 `SR_UPGRADE_RESTORE`（那种旧版不读它，留着只会让
+///   日志误导排查）、不传 `--upgrade-restore`；若交接里没有 `--session-id`
+///   但 relay 上已有同名会话，补上 `--session-id <原 id>`——这是存量参数，
+///   用来让旧版回到**同一个**会话，否则临时设备每次都会拿到新 ID。
+/// - **无参数 GUI 启动**（[`RestartContext::is_gui_resume`]，argv 为空）：
+///   **绝不往空 argv 里补参数**。旧 GUI 版不认识 `--session-id`，补进去只会让它
+///   启动即失败，把一次可救的回滚变成设备彻底失联（MYS-2819 的原始现象）。
+///   配置与身份只能走它自己的隐藏恢复通道：`SR_UPGRADE_RESTORE` 指向那份
+///   0600 私有交接文件（与新版启动时**同一个**通道，密钥始终只在文件里）。
+///
+/// 为什么 GUI 回滚可以复用 `SR_UPGRADE_RESTORE`：被回滚的是**刚刚发起升级的那
+/// 一份二进制**，无参数 GUI 与这条恢复协议由同一个版本引入，因此它一定读得懂；
+/// 而"读不懂的旧版会忽略未知环境变量"这条安全前提也仍然成立。
 fn spawn_agent_for_rollback(
     ctx: &RestartContext,
-    _handoff: &Path,
+    handoff: &Path,
     rollback_reason: &str,
 ) -> std::io::Result<std::process::Child> {
     let mut argv = ctx.argv.clone();
-    if !ctx.session_id.is_empty() && !argv_has_flag(&argv, "--session-id") {
+    if !ctx.is_gui_resume()
+        && !ctx.session_id.is_empty()
+        && !argv_has_flag(&argv, "--session-id")
+    {
         argv.push(OsString::from("--session-id"));
         argv.push(OsString::from(&ctx.session_id));
     }
@@ -3104,10 +3354,16 @@ fn spawn_agent_for_rollback(
     cmd.args(&argv)
         // 让旧版把"这是回滚重启"记进它自己的日志（未知环境变量无害）。
         .env(ROLLBACK_ENV, rollback_reason)
-        .env_remove(RESTORE_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::piped());
+    if ctx.is_gui_resume() {
+        // 无参数 GUI：配置 + 身份都从这份私有交接文件恢复。
+        cmd.env(RESTORE_ENV, handoff);
+    } else {
+        // 命令行旧版不读它，留着只会让排查日志产生误导。
+        cmd.env_remove(RESTORE_ENV);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

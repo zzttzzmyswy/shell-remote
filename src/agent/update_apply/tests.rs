@@ -129,6 +129,7 @@ fn sample_ctx(dir: &TmpDir, upgrade_id: &str) -> RestartContext {
         service_restart_policy: None,
         managed_plan: None,
         overlay: false,
+        gui: None,
     }
 }
 
@@ -1228,9 +1229,263 @@ fn test_rollback_spawn_passes_the_reason_through_the_environment() {
     let _ = std::fs::remove_file(&handoff);
 }
 
-// ── 9. 助手日志与残留清理 ──────────────────────────────────────────
+// ── 8b. 无参数 GUI 的交接（MYS-2819）──────────────────────────────
 
+/// 一份"无参数 GUI 连接"产生的样例快照：字段值与真实 GUI 连接一致。
+fn gui_snapshot(sid: &str, relay: &str) -> GuiHandoffConfig {
+    GuiHandoffConfig {
+        relay_url: relay.to_string(),
+        relay_insecure: true,
+        root: Some("/tmp/sr-root".to_string()),
+        token_type: "rw".to_string(),
+        shell: "/bin/sh".to_string(),
+        session_id: Some(sid.to_string()),
+        no_cmd_log: true,
+        desktop_capture: "x11".to_string(),
+        desktop_codec: "h264".to_string(),
+        desktop_fps: 24.0,
+        desktop_capture_fps: 12.0,
+        desktop_max_bitrate: 4000,
+        desktop_quality: "best".to_string(),
+        desktop_min_bitrate: 200,
+        desktop_display: Some(":1".to_string()),
+        desktop_lan_port: 39616,
+    }
+}
+
+/// 造一份 GUI 交接：`argv` 是**空的**（这就是无参数启动）。sample_ctx 里的
+/// 命令行参数换成空 vec，再注入快照。
+fn gui_ctx(dir: &TmpDir, upgrade_id: &str, relay: &str, sid: &str) -> RestartContext {
+    let mut ctx = sample_ctx(dir, upgrade_id);
+    ctx.argv = Vec::new();
+    ctx.with_gui_snapshot(gui_snapshot(sid, relay))
+}
+
+#[test]
+fn test_gui_handoff_roundtrip_keeps_the_active_snapshot_and_no_key() {
+    // 复现（红）：无参数 GUI 升级时 argv 为空，活跃配置只能进交接文件。
+    // 修复前 `RestartContext` 根本没有承载它的地方——快照在写入那一步就丢了。
+    let dir = TmpDir::new("gui-roundtrip");
+    let ctx = gui_ctx(&dir, "up-gui", "https://relay.example.com", "guisess1");
+    // 固定密钥走既有受保护字段（不是快照）：这里确认两条通道互不干扰。
+    let mut ctx = ctx;
+    ctx.fixed_key = Some("GUI-FIXED-KEY-7a".to_string());
+
+    let path = ctx.write_handoff_into(dir.path()).unwrap();
+    let back = RestartContext::read_handoff(&path).expect("无参数 GUI 交接必须能读回");
+    assert!(back.is_gui_resume(), "读回来必须仍认得这是 GUI 启动");
+    let snap = back.gui_snapshot().expect("快照必须原样保留");
+    assert_eq!(snap.relay(), "https://relay.example.com");
+    assert_eq!(snap.session_id.as_deref(), Some("guisess1"));
+    assert_eq!(snap.desktop_lan_port, 39616, "LAN 端口这类活跃配置不能丢");
+    assert_eq!(snap.desktop_display.as_deref(), Some(":1"));
+    assert_eq!(snap.desktop_fps, 24.0);
+    assert!(snap.no_cmd_log);
+    assert_eq!(snap.token_type, "rw");
+    assert_eq!(back.fixed_key.as_deref(), Some("GUI-FIXED-KEY-7a"));
+    assert!(back.argv.is_empty(), "无参数 GUI 的 argv 必须保持为空");
+
+    // 密钥只走受保护字段：快照与整份交接 JSON 里都不许出现它。
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("GUI-FIXED-KEY-7a"),
+        "固定密钥要能在交接文件里被回滚路径读到"
+    );
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let snap_json = &json["gui"];
+    assert!(
+        snap_json.is_object(),
+        "快照要作为独立字段落盘，不能混进 argv"
+    );
+    assert!(
+        !snap_json.to_string().contains("GUI-FIXED-KEY-7a"),
+        "快照里绝不能有密钥: {snap_json}"
+    );
+    assert!(
+        !snap_json.to_string().contains("key"),
+        "快照连 key 字段都不该有: {snap_json}"
+    );
+    // Debug 也不能带出密钥。
+    assert!(!format!("{back:?}").contains("GUI-FIXED-KEY-7a"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_command_line_handoff_stays_bit_identical_without_a_gui_snapshot() {
+    // 旧 CLI 兼容：命令行启动的交接**不能**多出 gui 字段，否则旧助手/旧 agent
+    // 读到不认识的结构可能出问题，也没必要让所有命令行设备都背上这份负担。
+    let dir = TmpDir::new("cli-compat");
+    let ctx = sample_ctx(&dir, "up-cli");
+    assert!(!ctx.is_gui_resume());
+    let path = ctx.write_handoff_into(dir.path()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        json.get("gui").is_none(),
+        "命令行交接不得写入 gui 字段: {json}"
+    );
+    let back = RestartContext::read_handoff(&path).unwrap();
+    assert!(back.gui_snapshot().is_none());
+    assert_eq!(back.argv, ctx.argv, "argv 原样保留");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_handoff_without_gui_field_is_read_as_a_command_line_start() {
+    // 跨代次：新版写、更旧的读，或者反过来。缺 `gui` 字段必须读成"命令行启动"，
+    // 而不是报错——这是纯加法字段的全部意义。
+    let dir = TmpDir::new("legacy-read");
+    let ctx = sample_ctx(&dir, "up-legacy");
+    let path = ctx.write_handoff_into(dir.path()).unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    json.as_object_mut().unwrap().remove("gui");
+    let legacy = dir.join("legacy.json");
+    write_private_new(&legacy, serde_json::to_vec(&json).unwrap().as_slice()).unwrap();
+    let back = RestartContext::read_handoff(&legacy).expect("缺 gui 字段必须能读");
+    assert!(!back.is_gui_resume(), "缺字段 = 命令行启动");
+    assert_eq!(back.session_id, "sess42");
+}
+
+#[test]
+fn test_gui_snapshot_inconsistent_with_the_handoff_identity_is_rejected() {
+    // 损坏/被改过的交接必须 fail-closed：不允许"用恢复默认值掩盖失败"。
+    type Mutate = Box<dyn Fn(&mut serde_json::Value)>;
+    let cases: Vec<(&str, Mutate)> = vec![
+        (
+            "session id 与交接身份不一致",
+            Box::new(|j: &mut serde_json::Value| {
+                j["gui"]["session_id"] = serde_json::json!("someoneelse");
+            }),
+        ),
+        (
+            "relay 与交接 relay 不一致",
+            Box::new(|j: &mut serde_json::Value| {
+                j["gui"]["relay_url"] = serde_json::json!("https://evil.example.com");
+            }),
+        ),
+        (
+            "token-type 与交接权限不一致",
+            Box::new(|j: &mut serde_json::Value| {
+                j["gui"]["token_type"] = serde_json::json!("ro");
+            }),
+        ),
+        (
+            "快照没有 relay 地址",
+            Box::new(|j: &mut serde_json::Value| {
+                j["gui"]["relay_url"] = serde_json::json!("");
+            }),
+        ),
+    ];
+    for (what, mutate) in cases {
+        let dir = TmpDir::new("gui-bad");
+        let ctx = gui_ctx(&dir, "up-bad", "https://relay.example.com", "guisess1");
+        let path = ctx.write_handoff_into(dir.path()).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        mutate(&mut json);
+        let bad = dir.join("bad.json");
+        write_private_new(&bad, serde_json::to_vec(&json).unwrap().as_slice()).unwrap();
+        let err = RestartContext::read_handoff(&bad)
+            .err()
+            .unwrap_or_else(|| panic!("{what} 必须被拒绝"));
+        assert!(
+            !err.to_string().trim().is_empty(),
+            "{what}: 错误要有可读原因"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// 无参数 GUI 回滚：旧版收到的必须是**空 argv** + 恢复环境变量。
+///
+/// 复现的现象：修复前这里会往空 argv 里补 `--session-id <id>`，而无参数入口
+/// 不认识这个参数——旧版启动即失败，一次可救的回滚变成设备彻底失联。所以这条
+/// 用例断言的是真实拉起行为（argv 真的为空、环境变量真的带上了交接文件），
+/// 不是某个字符串映射。
 #[cfg(unix)]
+#[test]
+fn test_gui_rollback_spawns_the_old_version_with_an_empty_argv() {
+    let dir = TmpDir::new("gui-rollback");
+    let mut ctx = gui_ctx(&dir, "up-gui-rb", "https://relay.example.com", "guisess9");
+    ctx.target_path = dir.join("shell-remote-old");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+
+    let record = dir.join("spawn.txt");
+    let script = dir.join("recorder");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\n{{\n  echo 'ARGC='$#\n  for a in \"$@\"; do echo \"ARG=$a\"; done\n  echo \"RESTORE=${{SR_UPGRADE_RESTORE:-}}\"\n  echo \"REASON=${{SR_UPGRADE_ROLLBACK:-}}\"\n}} > '{}'\n",
+            record.display()
+        ),
+    );
+    ctx.target_path = script;
+
+    let mut child = spawn_agent_for_rollback(&ctx, &handoff, "did not register").unwrap();
+    let _ = child.wait();
+    let text = std::fs::read_to_string(&record).expect("回滚进程必须被真的拉起来");
+
+    assert!(
+        text.contains("ARGC=0"),
+        "无参数 GUI 的回滚必须用空 argv 拉起旧版（补 --session-id 会让它起不来）: {text}"
+    );
+    assert!(
+        !text.contains("ARG=--session-id"),
+        "不得往空 argv 里补旧版不认识的参数: {text}"
+    );
+    assert!(
+        text.contains(&format!("RESTORE={}", handoff.display())),
+        "旧 GUI 版只能靠恢复环境变量找回配置与身份: {text}"
+    );
+    assert!(
+        text.contains("REASON=did not register"),
+        "回滚原因仍要经环境变量传下去: {text}"
+    );
+    // 密钥只在 0600 交接文件里，绝不出现在 argv/环境变量里。
+    let mut with_key = ctx.clone();
+    with_key.fixed_key = Some("GUI-ROLLBACK-SECRET-31".to_string());
+    assert!(!text.contains("GUI-ROLLBACK-SECRET-31"));
+    let _ = std::fs::remove_file(&handoff);
+}
+
+/// 命令行启动的回滚行为必须与既有版本**完全一致**：补 `--session-id`、不设
+/// `SR_UPGRADE_RESTORE`。这条用例守住"别为了 GUI 把老路径改坏"。
+#[cfg(unix)]
+#[test]
+fn test_command_line_rollback_keeps_its_original_contract() {
+    let dir = TmpDir::new("cli-rollback");
+    let mut ctx = sample_ctx(&dir, "up-cli-rb");
+    let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+    let record = dir.join("spawn.txt");
+    let script = dir.join("recorder");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\n{{\n  for a in \"$@\"; do echo \"ARG=$a\"; done\n  echo \"RESTORE=${{SR_UPGRADE_RESTORE:-}}\"\n}} > '{}'\n",
+            record.display()
+        ),
+    );
+    // 原始 argv 里没有 --session-id：回滚要替旧版补上，保住同一个会话。
+    ctx.target_path = script;
+    ctx.argv = vec![
+        OsString::from("agent"),
+        OsString::from("--relay-url"),
+        OsString::from("http://relay.example:3000"),
+    ];
+    let mut child = spawn_agent_for_rollback(&ctx, &handoff, "nope").unwrap();
+    let _ = child.wait();
+    let text = std::fs::read_to_string(&record).unwrap();
+    assert!(text.contains("ARG=--session-id"), "{text}");
+    assert!(text.contains("ARG=sess42"), "补的必须是交接里的实际 id: {text}");
+    assert!(
+        text.contains("RESTORE=\n"),
+        "命令行旧版不读 SR_UPGRADE_RESTORE，不许设它: {text}"
+    );
+    let _ = std::fs::remove_file(&handoff);
+}
+
+// ── 9. 助手日志与残留清理 ──────────────────────────────────────────#[cfg(unix)]
 #[test]
 fn test_helper_log_is_private_and_never_contains_tokens() {
     let dir = TmpDir::new("logperm");
@@ -1376,6 +1631,8 @@ esac
         child: std::process::Child,
         pub(super) base: String,
         _drain: std::thread::JoinHandle<()>,
+        /// 本次隔离用的 settings 文件（用例结束即删）。
+        settings: PathBuf,
     }
 
     impl TestRelay {
@@ -1392,22 +1649,42 @@ esac
                     .unwrap_or_default(),
             ];
             let bin = candidates.into_iter().find(|p| p.is_file())?;
+
+            // 自己先占一个端口再放掉，把它交给 relay 显式绑定。
+            //
+            // 为什么要这么绕：relay 的 `Relay server listening on {bind}` 打印的
+            // 是**请求绑定的那个字符串**，`--bind 127.0.0.1:0` 时它打出来的就是
+            // ":0"，拿不到 OS 实际分配的端口。以前这个 helper 因此永远读不到
+            // 端口、所有进程级用例都在"跳过：无法启动真 relay"里静默变成空跑。
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            let port = probe.local_addr().ok()?.port();
+            drop(probe);
+
+            // 隔离：独立的 settings 文件，绝不读写开发机上真实的
+            // ~/.shell-remote/relay-settings.json。
+            let settings = std::env::temp_dir().join(format!(
+                "sr-test-relay-settings-{}-{}.json",
+                std::process::id(),
+                port
+            ));
             let mut child = std::process::Command::new(&bin)
                 .args([
                     "relay",
                     "--bind",
-                    "127.0.0.1:0",
+                    &format!("127.0.0.1:{port}"),
                     "--auth",
                     "pl-pass",
                     "--no-tls",
+                    "--settings-file",
+                    &settings.to_string_lossy(),
                 ])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .ok()?;
-            // relay 把实际端口打进 stderr（bind 0 → OS 选端口）。前几行由
-            // 主线程读出来定端口，之后整条流交给排水线程。
-            let stderr = child.stderr.take()?;
+            // relay 的 tracing 走 **stdout**（stderr 只有 `agent pid=`）。
+            // 之前这里读的是 stderr，于是永远等不到端口。
+            let stderr = child.stdout.take()?;
             let (tx, rx) = std::sync::mpsc::channel::<String>();
             let drain = std::thread::Builder::new()
                 .name("sr-test-relay-log".into())
@@ -1427,32 +1704,35 @@ esac
                     }
                 })
                 .ok()?;
-            let mut port = String::new();
+            // 等到 relay 真的在这个端口上应答为止（而不是"日志里出现了端口"）。
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut up = false;
             while std::time::Instant::now() < deadline {
-                let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) else {
-                    continue;
-                };
-                if let Some(idx) = line.find("127.0.0.1:") {
-                    let rest = &line[idx + "127.0.0.1:".len()..];
-                    port = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect::<String>();
-                    if !port.is_empty() {
-                        break;
-                    }
+                // 顺手把日志排掉，避免管道写满把 relay 阻塞在 write 上。
+                while rx.try_recv().is_ok() {}
+                if std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                    Duration::from_millis(200),
+                )
+                .is_ok()
+                {
+                    up = true;
+                    break;
                 }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            if port.is_empty() {
+            let port_str = port.to_string();
+            if !up {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = std::fs::remove_file(&settings);
                 return None;
             }
             Some(Self {
                 child,
-                base: format!("http://127.0.0.1:{port}"),
+                base: format!("http://127.0.0.1:{port_str}"),
                 _drain: drain,
+                settings,
             })
         }
     }
@@ -1461,6 +1741,7 @@ esac
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.settings);
         }
     }
 
@@ -1504,7 +1785,7 @@ esac
     }
 
     /// 从真 relay 的注册响应里读一个会话的 (tokens)。
-    async fn register(client: &reqwest::Client, base: &str, sid: &str) -> Vec<String> {
+    pub(super) async fn register(client: &reqwest::Client, base: &str, sid: &str) -> Vec<String> {
         let resp: serde_json::Value = client
             .post(format!("{base}/agent/send"))
             .json(&serde_json::json!({
@@ -1587,11 +1868,12 @@ esac
             target_version: "9.9.9".to_string(),
             target_path: target.clone(),
             new_binary: new_bin.clone(),
-            new_sha256: new_sha,
+            new_sha256: new_sha.clone(),
             service_cgroup: None,
             service_restart_policy: None,
             managed_plan: None,
             overlay: false,
+            gui: None,
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
 
@@ -1625,9 +1907,10 @@ esac
             matches!(outcome, HelperOutcome::Registered { .. }),
             "新进程注册成功才算升级完成，实际: {outcome:?}"
         );
+        // 新版字节被 rename 到 target，`new_bin` 本身已经不在——摘要要在换机前算。
         assert_eq!(
-            std::fs::read(&target).unwrap(),
-            std::fs::read(&new_bin).unwrap(),
+            file_sha(&target),
+            new_sha,
             "target 必须是新版字节"
         );
 
@@ -1641,11 +1924,17 @@ esac
             registered_line.contains(&format!("sid={sid}")),
             "升级后 session_id 必须不变: {registered_line}"
         );
-        let mut got: Vec<String> = registered_line
+        // `tokens=` 后面还跟着 ` version=…`：先按空白切掉尾巴，否则
+        // "version=9.9.9" 会被当成一个 token。（这条用例以前一直在静默跳过，
+        // 所以这个解析 bug 从没暴露。）
+        let token_field = registered_line
             .split("tokens=")
             .nth(1)
             .unwrap_or("")
-            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        let mut got: Vec<String> = token_field
             .split(',')
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
@@ -2144,6 +2433,7 @@ mod real_old_binary {
             service_restart_policy: None,
             managed_plan: None,
             overlay: false,
+            gui: None,
         };
         let handoff = ctx.write_handoff_into(dir.path()).unwrap();
 
@@ -3104,4 +3394,428 @@ fn test_success_path_stops_swaps_and_starts() {
         "没有真 agent 时必然回滚，实际 {out:?}"
     );
     assert!(!ops.starts.lock().unwrap().is_empty(), "必须调用过 start");
+}
+
+// ── 11. 进程级：无参数 GUI 升级与回滚都恢复同配置/同身份（MYS-2819）──
+
+/// 无参数 GUI 场景里，"新版 agent"与"回滚后的旧版"都只能从交接文件拿配置。
+///
+/// 这条用例验证的是**真实进程关系**：真助手 + 真脚本进程 + 真 relay。
+/// 脚本模拟无参数 GUI 的启动契约——
+///
+/// - argv 必须为空（多一个参数就说明有人在往空 argv 里补东西）；
+/// - 配置只能来自 `SR_UPGRADE_RESTORE` 指向的私有交接文件；
+/// - 没有交接文件时**不许注册**（那等于静默变成一台新设备）。
+#[cfg(unix)]
+mod gui_process_level {
+    use super::*;
+
+    /// 无参数 GUI 版 agent 脚本：只从交接文件读配置与身份。
+    ///
+    /// 脚本模拟"健康的无参数 GUI agent"：从交接文件读出配置与身份后向 relay
+    /// 注册，打印换机回执并常驻。回滚用例把它当作**旧版**（target），另配一个
+    /// 立刻退出的坏新版来触发回滚。
+    fn gui_agent_script(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        let body = r#"#!/bin/sh
+set -u
+OUT="${SR_TEST_OUT:?}"
+RELAY="${SR_TEST_RELAY:?}"
+VER="${SR_TEST_VER:?}"
+H="${SR_UPGRADE_RESTORE:-}"
+
+{
+  echo "ARGC=$#"
+  for a in "$@"; do echo "ARG=$a"; done
+  echo "RESTORE=$H"
+} >> "$OUT"
+
+# 无参数 GUI 没有 argv：配置只能来自交接文件。
+if [ -z "$H" ] || [ ! -f "$H" ]; then
+  echo "no-handoff argc=$#" >> "$OUT"
+  exit 1
+fi
+
+CFG="$(python3 - "$H" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+g=d.get("gui") or {}
+toks=json.dumps([{"token":t["token"],"permission":t["permission"]} for t in d["tokens"]])
+print(json.dumps({
+  "sid": d.get("session_id",""),
+  "relay": g.get("relay_url",""),
+  "lan_port": g.get("desktop_lan_port",0),
+  "fps": g.get("desktop_fps",0),
+  "token_type": g.get("token_type",""),
+  "tokens": toks,
+}))
+PY
+)"
+echo "cfg=$CFG" >> "$OUT"
+
+SID="$(printf '%s' "$CFG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["sid"])')"
+TOKENS="$(printf '%s' "$CFG" | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["tokens"]))')"
+
+BODY="{\"type\":\"agent:register\",\"session_id\":\"$SID\",\"tokens\":$TOKENS,\"agent_version\":\"$VER\"}"
+RESP="$(curl -s -X POST "$RELAY/agent/send" -H 'Content-Type: application/json' -d "$BODY")"
+echo "resp=$RESP" >> "$OUT"
+case "$RESP" in
+  *'"type":"agent:registered"'*)
+    echo "registered pid=$$ sid=$SID version=$VER" >> "$OUT"
+    rm -f "$H"
+    echo "shell-remote: upgrade-registered upgrade_id=$SR_TEST_UPGRADE_ID version=$VER session=$SID" >&2
+    sleep 5
+    ;;
+  *) exit 1 ;;
+esac
+"#;
+        write_executable(&p, body);
+        p
+    }
+
+    /// 把脚本需要的环境变量挂上（新进程与回滚进程都从助手继承环境）。
+    struct ScriptEnv(Vec<&'static str>);
+
+    impl ScriptEnv {
+        fn install(out: &Path, relay: &str, ver: &str, upgrade_id: &str) -> Self {
+            std::env::set_var("SR_TEST_OUT", out);
+            std::env::set_var("SR_TEST_RELAY", relay);
+            std::env::set_var("SR_TEST_VER", ver);
+            std::env::set_var("SR_TEST_UPGRADE_ID", upgrade_id);
+            Self(vec![
+                "SR_TEST_OUT",
+                "SR_TEST_RELAY",
+                "SR_TEST_VER",
+                "SR_TEST_UPGRADE_ID",
+            ])
+        }
+    }
+
+    impl Drop for ScriptEnv {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    /// 这些用例都动进程级环境变量、且都会换掉同一个目录里的"二进制"，
+    /// 必须串行。
+    ///
+    /// 用 tokio 的锁而不是 std 的：这些是 `async` 用例，`std::sync::MutexGuard`
+    /// 会跨 await 持有（clippy 会告警，且一旦有人在里面阻塞就真的会卡住执行器）。
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    /// 造一份无参数 GUI 的完整现场：真 relay + 已注册身份 + GUI 交接。
+    async fn gui_fixture(tag: &str) -> Option<(TmpDir, super::process_level::TestRelay, String, RestartContext, PathBuf)> {
+        let relay = std::sync::Arc::new(super::process_level::TestRelay::start().await?);
+        let dir = TmpDir::new(tag);
+        let client = reqwest::Client::new();
+        let sid = "guiag0001";
+        let tokens =
+            super::process_level::register(&client, &relay.base, sid).await;
+        let _ = tag;
+        let target = dir.join("shell-remote");
+        let old_bin = gui_agent_script(dir.path(), "gui-agent-old");
+        std::fs::copy(&old_bin, &target).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let new_bin = gui_agent_script(dir.path(), "gui-agent-new");
+        let ctx = RestartContext {
+            session_id: sid.to_string(),
+            tokens: tokens
+                .iter()
+                .map(|t| (t.clone(), "rw".to_string()))
+                .collect(),
+            fixed_key: None,
+            token_type: "rw".to_string(),
+            relay_base: Some(relay.base.clone()),
+            relay_insecure: false,
+            // 无参数启动：argv 就是空的。
+            argv: Vec::new(),
+            old_pid: 0,
+            old_start: None,
+            upgrade_id: "gui-up-1".to_string(),
+            target_version: "9.9.9".to_string(),
+            target_path: target.clone(),
+            new_binary: new_bin.clone(),
+            new_sha256: sha256_of(&std::fs::read(&new_bin).unwrap()),
+            service_cgroup: None,
+            service_restart_policy: None,
+            managed_plan: None,
+            overlay: false,
+            gui: Some(gui_snapshot(sid, &relay.base)),
+        };
+        let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+        // 解开 Arc：调用方只需要一个能活到用例结束的 relay。
+        let relay = std::sync::Arc::try_unwrap(relay).map_err(|_| ()).ok()?;
+        Some((dir, relay, sid.to_string(), ctx, handoff))
+    }
+
+    /// 升级成功：新进程 PID 变了、argv 仍为空、配置与身份都来自交接。
+    #[tokio::test]
+    async fn test_gui_upgrade_restores_config_and_identity_with_empty_argv() {
+        let _g = serial().await;
+        let Some((dir, relay, sid, ctx, handoff)) = gui_fixture("gui-ok").await else {
+            eprintln!("跳过：无法启动真 relay 二进制");
+            return;
+        };
+        let out = dir.join("gui.log");
+        // 新版字节的摘要要在换机前算好：助手会把它 rename 到 target。
+        let new_sha = file_sha(&ctx.new_binary);
+        let _env = ScriptEnv::install(&out, &relay.base, "9.9.9", "gui-up-1");
+        let h = handoff.clone();
+        let outcome = tokio::task::spawn_blocking(move || helper_main(&h, false))
+            .await
+            .expect("helper task must not panic");
+
+        let log = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(
+            matches!(outcome, HelperOutcome::Registered { .. }),
+            "无参数 GUI 升级必须成功注册，实际 {outcome:?}；日志: {log}"
+        );
+        // 新版字节在换机时被 rename 到 target，new_binary 本身已经不在了 ——
+        // 所以要在跑助手之前就把它的摘要记下来。
+        assert_eq!(
+            file_sha(&ctx.target_path),
+            new_sha,
+            "target 必须换成新版的字节"
+        );
+        // argv 必须为空：无参数 GUI 的契约就是"一个参数都没有"。
+        assert!(log.contains("ARGC=0"), "新进程必须收到空 argv: {log}");
+        assert!(!log.contains("ARG=--session-id"), "{log}");
+        // 配置与身份都来自交接文件，且一字不差。
+        let cfg_line = log
+            .lines()
+            .find(|l| l.starts_with("cfg="))
+            .unwrap_or_else(|| panic!("新进程没有读到交接配置: {log}"));
+        let cfg: serde_json::Value =
+            serde_json::from_str(cfg_line.trim_start_matches("cfg=")).unwrap();
+        assert_eq!(cfg["sid"], sid, "必须沿用原 session id: {cfg}");
+        assert_eq!(
+            cfg["relay"], relay.base,
+            "relay 必须是连接时那份，不是磁盘草稿: {cfg}"
+        );
+        assert_eq!(cfg["lan_port"], 39616, "活跃 LAN 端口必须恢复: {cfg}");
+        assert_eq!(cfg["fps"], 24.0, "桌面参数必须恢复: {cfg}");
+        assert_eq!(cfg["token_type"], "rw");
+        let registered = log
+            .lines()
+            .find(|l| l.starts_with("registered "))
+            .unwrap_or_else(|| panic!("新进程没有注册: {log}"));
+        assert!(registered.contains(&format!("sid={sid}")), "{registered}");
+        assert!(
+            !handoff.exists(),
+            "注册成功后交接文件必须被消费（否则身份会一直留在磁盘上）"
+        );
+    }
+
+    /// 升级失败回滚：旧版被拉起，**同样是空 argv**，且照样拿到同配置/同身份。
+    ///
+    /// 这就是任务卡里"新版启动、失败回滚到原无参数 GUI 版都必须恢复同配置/
+    /// 同身份；处理空 argv 的回滚，不依赖用户手工再点连接"。
+    #[tokio::test]
+    async fn test_gui_rollback_restores_the_same_config_without_touching_argv() {
+        let _g = serial().await;
+        let Some((dir, relay, sid, mut ctx, handoff)) = gui_fixture("gui-rb").await else {
+            eprintln!("跳过：无法启动真 relay 二进制");
+            return;
+        };
+        let out = dir.join("gui.log");
+        // 把"要装的新版"换成一个立刻退出 1 的坏二进制：助手必然回滚。
+        // （fixture 里的 target 是**健康的** GUI 版，回滚后它会被重新拉起。）
+        let broken = dir.join("gui-agent-broken");
+        write_executable(&broken, "#!/bin/sh\nexit 1\n");
+        ctx.new_binary = broken.clone();
+        ctx.new_sha256 = sha256_of(&std::fs::read(&broken).unwrap());
+        let healthy_sha = file_sha(&ctx.target_path);
+        // 交接文件要按改过的 ctx 重写（sha 变了）。
+        std::fs::remove_file(&handoff).unwrap();
+        let handoff = ctx.write_handoff_into(dir.path()).unwrap();
+
+        let _env = ScriptEnv::install(&out, &relay.base, "9.9.9", "gui-up-1");
+        let h = handoff.clone();
+        // 注册上限收紧：坏新版立刻退出，助手据此马上回滚，不必等满 75s。
+        let outcome = tokio::task::spawn_blocking(move || {
+            helper_main_short_register_timeout(&h, Duration::from_secs(8))
+        })
+        .await
+        .expect("helper task must not panic");
+
+        // 回滚成功 = 旧版真的以**原身份**重新上线。助手判定依据是"交接文件被
+        // 消费"（只有 `restore_verdict` 确认身份对上之后才会删）。
+        match &outcome {
+            HelperOutcome::RolledBack { identity, reason } => {
+                assert!(
+                    reason.contains("did not register")
+                        || reason.contains("no registration")
+                        || reason.contains("exited early"),
+                    "回滚原因应指向新版起不来: {reason}"
+                );
+                assert_eq!(
+                    *identity,
+                    RollbackIdentity::Preserved,
+                    "无参数 GUI 回滚必须保住原身份，实际 {identity:?}"
+                );
+            }
+            other => panic!("新版起不来必须回滚，实际 {other:?}"),
+        }
+        // 交接文件必须已被旧版消费（身份已进内存，文件不再有用途）。
+        assert!(
+            !handoff.exists(),
+            "回滚后旧版必须消费交接文件（证明它按原身份注册成功）"
+        );
+        // 磁盘恢复成那份健康的旧版（回滚就是把 backup rename 回 target）。
+        assert_eq!(
+            file_sha(&ctx.target_path),
+            healthy_sha,
+            "回滚后 target 必须是原来的旧版字节"
+        );
+
+        let log = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(
+            log.contains("ARGC=0"),
+            "回滚后的旧 GUI 版必须收到空 argv: {log}"
+        );
+        assert!(
+            !log.contains("ARG=--session-id"),
+            "往空 argv 里补参数会让无参数入口起不来: {log}"
+        );
+        assert!(
+            !log.contains("no-handoff"),
+            "回滚进程必须拿到交接文件，否则会以新设备注册: {log}"
+        );
+        let cfg_line = log
+            .lines()
+            .find(|l| l.starts_with("cfg="))
+            .unwrap_or_else(|| panic!("回滚进程没有读到交接配置: {log}"));
+        let cfg: serde_json::Value =
+            serde_json::from_str(cfg_line.trim_start_matches("cfg=")).unwrap();
+        assert_eq!(cfg["sid"], sid, "回滚后身份必须不变: {cfg}");
+        assert_eq!(cfg["relay"], relay.base, "回滚后 relay 必须不变: {cfg}");
+        assert_eq!(cfg["lan_port"], 39616, "回滚后配置必须不变: {cfg}");
+        assert_eq!(cfg["fps"], 24.0, "回滚后桌面参数必须不变: {cfg}");
+        let registered = log
+            .lines()
+            .find(|l| l.starts_with("registered "))
+            .unwrap_or_else(|| panic!("回滚后的旧版必须能注册: {log}"));
+        assert!(registered.contains(&format!("sid={sid}")), "{registered}");
+    }
+}
+
+// ── 12. GUI 回滚不得再"重绑"一次身份（MYS-2819）─────────────────
+
+/// `rollback` 的命令行路径会用缓存 tokens 再 `register_existing` 一次（替不认识
+/// 交接文件的旧版把身份绑回去）。GUI 路径**不能**这么做：旧 GUI 版已经按交接
+/// 自己注册好了，助手再来一次 `register_existing` 会把 relay 上那个**正在用**的
+/// 会话驱逐掉（同 id 顶替），刚恢复的设备当场掉线。
+///
+/// 这里用"身份绑定"这一唯一可观测的副作用来断言：命令行路径会往 relay 发一次
+/// 带 tokens 的注册（relay 上该会话的 tokens 变成助手缓存的那份），GUI 路径
+/// 则完全不发。
+#[cfg(unix)]
+mod gui_rollback_no_rebind {
+    use super::*;
+
+    /// 助手日志里是否出现过"重绑身份"这条记录（`bind_identity` 的唯一痕迹）。
+    fn log_mentions_rebind(log: &str) -> bool {
+        log.contains("identity re-bound after rollback")
+            || log.contains("cannot re-bind the original identity")
+    }
+
+    /// 造一份交接文件，其中 relay 指向一个**真的会应答**的假 relay 端点，
+    /// 使 `bind_identity` 一旦被调用就会留下痕迹。
+    fn handoff_for(dir: &TmpDir, gui: bool, upgrade_id: &str) -> PathBuf {
+        let target = dir.join("shell-remote");
+        write_executable(&target, "#!/bin/sh\nexit 0\n");
+        let new_binary = dir.join("artifact");
+        std::fs::write(&new_binary, b"#!/bin/sh\n# v2\n").unwrap();
+        let mut ctx = RestartContext::new(
+            "rebind01".to_string(),
+            vec![("tok-x".to_string(), "rw".to_string())],
+            None,
+            "rw".to_string(),
+            // 端口 1：连接必然失败，但"尝试过"这一点会被写进日志。
+            Some("http://127.0.0.1:1".to_string()),
+            false,
+            Vec::new(),
+            target,
+            new_binary,
+            sha256_of(b"#!/bin/sh\n# v2\n"),
+            upgrade_id.to_string(),
+            "9.9.9".to_string(),
+            None,
+            None,
+            None,
+            false,
+        );
+        if gui {
+            let mut snap = gui_snapshot("rebind01", "http://127.0.0.1:1");
+            snap.session_id = Some("rebind01".to_string());
+            ctx = ctx.with_gui_snapshot(snap);
+        }
+        ctx.write_handoff_into(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn test_command_line_rollback_still_rebinds_the_identity() {
+        // 老路径的行为必须保住：旧 CLI 版不认识交接文件，助手要替它绑。
+        let dir = TmpDir::new("rebind-cli");
+        let handoff = handoff_for(&dir, false, "rb-cli");
+        let mut log = HelperLog::open(&handoff);
+        let ctx = RestartContext::read_handoff(&handoff).unwrap();
+        let backup = handoff.with_file_name("backup.bin");
+        std::fs::copy(&ctx.target_path, &backup).unwrap();
+        let _ = rollback(
+            &ctx,
+            &handoff,
+            &backup,
+            &mut log,
+            "test: no registration".to_string(),
+            None,
+            HelperTimeouts {
+                old_exit: Duration::from_secs(1),
+                register: Duration::from_secs(1),
+            },
+        );
+        let text = std::fs::read_to_string(dir.join("update-apply.log")).unwrap_or_default();
+        assert!(
+            log_mentions_rebind(&text),
+            "命令行路径必须仍然尝试重绑身份（否则临时设备会换 Token）: {text}"
+        );
+    }
+
+    #[test]
+    fn test_gui_rollback_never_rebinds_over_the_live_session() {
+        // 同一场景，但交接里带 GUI 快照 ⇒ 不许再绑一次。
+        let dir = TmpDir::new("rebind-gui");
+        let handoff = handoff_for(&dir, true, "rb-gui");
+        let mut log = HelperLog::open(&handoff);
+        let ctx = RestartContext::read_handoff(&handoff).unwrap();
+        assert!(ctx.is_gui_resume());
+        let backup = handoff.with_file_name("backup.bin");
+        std::fs::copy(&ctx.target_path, &backup).unwrap();
+        let _ = rollback(
+            &ctx,
+            &handoff,
+            &backup,
+            &mut log,
+            "test: no registration".to_string(),
+            None,
+            HelperTimeouts {
+                old_exit: Duration::from_secs(1),
+                register: Duration::from_secs(1),
+            },
+        );
+        let text = std::fs::read_to_string(dir.join("update-apply.log")).unwrap_or_default();
+        assert!(
+            !log_mentions_rebind(&text),
+            "GUI 回滚不得再 register_existing：那会驱逐旧版刚恢复的会话: {text}"
+        );
+    }
 }

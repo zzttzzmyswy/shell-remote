@@ -89,6 +89,12 @@ pub struct UpgradeContext {
     /// 换机助手的可执行文件（通常就是 `target` 自己：助手是同一个二进制里的
     /// 隐藏子命令）。测试可指向一个假助手。
     pub helper_exe: std::path::PathBuf,
+    /// **无参数 GUI 的活跃连接快照**（MYS-2819）。
+    ///
+    /// `Some` 表示"本进程是无参数 GUI 启动"：argv 是空的，新进程/回滚进程的
+    /// 配置只能从交接文件恢复。命令行启动恒为 `None`，交接行为与既有版本逐字节
+    /// 一致。快照里没有固定密钥——密钥仍只走 [`Self::fixed_key`]。
+    pub gui: Option<update_apply::GuiHandoffConfig>,
 }
 
 impl std::fmt::Debug for UpgradeContext {
@@ -102,6 +108,8 @@ impl std::fmt::Debug for UpgradeContext {
             .field("target", &self.target)
             .field("own_variant", &self.own_variant)
             .field("helper_exe", &self.helper_exe)
+            // GUI 快照只报 relay（配置不是日志内容；key 根本不在这里）。
+            .field("gui", &self.gui.as_ref().map(|g| g.relay()))
             .finish()
     }
 }
@@ -151,6 +159,8 @@ impl UpgradeContext {
             doh: DohConfig::default(),
             extra_roots: Vec::new(),
             relay_insecure,
+            // 命令行启动默认没有 GUI 快照；GUI 控制层在升级前显式注入。
+            gui: None,
         }
     }
 
@@ -359,6 +369,12 @@ fn hand_over_to_helper(
         // 常规换机：助手负责搬动二进制，overlay 不参与。
         false,
     );
+    // 无参数 GUI（MYS-2819）：argv 是空的，配置只能靠交接文件传给新进程与
+    // 回滚进程。命令行启动 `ctx.gui` 为 `None`，交接文件与既有版本逐字节一致。
+    let restart = match ctx.gui.clone() {
+        Some(snapshot) => restart.with_gui_snapshot(snapshot),
+        None => restart,
+    };
     // Token 只进 0600/当前用户 ACL 的交接文件：argv 会出现在 `ps` 里，
     // 日志会被收集走，两者都不能碰。
     let handoff = restart
@@ -472,6 +488,12 @@ fn hand_over_overlay(
         None,
         true,
     );
+    // 无参数 GUI（MYS-2819）：同 `hand_over_to_helper`，argv 为空时配置只能靠
+    // 交接文件传递。overlay 路径下由 base 重新拉起，交接文件同样要带上快照。
+    let restart = match ctx.gui.clone() {
+        Some(snapshot) => restart.with_gui_snapshot(snapshot),
+        None => restart,
+    };
     let handoff = restart
         .write_handoff()
         .map_err(|e| format!("cannot write the upgrade handoff file: {e}"))?;

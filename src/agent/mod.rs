@@ -3217,6 +3217,23 @@ async fn run_session(
                                     // 不在下载侧另行推断（推断错了就会让自签 relay 的兜底
                                     // 下载必然握手失败）。
                                     let relay_insecure = client.insecure_tls;
+                                    // 无参数 GUI 的活跃配置快照（MYS-2819）：命令行启动时
+                                    // 为 `None`，交接行为与既有版本完全一致。GUI 启动时必须
+                                    // 带上它，否则新进程只有空 argv、没有配置，回滚也只能
+                                    // 拉起一个"什么都不认识"的空壳。
+                                    //
+                                    // 取的是**连接时**写进 `AgentStatus` 的那份，不是磁盘上
+                                    // 的 ui-config.json：后者可能是用户后来改过的草稿。
+                                    #[cfg(feature = "tui")]
+                                    let gui_snapshot = status.as_ref().and_then(|st| {
+                                        let mut snap = st.gui_snapshot()?;
+                                        // session id 用**实际**在跑的那个（GUI 留空时由
+                                        // relay 随机分配），否则恢复后就成了另一台设备。
+                                        snap.session_id = Some(client.session_id.clone());
+                                        Some(snap)
+                                    });
+                                    #[cfg(not(feature = "tui"))]
+                                    let gui_snapshot = None;
                                     match self_exe.clone() {
                                         Some(exe) => {
                                             // 升级上下文显式装配：relay 客户端与 Token
@@ -3240,6 +3257,9 @@ async fn run_session(
                                             ctx.token_type = token_type.to_string();
                                             // 助手是本二进制的隐藏子命令，路径就是 target 自己。
                                             ctx.helper_exe = ctx.target.clone();
+                                            // GUI 快照随上下文进入升级路径（MYS-2819），
+                                            // 由 `perform_upgrade` 写进受保护交接文件。
+                                            ctx.gui = gui_snapshot;
                                             tokio::spawn(async move {
                                                 crate::agent::upgrade::perform_upgrade(ctx, req)
                                                     .await;
