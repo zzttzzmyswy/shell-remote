@@ -62,6 +62,26 @@ impl ChannelMap {
 pub struct SharedState {
     pub sessions: SessionRegistry,
     pub agent_broadcast: RwLock<HashMap<String, ChannelMap>>,
+    /// 注册生命周期互斥（MYS-2806 review 1/2）。
+    ///
+    /// 「一次注册」是**跨多个 await 的事务**：驱逐旧会话 → 清旧会话状态
+    /// （多个 await）→ 写入新会话的 capabilities/device/last_activity/通道
+    /// 映射。这些步骤分属不同的表，没有一把锁能覆盖全部；细分锁只能保证
+    /// 单张表自身不撕裂，挡不住两个注册交错执行。
+    ///
+    /// 反例（review 实测）：A 注册完成驱逐、释放细锁后停在清理里的某个
+    /// await；B 注册重新占用了同一个 sid 并写完自己的 last_activity/缓冲/
+    /// 升级状态；A 继续执行，把这些**属于新 incarnation** 的条目清掉。
+    /// 只在每个 await 前重新检查一次存在性挡不住——检查与清除之间仍有窗口，
+    /// 且检查通过时新会话可能还没开始写。
+    ///
+    /// 因此注册事务整体串行化：只有**整个注册（含驱逐清理）**做完，才允许
+    /// 下一个注册开始。这把锁只被注册路径持有，是低竞争路径（注册频率远低于
+    /// 数据面），不会影响终端/文件/桌面转发。
+    ///
+    /// 加锁顺序：register_tx → (sessions / agent_broadcast / pending_mcp / …)。
+    /// 反向没有任何调用点在持有上述细锁时会取 register_tx。
+    pub register_tx: tokio::sync::Mutex<()>,
     pub pending_mcp: RwLock<HashMap<String, (String, oneshot::Sender<String>)>>,
     pub download_streams: RwLock<HashMap<String, crate::relay::file_transfer::DownloadSink>>,
     pub last_activity: RwLock<HashMap<String, Instant>>,
@@ -440,6 +460,7 @@ impl SharedState {
     ) -> Self {
         Self {
             sessions: SessionRegistry::new(),
+            register_tx: tokio::sync::Mutex::new(()),
             agent_broadcast: RwLock::new(HashMap::new()),
             pending_mcp: RwLock::new(HashMap::new()),
             download_streams: RwLock::new(HashMap::new()),
@@ -2766,6 +2787,16 @@ pub async fn start(
                     }
                 }
                 for session_id in to_remove {
+                    if !state_clone.sessions.is_temporary(&session_id).await {
+                        continue;
+                    }
+                    // 与注册事务互斥（MYS-2806 review 1/2）：空闲回收同样会
+                    // 「删会话 → 清多张表」，必须与注册串行，否则会在注册
+                    // 过程中抹掉刚写入的新会话状态。锁在逐个会话内取，避免
+                    // 长时间独占阻塞注册。
+                    let _register_guard = state_clone.register_tx.lock().await;
+                    // 拿到锁后重判：期间可能已被重新注册成新 incarnation，
+                    // 那就不再是「空闲可回收」的会话。
                     if !state_clone.sessions.is_temporary(&session_id).await {
                         continue;
                     }

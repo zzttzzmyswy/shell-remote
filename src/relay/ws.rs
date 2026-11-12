@@ -1374,6 +1374,11 @@ pub async fn agent_send_handler(
 
     // agent:register is allowed without server auth (agents use keys for identity)
     if msg_type == "agent:register" {
+        // 注册事务互斥（MYS-2806 review 1/2）：从驱逐旧会话到写完新会话状态
+        // 是一个跨多个表、跨多个 await 的整体，细分锁挡不住两个注册交错。
+        // 详见 `SharedState::register_tx` 的说明与
+        // `review_eviction_cleanup_must_not_erase_reclaimed_sid`。
+        let _register_guard = state.register_tx.lock().await;
         // Rate limit registrations per client IP to prevent session-flooding DoS.
         let client_ip = crate::relay::auth::client_ip(&headers);
         {
@@ -1512,28 +1517,21 @@ pub async fn agent_send_handler(
         // 的断线重连，该会话仍然活着——Last-Event-ID 重放缓冲、升级任务状态
         // （MYS-2425）都必须保留，清掉会破坏续传与"换机重连后收敛"的既有语义。
         //
-        // 放在下面所有"写新状态"之前：新 incarnation 的 agent_broadcast 条目
-        // 在更后面才建立，不会被这次清理误删。
+        // 安全性由本分支入口的 `register_tx` 互斥保证（MYS-2806 review 1/2）：
+        // 整个「驱逐 → 清理 → 写新状态」事务期间不会有第二个注册、kick 或
+        // 空闲回收插进来。此前只在摘除 `agent_broadcast` 的临界区内检查了
+        // registry，释放锁后仍有多次 await，新注册可以插进来再被这里抹掉
+        // （review 的 `review_eviction_cleanup_must_not_erase_reclaimed_sid`
+        // 实测复现）。逐个 await 前补存在性检查挡不住——检查与清除之间仍有
+        // 窗口，因此这里改成真正的串行化，不再做那种检查。
         for stale in evicted_ids.iter().filter(|s| **s != session_id) {
-            // 「registry 里已不存在」与「摘掉 agent_broadcast」必须在**同一个**
-            // 临界区内判定：并发注册若刚把同一个 sid 重新占用，它的通道映射
-            // 属于新 incarnation，绝不能删（否则新 agent 的 SSE 会挂在一个
-            // 已被移除的条目上，会话永久收不到下行）。注册路径的顺序是
-            // 「先写 registry、再建 agent_broadcast 条目」，所以持着
-            // agent_broadcast 写锁读 registry 足以排除该竞态。
-            // 加锁顺序 agent_broadcast → sessions 不会与既有代码互锁：
-            // SessionRegistry 内部只碰 sessions/token_map，从不反向取
-            // agent_broadcast，也没有任何调用点嵌套持有 sessions 再等它。
+            // 该 sid 的浏览器流也要一并收敛。`browser_sessions` 里存的是
+            // SSE 流的 id，而 sse_sessions 才是 sender 所在表——两者都要摘，
+            // 否则浏览器 SSE 会挂在一个再也不会收到消息的通道上（终端画面
+            // 永久静止，不报错、不重连）。语义与 agent 断线时发
+            // `session:agent_disconnect` 一致：告诉浏览器"这个会话没了"。
             let (browser_sse, removed) = {
                 let mut broadcast = state.agent_broadcast.write().await;
-                if state.sessions.get(stale).await.is_some() {
-                    continue;
-                }
-                // 该 sid 的浏览器流也要一并收敛。`browser_sessions` 里存的是
-                // SSE 流的 id，而 sse_sessions 才是 sender 所在表——两者都要摘，
-                // 否则浏览器 SSE 会挂在一个再也不会收到消息的通道上（终端画面
-                // 永久静止，不报错、不重连）。语义与 agent 断线时发
-                // `session:agent_disconnect` 一致：告诉浏览器"这个会话没了"。
                 let browser_sse: Vec<String> = broadcast
                     .get(stale)
                     .map(|cm| cm.browser_sessions.values().cloned().collect())
@@ -5587,6 +5585,209 @@ mod tests {
         assert!(state.agent_broadcast.read().await.contains_key(&new_sid));
     }
 
+    // ── MYS-2806 review 1/2：注册/清理生命周期串行化 ────────────────
+
+    /// 驱逐清理**不能**抹掉期间被重新注册占用的同一个 sid。
+    ///
+    /// 负责人 review 的原探针（`review_eviction_cleanup_must_not_erase_reclaimed_sid`）
+    /// 用 `pending_mcp` 写锁把驱逐方卡在清理中途，再让第二个注册抢占同一个
+    /// sid 并写状态，最后放开锁看新状态是否被抹掉。修复前实测 FAIL
+    /// （`old cleanup erased the new registered session's last_activity`）。
+    ///
+    /// 修复改为**完整注册事务互斥**后，那个交错在语义上已不可能：驱逐方持锁
+    /// 期间第二个注册会一直阻塞，原探针若照搬会死锁（测试自己持有
+    /// `pending_mcp` 又等待第二个注册）。因此这里按负责人允许的方式，改为
+    /// 验证**串行化结果**——并且断言强度足以区分修复前后：
+    ///
+    /// - 修复后：驱逐方卡在清理中途时，第二个注册**必须仍在阻塞**（拿不到
+    ///   `register_tx`）；放开 pending 锁后两者依次完成，新状态完好。
+    /// - 修复前（无互斥）：第二个注册会**立刻完成**，第一条断言即失败。
+    ///
+    /// 这样既不依赖已不支持的旧执行顺序，也仍然钉住最初那个缺陷。
+    #[tokio::test]
+    async fn test_review_register_transaction_is_serialized_against_eviction_cleanup() {
+        let state = make_state("");
+        let old_sid = "race01";
+
+        // 1. A 以固定 key 注册到 race01。
+        let r = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(json!({"type":"agent:register","key":"race-old-key","session_id":old_sid})),
+        )
+        .await
+        .into_response();
+        assert_eq!(r.status(), 200);
+        state
+            .last_activity
+            .write()
+            .await
+            .insert(old_sid.to_string(), Instant::now());
+
+        // 2. 占住 pending_mcp 写锁，给驱逐方的清理制造一个确定的停顿点。
+        let pending_guard = state.pending_mcp.write().await;
+
+        // 3. 触发 token 复用驱逐：A 被顶掉，清理会卡在 pending_mcp 上。
+        let evict_task = {
+            let st = state.clone();
+            tokio::spawn(async move {
+                agent_send_handler(
+                    State(st),
+                    axum::http::HeaderMap::new(),
+                    Json(json!({"type":"agent:register","key":"race-old-key"})),
+                )
+                .await
+                .into_response()
+                .status()
+            })
+        };
+        // 等驱逐方走完「摘通道」这一步（即已进入清理阶段、正卡在 pending_mcp）。
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !state.agent_broadcast.read().await.contains_key(old_sid) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eviction should reach the cleanup barrier");
+
+        // 4. 第二个注册抢占 race01。修复后它必须**阻塞**在 register_tx 上。
+        let reclaim_task = {
+            let st = state.clone();
+            tokio::spawn(async move {
+                agent_send_handler(
+                    State(st),
+                    axum::http::HeaderMap::new(),
+                    Json(json!({"type":"agent:register","key":"race-new-key","session_id":"race01"})),
+                )
+                .await
+                .into_response()
+                .status()
+            })
+        };
+        // 给足调度机会：若没有互斥，它会在这一步之内完成。
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !reclaim_task.is_finished(),
+            "a registration must not run while another registration's eviction cleanup is in flight"
+        );
+        assert!(
+            state.sessions.get(old_sid).await.is_none(),
+            "the reclaimed sid must not be registered while the eviction transaction still holds the lock"
+        );
+
+        // 5. 放开停顿点：驱逐方完成并释放互斥，第二个注册随即完成。
+        drop(pending_guard);
+        assert_eq!(evict_task.await.unwrap(), 200);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), reclaim_task)
+                .await
+                .expect("reclaim must proceed once the eviction transaction releases the lock")
+                .unwrap(),
+            200
+        );
+
+        // 6. 串行化后的终态：race01 属于新 registration，状态完整。
+        assert!(state.sessions.get(old_sid).await.is_some());
+        assert!(state.agent_broadcast.read().await.contains_key(old_sid));
+        assert!(
+            state.last_activity.read().await.contains_key(old_sid),
+            "old cleanup erased the new registered session's last_activity"
+        );
+        state
+            .buffer_agent_event(old_sid, "{\"type\":\"terminal:input\"}")
+            .await;
+        state
+            .agent_upgrades
+            .write()
+            .await
+            .insert(old_sid.to_string(), json!({"upgrade_id":"new-upgrade"}));
+        assert!(state.agent_event_buffers.read().await.contains_key(old_sid));
+        assert!(state.agent_upgrades.read().await.contains_key(old_sid));
+    }
+
+    /// 「旧 SSE 的 Drop 清理」与「新注册」交错时，不得删掉新 incarnation 的通道。
+    ///
+    /// `AgentEventsCleanup::drop` 用 `same_channel` 判据只清自己那一份（
+    /// `ws.rs` 内 `AgentEventsCleanup` 实现），这里把它与新注册并发放置，
+    /// 钉住"旧连接退出不能清理新连接状态"这条任务卡约束。
+    #[tokio::test]
+    async fn test_review_stale_sse_drop_does_not_clear_new_registration() {
+        let state = make_state("");
+        let sid = "racesse1";
+
+        // 旧 incarnation：先注册，再手工装一条**旧**通道。
+        let r = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(json!({"type":"agent:register","key":"sse-key","session_id":sid})),
+        )
+        .await
+        .into_response();
+        assert_eq!(r.status(), 200);
+
+        let (old_tx, _old_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (old_bulk, _old_bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        {
+            let mut bc = state.agent_broadcast.write().await;
+            let cm = bc.get_mut(sid).unwrap();
+            cm.agent = Some(old_tx.clone());
+            cm.agent_bulk = Some(old_bulk.clone());
+        }
+
+        // 新 incarnation 接管同一 sid，装上新通道。
+        let r2 = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(json!({"type":"agent:register","key":"sse-key","session_id":sid})),
+        )
+        .await
+        .into_response();
+        assert_eq!(r2.status(), 200);
+        let (new_tx, _new_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (new_bulk, _new_bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        {
+            let mut bc = state.agent_broadcast.write().await;
+            let cm = bc.get_mut(sid).unwrap();
+            cm.agent = Some(new_tx.clone());
+            cm.agent_bulk = Some(new_bulk.clone());
+        }
+        state
+            .last_activity
+            .write()
+            .await
+            .insert(sid.to_string(), Instant::now());
+
+        // 旧 SSE 流结束 → 触发 Drop 清理。
+        let cleanup = AgentEventsCleanup {
+            tx: old_tx,
+            bulk_tx: old_bulk,
+            state: state.clone(),
+            session_id: sid.to_string(),
+        };
+        drop(cleanup);
+        // Drop 里是 spawn 出去的异步清理，给它跑完的机会。
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let bc = state.agent_broadcast.read().await;
+        let cm = bc.get(sid).expect("session must still exist");
+        assert!(
+            cm.agent.as_ref().is_some_and(|t| t.same_channel(&new_tx)),
+            "stale SSE drop must not clear the new incarnation's channel"
+        );
+        assert!(
+            cm.agent_bulk.as_ref().is_some_and(|t| t.same_channel(&new_bulk)),
+            "stale SSE drop must not clear the new incarnation's bulk channel"
+        );
+    }
+
     /// 阴性对照 1：同 sid 接管（agent 重启的正常路径）**不清**该 sid 的状态。
     ///
     /// 这条是兼容性约束：同 sid 的 session 仍是活的（id 没有被丢弃），
@@ -6468,4 +6669,5 @@ mod tests {
             .await
             .contains_key("nonexistent-host.invalid"));
     }
+
 }

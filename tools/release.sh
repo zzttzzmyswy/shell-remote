@@ -57,16 +57,38 @@ if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   echo "本地已存在 tag $TAG，拒绝覆盖。发新版本请先 bump Cargo.toml 的 version。" >&2
   exit 1
 fi
-if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG" 2>/dev/null)" ]; then
+
+# 远端查询必须区分「确实不存在」与「查询失败」（MYS-2806 review 2）：
+# `ls-remote` 在断网/认证失败时也输出空，直接当"不存在"会在无法确认远端
+# 状态的情况下继续发布。
+if ! ls_out="$(git ls-remote --tags origin "refs/tags/$TAG" 2>&1)"; then
+  echo "无法查询远端 tag 状态（网络或认证失败），为安全起见停止发布：" >&2
+  echo "  $ls_out" >&2
+  echo "这是**查询失败**，不能据此判断 $TAG 不存在。" >&2
+  exit 1
+fi
+if [ -n "$ls_out" ]; then
   echo "远端已存在 tag $TAG，拒绝覆盖。发新版本请先 bump Cargo.toml 的 version。" >&2
   exit 1
 fi
 
+REPO_SLUG="$(git remote get-url origin | sed -E 's#.*[:/]([^/]+/[^/]+?)(\.git)?$#\1#')"
+
 # 3) 已有同名 release → 停止（`gh release create` 会 422，但那时 tag 已经推出去了）。
-if gh release view "$TAG" >/dev/null 2>&1; then
+#    同样必须区分「确实不存在」与「查询失败」：`gh release view` 对"不存在"和
+#    "没登录/网络不通"都会非零退出，后者当作不存在会让发布在未知状态下继续。
+#    查询与创建必须针对**同一个仓库**，所以两者都显式带 `--repo`。
+if gh release view "$TAG" --repo "$REPO_SLUG" >/dev/null 2>"$ROOT/.release-view.err"; then
   echo "已存在 release $TAG，拒绝重复发布。发新版本请先 bump Cargo.toml 的 version。" >&2
   exit 1
 fi
+if ! grep -qiE 'not found|could not find|release not found|HTTP 404' "$ROOT/.release-view.err"; then
+  echo "无法确认 $TAG 的 release 状态（网络/认证/权限失败），停止发布：" >&2
+  sed 's/^/  /' "$ROOT/.release-view.err" >&2
+  echo "这是**查询失败**，不能据此判断该 release 不存在。" >&2
+  exit 1
+fi
+rm -f "$ROOT/.release-view.err"
 
 # ── 构建（可跳过）────────────────────────────────────────────────────
 #
@@ -110,9 +132,13 @@ echo "目标 commit: $COMMIT"
 # ── 副作用从这里开始 ────────────────────────────────────────────────
 TITLE="${GH_TITLE:-v$VERSION — shell-remote}"
 
-# NOTES 必须**先**构造好：旧版把 heredoc 直接塞进 `gh release create` 的参数
-# 列表里，续行会让资产路径被当成 notes 的一部分（实测 `gh release create`
-# 收到的 notes 后面拼着一整串 ./dist/... 路径，资产反而没传上去）。
+# NOTES 先构造好再作为**单个参数**传入。
+#
+# 更正（MYS-2806 review 3）：此前这里写着"旧版把资产路径拼进了 notes"，
+# 那是**错的**——原脚本的 heredoc 写在 `$( )` 里，是正确的。我当时用
+# `echo "gh $*"` 记录 mock 调用，多行 notes 被压成一行后看起来像资产路径
+# 落在 notes 里，属于测量方法的假象。资产一直是 8 个独立参数。
+# 这里保留"先构造后传参"的写法只是可读性选择，不是缺陷修复。
 NOTES="$(cat <<EOF
 ## $TAG
 
@@ -125,8 +151,6 @@ NOTES="$(cat <<EOF
 > 桌面转发的设备请改用 \`shell-remote-ui-*\` 二进制（安装/升级均按此文件名）。
 EOF
 )"
-
-REPO_SLUG="$(git remote get-url origin | sed -E 's#.*[:/]([^/]+/[^/]+?)(\.git)?$#\1#')"
 
 # tag 由本脚本自己创建并推送（而不是交给 `gh release create --target`）：
 # 这样"哪个 commit 被打了 tag"是本脚本的确定性结果，发布后可以直接
@@ -144,12 +168,36 @@ if ! gh release create "$TAG" \
   --title "$TITLE" \
   --notes "$NOTES" \
   "${ASSETS[@]}"; then
-  # 回滚：release 没建出来，本地与远端 tag 都要撤掉。否则重跑会撞上
-  # "已存在 tag"，运维只能手工清理——旧版正是这样卡住的。
-  echo "gh release create 失败，回滚 tag $TAG（本地 + 远端）" >&2
-  git push origin ":refs/tags/$TAG" >/dev/null 2>&1 || \
-    echo "警告: 远端 tag $TAG 回滚失败，请人工删除" >&2
-  git tag -d "$TAG" >/dev/null 2>&1 || true
+  # 失败后**绝不能**盲目删除 tag（MYS-2806 review 2）。
+  #
+  # `gh release create` 在 GitHub API 上是多个请求：创建 release → 上传资产 →
+  # 发布（草稿转正式）→ 清理草稿。失败可能发生在其中**任何一步之后**，因此
+  # 非零退出只说明"本次命令失败"，不说明"远端没有 release"。此时删掉远端 tag
+  # 会留下"release 存在、tag 却没了"的更糟状态：release 指向的 commit 失去
+  # 可追溯引用，而 `gh` 也不会替我们重新打。
+  #
+  # 正确做法：保留本地与远端 tag（它们指向确切 COMMIT，是唯一可靠的锚点），
+  # 报告实际状态与恢复方法，让人工决定；绝不自动覆盖/重发同版本。
+  echo >&2
+  echo "== 发布未成功完成：gh release create 返回非零 ==" >&2
+  echo "   版本: $TAG    commit: $COMMIT" >&2
+  echo "   tag 已保留（本地 + 远端），**未**自动删除或覆盖。" >&2
+  echo >&2
+  echo "   可能的状态与恢复方法：" >&2
+  echo "   1) release 已创建、仅资产上传/草稿清理失败（最常见）" >&2
+  echo "      → 先确认实际状态：gh release view $TAG --repo $REPO_SLUG" >&2
+  echo "      → 若 release 存在，直接补传缺失资产（不要重建同版本）：" >&2
+  echo "        gh release upload $TAG ${ASSETS[*]} --repo $REPO_SLUG --clobber" >&2
+  echo "   2) release 未创建，但 tag 已推送" >&2
+  echo "      → 确认后二选一：删除远端 tag 重来" >&2
+  echo "          git push origin :refs/tags/$TAG && git tag -d $TAG" >&2
+  echo "        或保留 tag 直接补建 release" >&2
+  echo "          gh release create $TAG --repo $REPO_SLUG --verify-tag --title \"\$GH_TITLE\" --notes-file <file> ${ASSETS[*]}" >&2
+  echo "   3) 结果未知（网络中断/超时）" >&2
+  echo "      → **不要**重跑本脚本；先 git ls-remote --tags origin 与" >&2
+  echo "        gh release view $TAG --repo $REPO_SLUG 查清远端实际状态" >&2
+  echo >&2
+  echo "   原则：同版本不覆盖、不重发。确需重发请 bump Cargo.toml 的 version。" >&2
   exit 1
 fi
 

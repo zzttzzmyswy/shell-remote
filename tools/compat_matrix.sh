@@ -13,6 +13,9 @@
 #   tools/compat_matrix.sh [--new <新二进制>] [--versions "<版本列表>"]
 #
 #   --new       默认 target/release/shell-remote（不存在则提示先 cargo build）
+#   --include-current  同版本号也照常测（用 GitHub 上已发布的真实二进制）；
+#               发布过 vX 之后又在分支上改代码时必须加，否则该版本会被跳过，
+#               看起来"覆盖了"其实什么都没验证。
 #   --versions  默认 "0.53.0 0.59.4 0.59.8 latest"；latest = GitHub 最新 release，
 #               当它等于新二进制的版本时自动跳过（那样两个方向都退化成同版本）
 #
@@ -31,6 +34,14 @@ GAPS_FILE="$SCRIPT_DIR/compat/known-gaps.txt"
 
 NEW_BIN="target/release/shell-remote"
 VERSIONS="$DEFAULT_VERSIONS"
+# --include-current：即使某个版本号等于新二进制的版本号，也照常测两个方向。
+#
+# 为什么需要（MYS-2806 review 4）：默认会跳过「与新二进制同版本」的版本，理由是
+# 两个方向会退化成同版本、没有意义。但**已发布的同名版本资产与本次 PR 构建的
+# 二进制字节不同**（发布了 v0.59.15，本分支又在它之上改了代码）。此时跳过就等于
+# 「什么都没验证」，却容易被读成「已覆盖」。带上本开关即可用 GitHub 上真实的
+# 已发布二进制跑 A/B 两个方向——版本号保持真实，不伪造、不新增 GAP。
+INCLUDE_CURRENT=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,6 +51,8 @@ while [ $# -gt 0 ]; do
     --versions)
       [ $# -ge 2 ] || { echo "--versions 需要一个版本列表" >&2; exit 2; }
       VERSIONS="$2"; shift 2 ;;
+    --include-current)
+      INCLUDE_CURRENT=1; shift ;;
     -h|--help)
       sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -335,6 +348,14 @@ run_combo() { # $1 版本 $2 组合 A|B $3 relay 二进制 $4 agent 二进制
     RELAY_ARGS+=(--admin-path "$ADMIN_PATH" --admin-pass "$ADMIN_PASS")
     ADMIN_ENABLED=1
   fi
+  # 隔离（任务卡第 7 条 / MYS-2806 review 4）：显式指定 settings 文件，不靠
+  # 覆盖 HOME 兜底——旧版只 `env HOME=...`，真实的 ~/.shell-remote 虽未被写到，
+  # 但语义上是"靠改 HOME 间接隔离"，且老版本没有 --settings-file 时仍会落到
+  # HOME 推导路径。两道都做：能显式就显式，HOME 仍然隔离给不需要该开关的
+  # 老二进制（自签证书缓存等也走 HOME）。
+  if has_opt "$RELAY_BIN" relay "--settings-file"; then
+    RELAY_ARGS+=(--settings-file "$DIR/relay-settings.json")
+  fi
 
   AGENT_ARGS=(agent --relay-url "$BASE" --key "$KEY" --root "$DIR")
   has_opt "$AGENT_BIN" agent "--session-id" && AGENT_ARGS+=(--session-id "$SID")
@@ -397,7 +418,7 @@ for v in $VERSIONS; do
       continue
     fi
   fi
-  if [ "$v" = "$NEW_VERSION" ]; then
+  if [ "$v" = "$NEW_VERSION" ] && [ "$INCLUDE_CURRENT" -eq 0 ]; then
     SKIPPED+=("$v")
     continue
   fi

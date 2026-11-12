@@ -109,6 +109,7 @@ api() { # $1 = path, rest = curl args
 start_relay() { # $1 = rate limit (optional)
   "$BIN" relay --bind "127.0.0.1:${PORT}" --auth cus-pass --no-tls \
     --admin-path "$ADMIN_PATH" --admin-user admin --admin-pass cspass \
+    --settings-file "$WORKDIR/relay-settings.json" \
     --registration-rate-limit "${1:-120}" \
     >> "$WORKDIR/relay.log" 2>&1 &
   RELAY_PID=$!
@@ -388,6 +389,7 @@ sleep 1
 start_relay_with_artifacts() {
   "$BIN" relay --bind "127.0.0.1:${PORT}" --auth cus-pass --no-tls \
     --admin-path "$ADMIN_PATH" --admin-user admin --admin-pass cspass \
+    --settings-file "$WORKDIR/relay-settings.json" \
     --download-dir "$ART_DIR" --allow-custom-upgrade \
     --upgrade-cdn "http://127.0.0.1:1" \
     --manifest-api-base "http://127.0.0.1:1" \

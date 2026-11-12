@@ -284,6 +284,9 @@ pub async fn kick_handler(
         )
             .into_response();
     }
+    // 与注册事务互斥（MYS-2806 review 1/2）：kick 也是「拆通道 → 删会话 →
+    // 清多张表」的跨 await 序列，不互斥就会在注册过程中抹掉新会话的状态。
+    let _register_guard = state.register_tx.lock().await;
     // Collect browser ids before dropping the channel map.
     let browser_ids: Vec<String> = {
         let bc = state.agent_broadcast.read().await;

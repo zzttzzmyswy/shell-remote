@@ -29,22 +29,36 @@ cleanup() {
 trap cleanup EXIT
 
 start_relay() {
+  # 隔离（任务卡第 7 条）：独立的 settings 文件，绝不读写真实的
+  # ~/.shell-remote/relay-settings.json——否则本脚本会覆盖运维的带宽配置。
   "$BIN" relay --bind "127.0.0.1:${PORT}" --auth crs-pass --no-tls \
     --admin-path "$ADMIN_PATH" --admin-user admin --admin-pass crspass \
+    --settings-file "$WORKDIR/relay-settings.json" \
     >> "$WORKDIR/relay.log" 2>&1 &
   RELAY_PID=$!
   for _ in $(seq 1 50); do curl -s -o /dev/null "$BASE/" && return 0; sleep 0.2; done
   return 1
 }
+# relay 重启后 cookie 失效，需要重新登录（且只在重启后登录一次）。
+start_relay_and_login() { start_relay && login_admin; }
 start_agent() { # $1 = index
   "$BIN" agent --relay-url "$BASE" --key "crskey$1" --session-id "crsag$1" \
     --shell /bin/sh --root "$WORKDIR" >> "$WORKDIR/agent$1.log" 2>&1 &
   APIDS[$1]=$!
   disown "$!" 2>/dev/null
 }
-online() {
+# 登录一次、之后复用 cookie。
+#
+# 旧版每次 `online()` 都重新 POST /login，而 admin 登录限流是 5 次/分钟/IP
+# （`relay/admin.rs` 的 `admin:` 桶）。`wait_online` 每秒轮询一次 → 5 秒后
+# 自己被限流，此后 overview 全部返回空，`agent_online` 读成 0，表现为
+# 「收敛后保持 20s」这一项超时（在线=0/40），看起来像 relay 掉线，其实是
+# 脚本自己把登录打爆了。只在 relay 重启后需要重新登录一次。
+login_admin() {
   curl -s -c "$WORKDIR/cookie" -X POST "$BASE${ADMIN_PATH}/login" -H 'Content-Type: application/json' \
     -d '{"user":"admin","pass":"crspass"}' -o /dev/null 2>/dev/null
+}
+online() {
   curl -s -b "$WORKDIR/cookie" "$BASE${ADMIN_PATH}/api/overview" 2>/dev/null \
     | grep -o '"agent_online":[0-9]*' | grep -o '[0-9]*$'
 }
@@ -66,12 +80,12 @@ check() { local name="$1"; shift; local r; r="$("$@")"; local rc=$?
 curl -s -o /dev/null "$BASE/" && { echo "FAIL: 端口 $PORT 被占用"; exit 1; }
 echo "── 并发注册冒烟：N=$N FLAP=$FLAP ROUNDS=$ROUNDS（日志 $WORKDIR）──"
 
-start_relay || { echo "FAIL: relay 未启动"; exit 1; }
+start_relay_and_login || { echo "FAIL: relay 未启动"; exit 1; }
 for i in $(seq 1 "$N"); do start_agent "$i"; done
 check "1. 冷启动 $N 个并发注册" wait_online "$N" 60
 
 kill -9 "$RELAY_PID"; sleep 1
-start_relay || { echo "FAIL: relay 重启失败"; exit 1; }
+start_relay_and_login || { echo "FAIL: relay 重启失败"; exit 1; }
 check "2. relay kill -9 重启后 $N 个同时重连" wait_online "$N" 120
 
 for r in $(seq 1 "$ROUNDS"); do

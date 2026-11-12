@@ -29,6 +29,9 @@ WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/sr-reltest.XXXXXX")"
 cleanup() { rm -rf "$WORKROOT"; }
 trap cleanup EXIT
 
+# 沙箱里 Cargo.toml 固定 9.9.9 → tag 固定 v9.9.9。
+TAG_UNDER_TEST="v9.9.9"
+
 fail=0
 ok()  { echo "  ✓ $*"; }
 bad() { echo "  ✗ $*"; fail=1; }
@@ -72,22 +75,39 @@ BD
     git push -q origin HEAD:refs/heads/master
   ) || return 1
 
-  # 假 gh：记录每次调用（**每个参数一行**：`$*` 会把 notes 的换行压平，
-  # 就看不出资产到底是被当成独立参数还是拼进了 notes）；`release view`
-  # 默认"不存在"（退出 1）。
+  # 假 gh：两种记录——
+  #   gh.log     每参数一行（`$*` 会把 notes 的换行压平，看不出参数边界）
+  #   calls.log  结构化调用标记（`CALL release-view` / `CALL release-create`），
+  #              断言必须读它；在 gh.log 里 grep "release create" 永远不匹配。
+  # 另：`release create` 可模拟三种结局（见下方环境变量）。
   cat > "$box/bin/gh" <<'GH'
 #!/bin/bash
 {
-  echo "=== gh call ==="
   for a in "$@"; do printf 'ARG %s\n' "$a"; done
 } >> "$GH_LOG"
 if [ "$1" = "release" ] && [ "$2" = "view" ]; then
-  # GH_EXISTING_RELEASE=1 → 假装该 release 已存在
+  echo "CALL release-view" >> "$CALLS_LOG"
+  # GH_VIEW_ERROR=1：网络/认证失败（**不是** 404），不能当作"不存在"
+  if [ "${GH_VIEW_ERROR:-0}" = "1" ]; then
+    echo "error: HTTP 401: Bad credentials (https://api.github.com/graphql)" >&2
+    exit 1
+  fi
   [ "${GH_EXISTING_RELEASE:-0}" = "1" ] && exit 0
+  echo "release not found" >&2
   exit 1
 fi
 if [ "$1" = "release" ] && [ "$2" = "create" ]; then
-  [ "${GH_FAIL_CREATE:-0}" = "1" ] && { echo "HTTP 422: already exists" >&2; exit 1; }
+  echo "CALL release-create" >> "$CALLS_LOG"
+  # GH_FAIL_CREATE=1：创建/上传/清理失败，但 **release 已创建**（review 探针场景）
+  if [ "${GH_FAIL_CREATE:-0}" = "1" ]; then
+    echo "release created, but asset upload failed: HTTP 502" >&2
+    exit 1
+  fi
+  # GH_UNKNOWN_REMOTE=1：结果未知（网络中断，无法判断远端是否已创建）
+  if [ "${GH_UNKNOWN_REMOTE:-0}" = "1" ]; then
+    echo "error: Post \"https://api.github.com/...\": dial tcp: i/o timeout" >&2
+    exit 1
+  fi
   exit 0
 fi
 exit 0
@@ -111,27 +131,38 @@ run_release() { # $1 = box, rest = args
   (
     cd "$box/repo" || exit 1
     PATH="$box/bin:$PATH" \
-      GH_LOG="$box/gh.log" BUILD_LOG="$box/build.log" \
+      GH_LOG="$box/gh.log" CALLS_LOG="$box/calls.log" BUILD_LOG="$box/build.log" \
       GH_EXISTING_RELEASE="${GH_EXISTING_RELEASE:-0}" \
       GH_FAIL_CREATE="${GH_FAIL_CREATE:-0}" \
+      GH_VIEW_ERROR="${GH_VIEW_ERROR:-0}" \
+      GH_UNKNOWN_REMOTE="${GH_UNKNOWN_REMOTE:-0}" \
       bash tools/release.sh "$@"
   ) > "$box/out.log" 2>&1
   echo $?
 }
 
 # 该沙箱是否**没有**发生任何破坏性动作（无 tag、无 release 调用）。
+#
+# 判据读 `calls.log` 里的结构化调用标记，而不是在 `gh.log` 里 grep
+# "release create"——后者永远不匹配（gh.log 是逐行 `ARG ...` 记录），
+# 旧版这个断言实际上是空的（MYS-2806 review 3）。
 no_side_effects() { # $1 = box
   local box="$1"
-  if git -C "$box/repo" rev-parse -q --verify "refs/tags/v9.9.9" >/dev/null; then
+  if git -C "$box/repo" rev-parse -q --verify "refs/tags/$TAG_UNDER_TEST" >/dev/null; then
     return 1
   fi
-  if git -C "$box/origin" rev-parse -q --verify "refs/tags/v9.9.9" >/dev/null; then
+  if git -C "$box/origin" rev-parse -q --verify "refs/tags/$TAG_UNDER_TEST" >/dev/null; then
     return 1
   fi
-  if [ -f "$box/gh.log" ] && grep -q "release create" "$box/gh.log"; then
+  if [ -f "$box/calls.log" ] && grep -qx "CALL release-create" "$box/calls.log"; then
     return 1
   fi
   return 0
+}
+
+# 是否调用过 `gh release create`（结构化标记，可靠）。
+release_create_called() { # $1 = box
+  [ -f "$1/calls.log" ] && grep -qx "CALL release-create" "$1/calls.log"
 }
 
 echo "── release.sh 隔离测试（$WORKROOT）──"
@@ -175,8 +206,8 @@ echo "── release.sh 隔离测试（$WORKROOT）──"
   [ "$rc" -ne 0 ] && ok "3. 本地已有 tag：非 0 退出（$rc）" || bad "3. 本地已有 tag 却成功退出"
   [ "$before" = "$after" ] && ok "3. 本地已有 tag：未被覆盖（无 tag -f）" \
     || bad "3. 本地已有 tag：被强制移动了"
-  grep -q "release create" "$box/gh.log" 2>/dev/null && bad "3. 本地已有 tag：仍建了 release" \
-    || ok "3. 本地已有 tag：未建 release"
+  release_create_called "$box" && bad "3. 本地已有 tag：仍建了 release" \
+    || ok "3. 本地已有 tag：未建 release（读结构化调用标记）"
 }
 
 # ── 4. 远端已有 tag ────────────────────────────────────────────────
@@ -192,8 +223,8 @@ echo "── release.sh 隔离测试（$WORKROOT）──"
   [ "$rc" -ne 0 ] && ok "4. 远端已有 tag：非 0 退出（$rc）" || bad "4. 远端已有 tag 却成功退出"
   [ "$remote_before" = "$remote_after" ] && ok "4. 远端已有 tag：未被强推覆盖" \
     || bad "4. 远端已有 tag：被 push -f 覆盖了"
-  grep -q "release create" "$box/gh.log" 2>/dev/null && bad "4. 远端已有 tag：仍建了 release" \
-    || ok "4. 远端已有 tag：未建 release"
+  release_create_called "$box" && bad "4. 远端已有 tag：仍建了 release" \
+    || ok "4. 远端已有 tag：未建 release（读结构化调用标记）"
 }
 
 # ── 5. 已有 release ────────────────────────────────────────────────
@@ -226,10 +257,14 @@ echo "── release.sh 隔离测试（$WORKROOT）──"
     || bad "6. release 只带了 $assets_in_call 个独立资产参数"
   grep -q -- '^ARG --verify-tag$' "$box/gh.log" && ok "6. release 校验已推送的 tag" \
     || bad "6. release 没有 --verify-tag"
-  # notes 里不该出现 dist/ 路径。
-  notes_arg="$(awk '/^ARG ## v9.9.9/{f=1} f&&/^ARG /{print} f&&/shell-remote-ui-\*/{exit}' "$box/gh.log")"
-  echo "$notes_arg" | grep -q 'dist/' && bad "6. notes 里混进了资产路径（旧版缺陷）" \
-    || ok "6. notes 内容干净（不含资产路径）"
+  # notes 参数本身不得含 dist/ 路径。
+  # 说明（MYS-2806 review 3）：原脚本**并没有**这个缺陷——heredoc 在 `$( )` 里
+  # 是正确的。旧版测试之所以"通过"，是因为它用 `echo "gh $*"` 把多行 notes
+  # 压成一行后看到了后面的资产路径，属于测量假象。这条断言保留，用来防止
+  # 将来真的把资产续行拼进 notes；它是防回归，不是修复证据。
+  notes_arg="$(awk '/^ARG --notes$/{getline; print; exit}' "$box/gh.log")"
+  printf '%s' "$notes_arg" | grep -q 'dist/' && bad "6. notes 参数里出现了资产路径" \
+    || ok "6. notes 参数不含资产路径"
 }
 
 # ── 7. 默认构建 vs --skip-build ──────────────────────────────────
@@ -268,16 +303,108 @@ echo "── release.sh 隔离测试（$WORKROOT）──"
   no_side_effects "$box" && ok "8. -h：未发生副作用" || bad "8. -h：发生了副作用"
 }
 
-# ── 9. 发布失败要回滚本地 tag ────────────────────────────────────
+# ── 9. release 已创建但上传/清理失败 → 必须**保留** tag，报告状态 ──
+#
+# MYS-2806 review 2 的确定性场景：`gh release create` 内部是「创建 release →
+# 上传资产 → 发布 → 清理草稿」多个请求。失败可能发生在创建**之后**，此时远端
+# 已有 release。盲目删 tag 会留下"release 存在、tag 没了"的更糟状态。
 {
-  box="$(new_box gh-fails)"
+  box="$(new_box gh-partial)"
   seed_assets "$box/repo"
   rc="$(GH_FAIL_CREATE=1 run_release "$box" --skip-build)"
-  [ "$rc" -ne 0 ] && ok "9. release 失败：非 0 退出（$rc）" || bad "9. release 失败却退出 0"
-  if git -C "$box/repo" rev-parse -q --verify "refs/tags/v9.9.9" >/dev/null; then
-    bad "9. release 失败后本地 tag 仍然存在（下次重跑会撞"已存在 tag"）"
+  [ "$rc" -ne 0 ] && ok "9. 创建后上传失败：非 0 退出（$rc）" || bad "9. 创建后上传失败却退出 0"
+  # release create 确实被调用（结构化标记）
+  release_create_called "$box" && ok "9. 确实调用了 gh release create" \
+    || bad "9. 没有调用 gh release create"
+  # 关键：本地与远端 tag 都必须**保留**
+  if git -C "$box/repo" rev-parse -q --verify "refs/tags/$TAG_UNDER_TEST" >/dev/null; then
+    ok "9. 本地 tag 保留（未被盲目删除）"
   else
-    ok "9. release 失败后本地 tag 已回滚"
+    bad "9. 本地 tag 被删除了（release 可能已创建，删 tag 会更糟）"
+  fi
+  if git -C "$box/origin" rev-parse -q --verify "refs/tags/$TAG_UNDER_TEST" >/dev/null; then
+    ok "9. 远端 tag 保留（未被盲目删除）"
+  else
+    bad "9. 远端 tag 被删除了 —— review 探针场景：release_created=true 但 remote_tag_exists=false"
+  fi
+  # 必须报告实际状态与恢复方法，而不是只说"失败了"
+  grep -q "已保留" "$box/out.log" && ok "9. 明确报告 tag 已保留" \
+    || bad "9. 没有说明 tag 的处理结果"
+  grep -q "gh release view" "$box/out.log" && ok "9. 给出状态确认命令" \
+    || bad "9. 没给出如何确认远端状态"
+  grep -q "gh release upload" "$box/out.log" && ok "9. 给出补传资产的恢复命令" \
+    || bad "9. 没给出恢复方法"
+  grep -qi "不要.*重跑\|不覆盖\|不重发" "$box/out.log" && ok "9. 明确禁止盲目重跑" \
+    || bad "9. 没警告不要重跑"
+}
+
+# ── 10. 远端结果未知（网络中断）→ 保留 tag 并报告，不猜 ──────────
+{
+  box="$(new_box gh-unknown)"
+  seed_assets "$box/repo"
+  rc="$(GH_UNKNOWN_REMOTE=1 run_release "$box" --skip-build)"
+  [ "$rc" -ne 0 ] && ok "10. 结果未知：非 0 退出（$rc）" || bad "10. 结果未知却退出 0"
+  if git -C "$box/origin" rev-parse -q --verify "refs/tags/$TAG_UNDER_TEST" >/dev/null; then
+    ok "10. 结果未知时远端 tag 保留"
+  else
+    bad "10. 结果未知时远端 tag 被删除（无法确认远端状态时不得删除引用）"
+  fi
+  grep -qi "结果未知\|未知" "$box/out.log" && ok "10. 明确标出结果未知" \
+    || bad "10. 没有区分"结果未知"与"确实失败""
+}
+
+# ── 11. 远端 tag / release 查询失败 ≠ 不存在 ─────────────────────
+{
+  # 11a：ls-remote 失败（远端不可达）→ 必须在发布动作前退出
+  box="$(new_box query-fail-tag)"
+  seed_assets "$box/repo"
+  # 让 origin 指向不存在的路径，ls-remote 会失败
+  ( cd "$box/repo" && git remote set-url origin "$box/does-not-exist.git" )
+  rc="$(run_release "$box" --skip-build)"
+  [ "$rc" -ne 0 ] && ok "11a. 远端查询失败：非 0 退出（$rc）" || bad "11a. 远端查询失败却继续发布"
+  release_create_called "$box" && bad "11a. 查询失败后仍然创建了 release" \
+    || ok "11a. 查询失败时未创建 release"
+  grep -q "查询失败\|无法查询" "$box/out.log" && ok "11a. 明确区分查询失败与不存在" \
+    || bad "11a. 把查询失败当成"远端不存在""
+}
+{
+  # 11b：gh release view 因网络/认证失败（非 404）→ 必须停止，不能当不存在
+  box="$(new_box query-fail-gh)"
+  seed_assets "$box/repo"
+  rc="$(GH_VIEW_ERROR=1 run_release "$box" --skip-build)"
+  [ "$rc" -ne 0 ] && ok "11b. gh 查询失败：非 0 退出（$rc）" || bad "11b. gh 查询失败却继续发布"
+  release_create_called "$box" && bad "11b. 查询失败后仍然创建了 release" \
+    || ok "11b. 查询失败时未创建 release"
+  grep -q "查询失败\|无法确认" "$box/out.log" && ok "11b. 明确区分查询失败与确实不存在" \
+    || bad "11b. 把 gh 查询失败当成"release 不存在""
+}
+
+# ── 12. 元测试：证明「是否调用 gh release create」这类断言真的有效 ──
+#
+# review 指出旧版用 `grep "release create" gh.log` 检查，而 mock 记的是逐行
+# `ARG release` / `ARG create`，永远不匹配 —— 那个断言实际上是空的。这里用
+# **已知会调用** 与 **已知不会调用** 两个沙箱反过来验证 `release_create_called`
+# 判据本身，确保它不是又一个恒真/恒假的空断言。
+{
+  box="$(new_box meta-called)"
+  seed_assets "$box/repo"
+  ( cd "$box/repo" && git commit -q --allow-empty -m x )   # 保证能正常发布
+  run_release "$box" --skip-build >/dev/null
+  release_create_called "$box" && ok "12. 元测试：确实调用时判据为真（断言非恒假）" \
+    || bad "12. 元测试：实际调用了 gh release create，判据却为假 → 断言失效"
+
+  box2="$(new_box meta-not-called)"
+  seed_assets "$box2/repo"
+  ( cd "$box2/repo" && git tag "$TAG_UNDER_TEST" )   # 已有 tag → 不会调用
+  run_release "$box2" --skip-build >/dev/null
+  release_create_called "$box2" && bad "12. 元测试：未调用时判据为真 → 断言失效" \
+    || ok "12. 元测试：未调用时判据为假（断言非恒真）"
+
+  # 再证「旧写法」确实无效：gh.log 里没有 "release create" 这一行
+  if grep -q "release create" "$box/gh.log" 2>/dev/null; then
+    bad "12. 元测试：gh.log 竟然包含 'release create'，说明探针假设有误"
+  else
+    ok "12. 元测试：旧写法 grep 'release create' 确实永不匹配（已废弃）"
   fi
 }
 
