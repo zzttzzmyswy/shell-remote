@@ -75,4 +75,33 @@ cargo build --release --bin shell-remote-ui --target x86_64-pc-windows-gnu
 | 登录 shell 环境（`/etc/profile`） | ✅ | 不适用（无该概念） |
 | 命令日志的密码输入过滤 | ✅（termios + 前台进程组） | ❌ 记录全部输入 |
 | 升级的 `--version` 冒烟测试 | ✅ | 跳过（以 SHA-256 为准） |
-| 换机助手（原子自升级） | ✅ | ⚠️ wine 下走通了下载/校验/替换/注册链路；交接文件的私有 DACL 用 SDK 类型构造并 readback 验证，Win10 真机仍待复验 |
+| 换机助手（原子自升级） | ✅ | ⚠️ wine 下走通下载/校验/替换/注册链路；交接文件 DACL **只部分验证**（见下），Win10 真机仍待复验 |
+
+### 交接文件 DACL 的验证边界
+
+`src/agent/update_apply.rs` 的 `restrict_to_current_user()` 用 SDK 的
+`SECURITY_DESCRIPTOR`（x64 上 40 字节，`Dacl` 在偏移 32）构造单 ACE DACL，
+并请求 `PROTECTED_DACL_SECURITY_INFORMATION`。修复前那里是一个手写的
+`[u8; 32]` 缓冲区，`InitializeSecurityDescriptor` 会写出界 8 字节，踩坏栈上
+相邻数据，后续 `SetFileSecurityW` 报 998（ERROR_NOACCESS）。
+
+在 **wine-11.21** 上跑 `cargo test --target x86_64-pc-windows-gnu` 的
+`windows_handoff_dacl` 三个用例，实测能验证的与不能验证的分列如下：
+
+| 项目 | wine 下 | 判据 |
+|---|---|---|
+| `SECURITY_DESCRIPTOR` 尺寸/`Dacl` 偏移 | ✅ 已验证 | 40 / 32，编译期常量断言 |
+| 写交接文件不报 998、内容可读回 | ✅ 已验证 | 走真实 `write_private_new` 路径 |
+| DACL 里有当前用户、且 SID 与令牌一致 | ✅ 已验证 | `GetNamedSecurityInfoW` + `EqualSid` 逐字节比对 |
+| `Everyone` 被剔除 | ✅ 已验证 | 反向对照证明是产品效果而非临时目录默认值 |
+| **`SE_DACL_PROTECTED` 继承保护位** | ❌ **未验证** | wine 丢弃该控制位 |
+
+继承保护位为什么在 wine 上无法验证：一个**完全绕开产品代码**的独立探针
+（用 SDDL `D:P(A;;GA;;;OW)` 直接调 `SetFileSecurityW`）在 wine 上
+`SetFileSecurityW` 返回成功，但 `GetNamedSecurityInfoW` 读回 rc=5，且落盘
+DACL 会被追加一个 `SYSTEM`（S-1-5-18）ACE——即"API 说成功、语义不落地"。
+测试因此现场探测该能力：平台不模拟时**只跳过保护位那一条**，并在输出里
+打印未覆盖说明，不用"ACE 数 == 1"这种弱判据冒充"保护位已验证"。
+
+真 Win10 上的 DACL/继承行为需要负责人在真机复验；本仓库的任何 wine 结果
+都不构成真机结论。
