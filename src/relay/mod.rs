@@ -62,6 +62,26 @@ impl ChannelMap {
 pub struct SharedState {
     pub sessions: SessionRegistry,
     pub agent_broadcast: RwLock<HashMap<String, ChannelMap>>,
+    /// 注册生命周期互斥（MYS-2806 review 1/2）。
+    ///
+    /// 「一次注册」是**跨多个 await 的事务**：驱逐旧会话 → 清旧会话状态
+    /// （多个 await）→ 写入新会话的 capabilities/device/last_activity/通道
+    /// 映射。这些步骤分属不同的表，没有一把锁能覆盖全部；细分锁只能保证
+    /// 单张表自身不撕裂，挡不住两个注册交错执行。
+    ///
+    /// 反例（review 实测）：A 注册完成驱逐、释放细锁后停在清理里的某个
+    /// await；B 注册重新占用了同一个 sid 并写完自己的 last_activity/缓冲/
+    /// 升级状态；A 继续执行，把这些**属于新 incarnation** 的条目清掉。
+    /// 只在每个 await 前重新检查一次存在性挡不住——检查与清除之间仍有窗口，
+    /// 且检查通过时新会话可能还没开始写。
+    ///
+    /// 因此注册事务整体串行化：只有**整个注册（含驱逐清理）**做完，才允许
+    /// 下一个注册开始。这把锁只被注册路径持有，是低竞争路径（注册频率远低于
+    /// 数据面），不会影响终端/文件/桌面转发。
+    ///
+    /// 加锁顺序：register_tx → (sessions / agent_broadcast / pending_mcp / …)。
+    /// 反向没有任何调用点在持有上述细锁时会取 register_tx。
+    pub register_tx: tokio::sync::Mutex<()>,
     pub pending_mcp: RwLock<HashMap<String, (String, oneshot::Sender<String>)>>,
     pub download_streams: RwLock<HashMap<String, crate::relay::file_transfer::DownloadSink>>,
     pub last_activity: RwLock<HashMap<String, Instant>>,
@@ -440,6 +460,7 @@ impl SharedState {
     ) -> Self {
         Self {
             sessions: SessionRegistry::new(),
+            register_tx: tokio::sync::Mutex::new(()),
             agent_broadcast: RwLock::new(HashMap::new()),
             pending_mcp: RwLock::new(HashMap::new()),
             download_streams: RwLock::new(HashMap::new()),
@@ -523,6 +544,29 @@ impl SharedState {
             .or_insert_with(EventBuffer::new)
             .push(msg.to_string())
     }
+}
+
+/// Recheck a candidate after waiting for registration or another cleanup.
+async fn reap_idle_session(state: &SharedState, sid: &str, now: Instant) -> bool {
+    let _register_guard = state.register_tx.lock().await;
+    if !state.sessions.is_temporary(sid).await {
+        return false;
+    }
+    let still_idle = state.last_activity.read().await.get(sid).is_some_and(|last| {
+        now.saturating_duration_since(*last) > Duration::from_secs(1800)
+    });
+    if !still_idle {
+        return false;
+    }
+    tracing::info!("Idle timeout: removing session {}", sid);
+    state.pending_mcp.write().await.retain(|_, (owner, _)| owner != sid);
+    state.sessions.remove(sid).await;
+    state.agent_broadcast.write().await.remove(sid);
+    remove_session_state(state, sid).await;
+    if let Some(rec) = &state.recorder {
+        rec.close(sid);
+    }
+    true
 }
 
 /// 统一清理某个 sid 在**所有** per-session map 中的条目。
@@ -627,6 +671,37 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, Request};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_idle_reaper_preserves_refreshed_temporary_session() {
+        let state = SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None);
+        let registered = state.sessions.register(None, "rw", Some("reap01".into())).await.unwrap();
+        let scan_time = Instant::now();
+        state.last_activity.write().await.insert("reap01".into(), scan_time - Duration::from_secs(1900));
+        // The scan picked this sid, but the cached-token reconnect completed first.
+        state.sessions.register_existing(registered.tokens, Some("reap01".into())).await.unwrap();
+        state.last_activity.write().await.insert("reap01".into(), Instant::now());
+        assert!(state.sessions.is_temporary("reap01").await);
+        assert!(!reap_idle_session(&state, "reap01", scan_time).await,
+            "a stale idle candidate must not delete a freshly reconnected temporary session");
+        assert!(state.sessions.get("reap01").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_idle_reaper_removes_only_expired_temporary_sessions() {
+        let state = SharedState::new("".into(), 100 * 1024 * 1024, None, String::new(), String::new(), None);
+        let now = Instant::now();
+        state.sessions.register(None, "rw", Some("reap02".into())).await.unwrap();
+        state.sessions.register(Some("fixed-key".into()), "rw", Some("reap03".into())).await.unwrap();
+        for sid in ["reap02", "reap03"] {
+            state.last_activity.write().await.insert(sid.into(), now - Duration::from_secs(1900));
+        }
+        assert!(reap_idle_session(&state, "reap02", now).await);
+        assert!(state.sessions.get("reap02").await.is_none());
+        assert!(!state.last_activity.read().await.contains_key("reap02"));
+        assert!(!reap_idle_session(&state, "reap03", now).await);
+        assert!(state.sessions.get("reap03").await.is_some());
+    }
 
     #[test]
     fn test_rate_limiter_namespaced_keys_do_not_interfere() {
@@ -2766,27 +2841,7 @@ pub async fn start(
                     }
                 }
                 for session_id in to_remove {
-                    if !state_clone.sessions.is_temporary(&session_id).await {
-                        continue;
-                    }
-                    tracing::info!("Idle timeout: removing session {}", session_id);
-                    {
-                        let mut pending = state_clone.pending_mcp.write().await;
-                        pending.retain(|_rid, (sid, _tx)| sid != &session_id);
-                    }
-                    state_clone.sessions.remove(&session_id).await;
-                    state_clone
-                        .agent_broadcast
-                        .write()
-                        .await
-                        .remove(&session_id);
-                    // 所有按 sid 索引的状态表统一清理（遥测/桌面/事件缓冲等），
-                    // 否则漏掉的表会随会话数单调增长。
-                    remove_session_state(&state_clone, &session_id).await;
-                    // Flush + close the recording file, if any.
-                    if let Some(rec) = &state_clone.recorder {
-                        rec.close(&session_id);
-                    }
+                    reap_idle_session(&state_clone, &session_id, now).await;
                 }
 
                 // Reap stale download sinks (>5min no activity).

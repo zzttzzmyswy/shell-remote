@@ -45,11 +45,20 @@ pub enum RegisterError {
 /// session with the same `session_id` (or sharing any of the new tokens) was
 /// displaced — i.e. a new agent incarnation took over the identity, and the
 /// old session's tokens were invalidated.
+///
+/// `evicted_ids` lists **which** session ids were dropped. The caller needs it
+/// to run the same per-session cleanup (`remove_session_state`) as kick / idle
+/// reap: token reuse can displace a session whose id differs from the one being
+/// registered, and every `RwLock<HashMap<sid, _>>` on `SharedState` would
+/// otherwise keep that dead session's entries forever (the idle reaper never
+/// sees them once `last_activity` has been refreshed by the new incarnation).
 #[derive(Debug, Clone)]
 pub struct RegisterResult {
     pub session_id: String,
     pub tokens: Vec<(String, Permission)>,
     pub evicted: bool,
+    /// 本次注册驱逐掉的会话 id（去重）。`evicted` 只是它的非空标志。
+    pub evicted_ids: Vec<String>,
 }
 
 impl SessionRegistry {
@@ -104,7 +113,7 @@ impl SessionRegistry {
         // 更新完毕：此前在每个被驱逐会话上反复 `token_map.read()` 再单独取
         // 写锁，中间窗口能读到「会话已换、token 还指向旧 sid」的撕裂状态。
         // 全仓库统一这个加锁顺序（反序会与这里互锁）。
-        let mut evicted = false;
+        let mut evicted_ids: Vec<String> = Vec::new();
         {
             let mut sessions = self.sessions.write().await;
             let mut tmap = self.token_map.write().await;
@@ -118,7 +127,9 @@ impl SessionRegistry {
                             for (ot, _) in &old_info.tokens {
                                 tmap.remove(ot);
                             }
-                            evicted = true;
+                            if !evicted_ids.contains(&old_sid) {
+                                evicted_ids.push(old_sid);
+                            }
                         }
                     }
                 }
@@ -127,7 +138,9 @@ impl SessionRegistry {
                 for (t, _) in &old_info.tokens {
                     tmap.remove(t);
                 }
-                evicted = true;
+                if !evicted_ids.contains(&session_id) {
+                    evicted_ids.push(session_id.clone());
+                }
             }
             sessions.insert(
                 session_id.clone(),
@@ -150,7 +163,8 @@ impl SessionRegistry {
         Ok(RegisterResult {
             session_id,
             tokens,
-            evicted,
+            evicted: !evicted_ids.is_empty(),
+            evicted_ids,
         })
     }
 
@@ -186,7 +200,7 @@ impl SessionRegistry {
             None => generate_session_id(),
         };
 
-        let mut evicted = false;
+        let mut evicted_ids: Vec<String> = Vec::new();
         {
             let mut sessions = self.sessions.write().await;
             let mut tmap = self.token_map.write().await;
@@ -199,7 +213,9 @@ impl SessionRegistry {
                             for (ot, _) in &old_info.tokens {
                                 tmap.remove(ot);
                             }
-                            evicted = true;
+                            if !evicted_ids.contains(&old_sid) {
+                                evicted_ids.push(old_sid);
+                            }
                         }
                     }
                 }
@@ -208,7 +224,9 @@ impl SessionRegistry {
                 for (t, _) in &old_info.tokens {
                     tmap.remove(t);
                 }
-                evicted = true;
+                if !evicted_ids.contains(&session_id) {
+                    evicted_ids.push(session_id.clone());
+                }
             }
             sessions.insert(
                 session_id.clone(),
@@ -231,7 +249,8 @@ impl SessionRegistry {
         Ok(RegisterResult {
             session_id,
             tokens,
-            evicted,
+            evicted: !evicted_ids.is_empty(),
+            evicted_ids,
         })
     }
 
@@ -547,6 +566,77 @@ mod tests {
         // Old session gone
         assert!(registry.authenticate("shared-key").await.is_some());
         assert!(!registry.sessions.read().await.contains_key(&sid1));
+    }
+
+    /// `evicted_ids` 必须**准确列出被丢弃的 sid**：调用方靠它决定清哪份
+    /// per-session 状态。少列一个 → 那个 sid 的条目永久泄漏（它已不在
+    /// registry 里，空闲回收器再也看不到）；多列一个 → 误删活着的会话状态。
+    #[tokio::test]
+    async fn test_evicted_ids_reports_exactly_the_dropped_sessions() {
+        let registry = SessionRegistry::new();
+
+        // 1) 全新 sid：没有东西被驱逐。
+        let a = registry
+            .register(None, "rw", Some("evok01".to_string()))
+            .await
+            .unwrap();
+        assert!(a.evicted_ids.is_empty(), "a fresh session evicts nothing");
+        assert!(!a.evicted);
+
+        // 2) token 复用、不同 sid：列出的必须是**旧 sid**，不是新 sid。
+        let b = registry
+            .register(Some("evokey".to_string()), "rw", None)
+            .await
+            .unwrap();
+        let c = registry
+            .register(Some("evokey".to_string()), "rw", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            c.evicted_ids,
+            vec![b.session_id.clone()],
+            "token reuse must report the displaced (different) sid"
+        );
+        assert!(!c.evicted_ids.contains(&c.session_id));
+
+        // 3) 同 sid 接管：列出的就是它自己（调用方按「== 本次 sid」跳过。
+        //    同 sid 的会话仍然活着，缓冲/升级状态必须保留）。
+        let d = registry
+            .register(Some("evokey2".to_string()), "rw", Some("evok02".to_string()))
+            .await
+            .unwrap();
+        let e = registry
+            .register(Some("evokey2".to_string()), "rw", Some("evok02".to_string()))
+            .await
+            .unwrap();
+        assert!(d.evicted_ids.is_empty());
+        assert_eq!(e.evicted_ids, vec!["evok02".to_string()]);
+        assert!(e.evicted);
+    }
+
+    /// `register_existing`（缓存 token 重连）与 `register` 同语义。
+    #[tokio::test]
+    async fn test_register_existing_evicted_ids() {
+        let registry = SessionRegistry::new();
+        let first = registry
+            .register(None, "rw", Some("evok03".to_string()))
+            .await
+            .unwrap();
+        let cached = first.tokens.clone();
+        let again = registry
+            .register_existing(cached, Some("evok03".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(again.evicted_ids, vec!["evok03".to_string()]);
+        assert!(again.evicted);
+
+        // Different tokens claiming the same id: also a takeover, same report.
+        let other = vec![("other-token-zz".to_string(), Permission::ReadWrite)];
+        let takeover = registry
+            .register_existing(other, Some("evok03".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(takeover.evicted_ids, vec!["evok03".to_string()]);
     }
 
     #[tokio::test]

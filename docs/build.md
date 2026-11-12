@@ -91,6 +91,21 @@ tools/release.sh
 
 发布：版本号以 `Cargo.toml` 为唯一源，脚本据此打 tag、重建 `dist/` 并创建 GitHub release。`--skip-build` 复用已有 `dist/`。CI 与人工发布都走这个入口，避免 tag 与二进制 `--version` 漂移。
 
+发布是**先验证、后动手**：下列任一条件不满足，脚本在任何 tag / release 创建之前就会失败退出，不会留下"tag 已推出、release 没建出来"的半成品。
+
+- 工作树必须干净（`dist/` 本身在 `.gitignore` 里，不算脏）；
+- `dist/` 八个制品齐全（CLI + UI × 四平台）；
+- 本地与远端都不得已存在同名 tag（脚本绝不 `tag -f` / `push -f`：强推已发布 tag 会让"某版本的字节"与 tag 指向的源码永久失配）；
+- 不得已存在同名 release。
+
+要重发某个版本，应 bump `Cargo.toml` 的 `version` 后发布；不要覆盖既有 tag/release。推送 tag 或创建 release 未成功确认时，脚本保留已有引用并停止。先核实远端 tag、release 和资产的实际状态；仅补传缺失且已校验的资产，不使用 `--clobber`。结果未知时不要重跑发布脚本。
+
+`tools/release_sh_test.sh` 用隔离沙箱（本地 bare 仓库当 origin + 假的 `gh` 与 `build-dist`）覆盖上述每一条断言，不接触真实仓库或 GitHub：
+
+```bash
+tools/release_sh_test.sh
+```
+
 **发版前必须跑跨版本兼容矩阵，并保证全部 PASS/GAP（不允许 FAIL）**：
 
 ```bash

@@ -1374,6 +1374,11 @@ pub async fn agent_send_handler(
 
     // agent:register is allowed without server auth (agents use keys for identity)
     if msg_type == "agent:register" {
+        // 注册事务互斥（MYS-2806 review 1/2）：从驱逐旧会话到写完新会话状态
+        // 是一个跨多个表、跨多个 await 的整体，细分锁挡不住两个注册交错。
+        // 详见 `SharedState::register_tx` 的说明与
+        // `review_eviction_cleanup_must_not_erase_reclaimed_sid`。
+        let _register_guard = state.register_tx.lock().await;
         // Rate limit registrations per client IP to prevent session-flooding DoS.
         let client_ip = crate::relay::auth::client_ip(&headers);
         {
@@ -1489,8 +1494,8 @@ pub async fn agent_send_handler(
                 .await
         };
 
-        let (session_id, tokens, evicted) = match register_result {
-            Ok(r) => (r.session_id, r.tokens, r.evicted),
+        let (session_id, tokens, evicted, evicted_ids) = match register_result {
+            Ok(r) => (r.session_id, r.tokens, r.evicted, r.evicted_ids),
             Err(crate::relay::session::RegisterError::InvalidId) => {
                 return (
                     axum::http::StatusCode::BAD_REQUEST,
@@ -1499,6 +1504,74 @@ pub async fn agent_send_handler(
                     .into_response();
             }
         };
+
+        // 注册驱逐不只会顶替**同一个** sid，还会因 token 复用顶替**别的** sid
+        // （`--key` 固定但没给 `--session-id` 时，relay 每次注册都随机出新的
+        // sid —— agent 重启即触发）。那个 sid 从此不在 registry 里：空闲回收器
+        // 永远看不到它（未知 sid 的 `is_temporary` 恒为 false），但所有按 sid
+        // 索引的表还留着它的条目。必须在这里按 kick / 空闲回收同一套语义清理，
+        // 否则每次重启都永久泄漏一整套 per-session 状态（事件缓冲最长 8MB、
+        // 桌面流、KPI 历史、网页映射与隧道…）。
+        //
+        // 只处理 `evicted_ids` 里**不等于本次 sid** 的那些：同 sid 接管是正常
+        // 的断线重连，该会话仍然活着——Last-Event-ID 重放缓冲、升级任务状态
+        // （MYS-2425）都必须保留，清掉会破坏续传与"换机重连后收敛"的既有语义。
+        //
+        // 安全性由本分支入口的 `register_tx` 互斥保证（MYS-2806 review 1/2）：
+        // 整个「驱逐 → 清理 → 写新状态」事务期间不会有第二个注册、kick 或
+        // 空闲回收插进来。此前只在摘除 `agent_broadcast` 的临界区内检查了
+        // registry，释放锁后仍有多次 await，新注册可以插进来再被这里抹掉
+        // （review 的 `review_eviction_cleanup_must_not_erase_reclaimed_sid`
+        // 实测复现）。逐个 await 前补存在性检查挡不住——检查与清除之间仍有
+        // 窗口，因此这里改成真正的串行化，不再做那种检查。
+        for stale in evicted_ids.iter().filter(|s| **s != session_id) {
+            // 该 sid 的浏览器流也要一并收敛。`browser_sessions` 里存的是
+            // SSE 流的 id，而 sse_sessions 才是 sender 所在表——两者都要摘，
+            // 否则浏览器 SSE 会挂在一个再也不会收到消息的通道上（终端画面
+            // 永久静止，不报错、不重连）。语义与 agent 断线时发
+            // `session:agent_disconnect` 一致：告诉浏览器"这个会话没了"。
+            let (browser_sse, removed) = {
+                let mut broadcast = state.agent_broadcast.write().await;
+                let browser_sse: Vec<String> = broadcast
+                    .get(stale)
+                    .map(|cm| cm.browser_sessions.values().cloned().collect())
+                    .unwrap_or_default();
+                let removed = broadcast.remove(stale).is_some();
+                (browser_sse, removed)
+            };
+            for sse_sid in &browser_sse {
+                let tx = state.sse_sessions.write().await.remove(sse_sid);
+                if let Some(tx) = tx {
+                    let msg = serde_json::json!({
+                        "type": "session:agent_disconnect",
+                        "session_id": stale,
+                        "payload": {},
+                    })
+                    .to_string();
+                    // 尽力而为：通道可能已满/已关闭，浏览器重连时会拿到
+                    // `Invalid token`（旧 token 已被驱逐时失效）并自行处理。
+                    deliver(&tx, "session:agent_disconnect", msg);
+                }
+            }
+            if removed {
+                tracing::info!(
+                    session = %stale,
+                    by = %session_id,
+                    browsers = browser_sse.len(),
+                    "evicted session state cleared on re-registration"
+                );
+            }
+            {
+                // 只摘该 sid 的 oneshot：等待方拿到 Err 后立即走失败分支，
+                // 而不是继续挂到自己的超时。
+                let mut pending = state.pending_mcp.write().await;
+                pending.retain(|_rid, (sid, _tx)| sid != stale);
+            }
+            crate::relay::remove_session_state(&state, stale).await;
+            if let Some(rec) = &state.recorder {
+                rec.close(stale);
+            }
+        }
 
         // R5#44 capability 协商最小子集：注册消息可带 capabilities 数组
         // （agent 声明 codec/后端/功能），存入会话供 admin overview 展示与
@@ -5379,6 +5452,410 @@ mod tests {
         assert!(state.agent_event_buffers.read().await.get(sid).is_none());
     }
 
+    // ── A9 续：注册驱逐**别人的**会话时的 per-session 状态清理 ─────────
+
+    /// token 复用会驱逐一个**不同 sid** 的会话（`--key` 固定、未指定
+    /// `--session-id` 时 relay 每次注册都随机出新的 sid，重启即触发）。被驱逐
+    /// 的 sid 从此不再出现在 registry 里，于是：
+    ///
+    /// - 空闲回收器看不到它（`is_temporary` 对未知 sid 恒为 false，
+    ///   `last_activity` 里的条目永远不会被选中），
+    /// - 但所有按 sid 索引的表（`agent_broadcast` / 事件缓冲最长 8MB /
+    ///   桌面流 / KPI 历史 …）仍留着它的条目。
+    ///
+    /// 旧行为：注册路径只在 `evicted` 时打一条 warn（ws.rs:1569-1573），
+    /// 状态一条都不清——每次 agent 重启就永久泄漏一整套 per-session 状态。
+    /// 这里断言被驱逐 sid 的条目全部消失。
+    #[tokio::test]
+    async fn test_register_token_reuse_clears_evicted_other_session_state() {
+        let state = make_state("");
+        // 第一轮：固定 key、无 session_id → relay 给一个随机 sid。
+        let first = json!({"type":"agent:register","key":"leak-key","token_type":"rw"});
+        let r1 = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(first))
+            .await
+            .into_response();
+        assert_eq!(r1.status(), 200);
+        let v1: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r1.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        let old_sid = v1["session_id"].as_str().unwrap().to_string();
+        assert_eq!(v1["evicted"], false);
+
+        // 该会话留下运行时状态（真实使用必然会有：SSE 下行、终端输出缓冲、
+        // 桌面流、KPI 采样）。
+        let (browser_tx, mut browser_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let browser_sse_sid = "bs_evicted_test".to_string();
+        state
+            .sse_sessions
+            .write()
+            .await
+            .insert(browser_sse_sid.clone(), browser_tx);
+        {
+            let mut cm = ChannelMap::new();
+            cm.browser_sessions
+                .insert("uid-evicted".to_string(), browser_sse_sid.clone());
+            cm.browser_tokens.insert(
+                "uid-evicted".to_string(),
+                (browser_sse_sid.clone(), "tok".to_string()),
+            );
+            state
+                .agent_broadcast
+                .write()
+                .await
+                .insert(old_sid.clone(), cm);
+        }
+        let _ = state
+            .buffer_agent_event(&old_sid, "{\"type\":\"terminal:input\"}")
+            .await;
+        state
+            .desktop_streams
+            .write()
+            .await
+            .insert(old_sid.clone(), crate::relay::desktop::DesktopStream::new());
+        state
+            .desktop_states
+            .write()
+            .await
+            .insert(old_sid.clone(), true);
+        state
+            .kpi_history
+            .write()
+            .await
+            .insert(old_sid.clone(), Default::default());
+        state
+            .last_activity
+            .write()
+            .await
+            .insert(old_sid.clone(), Instant::now());
+
+        // 第二轮：同一个固定 key、仍然不带 session_id → 新随机 sid，旧 sid
+        // 因 token 复用被驱逐。
+        let second = json!({"type":"agent:register","key":"leak-key","token_type":"rw"});
+        let r2 = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(second))
+            .await
+            .into_response();
+        assert_eq!(r2.status(), 200);
+        let v2: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r2.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        let new_sid = v2["session_id"].as_str().unwrap().to_string();
+        assert_ne!(new_sid, old_sid, "a fresh random sid is minted");
+        assert_eq!(v2["evicted"], true, "token reuse must evict the previous session");
+
+        // 旧 sid 已不在 registry，它的所有 per-session 条目必须一起消失。
+        assert!(state.sessions.get(&old_sid).await.is_none());
+        assert!(
+            state.agent_broadcast.read().await.get(&old_sid).is_none(),
+            "evicted session must not keep an agent channel-map entry"
+        );
+        assert!(
+            state.agent_event_buffers.read().await.get(&old_sid).is_none(),
+            "evicted session must not keep its replay buffer (up to 8MB)"
+        );
+        assert!(
+            state.desktop_streams.read().await.get(&old_sid).is_none(),
+            "evicted session must not keep its desktop stream"
+        );
+        assert!(
+            state.desktop_states.read().await.get(&old_sid).is_none(),
+            "evicted session must not keep its desktop state"
+        );
+        assert!(
+            state.kpi_history.read().await.get(&old_sid).is_none(),
+            "evicted session must not keep its KPI history"
+        );
+        assert!(
+            state.last_activity.read().await.get(&old_sid).is_none(),
+            "evicted session must not keep a last_activity entry (the reaper never sees it)"
+        );
+        // 浏览器流也必须收敛：它既不在 sse_sessions 里，也不该再挂在
+        // 已被删除的 channel map 上——否则浏览器终端永久静止且不会重连。
+        assert!(
+            state.sse_sessions.read().await.get(&browser_sse_sid).is_none(),
+            "evicted session's browser SSE stream must be closed, not left dangling"
+        );
+        assert!(
+            browser_rx.try_recv().is_err() || browser_rx.is_closed(),
+            "browser stream must end so the page can re-connect"
+        );
+        // 新会话照常可用。
+        assert!(state.sessions.get(&new_sid).await.is_some());
+        assert!(state.agent_broadcast.read().await.contains_key(&new_sid));
+    }
+
+    // ── MYS-2806 review 1/2：注册/清理生命周期串行化 ────────────────
+
+    /// 驱逐清理**不能**抹掉期间被重新注册占用的同一个 sid。
+    ///
+    /// 负责人 review 的原探针（`review_eviction_cleanup_must_not_erase_reclaimed_sid`）
+    /// 用 `pending_mcp` 写锁把驱逐方卡在清理中途，再让第二个注册抢占同一个
+    /// sid 并写状态，最后放开锁看新状态是否被抹掉。修复前实测 FAIL
+    /// （`old cleanup erased the new registered session's last_activity`）。
+    ///
+    /// 修复改为**完整注册事务互斥**后，那个交错在语义上已不可能：驱逐方持锁
+    /// 期间第二个注册会一直阻塞，原探针若照搬会死锁（测试自己持有
+    /// `pending_mcp` 又等待第二个注册）。因此这里按负责人允许的方式，改为
+    /// 验证**串行化结果**——并且断言强度足以区分修复前后：
+    ///
+    /// - 修复后：驱逐方卡在清理中途时，第二个注册**必须仍在阻塞**（拿不到
+    ///   `register_tx`）；放开 pending 锁后两者依次完成，新状态完好。
+    /// - 修复前（无互斥）：第二个注册会**立刻完成**，第一条断言即失败。
+    ///
+    /// 这样既不依赖已不支持的旧执行顺序，也仍然钉住最初那个缺陷。
+    #[tokio::test]
+    async fn test_review_register_transaction_is_serialized_against_eviction_cleanup() {
+        let state = make_state("");
+        let old_sid = "race01";
+
+        // 1. A 以固定 key 注册到 race01。
+        let r = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(json!({"type":"agent:register","key":"race-old-key","session_id":old_sid})),
+        )
+        .await
+        .into_response();
+        assert_eq!(r.status(), 200);
+        state
+            .last_activity
+            .write()
+            .await
+            .insert(old_sid.to_string(), Instant::now());
+
+        // 2. 占住 pending_mcp 写锁，给驱逐方的清理制造一个确定的停顿点。
+        let pending_guard = state.pending_mcp.write().await;
+
+        // 3. 触发 token 复用驱逐：A 被顶掉，清理会卡在 pending_mcp 上。
+        let evict_task = {
+            let st = state.clone();
+            tokio::spawn(async move {
+                agent_send_handler(
+                    State(st),
+                    axum::http::HeaderMap::new(),
+                    Json(json!({"type":"agent:register","key":"race-old-key"})),
+                )
+                .await
+                .into_response()
+                .status()
+            })
+        };
+        // 等驱逐方走完「摘通道」这一步（即已进入清理阶段、正卡在 pending_mcp）。
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !state.agent_broadcast.read().await.contains_key(old_sid) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eviction should reach the cleanup barrier");
+
+        // 4. 第二个注册抢占 race01。修复后它必须**阻塞**在 register_tx 上。
+        let reclaim_task = {
+            let st = state.clone();
+            tokio::spawn(async move {
+                agent_send_handler(
+                    State(st),
+                    axum::http::HeaderMap::new(),
+                    Json(json!({"type":"agent:register","key":"race-new-key","session_id":"race01"})),
+                )
+                .await
+                .into_response()
+                .status()
+            })
+        };
+        // 给足调度机会：若没有互斥，它会在这一步之内完成。
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !reclaim_task.is_finished(),
+            "a registration must not run while another registration's eviction cleanup is in flight"
+        );
+        assert!(
+            state.sessions.get(old_sid).await.is_none(),
+            "the reclaimed sid must not be registered while the eviction transaction still holds the lock"
+        );
+
+        // 5. 放开停顿点：驱逐方完成并释放互斥，第二个注册随即完成。
+        drop(pending_guard);
+        assert_eq!(evict_task.await.unwrap(), 200);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), reclaim_task)
+                .await
+                .expect("reclaim must proceed once the eviction transaction releases the lock")
+                .unwrap(),
+            200
+        );
+
+        // 6. 串行化后的终态：race01 属于新 registration，状态完整。
+        assert!(state.sessions.get(old_sid).await.is_some());
+        assert!(state.agent_broadcast.read().await.contains_key(old_sid));
+        assert!(
+            state.last_activity.read().await.contains_key(old_sid),
+            "old cleanup erased the new registered session's last_activity"
+        );
+        state
+            .buffer_agent_event(old_sid, "{\"type\":\"terminal:input\"}")
+            .await;
+        state
+            .agent_upgrades
+            .write()
+            .await
+            .insert(old_sid.to_string(), json!({"upgrade_id":"new-upgrade"}));
+        assert!(state.agent_event_buffers.read().await.contains_key(old_sid));
+        assert!(state.agent_upgrades.read().await.contains_key(old_sid));
+    }
+
+    /// 「旧 SSE 的 Drop 清理」与「新注册」交错时，不得删掉新 incarnation 的通道。
+    ///
+    /// `AgentEventsCleanup::drop` 用 `same_channel` 判据只清自己那一份（
+    /// `ws.rs` 内 `AgentEventsCleanup` 实现），这里把它与新注册并发放置，
+    /// 钉住"旧连接退出不能清理新连接状态"这条任务卡约束。
+    #[tokio::test]
+    async fn test_review_stale_sse_drop_does_not_clear_new_registration() {
+        let state = make_state("");
+        let sid = "racesse1";
+
+        // 旧 incarnation：先注册，再手工装一条**旧**通道。
+        let r = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(json!({"type":"agent:register","key":"sse-key","session_id":sid})),
+        )
+        .await
+        .into_response();
+        assert_eq!(r.status(), 200);
+
+        let (old_tx, _old_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (old_bulk, _old_bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        {
+            let mut bc = state.agent_broadcast.write().await;
+            let cm = bc.get_mut(sid).unwrap();
+            cm.agent = Some(old_tx.clone());
+            cm.agent_bulk = Some(old_bulk.clone());
+        }
+
+        // 新 incarnation 接管同一 sid，装上新通道。
+        let r2 = agent_send_handler(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(json!({"type":"agent:register","key":"sse-key","session_id":sid})),
+        )
+        .await
+        .into_response();
+        assert_eq!(r2.status(), 200);
+        let (new_tx, _new_rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+        let (new_bulk, _new_bulk_rx) = mpsc::channel::<String>(crate::relay::BULK_CHANNEL_CAPACITY);
+        {
+            let mut bc = state.agent_broadcast.write().await;
+            let cm = bc.get_mut(sid).unwrap();
+            cm.agent = Some(new_tx.clone());
+            cm.agent_bulk = Some(new_bulk.clone());
+        }
+        state
+            .last_activity
+            .write()
+            .await
+            .insert(sid.to_string(), Instant::now());
+
+        // 旧 SSE 流结束 → 触发 Drop 清理。
+        let cleanup = AgentEventsCleanup {
+            tx: old_tx,
+            bulk_tx: old_bulk,
+            state: state.clone(),
+            session_id: sid.to_string(),
+        };
+        drop(cleanup);
+        // Drop 里是 spawn 出去的异步清理，给它跑完的机会。
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let bc = state.agent_broadcast.read().await;
+        let cm = bc.get(sid).expect("session must still exist");
+        assert!(
+            cm.agent.as_ref().is_some_and(|t| t.same_channel(&new_tx)),
+            "stale SSE drop must not clear the new incarnation's channel"
+        );
+        assert!(
+            cm.agent_bulk.as_ref().is_some_and(|t| t.same_channel(&new_bulk)),
+            "stale SSE drop must not clear the new incarnation's bulk channel"
+        );
+    }
+
+    /// 阴性对照 1：同 sid 接管（agent 重启的正常路径）**不清**该 sid 的状态。
+    ///
+    /// 这条是兼容性约束：同 sid 的 session 仍是活的（id 没有被丢弃），
+    /// Last-Event-ID 重放缓冲与升级任务状态都必须保留——清掉会破坏断线续传
+    /// 与"换机重连后收敛为 failed"的既有语义。
+    #[tokio::test]
+    async fn test_reregister_same_session_keeps_buffer_and_upgrade_state() {
+        let state = make_state("");
+        let first = json!({"type":"agent:register","key":"keep-key","token_type":"rw","session_id":"keep01"});
+        let r1 = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(first))
+            .await
+            .into_response();
+        assert_eq!(r1.status(), 200);
+        let _ = state.buffer_agent_event("keep01", "{\"type\":\"terminal:input\"}").await;
+        state
+            .agent_upgrades
+            .write()
+            .await
+            .insert("keep01".to_string(), json!({"upgrade_id": "u1", "stage": "failed"}));
+
+        let second = json!({"type":"agent:register","key":"keep-key","token_type":"rw","session_id":"keep01"});
+        let r2 = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(second))
+            .await
+            .into_response();
+        assert_eq!(r2.status(), 200);
+        let v2: Value = serde_json::from_slice(
+            &axum::body::to_bytes(r2.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v2["evicted"], true, "same id + same key is a takeover");
+
+        assert!(
+            state.agent_event_buffers.read().await.get("keep01").is_some(),
+            "same-id takeover must keep the Last-Event-ID replay buffer"
+        );
+        assert!(
+            state.agent_upgrades.read().await.get("keep01").is_some(),
+            "same-id takeover must keep the upgrade status (MYS-2425)"
+        );
+    }
+
+    /// 阴性对照 2：**没有**驱逐（全新 sid）时不得误删别的会话状态。
+    #[tokio::test]
+    async fn test_register_without_eviction_keeps_other_session_state() {
+        let state = make_state("");
+        state
+            .desktop_streams
+            .write()
+            .await
+            .insert("other07".to_string(), crate::relay::desktop::DesktopStream::new());
+        let _ = state.buffer_agent_event("other07", "{\"type\":\"terminal:output\"}").await;
+
+        let body = json!({"type":"agent:register","token_type":"rw","session_id":"fresh07"});
+        let resp = agent_send_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+
+        assert!(
+            state.desktop_streams.read().await.get("other07").is_some(),
+            "a new session must not clear an unrelated session's state"
+        );
+        assert!(
+            state.agent_event_buffers.read().await.get("other07").is_some(),
+            "a new session must not clear an unrelated session's buffer"
+        );
+    }
+
     #[tokio::test]
     async fn test_end_desktop_streams_clears_state() {
         // A7 桌面部分：凭证变更后桌面下行流必须结束（否则旧流继续推帧）。
@@ -6192,4 +6669,5 @@ mod tests {
             .await
             .contains_key("nonexistent-host.invalid"));
     }
+
 }

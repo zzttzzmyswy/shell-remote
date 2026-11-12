@@ -1,10 +1,13 @@
 'use strict';
 // 服务器密码（relay --auth）守卫验证：真实 relay + agent + 无头 Chromium。
-// 校验：登录页必须填服务器密码；密码错 → 回登录页并提示；密码对 → 进入会话；
+// 校验：启用服务器密码时，缺失/错误密码 → 回登录页并提示；密码对 → 进入会话；
 // 管理后台密码 / 会话密钥不能当服务器密码用；MCP 仍需服务器密码。
 // 用法: BIN=./target/debug/shell-remote node tools/verify/verify_web_password.js
 const { chromium } = require('playwright');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const BIN = process.env.BIN || './target/debug/shell-remote';
 const PORT = +(process.env.PORT || 3187);
@@ -14,12 +17,14 @@ let fails = 0;
 const check = (name, ok, extra = '') => { console.log(`${ok ? '✓' : '✗'} ${name} ${extra}`); if (!ok) fails++; };
 
 (async () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'sr-web-password-'));
   const relay = spawn(BIN, ['relay', '--bind', `127.0.0.1:${PORT}`, '--auth', SERVER_PW, '--no-tls',
-    '--admin-path', '/adm', '--admin-user', 'admin', '--admin-pass', ADMIN_PW], { stdio: 'ignore' });
+    '--admin-path', '/adm', '--admin-user', 'admin', '--admin-pass', ADMIN_PW,
+    '--settings-file', path.join(work, 'settings.json')], { stdio: 'ignore' });
   let agent, browser;
   try {
     await sleep(1000);
-    agent = spawn(BIN, ['agent', '--relay-url', BASE, '--key', KEY, '--session-id', 'wp1766', '--shell', '/bin/sh'], { stdio: 'ignore' });
+    agent = spawn(BIN, ['agent', '--relay-url', BASE, '--key', KEY, '--session-id', 'wp1766', '--shell', '/bin/sh', '--root', work], { stdio: 'ignore' });
     await sleep(1500);
     browser = await chromium.launch();
     const login = async (token, pw) => {
@@ -31,10 +36,10 @@ const check = (name, ok, extra = '') => { console.log(`${ok ? '✓' : '✗'} ${n
       await p.click('#connect-btn');
       return p;
     };
-    // 1. 不填密码：前端拦截
+    // 1. 前端允许无密码 relay；本例启用 --auth，须由服务端拒绝空密码。
     let p = await login(KEY, null);
-    await sleep(500);
-    check('不填服务器密码不能进入', p.url().endsWith('/') && /服务器密码/.test(await p.locator('#connect-error').innerText()));
+    await p.waitForURL(/\/\?err=password/, { timeout: 15000 }).catch(() => {});
+    check('启用密码时，空密码被拒并回登录页', /err=password/.test(p.url()) && /服务器密码/.test(await p.locator('#connect-error').innerText()));
     // 2. 错密码（含：把管理后台密码、会话密钥当服务器密码）
     for (const [label, pw] of [['错误密码', 'nope'], ['管理后台密码', ADMIN_PW], ['会话密钥', KEY]]) {
       p = await login(KEY, pw);

@@ -1507,3 +1507,13 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
     .connect-container { padding: 1.75rem 1.25rem 1.5rem; }
     .install-section { padding: 1.25rem; }
 }
+
+/* Keep session identity clear of the action buttons on narrow screens. */
+@media (max-width: 600px) {
+    #toolbar { height: auto; flex-wrap: wrap; padding-block: var(--space-2); }
+    .toolbar-left, .toolbar-right { width: 100%; }
+    .toolbar-right { justify-content: flex-end; flex-wrap: wrap; }
+    .session-meta { width: 100%; }
+    #session-host, #session-id-btn { min-width: 0; }
+    #online-count { flex-shrink: 0; }
+}
