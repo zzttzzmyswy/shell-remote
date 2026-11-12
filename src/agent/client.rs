@@ -662,6 +662,7 @@ impl RelayClient {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_with_retry(
         relay_url: &str,
         fixed_key: Option<String>,
@@ -673,6 +674,13 @@ impl RelayClient {
         insecure_tls: bool,
         // LAN 直连地址（"ip:port"）随每次注册上报；None = 未开启（不带上报）。
         lan_addr: Option<String>,
+        // 每次**失败的尝试**立刻回调一次（MYS-2806 阶段4）。
+        //
+        // 重试全用完才把错误返回给调用方，最坏要等 1+2+4+…+60 秒；GUI 的配置
+        // 窗口需要在点"连接"后的几秒内就说清"为什么连不上"，而不是让用户对着
+        // "连接中"等两分钟。传 `None` 的调用方（CLI/TUI）行为完全不变。
+        // 回调收到的文本未经脱敏——调用方若要展示，必须先脱敏。
+        on_error: Option<&(dyn Fn(&str) + Sync)>,
     ) -> anyhow::Result<Self> {
         let relay_url = relay_url.trim_end_matches('/');
         let mut delay = tokio::time::Duration::from_secs(1);
@@ -695,10 +703,14 @@ impl RelayClient {
             {
                 Ok(client) => return Ok(client),
                 Err(e) => {
+                    let msg = format!("{e:#}");
+                    // 先回调再判断是否还有重试：GUI 需要**第一次**失败就可见。
+                    if let Some(cb) = on_error {
+                        cb(&msg);
+                    }
                     if attempt == max_retries {
                         return Err(e);
                     }
-                    let msg = format!("{e:#}");
                     let is_429 = msg.contains("HTTP 429");
                     // R5#26 token 过期快速重鉴权：旧 token 注册被拒（HTTP
                     // 401 token 无效 / 409 session 已被占用——relay 重启或

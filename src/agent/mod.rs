@@ -66,6 +66,18 @@ pub(crate) fn home_dir_from(home: Option<String>, userprofile: Option<String>) -
     home.or(userprofile).unwrap_or_else(|| ".".to_string())
 }
 
+/// 把文本里出现的固定密钥替换成 `<redacted>`（MYS-2806 阶段4）。
+///
+/// UI 会把连接错误原样显示在窗口里，而 relay/reqwest 的错误文本有可能带上
+/// 请求内容（注册消息里就有 `--key`）。这道脱敏是最后一道闸：即使别处漏了，
+/// 密钥也不会出现在用户界面或日志里。空密钥/`None` 原样返回。
+pub fn redact_secret(text: &str, secret: Option<&str>) -> String {
+    match secret {
+        Some(s) if !s.is_empty() => text.replace(s, "<redacted>"),
+        _ => text.to_string(),
+    }
+}
+
 struct TabState {
     shell: Shell,
     title: String,
@@ -1244,7 +1256,24 @@ pub async fn start_with_restore(
                 tracing::warn!("Agent session ended, reconnecting in {:?}...", delay);
             }
             Err(e) => {
+                // GUI 的配置窗口必须在窗口中显示"为什么连不上"（MYS-2806 阶段4）；
+                // TUI 只画状态，不看这个字段。展示前由控制层再做一次密钥脱敏。
+                #[cfg(feature = "tui")]
+                if let Some(st) = &status {
+                    st.set_error(format!("{e:#}"));
+                }
                 tracing::warn!("Agent session error: {}, reconnecting in {:?}...", e, delay);
+            }
+        }
+        // 手动停机（TUI q / GUI 断开）：结束会话后正常退出。
+        //
+        // 放在重连/退避之前：注册期间被打断时 run_session 已经返回，
+        // 这里必须先消费停机请求，而不是"再退避一次然后才看"。
+        #[cfg(feature = "tui")]
+        if let Some(st) = &status {
+            if st.take_shutdown() {
+                tracing::info!("shutdown requested by UI, exiting");
+                return Ok(());
             }
         }
         // 首次注册已回报（成功或已判定不可用）→ 后续重连不再带恢复语义。
@@ -1272,14 +1301,6 @@ pub async fn start_with_restore(
                 delay = Duration::from_secs(1);
             }
         }
-        // 手动停机（TUI q）：结束会话后正常退出进程。
-        #[cfg(feature = "tui")]
-        if let Some(st) = &status {
-            if st.take_shutdown() {
-                tracing::info!("shutdown requested by UI, exiting");
-                return Ok(());
-            }
-        }
 
         #[cfg(feature = "tui")]
         if let Some(st) = &status {
@@ -1289,10 +1310,110 @@ pub async fn start_with_restore(
             delay = Duration::from_secs(1);
         }
         let sleep_for = client::jittered(delay);
-        terminals
-            .absorb_while(&shell_path, tokio::time::sleep(sleep_for))
-            .await;
+        // 退避等待期间同样要能被打断（MYS-2806 阶段4）：UI 的"断开"只是置一个
+        // 原子标志，若这里死睡满 60s 退避，界面会眼看它挂着。等待切片轮询，
+        // 上限就是一次切片（≤200ms）。
+        if wait_or_shutdown(
+            #[cfg(feature = "tui")]
+            status.as_ref(),
+            sleep_for,
+            &mut terminals,
+            &shell_path,
+        )
+        .await
+        {
+            tracing::info!("shutdown requested while waiting to reconnect, exiting");
+            return Ok(());
+        }
+        // absorb_while 消费掉了这段时间里的 PTY 输出，保持既有行为。
         delay = std::cmp::min(delay * 2, max_delay);
+    }
+}
+
+/// 退避等待期间可被停机请求打断的等待。
+///
+/// 分片（[`SHUTDOWN_POLL_SLICE`]）而不是一次 `sleep(sleep_for)`：停机信号是
+/// 原子标志、没有唤醒机制，长睡会把"断开"拖到退避结束。分片之间照旧用
+/// [`Terminals::absorb_while`] 吸收 PTY 输出，重连间隙的终端回放不丢。
+/// 返回 `true` 表示收到了停机请求。
+async fn wait_or_shutdown(
+    #[cfg(feature = "tui")] status: Option<&AgentStatus>,
+    total: Duration,
+    terminals: &mut Terminals,
+    shell_path: &str,
+) -> bool {
+    // 没有界面状态（lean 构建）就没有可打断的对象：保持原来的一次长睡。
+    #[cfg(not(feature = "tui"))]
+    {
+        terminals
+            .absorb_while(shell_path, tokio::time::sleep(total))
+            .await;
+        return false;
+    }
+    #[cfg(feature = "tui")]
+    {
+        let deadline = tokio::time::Instant::now() + total;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let slice = remaining.min(SHUTDOWN_POLL_SLICE);
+            terminals
+                .absorb_while(shell_path, tokio::time::sleep(slice))
+                .await;
+            if let Some(st) = status {
+                if st.shutdown_pending() {
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+/// 停机信号的轮询粒度：既是退避等待的分片长度，也是注册期间取消的检查间隔。
+/// 200ms 足够让"点断开"在人的感知里是即时的，又不至于空转烧 CPU。
+/// 只有带界面状态（`tui`）的构建才有轮询者，lean 构建不需要它。
+#[cfg(feature = "tui")]
+const SHUTDOWN_POLL_SLICE: Duration = Duration::from_millis(200);
+
+/// 注册（含重试退避）与 UI 停机请求的竞速（MYS-2806 阶段4）。
+///
+/// **为什么需要**：`connect_with_retry` 内部会退避重试最多 10 次（1s→60s），
+/// 在途的注册 POST 还有 20s 超时。UI 的"断开"只写一个原子标志，若不在这里
+/// 竞速，用户点断开后 agent 仍会继续重试几分钟——界面看起来卡死，"断开后
+/// 改配置再连接"也就无从谈起（任务卡要求 5 秒内收敛）。
+///
+/// 用轮询而不是把 `AgentStatus` 塞进 `client.rs`：后者是 relay 协议层，
+/// 不该知道界面状态；轮询切片 200ms，对收敛时间的影响可以忽略。
+async fn connect_cancellable<F>(
+    #[cfg(feature = "tui")] status: Option<&AgentStatus>,
+    fut: F,
+) -> anyhow::Result<Option<F::Output>>
+where
+    F: std::future::Future,
+{
+    // 没有界面状态（lean 构建）就没有可打断的对象：直接等它跑完，
+    // 不为一个永不置位的标志白醒 5 次/秒。
+    #[cfg(not(feature = "tui"))]
+    {
+        return Ok(Some(fut.await));
+    }
+    #[cfg(feature = "tui")]
+    {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                out = &mut fut => return Ok(Some(out)),
+                _ = tokio::time::sleep(SHUTDOWN_POLL_SLICE) => {
+                    if let Some(st) = status {
+                        if st.shutdown_pending() {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1388,6 +1509,19 @@ async fn run_session(
     #[cfg(feature = "desktop")]
     let lan_addr_report = lan_desktop.as_ref().as_ref().map(|lan| lan.addr_report());
 
+    // 注册失败的即时回调（只有 GUI 需要）：把**每一次**失败尝试写进共享状态，
+    // 配置窗口不必等 1+2+4+…+60s 的重试全部用完才看到原因。
+    #[cfg(feature = "tui")]
+    let report_error = |msg: &str| {
+        if let Some(st) = status.as_ref() {
+            st.set_error(msg);
+        }
+    };
+    #[cfg(feature = "tui")]
+    let on_connect_error: Option<&(dyn Fn(&str) + Sync)> = Some(&report_error);
+    #[cfg(not(feature = "tui"))]
+    let on_connect_error: Option<&(dyn Fn(&str) + Sync)> = None;
+
     let connect = RelayClient::connect_with_retry(
         relay_url,
         key.clone(),
@@ -1400,8 +1534,24 @@ async fn run_session(
         lan_addr_report.clone(),
         #[cfg(not(feature = "desktop"))]
         None,
+        on_connect_error,
     );
-    let mut client = terminals.absorb_while(shell_path, connect).await?;
+    // 注册期间也要能被 UI 的"断开"打断（MYS-2806 阶段4）：connect_with_retry
+    // 内部最多退避重试 10 次、单次注册 POST 超时 20s，不竞速的话断开要等好几分钟。
+    // `None` = 期间收到停机请求，交给上层循环正常收尾（不是错误）。
+    let connected = connect_cancellable(
+        #[cfg(feature = "tui")]
+        status.as_ref(),
+        terminals.absorb_while(shell_path, connect),
+    )
+    .await?;
+    let mut client = match connected {
+        Some(res) => res?,
+        None => {
+            tracing::info!("shutdown requested during registration — aborting this attempt");
+            return Ok(());
+        }
+    };
 
     // Cache the tokens the moment registration succeeds — before anything
     // later in this function can bail (e.g. shell spawn failure). On the next
@@ -1503,6 +1653,8 @@ async fn run_session(
     #[cfg(feature = "tui")]
     if let Some(st) = &status {
         st.set_connected(&client.session_id, client.tokens.clone());
+        // 连接已经建立 → 之前的连接错误不再成立，清掉，避免 GUI 一直显示旧原因。
+        st.clear_error();
     }
 
     // Outbound channel + background sender. The main loop must never block on

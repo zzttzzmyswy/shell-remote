@@ -14,6 +14,12 @@ pub mod relay;
 pub mod status;
 #[cfg(feature = "tui")]
 pub mod tui;
+// MYS-2806 阶段4：UI 版无参数启动后的配置模型与连接控制层。
+// 只有 GUI 需要（界面由 `gui` 实现），CLI 的 lean 构建不编译。
+#[cfg(feature = "gui")]
+pub mod ui_config;
+#[cfg(feature = "gui")]
+pub mod ui_controller;
 pub mod web;
 pub mod tlsutil;
 

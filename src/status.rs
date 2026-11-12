@@ -51,6 +51,12 @@ struct StatusInner {
     refresh_requested: AtomicBool,
     /// 手动停机请求（TUI q/Ctrl-C 置位；run_session 退出 + start 返回）。
     shutdown_requested: AtomicBool,
+    /// 最近一次需要用户看见的连接错误（MYS-2806 阶段4）。
+    ///
+    /// TUI 只画状态，不需要它；GUI 配置窗口必须能把"为什么连不上"留在窗口里
+    /// （任务卡：错误留在窗口中，不闪退）。只存一条，新错误覆盖旧错误，连接
+    /// 成功即由 [`AgentStatus::clear_error`] 清掉。
+    last_error: Mutex<Option<String>>,
 }
 
 /// 与 agent 核心共享的只读状态句柄（Arc 克隆廉价，Send+Sync）。
@@ -144,6 +150,26 @@ impl AgentStatus {
     pub fn take_shutdown(&self) -> bool {
         self.inner.shutdown_requested.swap(false, Ordering::Relaxed)
     }
+
+    /// 记下一条要展示给用户的连接错误（只留最后一条）。
+    pub fn set_error(&self, message: impl Into<String>) {
+        *self.inner.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(message.into());
+    }
+
+    /// 最近一次连接错误（GUI 每帧读它渲染到窗口里）。
+    pub fn last_error(&self) -> Option<String> {
+        self.inner
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 连接成功 / 重新开始连接时清掉旧错误（旧原因已不再成立）。
+    pub fn clear_error(&self) {
+        *self.inner.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +220,21 @@ mod tests {
         assert!(st.shutdown_pending());
         assert!(st.take_shutdown());
         assert!(!st.take_shutdown());
+    }
+
+    #[test]
+    fn test_error_is_last_wins_and_clearable() {
+        // GUI 只展示一条原因：后到的覆盖先到的，连接成功就清空。
+        let st = AgentStatus::new(String::new());
+        assert_eq!(st.last_error(), None);
+        st.set_error("第一次失败");
+        assert_eq!(st.last_error().as_deref(), Some("第一次失败"));
+        st.set_error("第二次失败");
+        assert_eq!(st.last_error().as_deref(), Some("第二次失败"));
+        st.clear_error();
+        assert_eq!(st.last_error(), None);
+        // 清空之后再写的错误仍可见（不是一次性 latch）。
+        st.set_error("第三次失败");
+        assert_eq!(st.last_error().as_deref(), Some("第三次失败"));
     }
 }
