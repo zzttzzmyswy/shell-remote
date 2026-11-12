@@ -313,6 +313,39 @@ impl UiConfig {
         Ok(())
     }
 
+    /// 从一次连接构造自升级交接用的快照（MYS-2819）。
+    ///
+    /// `active_session_id` 必须是**这次连接实际在跑的** session id（GUI 留空时
+    /// 由 relay 随机分配），不能是草稿里那个 `Option`：恢复后要回到同一个会话。
+    ///
+    /// 快照里**没有密钥**：`GuiHandoffConfig` 刻意不带 key 字段，固定密钥继续
+    /// 只走交接文件的受保护 `fixed_key`。
+    pub fn to_handoff_snapshot(
+        &self,
+        active_session_id: &str,
+    ) -> crate::agent::update_apply::GuiHandoffConfig {
+        crate::agent::update_apply::GuiHandoffConfig {
+            relay_url: self.relay_url.clone(),
+            relay_insecure: self.relay_insecure,
+            root: self.root.clone(),
+            token_type: self.token_type.clone(),
+            shell: self.shell.clone(),
+            // 空串 = relay 随机分配过，而恢复需要一个确定的 id；此时留 `None`
+            // 让校验明确失败，而不是悄悄变成"再来一个新设备"。
+            session_id: Some(active_session_id.to_string()).filter(|s| !s.is_empty()),
+            no_cmd_log: self.no_cmd_log,
+            desktop_capture: self.desktop_capture.clone(),
+            desktop_codec: self.desktop_codec.clone(),
+            desktop_fps: self.desktop_fps,
+            desktop_capture_fps: self.desktop_capture_fps,
+            desktop_max_bitrate: self.desktop_max_bitrate,
+            desktop_quality: self.desktop_quality.clone(),
+            desktop_min_bitrate: self.desktop_min_bitrate,
+            desktop_display: self.desktop_display.clone(),
+            desktop_lan_port: self.desktop_lan_port,
+        }
+    }
+
     /// 默认配置文件路径：`<用户目录>/.shell-remote/ui-config.json`。
     ///
     /// 用户目录沿用 `agent::home_dir()` 的语义（`HOME` → `%USERPROFILE%`），
@@ -477,6 +510,43 @@ mod desktop_cfg_tests {
             cfg.to_desktop_config().quality,
             crate::agent::desktop::encoder::QUALITY_BALANCED
         );
+    }
+}
+
+/// 交接快照 → GUI 配置（MYS-2819）。只在 `gui` feature 下存在：交接类型本身
+/// 必须与 feature 无关（lean 构建里的 `update-apply` 助手也要能搬运它）。
+#[cfg(feature = "gui")]
+impl crate::agent::update_apply::GuiHandoffConfig {
+    /// 还原成一份可直接 `validate()` + `connect()` 的 [`UiConfig`]。
+    ///
+    /// `key` 故意留空：固定密钥只从交接的受保护 `fixed_key` 取，由
+    /// [`crate::ui_resume::GuiResume::config_with_key`] 在最后一刻补上。
+    ///
+    /// 校验交给调用方（`connect_restored` 会做）：这里只做纯粹的字段搬运，
+    /// 不给"帮你修好"留任何空间——一份坏快照就该被拒绝，而不是被猜成默认值。
+    pub fn to_ui_config(&self) -> anyhow::Result<UiConfig> {
+        if self.relay().is_empty() {
+            bail!("交接里的 GUI 配置缺少 relay 地址");
+        }
+        Ok(UiConfig {
+            relay_url: self.relay_url.clone(),
+            relay_insecure: self.relay_insecure,
+            key: None,
+            root: self.root.clone(),
+            token_type: self.token_type.clone(),
+            shell: self.shell.clone(),
+            session_id: self.session_id.clone(),
+            no_cmd_log: self.no_cmd_log,
+            desktop_capture: self.desktop_capture.clone(),
+            desktop_codec: self.desktop_codec.clone(),
+            desktop_fps: self.desktop_fps,
+            desktop_capture_fps: self.desktop_capture_fps,
+            desktop_max_bitrate: self.desktop_max_bitrate,
+            desktop_quality: self.desktop_quality.clone(),
+            desktop_min_bitrate: self.desktop_min_bitrate,
+            desktop_display: self.desktop_display.clone(),
+            desktop_lan_port: self.desktop_lan_port,
+        })
     }
 }
 
@@ -947,8 +1017,55 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_errors_never_leak_the_key() {
-        let secret = "TOP-SECRET-KEY-9f3a";
+    fn test_handoff_snapshot_roundtrips_every_field_except_the_key() {
+        // MYS-2819：自升级交接要带走**全部**活跃配置，恢复出来必须一模一样。
+        // 唯一不该过去的是密钥（它走交接的受保护 fixed_key）。
+        let dir = tempdir();
+        let cfg = UiConfig {
+            relay_url: "https://relay.example.com:8443/prefix".into(),
+            relay_insecure: true,
+            key: Some("SNAPSHOT-SECRET-11".into()),
+            root: Some(dir.path().to_string_lossy().into_owned()),
+            token_type: "both".into(),
+            shell: "/bin/sh".into(),
+            session_id: Some("snapdev1".into()),
+            no_cmd_log: true,
+            desktop_capture: "x11".into(),
+            desktop_codec: "h264".into(),
+            desktop_fps: 24.0,
+            desktop_capture_fps: 45.0,
+            desktop_max_bitrate: 4000,
+            desktop_quality: "best".into(),
+            desktop_min_bitrate: 120,
+            desktop_display: Some(":1".into()),
+            desktop_lan_port: 39616,
+        };
+        // session id 传"实际在跑的那个"（GUI 留空时由 relay 分配）。
+        let snap = cfg.to_handoff_snapshot("snapdev1");
+        let restored = snap.to_ui_config().expect("快照应能还原成配置");
+        // 除 key 外逐字段相等（含 LAN 端口与桌面参数）。
+        let mut expect = cfg.clone();
+        expect.key = None;
+        assert_eq!(restored, expect, "活跃配置必须一字不差地恢复");
+        // 快照里没有密钥，也不该有 key 字段。
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("SNAPSHOT-SECRET-11"), "{json}");
+        assert!(!json.contains("\"key\""), "{json}");
+        // 恢复出来的配置照常能通过 GUI 校验。
+        restored.validate().expect("恢复的配置必须合法");
+    }
+
+    #[test]
+    fn test_handoff_snapshot_without_an_active_session_id_is_not_recoverable() {
+        // 连接还没注册成功（没有实际 id）时不该造出一份"看起来能恢复"的快照：
+        // 空 id 会让新进程恢复到一个不存在的会话上。
+        let cfg = valid();
+        let snap = cfg.to_handoff_snapshot("");
+        assert!(snap.session_id.is_none(), "空 id 不能写成 Some(\"\")");
+    }
+
+    #[test]
+    fn test_validation_errors_never_leak_the_key() {        let secret = "TOP-SECRET-KEY-9f3a";
         // 挑几种会失败的组合：错误文本里都不许出现密钥。
         let cases = [
             UiConfig {
