@@ -13,6 +13,9 @@ use eframe::egui;
 
 use crate::status::{AgentStatus, Phase};
 
+mod config_window;
+pub use config_window::configure;
+
 /// 以独立线程运行窗口事件循环（阻塞；Linux/Windows 均支持非主线程 winit）。
 pub fn run(status: AgentStatus) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {

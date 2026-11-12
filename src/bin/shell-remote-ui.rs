@@ -14,7 +14,7 @@ use shell_remote::{agent, proto::TokenType};
 #[command(name = "shell-remote-ui", about = "shell-remote UI agent (terminal + desktop sharing)", version)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -182,6 +182,17 @@ impl View {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let Some(command) = cli.command else {
+        let dir = shell_remote::default_log_dir();
+        if std::env::var("SR_LOG_DIR").map(|s| s.trim().is_empty()).unwrap_or(true)
+            && std::fs::create_dir_all(&dir).is_ok()
+        {
+            std::env::set_var("SR_LOG_DIR", &dir);
+        }
+        shell_remote::install_panic_hook();
+        let _log_guard = shell_remote::init_logging();
+        return shell_remote::gui::configure();
+    };
 
     // 换机助手必须在这里分流，**先于任何 tracing 初始化与版本打印**。
     //
@@ -193,13 +204,13 @@ fn main() -> anyhow::Result<()> {
     // 助手不需要 tracing：它自己的日志走交接文件同目录的 `update-apply.log`
     // （0600，见 `HelperLog`）。UI 二进制也必须能当助手用，否则用 UI 制品
     // 升级时助手入口不存在，整条换机链路在 UI 设备上直接缺失。
-    if let Command::UpdateApply { handoff } = &cli.command {
+    if let Command::UpdateApply { handoff } = &command {
         shell_remote::install_panic_hook();
         let code = shell_remote::agent::update_apply::run(std::path::Path::new(handoff));
         std::process::exit(code);
     }
 
-    let view = View::resolve(match &cli.command {
+    let view = View::resolve(match &command {
         Command::Agent { view, .. } => view,
         Command::UpdateApply { .. } => {
             unreachable!("update-apply is dispatched before the view is resolved")
@@ -240,7 +251,7 @@ fn main() -> anyhow::Result<()> {
     tracing::info!("shell-remote-ui v{} (view={view:?})", version);
     eprintln!("agent pid={}", std::process::id());
 
-    match cli.command {
+    match command {
         Command::Agent {
             relay_url,
             relay_insecure,
@@ -402,4 +413,28 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn no_arguments_selects_configuration_window() {
+        assert!(Cli::try_parse_from(["shell-remote-ui"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn existing_agent_invocations_remain_compatible() {
+        let parsed = Cli::try_parse_from(["shell-remote-ui", "agent", "--view", "headless"])
+            .unwrap();
+        assert!(matches!(parsed.command, Some(Command::Agent { view, .. }) if view == "headless"));
+    }
+
+    #[test]
+    fn internal_upgrade_helper_keeps_its_entry_point() {
+        let parsed = Cli::try_parse_from(["shell-remote-ui", "update-apply", "handoff.json"])
+            .unwrap();
+        assert!(matches!(parsed.command, Some(Command::UpdateApply { handoff }) if handoff == "handoff.json"));
+    }
 }
