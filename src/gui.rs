@@ -30,7 +30,10 @@ pub fn run(status: AgentStatus) -> anyhow::Result<()> {
         options,
         Box::new(move |cc| {
             install_cjk_font(&cc.egui_ctx);
-            Ok(Box::new(GuiApp { status }))
+            Ok(Box::new(GuiApp {
+                status,
+                show_tokens: false,
+            }))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
@@ -38,6 +41,49 @@ pub fn run(status: AgentStatus) -> anyhow::Result<()> {
 
 struct GuiApp {
     status: AgentStatus,
+    show_tokens: bool,
+}
+
+/// 凭据完整显示并可复制；长值换行，复制反馈只保存时间，不另存凭据。
+fn credential_row(ui: &mut egui::Ui, label: &str, value: &str, visible: bool) {
+    ui.push_id(label, |ui| {
+        let id = ui.id().with("copied_at");
+        let now = ui.input(|i| i.time);
+        let copied = ui
+            .ctx()
+            .data(|d| d.get_temp::<f64>(id))
+            .map(|at| now - at < 2.0)
+            .unwrap_or(false);
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.strong(label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            !value.is_empty(),
+                            egui::Button::new(if copied { "已复制" } else { "复制" }),
+                        )
+                        .on_hover_text(format!("复制{label}"))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(value.to_owned());
+                        ui.ctx().data_mut(|d| d.insert_temp(id, now));
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_secs(2));
+                    }
+                });
+            });
+            let text = if value.is_empty() {
+                "—"
+            } else if visible {
+                value
+            } else {
+                "••••••••••••"
+            };
+            ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap());
+        });
+    });
 }
 
 impl eframe::App for GuiApp {
@@ -46,55 +92,79 @@ impl eframe::App for GuiApp {
         let phase = st.phase();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("shell-remote-ui 状态");
-            ui.separator();
+            ui.spacing_mut().scroll.floating = false;
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.heading("shell-remote-ui 状态");
+                ui.separator();
 
-            let (phase_text, phase_color) = match phase {
-                Phase::Connected => (phase.label(), egui::Color32::from_rgb(0x2e, 0x9e, 0x44)),
-                Phase::Reconnecting => (phase.label(), egui::Color32::from_rgb(0xe6, 0x9c, 0x1a)),
-                Phase::Connecting => (phase.label(), egui::Color32::from_rgb(0x1a, 0x8f, 0xc8)),
-                Phase::Starting => (phase.label(), egui::Color32::GRAY),
-            };
-            ui.horizontal(|ui| {
-                ui.label("状态：");
-                ui.colored_label(phase_color, phase_text);
+                let (phase_text, phase_color) = match phase {
+                    Phase::Connected => (phase.label(), egui::Color32::from_rgb(0x2e, 0x9e, 0x44)),
+                    Phase::Reconnecting => {
+                        (phase.label(), egui::Color32::from_rgb(0xe6, 0x9c, 0x1a))
+                    }
+                    Phase::Connecting => (phase.label(), egui::Color32::from_rgb(0x1a, 0x8f, 0xc8)),
+                    Phase::Starting => (phase.label(), egui::Color32::GRAY),
+                };
+                ui.horizontal(|ui| {
+                    ui.label("状态：");
+                    ui.colored_label(phase_color, phase_text);
+                });
+                credential_row(ui, "会话 ID", &st.session_id(), true);
+                ui.label(format!("Relay：{}", st.relay_url()));
+                ui.label(format!("延迟：{}", latency_text(st)));
+                ui.label(format!("已运行：{}", uptime_text(st)));
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.strong("连接 Token");
+                    ui.checkbox(&mut self.show_tokens, "显示");
+                });
+                let tokens = st.tokens();
+                if tokens.is_empty() {
+                    ui.weak("（未注册）");
+                } else {
+                    for (i, (tok, perm)) in tokens.iter().enumerate() {
+                        ui.push_id(i, |ui| {
+                            credential_row(
+                                ui,
+                                if perm == "ro" {
+                                    "只读 Token"
+                                } else {
+                                    "读写 Token"
+                                },
+                                tok,
+                                self.show_tokens,
+                            );
+                        });
+                    }
+                }
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("刷新 token（会话 id 不变）")
+                        .on_hover_text("重新注册获取新 token，旧 token 立即失效")
+                        .clicked()
+                    {
+                        tracing::info!("GUI: token refresh requested");
+                        st.request_refresh();
+                        self.show_tokens = false;
+                    }
+                    if ui
+                        .button("退出")
+                        .on_hover_text("停止 agent 并退出程序")
+                        .clicked()
+                    {
+                        tracing::info!("GUI: shutdown requested");
+                        st.request_shutdown();
+                        // 关闭窗口 → run_native 返回 → 主线程等 agent 收尾后退出。
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.weak("提示：仅本机查看用状态面板；终端/桌面转发照常经 relay 提供。");
             });
-            ui.label(format!("会话 id：{}", st.session_id()));
-            ui.label(format!("Relay：{}", st.relay_url()));
-            ui.label(format!("延迟：{}", latency_text(st)));
-            ui.label(format!("已运行：{}", uptime_text(st)));
-            ui.separator();
-
-            ui.label("Token：");
-            let tokens = st.tokens();
-            if tokens.is_empty() {
-                ui.weak("（未注册）");
-            } else {
-                for (tok, perm) in &tokens {
-                    ui.monospace(format!("  {perm}: {tok}"));
-                }
-            }
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                if ui
-                    .button("刷新 token（会话 id 不变）")
-                    .on_hover_text("重新注册获取新 token，旧 token 立即失效")
-                    .clicked()
-                {
-                    tracing::info!("GUI: token refresh requested");
-                    st.request_refresh();
-                }
-                if ui.button("退出").on_hover_text("停止 agent 并退出程序").clicked() {
-                    tracing::info!("GUI: shutdown requested");
-                    st.request_shutdown();
-                    // 关闭窗口 → run_native 返回 → 主线程等 agent 收尾后退出。
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-            ui.add_space(4.0);
-            ui.weak("提示：仅本机查看用状态面板；终端/桌面转发照常经 relay 提供。");
         });
 
         // 状态持续变化（延迟每心跳更新、重连状态）→ 500ms 重绘。
