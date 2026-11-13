@@ -372,11 +372,17 @@ async function waitNewFrame(page, before, deadlineMs) {
 //
 // 返回 {ok, ms, sat}：在 deadline 内出现过满足条件的画面即 ok。
 async function waitSaturation(page, want, deadlineMs) {
+  // 要求**连续两次**采样都满足才判定收敛：切换过程中画布会短暂停在过渡值
+  // （实测 LAN 路径第一次采样到 8.66、再采一次才是 0）。只认第一次命中会把
+  // "正在变灰"当成"已经是目标模式"，等于放松了验收。
   const t0 = Date.now();
   let last = null;
+  let prevOk = false;
   while (Date.now() - t0 < deadlineMs) {
     last = await page.evaluate(PAGE_SATURATION);
-    if (last !== null && want(last)) return { ok: true, ms: Date.now() - t0, sat: last };
+    const ok = last !== null && want(last);
+    if (ok && prevOk) return { ok: true, ms: Date.now() - t0, sat: last };
+    prevOk = ok;
     await sleep(200);
   }
   return { ok: false, ms: Date.now() - t0, sat: last };
