@@ -397,6 +397,9 @@ pub struct DesktopManager {
     /// agent 每收到 `desktop:congested` 递增；qos-ack 回传 `bp_count` 供
     /// 浏览器面板显示"relay 拥塞"计数——传输段拥塞对用户/调试可见。
     backpressure: Arc<std::sync::atomic::AtomicU32>,
+    /// 最近一次因 relay 拥塞请求 IDR 的时刻（毫秒墙钟），用于
+    /// [`CONGEST_IDR_MIN_GAP_MS`] 限频。
+    last_congest_idr_at: Arc<std::sync::atomic::AtomicI64>,
     /// 所选显示器在虚拟桌面坐标系中的原点（打包 `x << 32 | y`，见
     /// [`capture::pack_origin`]）。采集循环在打开捕获源（及重建）后写入，
     /// [`Self::handle_mouse`] 给鼠标移动加上它——否则采集副屏时点击落到主屏
@@ -442,6 +445,7 @@ impl DesktopManager {
             idr_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
             backpressure: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            last_congest_idr_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             capture_origin: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
@@ -538,18 +542,30 @@ impl DesktopManager {
         self.backpressure.fetch_add(1, O::Relaxed);
     }
 
-    /// relay 回传 `desktop:congested`：**丢帧即断链**，必须立刻补一颗关键帧。
+    /// relay 回传 `desktop:congested`：**丢帧即断链**，必须补一颗关键帧。
     ///
     /// relay 的 fan-out 在 viewer 缓冲满时丢帧并把该 viewer 置回"等关键帧"
     /// （`DesktopStream::push_frag` 的 `key_ok=false`）。在下一颗关键帧到达之前
     /// 这个 viewer 一条 delta 都收不到——只等周期 IDR（静止 [`KF_QUIET_MS`]
     /// 4s / 活跃 [`KF_ACTIVE_MS`] 6s）就是用户看到的"画面卡住几秒"。
     ///
-    /// 因此计数与 `request_idr()` 绑在一起：调用方只需调这一个方法，
-    /// 不存在"记了拥塞却忘了补关键帧"的漏网路径。限频由 relay 侧
-    /// （≤1 次 / 5s）保证，不会形成 reqkey 风暴。
+    /// 因此计数与 IDR 请求绑在一起：调用方只需调这一个方法，不存在"记了
+    /// 拥塞却忘了补关键帧"的漏网路径。
+    ///
+    /// **限频**：软编一颗关键帧本身要 250–500ms（AV1 720p），拥塞期间每拍都
+    /// 要关键帧等于把编码器钉死在出 IDR 上，反而拖长恢复时间。这里按
+    /// [`CONGEST_IDR_MIN_GAP_MS`] 抑制重复请求——真正的关键帧节拍由编码循环
+    /// 的 `last_kf_wall` 推进，本方法只负责"别等到 4~6s 的周期 IDR"。
     pub fn on_relay_congested(&self) {
+        use std::sync::atomic::Ordering as O;
         self.bump_backpressure();
+        let now = unix_ms_now();
+        let last = self.last_congest_idr_at.load(O::Relaxed);
+        if now.saturating_sub(last) < CONGEST_IDR_MIN_GAP_MS {
+            // 刚请求过：关键帧很快就到（或已到），不重复打断编码。
+            return;
+        }
+        self.last_congest_idr_at.store(now, O::Relaxed);
         self.request_idr();
     }
 
@@ -1192,6 +1208,13 @@ pub const KF_QUIET_MS: u64 = 4000;
 pub const KF_ACTIVE_MS: u64 = 6000;
 /// 帧均字节阈值：超过则视为活跃内容（需要高频关键帧）。
 pub const KF_ACTIVE_BYTES_FRAME: f64 = 2048.0;
+
+/// relay 拥塞触发的 IDR 请求最小间隔（MYS-2837）。
+///
+/// 软编一颗关键帧要 250–500ms（AV1 720p）；拥塞持续期间每一拍都请求 IDR，
+/// 编码器就一直出关键帧、delta 反而更少，恢复被拖长。1s 既保证"远快于
+/// 4–6s 的周期 IDR"，又不至于把编码器钉死在 IDR 上。
+pub const CONGEST_IDR_MIN_GAP_MS: i64 = 1000;
 
 /// 动态关键帧间隔由 [`KF_QUIET_MS`]/[`KF_ACTIVE_MS`] 取代旧的 500ms 固定
 /// 静止心跳（MYS-886 需求7-1：静止 4s 一个 IDR，带宽显著低于 relay 观看者
@@ -3137,20 +3160,48 @@ mod tests {
     }
 
     /// 编码循环消费掉 IDR 请求后，再来一次拥塞仍能重新置位
-    /// （不是一次性的：每次丢帧都要补关键帧，否则第二次拥塞又会卡住）。
+    /// （限频窗口过去后必须能再次请求，否则第二次拥塞又会卡住）。
     #[test]
     fn test_relay_congested_requests_idr_each_time() {
         use std::sync::atomic::Ordering as O;
         let dm = DesktopManager::new(DesktopConfig::default());
 
         dm.on_relay_congested();
+        assert!(dm.idr_pending());
         // 模拟编码循环取走请求（`force_idr` 后清 flag）。
         dm.idr_request.store(false, O::Relaxed);
-        assert!(!dm.idr_pending());
+        // 模拟限频窗口已过。
+        dm.last_congest_idr_at.store(0, O::Relaxed);
 
         dm.on_relay_congested();
-        assert!(dm.idr_pending(), "第二次拥塞必须重新请求关键帧");
+        assert!(dm.idr_pending(), "限频窗口过后必须重新请求关键帧");
         assert_eq!(dm.backpressure_count(), 2, "计数两次都要记");
+    }
+
+    /// 拥塞期连续通知必须被限频：软编一颗 IDR 要 250–500ms，每拍都请求
+    /// 等于把编码器钉死在出关键帧上（实测 IDR 请求数会比正常高 2–3 倍）。
+    #[test]
+    fn test_relay_congested_idr_is_rate_limited() {
+        use std::sync::atomic::Ordering as O;
+        let dm = DesktopManager::new(DesktopConfig::default());
+
+        dm.on_relay_congested();
+        assert!(dm.idr_pending());
+        dm.idr_request.store(false, O::Relaxed); // 编码循环已消费
+
+        // 限频窗口内再来 3 次拥塞：计数照记，但不得再打断编码。
+        for _ in 0..3 {
+            dm.on_relay_congested();
+        }
+        assert!(
+            !dm.idr_pending(),
+            "限频窗口内不得重复请求 IDR（会把编码器钉死在关键帧上）"
+        );
+        assert_eq!(
+            dm.backpressure_count(),
+            4,
+            "拥塞计数不受限频影响（归因/面板要看到真实次数）"
+        );
     }
 
     #[test]
