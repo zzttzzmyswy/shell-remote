@@ -56,6 +56,142 @@ v0.51.0 起拆分为两个二进制：
 
 `shell-remote-ui` 在 `Cargo.toml` 里声明了 `required-features = ["desktop", "tui", "gui"]`，lean 构建时 cargo 自动跳过该 bin。
 
+## 低空间编译与测试（日常开发）
+
+一次默认的 `cargo test --lib --no-run`（默认 feature，含 desktop/gui/av1/tui）
+在本仓库实测写出 **3 684 264 KiB（3.51 GiB）** 的 `target/`。组成里真正对日
+常排障有用的部分很小，大头是「依赖的完整 DWARF」和「增量编译缓存」：
+
+| 分项 | 默认配置 (KiB) | 占基线 |
+|---|---|---|
+| `debug/deps`（依赖 rlib + 测试二进制） | 2 465 356 | 66.9% |
+| `debug/incremental` | 914 620 | 24.8% |
+| `debug/build`（构建脚本产物） | 296 096 | 8.0% |
+
+因此 `Cargo.toml` 对 dev/test 两个 profile 做了收敛：
+
+```toml
+[profile.dev]
+debug = "line-tables-only"   # 保留 文件:行号，砍掉变量/类型 DWARF
+incremental = false          # 增量缓存约占基线 25%，按需再开
+
+[profile.dev.package."*"]
+debug = false                # 依赖内部调试信息日常用不到
+```
+
+`[profile.test]` 同理。**这不是"少编东西"**：feature、优化级别、链接方式、
+`[profile.release]` 全部未变，测试数量和覆盖范围也不变——只是不再为每一行
+代码生成日常用不到的调试元数据。
+
+### 日常用法
+
+```bash
+tools/test_lib.sh                        # 默认 feature，跑 lib 测试
+tools/test_lib.sh --no-default-features  # lean（CLI 形态，不编桌面依赖）
+tools/test_lib.sh --space                # 跑完打印 target 空间分项
+tools/test_lib.sh --no-run -- --target-dir /data/t  # 指定 target 目录
+```
+
+脚本会回显本次的 profile / feature / 增量设置 / 工具链，并在开工前检查可用空
+间（默认要求 4096 MB，`SR_MIN_FREE_MB` 可调），空间不够就直接失败，不会编到
+一半写爆磁盘。
+
+**target 目录只有一个口径**：`--target-dir <B>` / `--target-dir=<B>` >
+`CARGO_TARGET_DIR` > `<repo>/target`（与 cargo 自身优先级一致）。脚本把结果
+收敛成一个值再调 cargo，**空间预检、实际构建、事后统计永远指向同一路径**，
+不会出现「回显 A、实际写 B」。相对路径按仓库根解析；收尾时若 cargo 成功却
+没有产物落在该目录，脚本直接报错退出（码 3），拒绝按空目录报告 0 空间。
+
+受支持的口径参数：`--target-dir`、`--profile`、`--release`、`--features`、
+`--all-features`、`--target <triple>`（交叉编译，产物在
+`<target>/<triple>/<profile>/`）。回显会如实反映这些值。
+**`--manifest-path` 被显式拒绝**：它会改变 cargo 解析 target 默认根目录的基准，
+与本脚本及 `build-dist.sh` 的取件路径假设冲突；需要别的目录请用 `--target-dir`。
+
+桌面捕获的 X11 测试需要一个真实 X server，没有时它们会因为连不上 display 而
+失败（不是代码问题）：
+
+```bash
+Xvfb :99 -screen 0 1280x1024x24 &
+SR_XTEST_DISPLAY=:99 tools/test_lib.sh
+```
+
+### 需要完整调试时
+
+变量级 DWARF、单步进入依赖内部时，用命名 profile，**不要**改回默认值：
+
+```bash
+tools/test_lib.sh --full-debug                    # 等价 cargo test --profile test-full --lib
+cargo test --profile test-full --lib
+cargo build --profile dev-full
+```
+
+`test-full` / `dev-full` 继承上面的收敛配置，只把 `debug` 还原成 `2`（含依赖）。
+两者是独立的 target 子目录，与日常产物并存、互不污染——但也不要同时跑两套
+全量编译，磁盘会翻倍。
+
+边改边编需要增量时：
+
+```bash
+tools/test_lib.sh --incremental   # 或直接 CARGO_INCREMENTAL=1 cargo test --lib
+```
+
+### 空间实测（同工具链、同 feature、同一条命令）
+
+cargo/rustc 1.98.0，`cargo test --lib --no-run`（默认 feature），`du -sk` 计
+（**KiB**，非 SI 的 kB；表中同时给出换算后的 GiB）：
+
+| 配置 | target 总计 (KiB) | 换算 (GiB) | 耗时 | 降幅 |
+|---|---|---|---|---|
+| 默认（debug=2 + incremental） | 3 684 264 | 3.51 | 127 s | — |
+| **本配置**（line-tables + deps debug=false + 无增量） | **1 355 192** | **1.29** | 88 s | **−63%** |
+| 仅 debug=0 + 无增量 | 1 314 244 | 1.25 | 107 s | −64% |
+| line-tables + 无增量（依赖仍带 DWARF） | 1 883 348 | 1.80 | 93 s | −49% |
+
+降幅 = `1 − 1 355 192 / 3 684 264 = 63.2%`。基线分项（KiB）：`debug/deps`
+2 465 356、`debug/incremental` 914 620、`debug/build` 296 096。
+
+本配置没有选最省的 `debug=0`：保留 `line-tables-only` 让 panic 与
+`std::backtrace::Backtrace`（见 `src/lib.rs` 的崩溃日志 hook）仍能打出
+`文件:行号`，代价是 `1 355 192 − 1 314 244 = 40 948 KiB`（约 40 MiB，占
+`debug=0` 方案的 3%），换来完整的定位能力。
+
+复现口径：`du -sk <target>`（KiB，1 GiB = 1 048 576 KiB）；耗时取
+`cargo test --lib --no-run` 的 wall clock；各配置各自独立 target 顺序测量，
+未并行。空间是**配置产物大小**，磁盘占用观感还会受文件系统块大小影响。
+
+复核：本配置用 `tools/test_lib.sh --no-run -- --target-dir <全新目录>` 独立
+重建两次，得到 1 355 192 KiB 与 1 356 540 KiB（差 1 348 KiB，0.1%，来自
+`debug/deps` 里指纹/mtime 相关的微小差异），两次都无 `debug/incremental`。
+表中取第一次的值。
+
+同一命令第二次运行有真实复用（cargo 指纹命中：0.43 s、无 `Compiling`、
+体积不变）；需要看「改一行代码后重编多久」时用 `--incremental`，它会把
+`debug/incremental` 加回来（基线口径下该目录 914 620 KiB，本配置下约
++576 000 KiB），这是**按需**的取舍，不是默认代价。
+
+### 安全清理边界
+
+- 只删**本任务自己的** `target/`、`target-gnu/`、`dist/`、`dist-gnu/`
+  （都在 `.gitignore` 里，删掉只会触发重编）。不要清 `~/.cargo` 共享缓存，
+  也不要动别的 checkout 的 target。
+- **不要**用 `rm -rf target/debug/deps` 之类的子目录清理来"省空间"：会让
+  cargo 的指纹与实际产物失配，下一次可能报奇怪的链接错误。
+- 发布产物不经过 dev/test profile，清 `target/` 不影响已产出的 `dist/`。
+- 不要为了省空间在 `dist/` 上做增量/`--clobber` 之类的复用，发布流程见下文。
+
+```bash
+tools/build_space_contract_test.sh
+```
+
+上面这些约束的合同测试：解析 `Cargo.toml` 校验 profile 取值、确认
+`[profile.release]` 未被改动，再用假 cargo 校验 `test_lib.sh` 的参数透传与
+失败传播，并用一个极小 crate 做真实 rustc 探针确认 `debuginfo` /
+`incremental` 标志确实按预期传下去。其中 P16–P22 专门守 target 目录口径：
+`--target-dir` 的两种写法都要压过 `CARGO_TARGET_DIR`、预检与统计指向同一路径、
+`--manifest-path` 被拒、低空间不启动编译、回显如实。不编译本仓库、不碰真实
+`target/`。
+
 ## 静态 C++ 标准库（Windows UI）
 
 OpenH264 是 C++ 源码，因此 UI 构建要链 C++ 标准库。**Linux CLI 是

@@ -98,6 +98,58 @@ http-body-util = "0.1"
 # 单测用它把"5MB @1MB/s ≈ 4.8s"压缩到毫秒级。仅测试构建启用，不进发布产物。
 tokio = { version = "1", features = ["full", "test-util"] }
 
+# ── 日常 dev/test 的低空间 profile（MYS-2836 阶段1）────────────────────
+#
+# 一次 `cargo test --lib --no-run` 默认会写出十几 GB 级 target：debug=2 给
+# **所有依赖**也生成完整 DWARF，而增量编译又会把每个 crate 的中间产物再存
+# 一份到 `debug/incremental/`。日常跑测试根本用不到依赖内部的完整调试信息
+# （出问题几乎总在本仓库代码里），所以：
+#
+#   * 本仓库 crate：`line-tables-only` —— 保住文件:行号（panic/backtrace 仍
+#     能定位到具体行），砍掉变量/类型的完整 DWARF，这是体积的主要来源。
+#   * 依赖（`package."*"`）：`debug = false` —— 依赖内部的变量级调试信息对
+#     本仓库的排障没有增量价值。
+#   * `incremental = false` —— 增量缓存是纯开发期缓存，基线 target 里约占
+#     25%（914 620 / 3 684 264 KiB），且同一命令的第二次运行靠指纹复用就能
+#     秒过，不需要它。需要边改边编时用 `CARGO_INCREMENTAL=1` 显式打开。
+#
+# 需要完整调试（变量级 DWARF、进入依赖内部单步）时用命名 profile，
+# 见下面的 `dev-full` / `test-full`，不要为此改回默认值。
+#
+# 量测与结论见 docs/build.md「低空间编译与测试」。
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
+
+# 完整调试 profile：需要变量级 DWARF / 单步进依赖时显式选择。
+#   cargo test --profile test-full --lib
+#   cargo build --profile dev-full
+# 两者都继承上面已收紧的默认值，这里只把 debug 还原成 2（含依赖），
+# 其余（如 incremental）保持低空间口径，避免一开就回到十几 GB。
+[profile.dev-full]
+inherits = "dev"
+debug = 2
+
+[profile.dev-full.package."*"]
+debug = 2
+
+[profile.test-full]
+inherits = "test"
+debug = 2
+
+[profile.test-full.package."*"]
+debug = 2
+
 [profile.release]
 opt-level = "z"
 lto = true
