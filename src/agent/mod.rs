@@ -1467,6 +1467,11 @@ impl UplinkChain {
     fn new() -> Self {
         Self { chain_ok: false, generation: 0, init_sent: false }
     }
+
+    fn delivery_failed(&mut self) {
+        self.chain_ok = false;
+        self.init_sent = false;
+    }
 }
 
 /// 一批上行消息的规划结果。
@@ -1588,7 +1593,7 @@ fn plan_uplink_batch(batch: Vec<serde_json::Value>, chain: &mut UplinkChain) -> 
     let mut send_frames: Vec<serde_json::Value> = Vec::new();
     for m in frames[start_idx..end_idx].iter() {
         let is_key = m["payload"]["key"].as_bool().unwrap_or(false);
-        if is_key {
+        if is_key && (chain.init_sent || init_msg.is_some()) {
             // 关键帧是随机访问点：任何时候都可以发，发完即重开链。
             send_frames.push((*m).clone());
             chain.chain_ok = true;
@@ -1602,6 +1607,11 @@ fn plan_uplink_batch(batch: Vec<serde_json::Value>, chain: &mut UplinkChain) -> 
             continue;
         }
         send_frames.push((*m).clone());
+    }
+
+    // 窗内的关键帧只修复窗内参考链；被裁掉的尾部仍是下一批的缺口。
+    if end_idx < frames.len() {
+        chain.chain_ok = false;
     }
 
     // 5) 控制面：只对 `desktop:cursor` 做"保留最新 N 条"的裁剪，其余控制消息
@@ -2107,9 +2117,9 @@ async fn run_session(
                 let plan = plan_uplink_batch(batch, &mut chain);
                 if plan.need_keyframe {
                     // 丢过帧 / 参考链断了：立刻向编码循环要一颗关键帧，而不是
-                    // 干等静默期那颗心跳 IDR（最长 6s）。限频由编码循环的
-                    // reqkey 语义保证（置 flag，下一拍 force_idr）。
-                    desktop_for_uplink.request_idr();
+                    // 干等静默期那颗心跳 IDR（最长 6s）。与 relay 拥塞共享
+                    // 限频，避免持续丢帧时每一拍都重编关键帧。
+                    desktop_for_uplink.request_congestion_keyframe();
                 }
                 let mut out = plan.send;
                 if plan.dropped > 0 {
@@ -2287,7 +2297,7 @@ async fn run_session(
                         .send(),
                 )
                 .await;
-                match send_outcome {
+                let delivered = match send_outcome {
                     Ok(Ok(r)) => {
                         let status = r.status();
                         let body_len = tokio::time::timeout(Duration::from_secs(2), r.bytes())
@@ -2295,11 +2305,21 @@ async fn run_session(
                             .map(|b| b.map(|b| b.len()).unwrap_or(0))
                             .unwrap_or(0);
                         tracing::trace!("desk POST batch {status} body={body_len}");
+                        status.is_success()
                     }
-                    Ok(Err(e)) => tracing::warn!("desk POST batch failed: {e}"),
+                    Ok(Err(e)) => {
+                        tracing::warn!("desk POST batch failed: {e}");
+                        false
+                    }
                     Err(_) => {
-                        tracing::warn!("desk POST batch timed out after 5s, dropping batch")
+                        tracing::warn!("desk POST batch timed out after 12s, dropping batch");
+                        false
                     }
+                };
+                if !delivered {
+                    // 规划不等于送达：WS 和 HTTP 都失败后不能沿用已计划的参考链。
+                    chain.delivery_failed();
+                    desktop_for_uplink.request_reinit();
                 }
                 tokio::task::yield_now().await;
             }
@@ -5842,6 +5862,37 @@ mod tests {
             "有关键帧在，后续 delta 是安全且应该发的: {kinds:?}"
         );
         assert!(kinds.len() <= MAX_BATCH_MEDIA + 1, "批必须有界: {}", kinds.len());
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_trimmed_gop_tail_blocks_next_batch_until_key() {
+        for gop in [73, 120, 180] {
+            let mut chain = UplinkChain::new();
+            let mut batch = vec![up_init(1), up_key(1)];
+            batch.extend((2..=gop).map(up_delta));
+            let first = plan_uplink_batch(batch, &mut chain);
+            assert_eq!(first.send.len(), MAX_BATCH_MEDIA + 1);
+            assert!(first.need_keyframe);
+            assert!(!chain.chain_ok, "裁掉 GOP 尾部后下一批有参考缺口");
+            let next = plan_uplink_batch(vec![up_delta(gop + 1)], &mut chain);
+            assert!(next.send.is_empty(), "不能把尾部缺口之后的 delta 送出");
+            let recovered = plan_uplink_batch(vec![up_key(gop + 2), up_delta(gop + 3)], &mut chain);
+            assert_eq!(up_kinds(&recovered.send), vec!["key", "delta"]);
+            assert!(chain.chain_ok);
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_failed_delivery_requires_init_and_key_again() {
+        let mut chain = UplinkChain::new();
+        plan_uplink_batch(vec![up_init(1), up_key(1)], &mut chain);
+        chain.delivery_failed();
+        let next = plan_uplink_batch(vec![up_key(2), up_delta(3)], &mut chain);
+        assert!(next.send.is_empty(), "init 也可能未送达，不能仅凭关键帧恢复");
+        let recovered = plan_uplink_batch(vec![up_init(2), up_key(1), up_delta(2)], &mut chain);
+        assert_eq!(up_kinds(&recovered.send), vec!["init", "key", "delta"]);
     }
 
     /// **反例 2（验收附件）**：`init` 已被单独发走、本批只有 `key(seq1) +

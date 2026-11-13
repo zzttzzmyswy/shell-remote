@@ -40,15 +40,18 @@ function test(name, fn) {
 
 // 建一个用可控 Date 的实例（时间判据 2s/4s 由 makeClock 推进）。
 function makeSandboxView(FakeDate, overrides) {
+  const sent = [], intervals = [];
   const c = {
-    window: { shellRemote: { send: () => {}, on: () => {} } },
+    window: { shellRemote: { send: (...args) => sent.push(args), on: () => {} } },
     console,
     Date: FakeDate,
-    setTimeout, clearTimeout, setInterval, clearInterval,
+    setTimeout: () => 1, clearTimeout() {},
+    setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
+    clearInterval() {},
     Uint8Array, BigInt, Map,
     requestAnimationFrame: () => 0,
     document: {
-      getElementById: () => null,
+      getElementById: (id) => id === 'desktop-metrics' ? {} : null,
       createElement: () => ({
         getContext: () => null,
         classList: { add() {}, remove() {}, contains() { return false; } },
@@ -66,6 +69,7 @@ function makeSandboxView(FakeDate, overrides) {
     _codecKind: null, _av1Mono: 0, _dec: null, _initDecoder() {},
   });
   if (overrides) Object.assign(v, overrides);
+  v._review = { sent, intervals };
   return v;
 }
 
@@ -152,19 +156,15 @@ test('近期收到过 init 时，小幅回退不触发缺 init', () => {
   assert.strictEqual(v._lastSeq, 3, '基线应接受换代后的新序号');
 });
 
-// ── 用例 5：旧代残留帧不得把基线抬回去（跨代不可比）────────────────
-test('换代后旧代迟到帧不会把 seq 基线抬回旧值', () => {
-  const clock = makeClock(1_700_000_000_000);
-  const v = makeSandboxView(clock.Date, { _lastSeq: 100, _codecKind: 'av1' });
+// 没有新 init 的后续回退必须检测到，不能永久沿用第一次 init。
+test('已播放一代后新 init 丢失，下一次 seq 回退仍能检测到', () => {
+  const v = makeSandboxView(Date);
   v._handleMoov(av1c());
-  v._handleMoof(moof(1, true));   // 新一代第 1 帧
-  v._handleMoof(moof(2, false));  // 新一代第 2 帧
-  assert.strictEqual(v._lastSeq, 2);
-  v._handleMoof(moof(90, false)); // 旧代迟到帧
-  assert.strictEqual(v._lastSeq, 90, '收到更大的号仍前进（它只是更靠后的帧）');
-  // 回到新一代的下一帧时必须能被正确接受，而不是"永远回退"。
-  v._handleMoof(moof(3, false));
-  assert.strictEqual(v._lastSeq, 3, '跨代序号不可比，不能被旧号永久锁死');
+  v._handleMoof(moof(1, true));
+  v._handleMoof(moof(100, false));
+  v._handleMoof(moof(1, true));
+  assert.strictEqual(v._lastSeq, 1);
+  assert.ok(v._awaitGen > v._initGen, '旧 init 不能覆盖后续代次');
 });
 
 // ── 用例 6（验收新增）：有效 init 后隔 2100ms 才来 seq=1，不得误判缺 init ──
@@ -199,6 +199,48 @@ test('迟到的 init 会清掉缺口标记', () => {
   v._handleMoov(av1c());          // init 迟到但到了
   assert.strictEqual(v._awaitGen, 0, 'init 到达后缺口必须清零');
   assert.ok(v._initGen >= v._genSeq, '代次覆盖关系必须成立');
+});
+
+test('持续停帧时普通 reqkey 会升级为 reinit，且仍限频', () => {
+  const clock = makeClock(1_700_000_000_000);
+  const v = makeSandboxView(clock.Date, {
+    connected: true, _gotFirstFrame: true, _codecKind: 'av1',
+    _lastNewFrameAt: clock.Date.now(), _lastDataAt: clock.Date.now(),
+    _reqKeyAt: 0, _reqKeyCount: 0, _reqKeyWindowStart: 0,
+    _startTestDelay() {}, _e2eMs: undefined, _decodeCount: 0,
+  });
+  v._startMetrics();
+  const tick = v._review.intervals.find(x => x.ms === 250).fn;
+  for (let i = 0; i < 48; i++) {
+    clock.advance(250);
+    v._lastDataAt = clock.Date.now();
+    tick();
+  }
+  const sent = v._review.sent.filter(x => x[0] === 'desktop:reqkey');
+  assert.ok(sent.some(x => x[1].reinit), '停帧 12 秒必须实际送出 reinit');
+  assert.ok(sent.length <= 4, '共享限额仍限制请求风暴');
+});
+
+test('被限频的 reinit 不推进已发送时间，下一次可用时重试', () => {
+  const clock = makeClock(1_700_000_000_000);
+  const v = makeSandboxView(clock.Date, {
+    connected: true, _codecKind: 'av1', _reqKeyAt: 0,
+    _reqKeyCount: 0, _reqKeyWindowStart: 0,
+  });
+  v._requestKey();
+  clock.advance(1000);
+  assert.strictEqual(v._requestKey(true), false);
+  assert.strictEqual(v._lastInitReq, 0);
+  clock.advance(2000);
+  assert.strictEqual(v._requestKey(true), true);
+  assert.strictEqual(v._lastInitReq, clock.Date.now());
+});
+
+test('无参数集的 moov 不能清除缺 init 状态', () => {
+  const v = makeSandboxView(Date, { _genSeq: 2, _initGen: 1, _awaitGen: 2, _lastSeq: 40 });
+  v._handleMoov(new Uint8Array(16));
+  assert.strictEqual(v._awaitGen, 2);
+  assert.strictEqual(v._lastSeq, 40);
 });
 
 console.log('\n' + (fails.length === 0

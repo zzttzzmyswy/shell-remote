@@ -74,14 +74,8 @@
       this._reqKeyAt = 0;         // 上次 desktop:reqkey 发送时刻（限频）
       this._reqKeyCount = 0;      // 最近 10s 内 reqkey 次数
       this._lastSeq = 0;        // 最近收到的帧号（seqn box）
-      // 参数集代际跟踪（MYS-2837）：agent 重建编码器后 seq 归 1 并重发 init；
-      // 若新 init 被上行积压丢掉，靠它触发 reinit 重取参数集。
-      // 参数集代次覆盖状态（MYS-2837）。**显式状态，不用时间阈值**：
-      //   `_genSeq`      当前已知的最新代次（每收到一个 init +1）
-      //   `_initGen`     最近一次 init 覆盖到的代次（0 = 还没收到过 init）
-      //   `_awaitGen`    已见过帧、但还没等到 init 的那一代（0 = 无缺口）
-      // 判据是 `_initGen >= _genSeq` 而不是"init 是不是 2 秒内到的"——
-      // 首帧解码慢、上行排队久都不会让状态失真。
+      // 本地观察到的代次。有效 init 开启新代并清空 seq 基线；没有新 init
+      // 的序号回退则开启一个缺参数集的代次，直到收到有效 init。
       this._genSeq = 0;
       this._initGen = 0;
       this._awaitGen = 0;
@@ -341,23 +335,34 @@
     // 解码错误/解码积压丢帧时，让 agent 立即 force_idr 重同步，不再等周期
     // IDR（活跃期 6s）。限频：3s 最小间隔 + 10s 内最多 3 次，防刷新风暴。
     //
-    // MYS-2837 `reinit`：连**参数集**一起重发。切灰度/切 codec 会换 init
-    // 段（AV1 彩色 ↔ 单色、av1 ↔ h264），而 init 是控制面消息，agent 上行
-    // 队列积压时会和媒体帧一起被"丢旧保新"——丢了 init，浏览器手里的参数集
-    // 就永远是旧的那份：新码流解不出（实测 `Decoding error.`），或者干脆
-    // 一帧都收不到（只剩旧参数集的 delta，全被丢弃）→ 表现就是卡在
-    // "正在通过中继（Relay）拉流…"。这里在"参数集可能已过期"的场景显式要求
-    // agent 重发 init，而不是靠等下一条 init 自己走运没被丢。
+    // 参数集缺失或停帧时，普通请求升级为 reinit，避免抢占共同限额。
     _requestKey(reinit) {
       if (!this.connected || !window.shellRemote || !window.shellRemote.send) return;
       const now = Date.now();
-      if (now - this._reqKeyAt < 3000) return;
+      reinit = !!reinit || this._needsInitRecovery(now);
+      if (reinit && now - (this._lastInitReq || 0) < 4000) return false;
+      if (now - this._reqKeyAt < 3000) return false;
       if (now - this._reqKeyWindowStart > 10000) { this._reqKeyWindowStart = now; this._reqKeyCount = 0; }
       if (this._reqKeyCount >= 3) return;
       this._reqKeyAt = now;
       this._reqKeyCount += 1;
       this._reqKeyHistory = (this._reqKeyHistory || 0) + 1;
       window.shellRemote.send('desktop:reqkey', reinit ? { reinit: true } : {});
+      if (reinit) this._lastInitReq = now;
+      return true;
+    }
+
+    _needsInitRecovery(now) {
+      return (!this._codecKind && this._lastDataAt > 0 && now - this._lastDataAt < 3000) ||
+        (this._codecKind && this._lastNewFrameAt > 0 && now - this._lastNewFrameAt > 3000) ||
+        (this._awaitGen > 0 && this._initGen < this._awaitGen);
+    }
+
+    _acceptInit() {
+      this._genSeq += 1;
+      this._initGen = this._genSeq;
+      this._awaitGen = 0;
+      this._lastSeq = 0;
     }
 
     // 白闪修复（R5#74-78）：连接/切流/重连时显示"正在连接桌面…"覆盖层，
@@ -1026,11 +1031,6 @@
     }
 
     _handleMoov(body) {
-      // 新一代参数集到了（MYS-2837）：代次 +1 并标记"这一代已被 init 覆盖"。
-      // 注意不是记时间戳——用状态判定才不会因为首帧解码慢而误判。
-      this._genSeq += 1;
-      this._initGen = this._genSeq;
-      this._awaitGen = 0; // 缺口已补上
       // 找 codec 配置 box：先扫 avcC（H.264），再扫 av1C（AV1）。
       //   avcC payload: [i+4]=1(version) [i+5..i+7]=profile/compat/level
       //   av1C payload: [i+4]=0x81(marker+version) [i+5]=profile(3)|level(5)
@@ -1046,6 +1046,7 @@
           // description 取 AVCDecoderConfigurationRecord（不含 box 标签）。
           this._desc = body.slice(i + 4, numPpsOff + 3 + ppsLen);
           this._codecKind = 'h264';
+          this._acceptInit();
           this._initDecoder();
           return;
         }
@@ -1062,6 +1063,7 @@
           // 码流是单色时信令必须同步，否则解码端按彩色 I420 输出垃圾色度。
           this._av1Mono = (body[i+6] >> 4) & 0x1;    // monochrome(1)
           this._codecKind = 'av1';
+          this._acceptInit();
           this._initDecoder();
           return;
         }
@@ -1222,38 +1224,13 @@
       if (!sawTrun || sampleSize === 0) return;
       // 真实上行丢帧统计：TCP 有序，seq gap 只能来自上游丢弃（上传队列丢旧/
       // relay 丢旧）。对齐 rustdesk 控制端丢帧口径。
-      // 参数集代际（MYS-2837）：agent 每次重建编码器（切灰度/切 codec/换
-      // 分辨率）都把 Moof seq 归 1 并重发 init。所以"seq 比上一帧小"表示
-      // 码流换代了，此时**上一代的 _lastSeq 立刻作废**。
-      //
-      // 这里必须无条件接受回退后的 `_lastSeq = frameSeq`：只要这一代的 init
-      // 已经收到，一个更小的 seq 就是合法的"新代第 N 帧"，不是缺 init。
-      // 旧实现保留 `max(old, new)` 并把回退判成缺 init，导致每次灰度/编码
-      // 切换后都误发一次多余的 reinit。
-      //
-      // seq 回退 = 码流换代（agent 重建编码器后 seq 归 1）。
-      //
-      // 判"这一代有没有拿到 init"只看状态 `_initGen >= _genSeq`，与时间无关：
-      // 首帧解码慢、上行排队久都不会让一个**已经收到**的 init 失效（旧实现
-      // 的"2 秒内见过 init"启发式在 2100ms 后就会误判）。
-      //
-      // 关键区分：
-      //   - 收到过 init（`_genSeq > 0`）且不是回退 → 只是同代序号前进/跳号；
-      //   - seq 回退且 `_initGen >= _genSeq` → 这一代的 init 已经到手，
-      //     只是新代第 N 帧，正常继续（不请求 reinit）；
-      //   - seq 回退且 `_initGen < _genSeq` 或从未收到 init → 真的缺参数集，
-      //     记 `_awaitGen` 交给看门狗限频 reinit。
+      // 有效 init 已清空旧序号。仍然回退就说明新一代的 init 缺失；
+      // 旧代的 init 不能覆盖此后的所有换代，且首帧延迟不影响这个判据。
       if (frameSeq > 0) {
         const rolledBack = this._lastSeq > 0 && frameSeq < this._lastSeq;
         if (rolledBack) {
-          // 帧告诉我们换代了：如果 init 已经把它覆盖到，那没事；否则这一代
-          // 缺参数集。两种情况都把 seq 基线重置（跨代 seq 不可比）。
-          if (this._initGen < this._genSeq) {
-            if (!this._awaitGen) this._awaitGen = this._genSeq;
-          } else if (this._genSeq === 0 || this._initGen === 0) {
-            // 从没收到过 init 却收到回退帧：同样视为缺参数集。
-            if (!this._awaitGen) this._awaitGen = Math.max(this._genSeq, 1);
-          }
+          this._genSeq += 1;
+          this._awaitGen = this._genSeq;
         } else if (this._lastSeq > 0 && frameSeq > this._lastSeq + 1) {
           this._seqDrop += frameSeq - this._lastSeq - 1;
         }
@@ -1519,12 +1496,7 @@
       this._reqKeyWindowStart = 0;
       this._lastSeq = 0;
       this._seqDrop = 0;
-      // 参数集代次覆盖状态（MYS-2837）。**显式状态，不用时间阈值**：
-      //   `_genSeq`      当前已知的最新代次（每收到一个 init +1）
-      //   `_initGen`     最近一次 init 覆盖到的代次（0 = 还没收到过 init）
-      //   `_awaitGen`    已见过帧、但还没等到 init 的那一代（0 = 无缺口）
-      // 判据是 `_initGen >= _genSeq` 而不是"init 是不是 2 秒内到的"——
-      // 首帧解码慢、上行排队久都不会让状态失真。
+      // 断开后清空参数集代次。
       this._genSeq = 0;
       this._initGen = 0;
       this._awaitGen = 0;
@@ -1714,28 +1686,9 @@
             (Date.now() - self._lastNewFrameAt) > 500) {
             self._requestKey();
           }
-          // 参数集缺失/过期看门狗（MYS-2837）：三种迹象都指向"浏览器手里的
-          // 参数集不是当前码流那份"——解码器已建好却长时间解不出帧、收到
-          // moof 却始终没有 init、或 seq 回退（agent 换了代）但新 init 没到。
-          // 切灰度/切 codec 时 init 是控制面消息，agent 上行积压会把它和媒体
-          // 帧一起丢掉，浏览器于是永远停在"正在通过中继（Relay）拉流…"。
-          // 这里主动要 `reinit`，让 agent 把 init 和新关键帧重发一遍
-          // （限频 4s，最多 3 次/10s，与 _requestKey 共用限额，不会形成风暴）。
-          if (self.connected) {
-            const nowMs = Date.now();
-            const noInitButData = !self._codecKind && self._lastDataAt > 0 &&
-              (nowMs - self._lastDataAt) < 3000;
-            const decodedButStalled = self._codecKind && self._lastNewFrameAt > 0 &&
-              (nowMs - (self._lastNewFrameAt) > 3000);
-            // agent 换了参数集（seq 回退）但这一代的 init 没到：relay 那侧
-            // viewer 会一直等参数集，这里限频要一次 reinit 把 init 带回来。
-            // 判据是显式状态 `_awaitGen`（缺哪一代就等哪一代），不是时间窗。
-            const staleParamSets = self._awaitGen > 0 && self._initGen < self._awaitGen;
-            if ((noInitButData || decodedButStalled || staleParamSets) &&
-              (nowMs - (self._lastInitReq || 0)) > 4000) {
-              self._lastInitReq = nowMs;
-              self._requestKey(true);
-            }
+          // 无首帧/缺参数集时也走同一恢复入口；计时仅在实际发送后推进。
+          if (self.connected && self._needsInitRecovery(Date.now())) {
+            self._requestKey(true);
           }
           // R4 乙30s 判死：曾连上（收到过首帧）但 30s 无任何视频数据到达
           // （WS/SSE 半开黑洞、relay 静默卡死）→ 判定连接死亡，触发重连。

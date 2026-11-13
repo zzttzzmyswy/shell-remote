@@ -557,16 +557,20 @@ impl DesktopManager {
     /// [`CONGEST_IDR_MIN_GAP_MS`] 抑制重复请求——真正的关键帧节拍由编码循环
     /// 的 `last_kf_wall` 推进，本方法只负责"别等到 4~6s 的周期 IDR"。
     pub fn on_relay_congested(&self) {
-        use std::sync::atomic::Ordering as O;
         self.bump_backpressure();
+        self.request_congestion_keyframe();
+    }
+
+    /// 上行裁剪和 relay 背压共用限频；普通接入请求仍可立即请求 IDR。
+    pub fn request_congestion_keyframe(&self) {
+        use std::sync::atomic::Ordering as O;
         let now = unix_ms_now();
-        let last = self.last_congest_idr_at.load(O::Relaxed);
-        if now.saturating_sub(last) < CONGEST_IDR_MIN_GAP_MS {
-            // 刚请求过：关键帧很快就到（或已到），不重复打断编码。
-            return;
+        let accepted = self.last_congest_idr_at.fetch_update(O::Relaxed, O::Relaxed, |last| {
+            (now.saturating_sub(last) >= CONGEST_IDR_MIN_GAP_MS).then_some(now)
+        });
+        if accepted.is_ok() {
+            self.request_idr();
         }
-        self.last_congest_idr_at.store(now, O::Relaxed);
-        self.request_idr();
     }
 
     /// 累计 relay 段拥塞次数（面板"relay 拥塞"计数）。
@@ -3157,6 +3161,18 @@ mod tests {
             dm.idr_pending(),
             "relay 丢帧后必须立刻请求关键帧，否则 viewer 要等最多 6s 才恢复"
         );
+    }
+
+    #[test]
+    fn test_uplink_and_relay_congestion_share_keyframe_limit() {
+        use std::sync::atomic::Ordering as O;
+        let dm = DesktopManager::new(DesktopConfig::default());
+        dm.request_congestion_keyframe();
+        assert!(dm.idr_pending());
+        dm.idr_request.store(false, O::Relaxed);
+        dm.on_relay_congested();
+        assert!(!dm.idr_pending());
+        assert_eq!(dm.backpressure_count(), 1, "上行裁剪不冒充 relay 拥塞计数");
     }
 
     /// 编码循环消费掉 IDR 请求后，再来一次拥塞仍能重新置位
