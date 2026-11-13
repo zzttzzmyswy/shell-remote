@@ -95,8 +95,26 @@ impl DesktopStream {
 
     /// Cache a fresh init segment and forward it to all connected viewers
     /// (a re-init after a codec/parameter-set change).
+    ///
+    /// MYS-2837：换 init 意味着**参数集变了**（切灰度 → AV1 单色、切 codec、
+    /// 换分辨率）。此刻 channel 里可能还压着若干条用**旧**参数集编的 frag：
+    /// 它们排在 init 之后送出，浏览器会拿新解码器去解旧码流——实测直接报
+    /// `Decoding error.`，随后要靠 reqkey/黑名单兜底，画面卡住十几秒。
+    /// 因此这里把所有 viewer 置回"等关键帧"（`key_ok=false`）：旧参数集的
+    /// delta 全部丢弃，直到 agent 发来携带新参数集的关键帧才恢复投递。
+    /// agent 侧原地重建后立刻 force IDR（见 `run_desktop_pipeline`），所以
+    /// 恢复窗口就是一颗关键帧的编码时间，而不是等周期 IDR。
     pub async fn set_init(&self, bytes: Vec<u8>) {
         *self.inner.init.write().await = Some(bytes.clone());
+        // 参数集已变：先让所有 viewer 回到等关键帧，再广播新 init
+        // （顺序不能反——先广播 init 再置位，中间插进来的旧 frag 仍会被放行）。
+        let reset = self.invalidate_keys().await;
+        if reset > 0 {
+            tracing::debug!(
+                viewers = reset,
+                "desktop init replaced — viewers reset to wait for a key frame"
+            );
+        }
         self.broadcast_to_viewers(bytes).await;
     }
 

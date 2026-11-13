@@ -74,6 +74,11 @@
       this._reqKeyAt = 0;         // 上次 desktop:reqkey 发送时刻（限频）
       this._reqKeyCount = 0;      // 最近 10s 内 reqkey 次数
       this._lastSeq = 0;        // 最近收到的帧号（seqn box）
+      // 本地观察到的代次。有效 init 开启新代并清空 seq 基线；没有新 init
+      // 的序号回退则开启一个缺参数集的代次，直到收到有效 init。
+      this._genSeq = 0;
+      this._initGen = 0;
+      this._awaitGen = 0;
       this._seqDrop = 0;        // 真实上行丢帧数（seq gap 累计）
       this._arrivals = [];      // 帧到达间隔窗口（jitter 计算）
       this._lastArrival = 0;
@@ -329,16 +334,35 @@
     // 请求关键帧（对齐 rustdesk 控制端 refresh_video）：接入/参考链断裂/
     // 解码错误/解码积压丢帧时，让 agent 立即 force_idr 重同步，不再等周期
     // IDR（活跃期 6s）。限频：3s 最小间隔 + 10s 内最多 3 次，防刷新风暴。
-    _requestKey() {
+    //
+    // 参数集缺失或停帧时，普通请求升级为 reinit，避免抢占共同限额。
+    _requestKey(reinit) {
       if (!this.connected || !window.shellRemote || !window.shellRemote.send) return;
       const now = Date.now();
-      if (now - this._reqKeyAt < 3000) return;
+      reinit = !!reinit || this._needsInitRecovery(now);
+      if (reinit && now - (this._lastInitReq || 0) < 4000) return false;
+      if (now - this._reqKeyAt < 3000) return false;
       if (now - this._reqKeyWindowStart > 10000) { this._reqKeyWindowStart = now; this._reqKeyCount = 0; }
       if (this._reqKeyCount >= 3) return;
       this._reqKeyAt = now;
       this._reqKeyCount += 1;
       this._reqKeyHistory = (this._reqKeyHistory || 0) + 1;
-      window.shellRemote.send('desktop:reqkey', {});
+      window.shellRemote.send('desktop:reqkey', reinit ? { reinit: true } : {});
+      if (reinit) this._lastInitReq = now;
+      return true;
+    }
+
+    _needsInitRecovery(now) {
+      return (!this._codecKind && this._lastDataAt > 0 && now - this._lastDataAt < 3000) ||
+        (this._codecKind && this._lastNewFrameAt > 0 && now - this._lastNewFrameAt > 3000) ||
+        (this._awaitGen > 0 && this._initGen < this._awaitGen);
+    }
+
+    _acceptInit() {
+      this._genSeq += 1;
+      this._initGen = this._genSeq;
+      this._awaitGen = 0;
+      this._lastSeq = 0;
     }
 
     // 白闪修复（R5#74-78）：连接/切流/重连时显示"正在连接桌面…"覆盖层，
@@ -1022,6 +1046,7 @@
           // description 取 AVCDecoderConfigurationRecord（不含 box 标签）。
           this._desc = body.slice(i + 4, numPpsOff + 3 + ppsLen);
           this._codecKind = 'h264';
+          this._acceptInit();
           this._initDecoder();
           return;
         }
@@ -1038,6 +1063,7 @@
           // 码流是单色时信令必须同步，否则解码端按彩色 I420 输出垃圾色度。
           this._av1Mono = (body[i+6] >> 4) & 0x1;    // monochrome(1)
           this._codecKind = 'av1';
+          this._acceptInit();
           this._initDecoder();
           return;
         }
@@ -1198,11 +1224,17 @@
       if (!sawTrun || sampleSize === 0) return;
       // 真实上行丢帧统计：TCP 有序，seq gap 只能来自上游丢弃（上传队列丢旧/
       // relay 丢旧）。对齐 rustdesk 控制端丢帧口径。
+      // 有效 init 已清空旧序号。仍然回退就说明新一代的 init 缺失；
+      // 旧代的 init 不能覆盖此后的所有换代，且首帧延迟不影响这个判据。
       if (frameSeq > 0) {
-        if (this._lastSeq > 0 && frameSeq > this._lastSeq + 1) {
+        const rolledBack = this._lastSeq > 0 && frameSeq < this._lastSeq;
+        if (rolledBack) {
+          this._genSeq += 1;
+          this._awaitGen = this._genSeq;
+        } else if (this._lastSeq > 0 && frameSeq > this._lastSeq + 1) {
           this._seqDrop += frameSeq - this._lastSeq - 1;
         }
-        this._lastSeq = Math.max(this._lastSeq, frameSeq);
+        this._lastSeq = frameSeq;
       }
       this._pending = { ptsUs: ptsUs, isKey: isKey, captureMs: captureMs, size: sampleSize };
     }
@@ -1464,6 +1496,11 @@
       this._reqKeyWindowStart = 0;
       this._lastSeq = 0;
       this._seqDrop = 0;
+      // 断开后清空参数集代次。
+      this._genSeq = 0;
+      this._initGen = 0;
+      this._awaitGen = 0;
+      this._lastInitReq = 0;
       this._arrivals = [];
       this._lastArrival = 0;
       this._ackFps = null;
@@ -1648,6 +1685,10 @@
           if (self.connected && self._gotFirstFrame && self._lastNewFrameAt &&
             (Date.now() - self._lastNewFrameAt) > 500) {
             self._requestKey();
+          }
+          // 无首帧/缺参数集时也走同一恢复入口；计时仅在实际发送后推进。
+          if (self.connected && self._needsInitRecovery(Date.now())) {
+            self._requestKey(true);
           }
           // R4 乙30s 判死：曾连上（收到过首帧）但 30s 无任何视频数据到达
           // （WS/SSE 半开黑洞、relay 静默卡死）→ 判定连接死亡，触发重连。
