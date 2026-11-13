@@ -88,20 +88,43 @@ cargo build --release --bin shell-remote-ui --target x86_64-pc-windows-gnu
 在 **wine-11.21** 上跑 `cargo test --target x86_64-pc-windows-gnu` 的
 `windows_handoff_dacl` 三个用例，实测能验证的与不能验证的分列如下：
 
-| 项目 | wine 下 | 判据 |
-|---|---|---|
-| `SECURITY_DESCRIPTOR` 尺寸/`Dacl` 偏移 | ✅ 已验证 | 40 / 32，编译期常量断言 |
-| 写交接文件不报 998、内容可读回 | ✅ 已验证 | 走真实 `write_private_new` 路径 |
-| DACL 里有当前用户、且 SID 与令牌一致 | ✅ 已验证 | `GetNamedSecurityInfoW` + `EqualSid` 逐字节比对 |
-| `Everyone` 被剔除 | ✅ 已验证 | 反向对照证明是产品效果而非临时目录默认值 |
-| **`SE_DACL_PROTECTED` 继承保护位** | ❌ **未验证** | wine 丢弃该控制位 |
+| 项目 | wine 下 | 真 Windows | 判据 |
+|---|---|---|---|
+| `SECURITY_DESCRIPTOR` 尺寸/`Dacl` 偏移 | ✅ 已验证 | ✅ 必过 | 40 / 32，编译期常量断言 |
+| 写交接文件不报 998、内容可读回 | ✅ 已验证 | ✅ 必过 | 走真实 `write_private_new` 路径 |
+| DACL 里有当前用户、且 SID 与令牌一致 | ✅ 已验证 | ✅ 必过 | `GetNamedSecurityInfoW` + `EqualSid` 逐字节比对 |
+| 收紧能压掉**显式设置的宽 ACL** | ✅ 已验证 | ✅ 必过 | 先把 DACL 设成「受保护 + Everyone 全权」，再走产品路径，要求 Everyone 消失 |
+| **`SE_DACL_PROTECTED` 继承保护位** | ❌ **未覆盖** | ✅ **必须成立，不允许跳过** | 见下 |
 
-继承保护位为什么在 wine 上无法验证：一个**完全绕开产品代码**的独立探针
-（用 SDDL `D:P(A;;GA;;;OW)` 直接调 `SetFileSecurityW`）在 wine 上
-`SetFileSecurityW` 返回成功，但 `GetNamedSecurityInfoW` 读回 rc=5，且落盘
-DACL 会被追加一个 `SYSTEM`（S-1-5-18）ACE——即"API 说成功、语义不落地"。
-测试因此现场探测该能力：平台不模拟时**只跳过保护位那一条**，并在输出里
-打印未覆盖说明，不用"ACE 数 == 1"这种弱判据冒充"保护位已验证"。
+#### 跳过与否由「环境」决定，不由「探测结果」决定
 
-真 Win10 上的 DACL/继承行为需要负责人在真机复验；本仓库的任何 wine 结果
-都不构成真机结论。
+这是本用例最关键的一条设计约束。早期的写法是"探测一下平台支不支持保护位，
+不支持就跳过"——那会在**真实 Windows 也回归时静默降级**，而那恰好是最该报错的
+时刻。
+
+现在先用 `running_under_wine()` 判断环境：wine 的 `ntdll.dll` 导出
+`wine_get_version`，真实 Windows 没有这个符号。
+
+- **环境是 wine** → 保护位那段打印"未覆盖（wine 限制）"并**继续**；同时用独立
+  探针复验"wine 确实丢弃了该控制位"，如果哪天 wine 支持了，这条会反过来失败并
+  提示把断言改成无条件执行。
+- **环境是真 Windows** → 保护位与"恰好一个 ACE"**无条件断言**，没有任何降级
+  分支。真机上跳过保护位检查是不可能的。
+
+#### 权限负面对照不依赖临时目录的默认 ACL
+
+上一版用"普通文件的 ACE 数不是 1"做对照，那依赖临时目录默认权限恰好比较宽——
+换台机器、换个父目录就可能空过。现在改成**自己造输入**：用 SDDL
+`D:P(A;;GA;;;WD)` 把文件 DACL 显式设成「受保护 + Everyone 全权」，确认这个宽
+权限真的读得回来，再调 `restrict_to_current_user`，要求 Everyone 消失、当前
+用户仍在列。wine 上实测 `["S-1-5-18", "…-1000", "S-1-1-0"]` → `["S-1-5-18", "…-1000"]`。
+
+#### 为什么 wine 上验不了保护位
+
+一个**完全绕开产品代码**的独立探针（SDDL 直接调 `SetFileSecurityW`）在 wine 上
+返回成功，但 `GetNamedSecurityInfoW` 读回 rc=5，且落盘 DACL 会被追加一个
+`SYSTEM`（S-1-5-18）ACE——即"API 说成功、语义不落地"。所以 wine 的 DACL 结果
+只能作为"产品代码确实调用了正确的 API 并落盘"的证据，**不能**证明继承保护位。
+
+真 Win10 上的 DACL/继承行为需要负责人在真机复验；本仓库的任何 wine 结果都不
+构成真机结论。

@@ -32,9 +32,13 @@ bash tools/gui_release_window_test.sh \
   --expect-fail-wrong-pid         tools/fake_foreign_window_app.sh \
   --expect-fail-missing-restore   dist/shell-remote-ui-x86_64
 
-# 3. 真实无参数 GUI 的完整自升级与失败回滚
+# 3. 真实无参数 GUI 的完整自升级与失败回滚（Linux 原生）
 bash tools/gui_upgrade_real_test.sh \
   --ui dist/shell-remote-ui-x86_64 --relay dist/shell-remote-x86_64
+
+# 3b. Windows 完整 GUI 链路（隔离 wine）：开窗 → 连接 → 下载 → 换机 → 回滚
+bash tools/win_wine_gui_chain_test.sh \
+  --ui dist/shell-remote-ui-x86_64.exe --relay dist/shell-remote-x86_64
 
 # 4. 40-agent 高频注册
 SR_LOG_DIR='' BIN=$PWD/dist/shell-remote-x86_64 N=40 FLAP=10 ROUNDS=5 PORT=39726 \
@@ -128,15 +132,34 @@ WM_DELETE_WINDOW 关闭后自行退出），并且内置两条负例：
 - **`no_cmd_log` 不是空断言**：先要求日志文件本身有 ≥5 行（证明日志管道在工作），
   再要求 MCP 调用不新增 `[MCP] exec` 行。实测把勾选去掉时该断言变红（1→2）。
 
+**活跃配置的断言是一个复用函数** `assert_active_config`，在**连接后、升级后、
+回滚后三处各跑一次**，每次逐项覆盖全部三个设置：
+
+| 设置 | 判据（每次都测） |
+|---|---|
+| shell | PTY 子进程的 `argv[0]` 等于窗口里配置的 `/bin/sh` |
+| root | 相对路径上传必须落在配置的 `$W/active-root` 下 |
+| no_cmd_log | MCP 调用不得新增 `[MCP] exec` 行，且日志本身 ≥5 行（证明管道在工作） |
+
+> 上一版的注释写"回滚后 shell/root 都验"，实际只验了 shell；`no_cmd_log` 只在
+> 连接后查过一次，升级与回滚后完全没查。现已改为同一份判据三处复用，并在文档
+> 里按实际行为描述。
+
+为证明这份判据**不是恒真**，测试内置三条负面元测试：把期望 shell 写错、把期望
+root 指向别的目录、把命令日志文件藏起来——三种情况下 `assert_active_config`
+都必须返回非零。三条都实测变红。
+
 断言（成功换机）：PID 变化、磁盘 hash 变成新制品、身份**逐字节**相同
 （session_id + 一 rw 一 ro）、`registered` 回执的 upgrade_id 与本轮一致（不符即
-失败，上一版只 echo）、交接文件被消费、root/shell 跨进程保持、恢复后远程命令
-仍可执行。
+失败，上一版只 echo）、交接文件被消费、恢复后远程命令仍可执行。
 
 断言（失败回滚）：坏制品必须**先能通过换机前的 `--version` 冒烟测试**（否则会在
 替换前就被拦下，那是"失败未替换"，不是回滚），再由助手日志证明
 `new binary installed → 新版启动失败 → previous binary restored` 三步都发生，
-最后磁盘回到旧 hash、同身份可用。
+最后磁盘回到旧 hash、同身份可用。**终态必须是 `rolled_back`**——`failed` 不算
+回滚通过（它可能意味着新版压根没换上、或旧版也没起来）；本轮 `upgrade_id` 必须
+非空且与终态回执一致；回滚后交接文件必须无残留，且助手日志要有
+`previous agent restarted`（回滚闭环）。
 
 > 该脚本会 `unset INVOCATION_ID`：常规 CI/容器里进程处在别人的 `*.service`
 > cgroup 中且不是 MainPID，产品的 fail-closed 会正确拒绝换机（那是生产安全
@@ -174,8 +197,8 @@ relay 端口必须不可连（relay 离线）、PTY 子孙必须退出。
 | 服务端 `agent_version` 与本地一致 | ✅ | ✅ | ✅ |
 | 退出后会话转 `online=false` | ✅ | ✅ | ✅ |
 | 子进程 / wine 前缀清理 | ✅（PTY 子孙） | ✅（PTY 子孙） | ✅（按 WINEPREFIX 认领） |
-| 无参数窗口 GUI | ✅ **原生真窗口** | ❌ 未跑（模拟器无显示后端） | ⚠️ wine 下配置窗口出现过；本轮验证脚本**未纳入** wine 窗口用例 |
-| 完整自升级 / 回滚（both 身份 + 活跃配置） | ✅ 原生跑通 | ❌ 未跑 | ❌ 未跑完整换机 |
+| 无参数窗口 GUI | ✅ **原生真窗口** | ❌ 未跑（模拟器无显示后端） | ✅ **wine 下真实 Windows GUI 开窗**（`tools/win_wine_gui_chain_test.sh`） |
+| 完整自升级 / 回滚（both 身份 + 活跃配置） | ✅ 原生跑通 | ❌ 未跑 | ✅ **wine 下跑通**：下载 → exe 真实替换 → 身份保持 → 坏版本回滚 → hash 恢复 |
 | 交接文件 DACL：单 ACE 是当前用户、Everyone 被剔除 | — | — | ✅ wine（`EqualSid` 逐字节比对） |
 | 交接文件 DACL：**`SE_DACL_PROTECTED` 继承保护位** | — | — | ❌ **未验证**：wine 丢弃该控制位 |
 | 真实桌面抓屏 / AV1 实际编码 | ❌ 未跑 | ❌ 未跑 | ❌ 未跑 |
@@ -184,7 +207,7 @@ relay 端口必须不可连（relay 离线）、PTY 子孙必须退出。
 
 1. **ARM 的窗口与自升级**：qemu 用户态没有显示后端，跑不了窗口；自升级需要真实
    进程替换，也没跑。上表 ✅ 只覆盖"能启动、能注册、能力声明正确、能退出"。
-2. **wine 的继承保护位**：见 [windows.md](windows.md) 的"DACL 的验证边界"。
+2. **wine 上的 DACL 继承保护位**：见 [windows.md](windows.md) 的"DACL 的验证边界"。
    一个完全绕开产品代码的 SDDL 探针在 wine 上 `SetFileSecurityW` 返回成功，
    但 `GetNamedSecurityInfoW` 读回 rc=5，落盘 DACL 还会被追加一个 SYSTEM ACE。
    测试因此现场探测该能力，平台不支持时**只跳过保护位那一条**并打印未覆盖说明。
