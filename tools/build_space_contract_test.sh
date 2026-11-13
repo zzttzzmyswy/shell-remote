@@ -12,6 +12,9 @@
 #   P8  test_lib.sh 把 CARGO_TARGET_DIR 原样传给 cargo（与取件路径一致）
 #   P9  test_lib.sh 失败正确传播（cargo 非零 → 脚本非零）
 #   P10 test_lib.sh 空间不足时开工前就失败，不进入编译
+#   P16–P22 有效 target 目录解析：--target-dir 分写/等号形式压过 CARGO_TARGET_DIR，
+#       预检/构建/统计指向同一路径；--manifest-path 被拒；低空间不启动编译；
+#       回显如实反映 --profile/--release/--features；目录缺失不静默报 0
 #   P11 profile 收紧确实传到了 rustc（真实编译探针，不是只读 toml）
 #   P12 --full-debug 确实把 debug 还原成 2（真实编译探针）
 #   P13 --incremental 确实打开了 -C incremental（真实编译探针）
@@ -32,6 +35,8 @@ CARGO_TOML="$ROOT/Cargo.toml"
 BUILD_MD="$ROOT/docs/build.md"
 
 WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/sr-space.XXXXXX")"
+# realpath 一次：脚本内部对 target 目录做 realpath -m，断言要比对同一形态。
+WORKROOT="$(realpath -m "$WORKROOT")"
 cleanup() { [ -n "${KEEP_WORKROOT:-}" ] || rm -rf "$WORKROOT"; }
 trap cleanup EXIT
 
@@ -167,6 +172,83 @@ rc=$(FAKE_CARGO_LOG="$WORKROOT/p10.log" PATH="$FAKEBIN:$PATH" SR_MIN_FREE_MB=999
   CARGO_TARGET_DIR="" bash "$TEST_LIB" --no-run >"$WORKROOT/p10.out" 2>&1; echo $?)
 [ "$rc" -ne 0 ] && ok "P10 空间不足 → 非零退出（$rc）" || bad "P10 空间不足仍返回 0"
 [ -f "$WORKROOT/p10.log" ] && bad "P10 空间不足却仍调用了 cargo" || ok "P10 未进入编译"
+
+echo
+echo "── P16–P22 有效 target 目录解析（预检/构建/统计必须同一路径）──"
+# 这条是 review 抓到的真缺陷：旧实现透传 --target-dir 但仍按
+# CARGO_TARGET_DIR 预检与统计，导致"回显 A、编译写 B、A 不存在也没有空间统计"。
+
+# 让假 cargo 真的建出目录，脚本的事后一致性校验才会通过。
+run_dir() { # $1=outdir $2=期望产物目录 $3...=test_lib 参数
+  local out="$1" want="$2"; shift 2
+  rm -f "$out.log"
+  FAKE_CARGO_LOG="$out.log" PATH="$FAKEBIN:$PATH" SR_MIN_FREE_MB=0 \
+    FAKE_CARGO_TOUCH="$want/CACHEDIR.TAG" CARGO_TARGET_DIR="${FAKE_TARGET_DIR:-}" \
+    bash "$TEST_LIB" "$@" >"$out.out" 2>&1
+  echo $?
+}
+
+# P16: --target-dir <B>（分写）必须压过 CARGO_TARGET_DIR=A
+A="$WORKROOT/dirA"; B="$WORKROOT/dirB"; C="$WORKROOT/dirC"
+rc=$(FAKE_TARGET_DIR="$A" run_dir "$WORKROOT/p16" "$B" --space --no-run -- --target-dir "$B")
+grep -q "^CARGO_TARGET_DIR=$B$" "$WORKROOT/p16.log" \
+  && ok "P16 --target-dir 分写：cargo 收到 B" \
+  || { bad "P16 cargo 收到的不是 B"; grep '^CARGO_TARGET_DIR=' "$WORKROOT/p16.log"; }
+grep -q "^target_dir:  $B$" "$WORKROOT/p16.out" \
+  && ok "P16 回显的 target_dir 是 B（不是 CARGO_TARGET_DIR=A）" \
+  || { bad "P16 回显不是 B"; grep '^target_dir:' "$WORKROOT/p16.out"; }
+grep -q "^target:.*\[$B\]$" "$WORKROOT/p16.out" \
+  && ok "P16 空间统计指向 B" || bad "P16 空间统计没指向 B"
+[ -d "$A" ] && bad "P16 仍在 A 建了目录（预检/构建不一致）" || ok "P16 未在 A 留下产物"
+
+# P17: --target-dir=<C>（等号形式）
+rc=$(FAKE_TARGET_DIR="$A" run_dir "$WORKROOT/p17" "$C" --space --no-run -- --target-dir="$C")
+grep -q "^CARGO_TARGET_DIR=$C$" "$WORKROOT/p17.log" \
+  && ok "P17 --target-dir= 等号形式：cargo 收到 C" \
+  || { bad "P17 等号形式未生效"; grep '^CARGO_TARGET_DIR=' "$WORKROOT/p17.log"; }
+grep -q "^target:.*\[$C\]$" "$WORKROOT/p17.out" && ok "P17 空间统计指向 C" || bad "P17 统计没指向 C"
+
+# P18: --target-dir 必须从透传里被摘掉，不能与 CARGO_TARGET_DIR 两处并存
+grep -q -- "--target-dir" "$WORKROOT/p16.log" \
+  && bad "P18 --target-dir 仍被原样透传（两处口径并存）" \
+  || ok "P18 --target-dir 已收敛，未重复透传"
+
+# P19: --manifest-path 显式拒绝，且不启动编译
+rc=$(FAKE_CARGO_LOG="$WORKROOT/p19.log" PATH="$FAKEBIN:$PATH" SR_MIN_FREE_MB=0 \
+  CARGO_TARGET_DIR="" bash "$TEST_LIB" --no-run -- --manifest-path /tmp/x/Cargo.toml \
+  >"$WORKROOT/p19.out" 2>&1; echo $?)
+[ "$rc" -ne 0 ] && ok "P19 --manifest-path 被拒绝（非零 $rc）" || bad "P19 --manifest-path 被接受"
+grep -q "manifest-path" "$WORKROOT/p19.out" && ok "P19 报错说明了原因" || bad "P19 没有说明拒绝原因"
+[ -f "$WORKROOT/p19.log" ] && bad "P19 拒绝后仍调用了 cargo" || ok "P19 未进入编译"
+
+# P20: 低空间预检针对的是 --target-dir 那个路径（不是 CARGO_TARGET_DIR）
+rc=$(FAKE_CARGO_LOG="$WORKROOT/p20.log" PATH="$FAKEBIN:$PATH" SR_MIN_FREE_MB=999999999 \
+  CARGO_TARGET_DIR="" bash "$TEST_LIB" --no-run -- --target-dir "$WORKROOT/fullB" \
+  >"$WORKROOT/p20.out" 2>&1; echo $?)
+[ "$rc" -ne 0 ] && ok "P20 低空间 → 非零退出（$rc）" || bad "P20 低空间仍返回 0"
+grep -q "$WORKROOT/fullB" "$WORKROOT/p20.out" \
+  && ok "P20 报错指向 --target-dir 路径（预检用对了目录）" \
+  || { bad "P20 预检没指向 --target-dir"; head -3 "$WORKROOT/p20.out"; }
+[ -f "$WORKROOT/p20.log" ] && bad "P20 低空间却仍调用了 cargo" || ok "P20 未进入编译"
+
+# P21: 回显如实反映 --profile / --release / --features
+rc=$(FAKE_TARGET_DIR="$A" run_dir "$WORKROOT/p21a" "$A" --space --no-run -- --profile test-full)
+grep -q "^profile:     test-full" "$WORKROOT/p21a.out" && ok "P21 --profile test-full 如实回显" \
+  || bad "P21 --profile 回显不实"
+rc=$(FAKE_TARGET_DIR="$A" run_dir "$WORKROOT/p21b" "$A" --no-run -- --release)
+grep -q "^profile:     release" "$WORKROOT/p21b.out" && ok "P21 --release 如实回显" \
+  || bad "P21 --release 回显不实"
+rc=$(FAKE_TARGET_DIR="$A" run_dir "$WORKROOT/p21c" "$A" --no-run -- --features "desktop")
+grep -q -- "--features desktop" "$WORKROOT/p21c.out" && ok "P21 --features 如实回显" \
+  || bad "P21 --features 回显不实"
+
+# P22: cargo 成功但解析出的目录不存在 → 报错，绝不按空目录报告 0 空间
+rc=$(FAKE_CARGO_LOG="$WORKROOT/p22.log" PATH="$FAKEBIN:$PATH" SR_MIN_FREE_MB=0 \
+  CARGO_TARGET_DIR="" bash "$TEST_LIB" --space --no-run -- --target-dir "$WORKROOT/never" \
+  >"$WORKROOT/p22.out" 2>&1; echo $?)
+[ "$rc" -eq 3 ] && ok "P22 目录缺失 → 退出 3（不静默报 0）" || bad "P22 目录缺失时退出 $rc（期望 3）"
+grep -qE "^target:.*0 KiB" "$WORKROOT/p22.out" \
+  && bad "P22 仍然按空目录报告了 0 KiB" || ok "P22 没有按空目录报告空间"
 
 echo
 echo "── P11–P13 真实 rustc 探针（极小 crate，秒级）──"

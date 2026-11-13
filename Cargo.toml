@@ -109,9 +109,9 @@ tokio = { version = "1", features = ["full", "test-util"] }
 #     能定位到具体行），砍掉变量/类型的完整 DWARF，这是体积的主要来源。
 #   * 依赖（`package."*"`）：`debug = false` —— 依赖内部的变量级调试信息对
 #     本仓库的排障没有增量价值。
-#   * `incremental = false` —— 增量缓存是纯开发期缓存，约占 target 的 40%，
-#     且同一命令的第二次运行靠指纹复用就能秒过，不需要它。需要边改边编时
-#     用 `CARGO_INCREMENTAL=1` 显式打开。
+#   * `incremental = false` —— 增量缓存是纯开发期缓存，基线 target 里约占
+#     25%（914 620 / 3 684 264 KiB），且同一命令的第二次运行靠指纹复用就能
+#     秒过，不需要它。需要边改边编时用 `CARGO_INCREMENTAL=1` 显式打开。
 #
 # 需要完整调试（变量级 DWARF、进入依赖内部单步）时用命名 profile，
 # 见下面的 `dev-full` / `test-full`，不要为此改回默认值。
