@@ -74,6 +74,10 @@
       this._reqKeyAt = 0;         // 上次 desktop:reqkey 发送时刻（限频）
       this._reqKeyCount = 0;      // 最近 10s 内 reqkey 次数
       this._lastSeq = 0;        // 最近收到的帧号（seqn box）
+      // 参数集代际跟踪（MYS-2837）：agent 重建编码器后 seq 归 1 并重发 init；
+      // 若新 init 被上行积压丢掉，靠它触发 reinit 重取参数集。
+      this._awaitingInit = false;
+      this._awaitingInitAt = 0;
       this._seqDrop = 0;        // 真实上行丢帧数（seq gap 累计）
       this._arrivals = [];      // 帧到达间隔窗口（jitter 计算）
       this._lastArrival = 0;
@@ -329,7 +333,15 @@
     // 请求关键帧（对齐 rustdesk 控制端 refresh_video）：接入/参考链断裂/
     // 解码错误/解码积压丢帧时，让 agent 立即 force_idr 重同步，不再等周期
     // IDR（活跃期 6s）。限频：3s 最小间隔 + 10s 内最多 3 次，防刷新风暴。
-    _requestKey() {
+    //
+    // MYS-2837 `reinit`：连**参数集**一起重发。切灰度/切 codec 会换 init
+    // 段（AV1 彩色 ↔ 单色、av1 ↔ h264），而 init 是控制面消息，agent 上行
+    // 队列积压时会和媒体帧一起被"丢旧保新"——丢了 init，浏览器手里的参数集
+    // 就永远是旧的那份：新码流解不出（实测 `Decoding error.`），或者干脆
+    // 一帧都收不到（只剩旧参数集的 delta，全被丢弃）→ 表现就是卡在
+    // "正在通过中继（Relay）拉流…"。这里在"参数集可能已过期"的场景显式要求
+    // agent 重发 init，而不是靠等下一条 init 自己走运没被丢。
+    _requestKey(reinit) {
       if (!this.connected || !window.shellRemote || !window.shellRemote.send) return;
       const now = Date.now();
       if (now - this._reqKeyAt < 3000) return;
@@ -338,7 +350,7 @@
       this._reqKeyAt = now;
       this._reqKeyCount += 1;
       this._reqKeyHistory = (this._reqKeyHistory || 0) + 1;
-      window.shellRemote.send('desktop:reqkey', {});
+      window.shellRemote.send('desktop:reqkey', reinit ? { reinit: true } : {});
     }
 
     // 白闪修复（R5#74-78）：连接/切流/重连时显示"正在连接桌面…"覆盖层，
@@ -1007,6 +1019,8 @@
     }
 
     _handleMoov(body) {
+      // 新一代参数集到了：清掉"等 init"标记（MYS-2837）。
+      this._awaitingInit = false;
       // 找 codec 配置 box：先扫 avcC（H.264），再扫 av1C（AV1）。
       //   avcC payload: [i+4]=1(version) [i+5..i+7]=profile/compat/level
       //   av1C payload: [i+4]=0x81(marker+version) [i+5]=profile(3)|level(5)
@@ -1198,6 +1212,16 @@
       if (!sawTrun || sampleSize === 0) return;
       // 真实上行丢帧统计：TCP 有序，seq gap 只能来自上游丢弃（上传队列丢旧/
       // relay 丢旧）。对齐 rustdesk 控制端丢帧口径。
+      // 参数集过期判定（MYS-2837）：agent 每次重建编码器（切灰度/切 codec/
+      // 换分辨率）都把 Moof seq 归 1 并重发 init。因此"seq 回退到比已见值
+      // 还小的数"= 码流换了一代参数集。若这一代的新 init 没到达（agent 上行
+      // 积压会把 init 和媒体帧一起丢旧保新），手上的参数集就是上一代的：
+      // 单色/彩色或 av1/h264 对不上，解码器报错或一帧都解不出。
+      // 必须在下面对 `_lastSeq` 取 max 之前比较——取 max 之后永远看不到回退。
+      if (frameSeq > 0 && this._lastSeq > 0 && frameSeq < this._lastSeq) {
+        if (!this._awaitingInit) this._awaitingInitAt = Date.now();
+        this._awaitingInit = true;
+      }
       if (frameSeq > 0) {
         if (this._lastSeq > 0 && frameSeq > this._lastSeq + 1) {
           this._seqDrop += frameSeq - this._lastSeq - 1;
@@ -1464,6 +1488,9 @@
       this._reqKeyWindowStart = 0;
       this._lastSeq = 0;
       this._seqDrop = 0;
+      this._awaitingInit = false;
+      this._awaitingInitAt = 0;
+      this._lastInitReq = 0;
       this._arrivals = [];
       this._lastArrival = 0;
       this._ackFps = null;
@@ -1648,6 +1675,28 @@
           if (self.connected && self._gotFirstFrame && self._lastNewFrameAt &&
             (Date.now() - self._lastNewFrameAt) > 500) {
             self._requestKey();
+          }
+          // 参数集缺失/过期看门狗（MYS-2837）：三种迹象都指向"浏览器手里的
+          // 参数集不是当前码流那份"——解码器已建好却长时间解不出帧、收到
+          // moof 却始终没有 init、或 seq 回退（agent 换了代）但新 init 没到。
+          // 切灰度/切 codec 时 init 是控制面消息，agent 上行积压会把它和媒体
+          // 帧一起丢掉，浏览器于是永远停在"正在通过中继（Relay）拉流…"。
+          // 这里主动要 `reinit`，让 agent 把 init 和新关键帧重发一遍
+          // （限频 4s，最多 3 次/10s，与 _requestKey 共用限额，不会形成风暴）。
+          if (self.connected) {
+            const nowMs = Date.now();
+            const noInitButData = !self._codecKind && self._lastDataAt > 0 &&
+              (nowMs - self._lastDataAt) < 3000;
+            const decodedButStalled = self._codecKind && self._lastNewFrameAt > 0 &&
+              (nowMs - (self._lastNewFrameAt) > 3000);
+            // 最常见的一种：agent 换了参数集（seq 归 1）但新 init 没到。
+            const staleParamSets = self._awaitingInit === true &&
+              (nowMs - (self._awaitingInitAt || 0)) > 800;
+            if ((noInitButData || decodedButStalled || staleParamSets) &&
+              (nowMs - (self._lastInitReq || 0)) > 4000) {
+              self._lastInitReq = nowMs;
+              self._requestKey(true);
+            }
           }
           // R4 乙30s 判死：曾连上（收到过首帧）但 30s 无任何视频数据到达
           // （WS/SSE 半开黑洞、relay 静默卡死）→ 判定连接死亡，触发重连。

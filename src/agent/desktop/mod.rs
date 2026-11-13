@@ -323,8 +323,15 @@ pub struct DesktopManager {
     /// 默认 0 ＝ 未校准（行为与旧版一致）。
     clock_offset: std::sync::atomic::AtomicI64,
     /// 运行时编码方案（av1/h264）。初始 = config.codec，前端可通过
-    /// desktop:codec 热切换（重建桌面流），见 [`Self::set_codec`]。
+    /// desktop:codec 热切换（**原地**重建编码器，见 [`Self::set_codec`]）。
     codec: std::sync::RwLock<String>,
+    /// 目标编码方案（与 [`Self::codec`] 同值；`Arc` 以便 move 进编码循环）。
+    ///
+    /// MYS-2837：编码循环每拍比对它与 `cfg.codec`（当前编码器的真实状态），
+    /// 不同就原地重建编码器 + 重发 init，而不是让管理面 stop→start 整条流
+    /// ——后者会让 relay 删掉 DesktopStream，新流的首个 init 被上行背压丢掉，
+    /// 浏览器永久卡在"正在通过中继（Relay）拉流…"。
+    codec_target: Arc<std::sync::RwLock<String>>,
     /// 运行时目标编码帧率（内容驱动：静态 1fps / 动态满帧 / 解码背压才降帧，
 /// 见 QosAdaptive）。
     fps: Arc<std::sync::atomic::AtomicU32>,
@@ -361,6 +368,17 @@ pub struct DesktopManager {
     /// 弱网下带宽占用显著下降（亮度是主观关键），画质降为灰度可接受。
     /// 运行时即时生效，不重建编码器/不重启流。
     gray: Arc<std::sync::atomic::AtomicBool>,
+    /// 目标单色编码状态（`gray && codec=="av1"` 的派生值，只由管理面写入）。
+    ///
+    /// MYS-2837：编码循环每拍比对它与 `cfg.monochrome`，不同就**原地**重建
+    /// 编码器并重发 init（与"分辨率变更重配"同一条路径），不再 stop→start
+    /// 整条桌面流。旧实现在这里停流重建：relay 侧 `desktop:stopped` 会删掉
+    /// DesktopStream、`desktop:started` 再建新的，而新流的 init 排在积压队列
+    /// 末尾被上行"丢旧保新"当陈旧媒体帧丢掉——relay 永远等不到 init，浏览器
+    /// 就永久停在"正在通过中继（Relay）拉流…"（实测 AV1 720p/1080p 均可复现）。
+    /// 原地重建不换 DesktopStream 实例，init 由 `set_init` 覆盖缓存并广播给
+    /// 现有 viewer，不存在"新流第一个 init 被丢"的窗口。
+    mono_target: Arc<std::sync::atomic::AtomicBool>,
     /// 浏览器请求重发 init（`desktop:reqkey {reinit:true}`，MYS-2765 #6）：
     /// token 吊销 / 流被重建后浏览器手里的 init 已失效，下一次编码必带新的
     /// 参数集 init 段。与 [`Self::idr_request`] 分开：reqkey 只要 IDR，reinit
@@ -405,7 +423,8 @@ impl DesktopManager {
             input_sink: std::sync::Mutex::new(None),
             clipboard: tokio::sync::Mutex::new(None),
             clock_offset: std::sync::atomic::AtomicI64::new(0),
-            codec: std::sync::RwLock::new(codec),
+            codec: std::sync::RwLock::new(codec.clone()),
+            codec_target: Arc::new(std::sync::RwLock::new(codec)),
             fps: Arc::new(std::sync::atomic::AtomicU32::new(fps0)),
             quality: std::sync::RwLock::new(quality0),
             display: std::sync::RwLock::new(display0),
@@ -418,6 +437,7 @@ impl DesktopManager {
             qos_bitrate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             qos_encode_dims: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gray: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mono_target: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reinit_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idr_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
@@ -451,33 +471,37 @@ impl DesktopManager {
     }
 
     /// 灰度模式开关（web 端 `desktop:gray`）。两层实现（MYS-954 增强）：
-    /// - AV1：切换单色编码并**重建桌面流**（libaom 原生 monochrome 码流不含
-    ///   色度平面，全部比特给亮度——比"UV 填 128 再压缩"省更多码率；且 AV1
-    ///   是默认 codec，弱网省带宽主要走这条）。重建为低频操作可接受
-    ///   （set_codec/set_quality 同机制）。
+    /// - AV1：切换单色编码（libaom 原生 monochrome 码流不含色度平面，全部
+    ///   比特给亮度——比"UV 填 128 再压缩"省更多码率；且 AV1 是默认 codec，
+    ///   弱网省带宽主要走这条）。
     /// - H264：无 monochrome 能力，翻转编码前 UV 置 128 的像素级灰度
     ///   flag（下一帧即时生效，不重建）。
     ///
     /// MYS-2765 #4：单色不再是独立状态，而是 `gray && codec == av1` 的派生值
     /// （见 [`Self::monochrome_now`]）。此前独立字段在"AV1 开灰度 → 切 H264 →
     /// 关灰度"后残留 true，切回 AV1 就输出单色而灰度显示为关——派生后该状态
-    /// 组合不可表达。因此这里只在**运行中 AV1 且派生值确有变化**时重建流，
-    /// 状态不变时是纯 no-op（不打断正在看的流）。
+    /// 组合不可表达。
+    ///
+    /// MYS-2837：派生值变化时**不再 stop→start 整条桌面流**，只写
+    /// [`Self::mono_target`]；编码循环下一拍发现它与当前编码器状态不同，就地
+    /// 重建编码器 + 重发 init（与分辨率变更重配同一条路径）。见
+    /// [`Self::mono_target`] 的注释——旧实现在 AV1 上切灰度会把 relay 侧的
+    /// DesktopStream 删掉重建，新流的 init 又被上行背压丢掉，浏览器永久卡在
+    /// "正在通过中继（Relay）拉流…"。状态不变时仍是纯 no-op（不打断流）。
     pub async fn set_gray(&self, enabled: bool, post: PostFn) -> Result<(), String> {
         use std::sync::atomic::Ordering as O;
-        let was = self.monochrome_now();
+        // post 参数保留：签名是既有桌面控制接口的一部分（调用方按统一形状
+        // 传），只是现在不需要借它广播 stopped/started。
+        let _ = post;
         self.gray.store(enabled, O::Relaxed);
         let now = self.monochrome_now();
+        self.mono_target.store(now, O::Relaxed);
         tracing::info!(
             enabled,
             monochrome = now,
             "desktop gray mode {}",
             if enabled { "ON" } else { "OFF" }
         );
-        if was != now && self.is_running() {
-            self.stop(post.clone()).await;
-            self.start(post).await;
-        }
         Ok(())
     }
 
@@ -661,14 +685,19 @@ impl DesktopManager {
         tracing::info!(qos_scale = permille, "desktop QoS: bitrate scale adjusted");
     }
 
-    /// 运行时热切换编码方案（av1/h264）。仅当桌面正在运行时重建
-    /// 桌面流（stop 旧流 → start 新流，前端按新 init 段的 codec box
-    /// 自动切换解码）。codec 不变时是 no-op。
+    /// 运行时热切换编码方案（av1/h264）。codec 不变时是 no-op。
+    ///
+    /// MYS-2837：与灰度切换同一个病理——旧实现 stop→start 整条流，relay 会
+    /// 删掉 DesktopStream 再建，而新流的首个 init 排在上行积压队列末尾被
+    /// "丢旧保新"丢掉，relay 永远等不到 init → 浏览器卡在"正在通过中继
+    /// （Relay）拉流…"。现在只写目标 codec（[`Self::codec_target`]），编码
+    /// 循环下一拍就地重建编码器并重发 init，DesktopStream 实例不变。
     pub async fn set_codec(&self, codec: &str, post: PostFn) -> Result<(), String> {
         let codec = codec.to_string();
         if !self.config.supports_codec(&codec) {
             return Err(format!("unsupported codec {codec}"));
         }
+        let _ = post;
         {
             let mut cur = self.codec.write().map_err(|_| "codec lock poisoned".to_string())?;
             if *cur == codec {
@@ -676,11 +705,21 @@ impl DesktopManager {
             }
             *cur = codec;
         }
-        if self.is_running() {
-            self.stop(post.clone()).await;
-            self.start(post).await;
-        }
+        // 单色是 `gray && codec == av1` 的派生值：切 codec 会改变它，两者一起
+        // 交给编码循环比对（一次重建同时满足 codec 与单色变化）。
+        self.publish_codec_targets();
         Ok(())
+    }
+
+    /// 把当前 codec/单色派生值发布给编码循环（MYS-2837）。
+    fn publish_codec_targets(&self) {
+        use std::sync::atomic::Ordering as O;
+        let mono = self.monochrome_now();
+        self.mono_target.store(mono, O::Relaxed);
+        let codec = self.codec();
+        if let Ok(mut c) = self.codec_target.write() {
+            *c = codec;
+        }
     }
 
     /// 当前编码方案（供日志/指标）。
@@ -892,6 +931,15 @@ impl DesktopManager {
         // 单色是 `gray && codec == av1` 的派生值（MYS-2765 #4），不再独立存储
         // ——否则灰度关而 AV1 仍输出单色的状态可被构造出来。
         cfg.monochrome = self.monochrome_now();
+        // 编码循环以 `cfg.monochrome` 为"当前编码器状态"基线，跟
+        // [`Self::mono_target`] 比对决定是否原地重建（MYS-2837）。每次
+        // start（含 codec/quality/display 重建）都从派生值重新对齐。
+        self.mono_target
+            .store(cfg.monochrome, std::sync::atomic::Ordering::Relaxed);
+        // 目标 codec 同理：本次运行的编码器就是 cfg.codec，目标与之一致。
+        if let Ok(mut c) = self.codec_target.write() {
+            *c = cfg.codec.clone();
+        }
         // 运行时选屏（web 显示器下拉可改）覆盖启动 --desktop-display 的**选屏
         // 值**；X display 串仍取启动配置（MYS-2765 #9：`--desktop-display :0`
         // 不能被浏览器切屏覆盖，否则无 `$DISPLAY` 的服务里切屏连不上）。
@@ -913,6 +961,8 @@ impl DesktopManager {
             qos_bitrate: self.qos_bitrate.clone(),
             qos_encode_dims: self.qos_encode_dims.clone(),
             gray: self.gray.clone(),
+            mono_target: self.mono_target.clone(),
+            codec_target: self.codec_target.clone(),
             idr_request: self.idr_request.clone(),
             reinit_request: self.reinit_request.clone(),
             last_active_at: self.last_active_at.clone(),
@@ -1293,6 +1343,17 @@ struct RunShared {
     qos_encode_dims: Arc<AtomicU64>,
     /// 灰度像素级开关（H264 走 UV 置 128）。
     gray: Arc<AtomicBool>,
+    /// 目标单色编码状态（`gray && codec=="av1"` 的派生值）。
+    ///
+    /// MYS-2837：循环每拍把它与 `cfg.monochrome`（当前编码器的真实状态）
+    /// 比对，不同就**原地**重建编码器并重发 init，而不是让管理面 stop→start
+    /// 整条流。原地重建复用"分辨率变更重配"路径：`mp4_cfg=None` + `seq=1`
+    /// 让下一个 IDR 携带新参数集并广播 init，relay 的 DesktopStream 实例
+    /// 不变，现有 viewer 直接收到新 init。
+    mono_target: Arc<AtomicBool>,
+    /// 目标编码方案（av1/h264）。与 [`Self::mono_target`] 同一个理由：
+    /// 热切换 codec 也走原地重建，不再 stop→start 整条桌面流。
+    codec_target: Arc<std::sync::RwLock<String>>,
     /// 浏览器 reqkey：下一个编码帧强制 IDR。
     idr_request: Arc<AtomicBool>,
     /// 浏览器 reqkey {reinit:true}：下一个关键帧重发 init 段。
@@ -1369,6 +1430,8 @@ async fn run_desktop_pipeline(
         qos_bitrate,
         qos_encode_dims,
         gray,
+        mono_target,
+        codec_target,
         idr_request,
         reinit_request,
         last_active_at,
@@ -1556,6 +1619,14 @@ async fn run_desktop_pipeline(
     // 实际故障/崩溃（区别于 #84 的慢帧），达 ENCODE_ERR_TRIGGER 即降级。
     let mut encode_err_streak: u32 = 0;
     let mut encode_degraded = false;
+    // 灰度（单色）原地重建的退避时刻（虚拟墙钟 ms）。重建失败时置为
+    // `wall_ms + 1000`，避免每帧重试把编码循环拖死；成功后不再参与判断
+    // （`mono_target == cfg.monochrome` 即为稳态）。
+    let mut mono_retry_at: u64 = 0;
+    // 灰度重建后"立刻重发 init"的标记（MYS-2837）。重建时已清 `mp4_cfg`，
+    // 但只有下一颗关键帧才会落 init；静止桌面要等到 4s 静默 IDR——用户看到
+    // 的就是"切了灰度，画面几秒不变"。这里置位让本轮立即产一颗关键帧。
+    let mut mono_resend_idr = false;
     const SLOW_ENCODE_MS: f64 = 66.0;
     // moof 复用 muxer（R5#45）：tfhd 模板缓存，每帧只重建变化部分，
     // 减少高频路径的 moof 构建分配。
@@ -1564,6 +1635,69 @@ async fn run_desktop_pipeline(
     let mut br_guard = BitrateGuard::new(1_000_000);
 
     while running.load(Ordering::SeqCst) {
+        // 灰度（AV1 单色）原地重建（MYS-2837）：`desktop:gray` 只更新目标值
+        // [`RunShared::mono_target`]，真正的编码器重建在这里做——放在取帧之前，
+        // 静止桌面（capture 线程不出新帧）也能立刻生效，不必等下一帧内容。
+        //
+        // 旧实现让管理面 stop→start 整条流：relay 侧 `desktop:stopped` 会删掉
+        // DesktopStream、`desktop:started` 再建新的，而新流的首个 init 排在
+        // 上行积压队列末尾被"丢旧保新"当陈旧媒体帧丢掉——relay 永远等不到
+        // init，浏览器就永久停在"正在通过中继（Relay）拉流…"（实测 AV1
+        // 720p/1080p 均可复现）。原地重建不换 DesktopStream 实例：`mp4_cfg`
+        // 清空 + `seq` 归 1 让下一个 IDR 带新参数集，`set_init` 覆盖缓存并
+        // 广播给现有 viewer，不存在"新流第一个 init 被丢"的窗口。
+        //
+        // 判据是"目标 codec/单色"与"当前编码器状态"的差：切 codec 与切灰度
+        // 走同一处重建，不会各写一套。
+        let want_codec = codec_target
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_else(|_| cfg.codec.clone());
+        let want_mono = mono_target.load(Ordering::Relaxed);
+        if (want_codec != cfg.codec || want_mono != cfg.monochrome) && wall_ms >= mono_retry_at {
+            match encoder::create_encoder_fallback(
+                &want_codec,
+                enc_w as u32,
+                enc_h as u32,
+                cfg.max_bps,
+                cfg.fps,
+                cfg.quality,
+                want_mono,
+            ) {
+                Ok((new_enc, actual)) => {
+                    enc = new_enc;
+                    cfg.monochrome = want_mono;
+                    if actual != want_codec {
+                        tracing::warn!(
+                            requested = %want_codec,
+                            actual = %actual,
+                            "desktop codec fell back during runtime rebuild"
+                        );
+                    }
+                    cfg.codec = actual;
+                    // 参数集变了：下个关键帧必须重新携带并广播 init 给所有
+                    // viewer（与"分辨率变更重配"同一条路径）。
+                    mp4_cfg = None;
+                    seq = 1;
+                    enc.force_idr();
+                    last_kf_wall = wall_ms;
+                    // 下一拍即使没有新帧也要用最近一帧重编一颗关键帧，把新
+                    // init 立刻送给 viewer（等价于 reqkey，但不走浏览器往返）。
+                    mono_resend_idr = true;
+                    tracing::info!(
+                        monochrome = want_mono,
+                        codec = %cfg.codec,
+                        "desktop encoder rebuilt in place (codec/monochrome change)"
+                    );
+                }
+                Err(e) => {
+                    // 保持旧编码器继续出流，1s 后再试——不因一次失败把整条
+                    // 桌面流打掉。
+                    mono_retry_at = wall_ms + 1000;
+                    tracing::error!("encoder runtime rebuild failed: {e} — keeping current encoder");
+                }
+            }
+        }
         let cur_fps = fps_ctl.load(Ordering::SeqCst).clamp(1, 60);
         enc.set_frame_rate(cur_fps as f32);
         let min_gap = Duration::from_secs_f64(1.0 / cur_fps as f64);
@@ -1645,7 +1779,8 @@ async fn run_desktop_pipeline(
                 let due = last_static.as_ref().is_some()
                     && (frame_idx == 0
                         || last_kf_wall + kf_ms <= wall_ms
-                        || idr_request.load(Ordering::SeqCst));
+                        || idr_request.load(Ordering::SeqCst)
+                        || mono_resend_idr);
                 if due {
                     // 决策只读 flag；消费与 force_idr 由下方"有帧即决策"块统一处理。
                     synthetic = true;
@@ -1674,9 +1809,14 @@ async fn run_desktop_pipeline(
             last_kf_wall = wall_ms;
         }
         // IDR 决策（仅在确有帧可编时）：首帧 / 周期到期 / reqkey 请求。
-        if frame_idx == 0 || last_kf_wall + kf_ms <= wall_ms || idr_request.swap(false, Ordering::SeqCst) {
+        if frame_idx == 0
+            || last_kf_wall + kf_ms <= wall_ms
+            || idr_request.swap(false, Ordering::SeqCst)
+            || mono_resend_idr
+        {
             enc.force_idr();
             last_kf_wall = wall_ms;
+            mono_resend_idr = false;
         }
         // 有新帧：fps 是两次编码的最小间隔（上限节奏）。间隔已满足 → 立即
         // 编码；未满足 → 等余量再编。
@@ -2773,6 +2913,11 @@ fn base64(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// 测试里 pipeline 的"目标 codec"：默认 av1（DesktopConfig::default）。
+    fn codec_for_test() -> String {
+        DesktopConfig::default().codec
+    }
+
     /// 测试用运行句柄：默认值等价旧版的直接参数（带宽=cfg.max_bps、fps=30、
     /// QoS 1000‰、灰度/reqkey 关闭）。
     fn test_shared(post: PostFn, bw: u64) -> RunShared {
@@ -2786,6 +2931,8 @@ mod tests {
             qos_bitrate: Arc::new(AtomicU64::new(0)),
             qos_encode_dims: Arc::new(AtomicU64::new(0)),
             gray: Arc::new(AtomicBool::new(false)),
+            mono_target: Arc::new(AtomicBool::new(false)),
+            codec_target: Arc::new(std::sync::RwLock::new(codec_for_test())),
             idr_request: Arc::new(AtomicBool::new(false)),
             reinit_request: Arc::new(AtomicBool::new(false)),
             last_active_at: Arc::new(std::sync::atomic::AtomicI64::new(unix_ms_now())),
@@ -3919,6 +4066,248 @@ mod tests {
                 "reinit 后必须重发 init 段，before={inits_before} after={inits_after}"
             );
         });
+    }
+
+    /// MYS-2837 回归：AV1 灰度切换必须是**原地**编码器重建 + 重发 init，
+    /// 不能 stop→start 整条桌面流。
+    ///
+    /// 未修复基线（`set_gray` 里 `stop()` + `start()`）在真环境上会把 relay
+    /// 的 DesktopStream 删掉重建，新流的首个 init 排在上行积压队列末尾被
+    /// "丢旧保新"丢弃 → relay 永远等不到 init → 浏览器永久停在"正在通过
+    /// 中继（Relay）拉流…"（AV1 720p/1080p 均复现）。
+    ///
+    /// 断言点（对基线**必然失败**，因为基线根本没有原地重建路径）：
+    ///   1. 灰度开关不产生 `desktop:stopped`（流不重建）；
+    ///   2. 切换后必须出现**新的** init 段（新参数集要送给 viewer）；
+    ///   3. 切换后关键帧必须继续产出（不是卡死）。
+    #[test]
+    fn test_gray_toggle_rebuilds_encoder_in_place_and_resends_init() {
+        let cfg = DesktopConfig {
+            fps: 15.0,
+            codec: "av1".to_string(),
+            capture: "x11".to_string(), // 仅用于 config，下面直接注入 src
+            ..DesktopConfig::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let r2 = running.clone();
+        let shared = test_shared(post, cfg.max_bps);
+        let mono = shared.mono_target.clone();
+        let src: Box<dyn capture::FrameSource> = Box::new(ModerateSource {
+            w: 320,
+            h: 180,
+            t: 0,
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = tokio::spawn(run_desktop_pipeline(
+                cfg, r2, shared, src, "test".to_string(),
+            ));
+            // 等首个 init + 若干帧稳定下来。
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let inits_before = count_inits(&posted);
+            assert_eq!(inits_before, 1, "启动只应有一个 init");
+            let stopped_before = count_type(&posted, "desktop:stopped");
+            let keys_before = count_key_frags(&posted);
+
+            // 等价于 desktop:gray {enabled:true}：只改目标值，不碰流生命周期。
+            mono.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(900)).await;
+
+            let inits_after = count_inits(&posted);
+            let stopped_after = count_type(&posted, "desktop:stopped");
+            let keys_after = count_key_frags(&posted);
+            running.store(false, Ordering::SeqCst);
+            let _ = handle.await;
+
+            assert_eq!(
+                stopped_after, stopped_before,
+                "灰度切换不得停流（旧实现 stop→start 会让 relay 删掉 DesktopStream，\
+                 新流 init 被上行背压丢弃 → 浏览器永久卡在 Relay 拉流）"
+            );
+            assert!(
+                inits_after > inits_before,
+                "灰度切换必须重发 init 段（新参数集要送给 viewer），\
+                 before={inits_before} after={inits_after}"
+            );
+            assert!(
+                keys_after > keys_before,
+                "灰度切换后必须继续产关键帧（不是卡死），before={keys_before} after={keys_after}"
+            );
+        });
+    }
+
+    /// 灰度原地重建后的**状态一致性**：关掉灰度必须再重发一次 init，并且
+    /// 编码器回到彩色（`cfg.monochrome=false`）。正反两次切换都不得停流。
+    #[test]
+    fn test_gray_toggle_off_restores_color_and_resends_init_again() {
+        let cfg = DesktopConfig {
+            fps: 15.0,
+            codec: "av1".to_string(),
+            capture: "x11".to_string(),
+            ..DesktopConfig::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let r2 = running.clone();
+        let shared = test_shared(post, cfg.max_bps);
+        let mono = shared.mono_target.clone();
+        let src: Box<dyn capture::FrameSource> = Box::new(ModerateSource {
+            w: 320,
+            h: 180,
+            t: 0,
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = tokio::spawn(run_desktop_pipeline(
+                cfg, r2, shared, src, "test".to_string(),
+            ));
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let inits_0 = count_inits(&posted);
+
+            mono.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let inits_1 = count_inits(&posted);
+
+            mono.store(false, Ordering::SeqCst);
+            mono.store(false, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let inits_2 = count_inits(&posted);
+
+            let stopped = count_type(&posted, "desktop:stopped");
+            running.store(false, Ordering::SeqCst);
+            let _ = handle.await;
+
+            assert!(inits_1 > inits_0, "开灰度要重发 init：{inits_0} → {inits_1}");
+            assert!(inits_2 > inits_1, "关灰度要再重发一次 init：{inits_1} → {inits_2}");
+            assert_eq!(stopped, 0, "两次灰度切换都不得停流（不得出现 desktop:stopped）");
+        });
+    }
+
+    /// 重复设置相同 gray 必须是纯 no-op（不重建编码器、不重发 init）。
+    ///
+    /// 旧实现靠 `monochrome_now()` 的 was/now 比较做 no-op，但那条判断在
+    /// stop→start 之后才成立；MYS-2837 改成目标值驱动后，这条语义必须用
+    /// 编码循环的 `mono_target != cfg.monochrome` 判断继续成立。
+    #[test]
+    fn test_setting_same_gray_twice_is_noop() {
+        let cfg = DesktopConfig {
+            fps: 15.0,
+            codec: "av1".to_string(),
+            capture: "x11".to_string(),
+            ..DesktopConfig::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let r2 = running.clone();
+        let shared = test_shared(post, cfg.max_bps);
+        let mono = shared.mono_target.clone();
+        let src: Box<dyn capture::FrameSource> = Box::new(ModerateSource { w: 320, h: 180, t: 0 });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = tokio::spawn(run_desktop_pipeline(
+                cfg, r2, shared, src, "test".to_string(),
+            ));
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            mono.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let inits_after_first = count_inits(&posted);
+
+            // 重复设置同一值（浏览器重复点/重发命令）。
+            for _ in 0..5 {
+                mono.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            let inits_after_repeat = count_inits(&posted);
+
+            running.store(false, Ordering::SeqCst);
+            let _ = handle.await;
+            assert_eq!(
+                inits_after_repeat, inits_after_first,
+                "重复设置相同 gray 必须是 no-op（不得重建编码器/重发 init），\
+                 before={inits_after_first} after={inits_after_repeat}"
+            );
+        });
+    }
+
+    /// MYS-2837 回归（同一根因的另一条入口）：运行时切 codec 也必须原地
+    /// 重建编码器 + 重发 init，不得 stop→start 整条流。
+    ///
+    /// 未修复基线在这里 stop→start：relay 删掉 DesktopStream 再建新的，新流
+    /// 首个 init 被上行背压丢掉 → 浏览器卡在"正在通过中继（Relay）拉流…"。
+    #[test]
+    fn test_codec_switch_rebuilds_encoder_in_place_and_resends_init() {
+        let cfg = DesktopConfig {
+            fps: 15.0,
+            codec: "av1".to_string(),
+            capture: "x11".to_string(),
+            ..DesktopConfig::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let r2 = running.clone();
+        let shared = test_shared(post, cfg.max_bps);
+        let codec_target = shared.codec_target.clone();
+        let src: Box<dyn capture::FrameSource> = Box::new(ModerateSource { w: 320, h: 180, t: 0 });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = tokio::spawn(run_desktop_pipeline(
+                cfg, r2, shared, src, "test".to_string(),
+            ));
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let inits_before = count_inits(&posted);
+            let stopped_before = count_type(&posted, "desktop:stopped");
+
+            // 等价于 desktop:codec {codec:"h264"}。
+            *codec_target.write().unwrap() = "h264".to_string();
+            tokio::time::sleep(Duration::from_millis(900)).await;
+
+            let inits_after = count_inits(&posted);
+            let stopped_after = count_type(&posted, "desktop:stopped");
+            let keys_after = count_key_frags(&posted);
+            running.store(false, Ordering::SeqCst);
+            let _ = handle.await;
+
+            assert_eq!(
+                stopped_after, stopped_before,
+                "切 codec 不得停流（旧实现 stop→start 会让新流 init 被上行背压丢弃）"
+            );
+            assert!(
+                inits_after > inits_before,
+                "切 codec 必须重发 init，before={inits_before} after={inits_after}"
+            );
+            assert!(keys_after > 0, "切 codec 后必须继续产关键帧");
+        });
+    }
+
+    fn count_type(posted: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>, ty: &str) -> usize {
+        posted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v["type"] == ty)
+            .count()
+    }
+
+    fn count_key_frags(posted: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> usize {
+        posted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| {
+                v["type"] == "desktop:video"
+                    && v["payload"]["kind"] == "frag"
+                    && v["payload"]["key"].as_bool() == Some(true)
+            })
+            .count()
     }
 
     fn count_inits(posted: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> usize {
