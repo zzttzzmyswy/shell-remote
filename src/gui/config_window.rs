@@ -241,31 +241,26 @@ impl ConfigApp {
         section(ui, "连接状态", "连接期间设置已锁定；断开后可以修改。");
         ui.label(format!("Relay：{}", status.relay_url()));
         if status.phase() == Phase::Connected {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("会话 ID：{}", status.session_id()));
-                if let Some(ms) = status.latency_ms() {
-                    ui.weak(format!("延迟 {ms} ms"));
-                }
-            });
+            super::credential_row(ui, "会话 ID", &status.session_id(), true);
+            if let Some(ms) = status.latency_ms() {
+                ui.weak(format!("延迟 {ms} ms"));
+            }
             ui.horizontal(|ui| {
                 ui.strong("访问凭据");
                 ui.checkbox(&mut self.show_tokens, "显示");
             });
-            for (token, permission) in status.tokens() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(if permission == "ro" {
-                        "只读"
-                    } else {
-                        "读写"
-                    });
-                    ui.monospace(if self.show_tokens {
-                        token.as_str()
-                    } else {
-                        "••••••••••••"
-                    });
-                    if ui.small_button("复制").clicked() {
-                        ui.ctx().copy_text(token);
-                    }
+            for (i, (token, permission)) in status.tokens().into_iter().enumerate() {
+                ui.push_id(i, |ui| {
+                    super::credential_row(
+                        ui,
+                        if permission == "ro" {
+                            "只读 Token"
+                        } else {
+                            "读写 Token"
+                        },
+                        &token,
+                        self.show_tokens,
+                    );
                 });
             }
             if ui
@@ -403,6 +398,7 @@ impl eframe::App for ConfigApp {
                 ui.add_space(6.0);
             });
         egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24)).show(ctx, |ui| {
+            ui.spacing_mut().scroll.floating = false;
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_space(8.0);
                 if let Some(error) = self.error.as_deref().or(self.controller.last_error()) {

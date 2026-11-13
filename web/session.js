@@ -19,6 +19,7 @@
     // desktopActive 已为 false，但流仍在跑——据此允许其点「桌面」重新观看
     // （MYS-2765 验收复核：此前会误报「无法开启桌面」）。
     let remoteDesktopRunning = false;
+    let desktopDismissed = false; // 用户已明确返回终端，迟到事件不得重新抢占视图
     let desktopStarting = false;  // 已发 desktop:start 等待回复
     // 网页视图状态（MYS-2383-C / MYS-2383-G）：与桌面同级的独立视图，互不覆盖
     // DOM。模式判定只看 `session:capabilities` 里的能力字符串 + 当前 token 权限
@@ -47,7 +48,7 @@
     let connectT0 = 0;
     const CONNECT_STAGE_PCT = { ws: 15, lan: 35, p2p: 60, relay: 75 };
     function showConnectModal() {
-        if (connectModalShown) return;
+        if (currentView !== 'desktop' || connectModalShown) return;
         connectModalShown = true;
         connectT0 = Date.now();
         connectModal.classList.remove('hidden');
@@ -432,12 +433,58 @@
         // 编码/码率控件仅桌面模式显示（MYS-886）。
         const bar = document.getElementById('desktop-ctrl-bar');
         if (bar) bar.classList.remove('hidden');
+        requestAnimationFrame(keepControlsInBounds);
+    }
+
+    const controlsBar = document.getElementById('desktop-ctrl-bar');
+    const controlsMove = document.getElementById('desktop-controls-move');
+    let controlsPosition = null;
+    let controlsDrag = null;
+    function positionControls(x, y) {
+        if (!controlsBar || controlsBar.classList.contains('hidden') || !desktopContainer.clientWidth) return;
+        const margin = 8;
+        const maxX = Math.max(margin, desktopContainer.clientWidth - controlsBar.offsetWidth - margin);
+        const maxY = Math.max(margin, desktopContainer.clientHeight - controlsBar.offsetHeight - margin);
+        controlsPosition = { x: Math.max(margin, Math.min(x, maxX)), y: Math.max(margin, Math.min(y, maxY)) };
+        controlsBar.style.left = controlsPosition.x + 'px';
+        controlsBar.style.top = controlsPosition.y + 'px';
+    }
+    function keepControlsInBounds() {
+        if (controlsPosition) positionControls(controlsPosition.x, controlsPosition.y);
+    }
+    if (controlsBar && controlsMove) {
+        controlsMove.addEventListener('pointerdown', function(e) {
+            if (!e.isPrimary || e.button !== 0) return;
+            controlsDrag = { id: e.pointerId, x: e.clientX, y: e.clientY, left: controlsBar.offsetLeft, top: controlsBar.offsetTop };
+            controlsMove.setPointerCapture(e.pointerId);
+            controlsBar.classList.add('is-dragging');
+            e.preventDefault();
+        });
+        controlsMove.addEventListener('pointermove', function(e) {
+            if (!controlsDrag || controlsDrag.id !== e.pointerId) return;
+            positionControls(controlsDrag.left + e.clientX - controlsDrag.x, controlsDrag.top + e.clientY - controlsDrag.y);
+        });
+        function endControlsDrag() { controlsDrag = null; controlsBar.classList.remove('is-dragging'); }
+        controlsMove.addEventListener('pointerup', endControlsDrag);
+        controlsMove.addEventListener('pointercancel', endControlsDrag);
+        controlsMove.addEventListener('lostpointercapture', endControlsDrag);
+        controlsMove.addEventListener('keydown', function(e) {
+            const delta = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+            if (e.key !== 'Home' && !delta) return;
+            e.preventDefault(); e.stopPropagation();
+            const step = e.shiftKey ? 32 : 8;
+            if (e.key === 'Home') positionControls(12, 12);
+            else positionControls(controlsBar.offsetLeft + delta[0] * step, controlsBar.offsetTop + delta[1] * step);
+        });
+        new ResizeObserver(keepControlsInBounds).observe(desktopContainer);
+        new ResizeObserver(keepControlsInBounds).observe(controlsBar);
     }
 
     function showTerminalView() {
         hideWebView(false);
         currentView = 'terminal';
         desktopActive = false;
+        hideConnectModal();
         terminalArea.classList.remove('hidden');
         desktopContainer.classList.add('hidden');
         tabBarEl.classList.remove('hidden');
@@ -455,6 +502,7 @@
         if (!webAvailable) return;
         if (webMode === 'v2' ? !webMapV2 : !webView) return;
         currentView = 'web';
+        hideConnectModal();
         webActive = true;
         terminalArea.classList.add('hidden');
         desktopContainer.classList.add('hidden');
@@ -828,6 +876,9 @@
         // 正在跑而用户临时切到了网页视图，这时点按钮应当是"回去接着看"，不是
         // 把流停掉。
         if (currentView === 'desktop') {
+            desktopDismissed = true;
+            clearCodecSwitchPending();
+            hideConnectModal();
             // 切回终端：停流（只读会话不发 desktop:stop：它要求写权限，会 403）
             clearDesktopStartTimer();
             desktopView.disconnect();
@@ -836,6 +887,7 @@
             showTerminalView();
             return;
         }
+        desktopDismissed = false;
         if (desktopActive) {
             // 桌面流还在跑（用户从网页/终端切回来）：只恢复显示，不发 desktop:start。
             clearDesktopStartTimer();
@@ -856,13 +908,16 @@
         }
         if (desktopStarting) return;
         desktopStarting = true;
-        toggleDesktopBtn.disabled = true;
-        toggleDesktopBtn.textContent = '连接中…';
+        showDesktopView();
+        updateConnectModal('ws', '正在启动远端桌面…');
         clearDesktopStartTimer();
         desktopStartTimer = setTimeout(function() {
             desktopStartTimer = null;
             if (!desktopStarting) return;
             resetDesktopStarting();
+            desktopDismissed = true;
+            desktopView.disconnect();
+            showTerminalView();
             showToast('桌面启动超时', 'error');
         }, DESKTOP_START_TIMEOUT);
         window.shellRemote.send('desktop:start', {});
@@ -1159,7 +1214,7 @@
             sel.value = (codecs.indexOf(cur) >= 0) ? cur : (codecs[0] || 'av1');
         }
         remoteDesktopRunning = !!(msg.payload && msg.payload.running);
-        if (msg.payload && msg.payload.running && !desktopActive && !desktopStarting) {
+        if (msg.payload && msg.payload.running && !desktopDismissed && !desktopActive && !desktopStarting) {
             // 其它浏览器已开启桌面：把流连上。正在网页视图里时不抢视图。
             desktopActive = true;
             if (currentView !== 'web') showDesktopView();
@@ -1182,14 +1237,14 @@
         const running = !!(msg.payload && msg.payload.running);
         remoteDesktopRunning = running;
         if (running) {
-            if (!desktopActive && !desktopStarting) {
+            if (!desktopDismissed && !desktopActive && !desktopStarting) {
                 // 桌面在跑：接入观看。用户正停在网页视图时不抢视图——只把流连上
                 // （画面落在已隐藏的容器里），等他点「桌面」再显示。
                 desktopActive = true;
                 if (currentView !== 'web') showDesktopView();
                 desktopView.connect(true);
             }
-        } else if (desktopActive && !window.__codecSwitchPending) {
+        } else if (desktopActive && !desktopStarting && !window.__codecSwitchPending) {
             // 桌面已停且不在编码热切换：断开流；只在用户正看着桌面时退回终端。
             desktopView.disconnect();
             desktopActive = false;
@@ -1204,6 +1259,7 @@
         // 编码热切换完成：清除 pending 标志。
         clearCodecSwitchPending();
         remoteDesktopRunning = !(msg.payload && msg.payload.error);
+        if (desktopDismissed) { hideConnectModal(); return; }
         if (msg.payload && msg.payload.error) {
             showToast('桌面启动失败: ' + msg.payload.error, 'error');
             showTerminalView();
