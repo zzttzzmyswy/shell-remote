@@ -83,12 +83,13 @@ TMPROOT="$(mktemp -d)"
 CASE_PIDS=()
 CASE_XPID=""
 cleanup_all(){
-  local p
-  for p in "${CASE_PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
-  [ -n "$CASE_XPID" ] && kill -9 "$CASE_XPID" 2>/dev/null
-  rm -rf "$TMPROOT"
+  python3 "$ROOT_DIR/tools/stop_test_processes.py" "${CASE_PIDS[@]:-}"
+  echo "窗口测试日志保留：$TMPROOT"
 }
 trap cleanup_all EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 free_display(){ local n; for n in $(seq 60 120); do [ -e "/tmp/.X11-unix/X$n" ] || { echo ":$n"; return 0; }; done; return 1; }
 
@@ -162,7 +163,8 @@ run_window_case(){ # $1 标签 $2 二进制 [额外 argv...]；WINDOW_TIMEOUT �
       # 诊断：同屏有没有别人的窗口？有就证明这里判的是"归属"而不是"有没有"。
       echo "      同屏可见窗口数（含其它进程）：$(xdotool search --onlyvisible --name '.*' 2>/dev/null | wc -l)"
     fi
-    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    python3 "$ROOT_DIR/tools/stop_test_processes.py" "$pid" || { RESULT="cleanup_failed"; cbad "$label: 子进程清理失败"; }
+    wait "$pid" 2>/dev/null
     kill -9 "$xpid" 2>/dev/null; wait "$xpid" 2>/dev/null; CASE_XPID=""
     unset DISPLAY
     return 1
@@ -222,7 +224,7 @@ run_window_case(){ # $1 标签 $2 二进制 [额外 argv...]；WINDOW_TIMEOUT �
   else
     RESULT="close_timeout"
     cbad "$label: 关闭窗口 ${CLOSE_WAIT}s 后进程仍在（强杀不算通过）"
-    kill -9 "$pid" 2>/dev/null
+    python3 "$ROOT_DIR/tools/stop_test_processes.py" "$pid" || cbad "$label: 子进程清理失败"
   fi
   left="$(leftover_for "$bin" "$pid")"
   if [ "$left" = "0" ]; then

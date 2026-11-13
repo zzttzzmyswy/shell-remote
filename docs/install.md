@@ -2,7 +2,13 @@
 
 ## 下载预编译二进制
 
-[GitHub Releases](https://github.com/zzttzzmyswy/shell-remote/releases) 每个架构提供两个 musl 静态二进制：`shell-remote-<arch>`（CLI，relay + agent 仅终端）与 `shell-remote-ui-<arch>`（UI，agent 终端 + 桌面）。
+[GitHub Releases](https://github.com/zzttzzmyswy/shell-remote/releases) 每个架构提供两个二进制：`shell-remote-<arch>`（CLI，relay + agent 仅终端，**musl 静态**）与 `shell-remote-ui-<arch>`（UI，agent 终端 + 桌面，**GNU/glibc 动态**）。
+
+> **Linux UI 不是静态二进制**（MYS-2821）。它必须动态链接 glibc 才能在运行时
+> `dlopen` libX11 / libxkbcommon / libGL，因此运行要求 **glibc ≥ 2.35** 且系统里
+> 有 X11/GL/XKB 运行库（Ubuntu 22.04+ / Debian 12+ / Fedora 36+ 之类满足）。
+> **Alpine 等 musl 发行版只能直接用 CLI**，UI 跑不起来。Windows 两件都是
+> mingw 构建，无此限制。
 
 ```bash
 curl -fLO https://github.com/zzttzzmyswy/shell-remote/releases/latest/download/shell-remote-x86_64

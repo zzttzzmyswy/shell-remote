@@ -151,9 +151,10 @@ claim_all(){
 # 幂等：断言里可以主动调用（要验证"清理后哨兵仍活"），EXIT trap 再兜一次。
 # 保留日志：**不删 $W**，失败后要看的东西都在里面。
 cleanup(){
-  local pids p left
+  local pids p left keep="${1:-}"
   CLEANED=1
   pids="$(claim_all)"
+  if [ -n "$keep" ]; then pids="$(printf '%s\n' $pids | grep -vx "$keep" | tr '\n' ' ')"; fi
   [ -z "${pids// /}" ] && return 0
   # 先 TERM 让它们有机会自己收尾，再 KILL 兜底。
   for p in $pids; do kill -TERM "$p" 2>/dev/null; done
@@ -167,6 +168,7 @@ cleanup(){
   # 等待真的消失（最多 15s），期间可能有新掉出来的子孙。
   for _ in $(seq 1 60); do
     left="$(claim_all)"
+    if [ -n "$keep" ]; then left="$(printf '%s\n' $left | grep -vx "$keep" | tr '\n' ' ')"; fi
     [ -z "${left// /}" ] && break
     for p in $left; do kill -9 "$p" 2>/dev/null; done
     sleep 0.25
@@ -972,11 +974,16 @@ fi
 
 # 5.3 跑真正的统一 cleanup（与 EXIT trap 同一个函数，幂等）。
 #
-# 注意顺序：哨兵**属于** weakest 认领范围之外的一个独立进程，但它的 exe 在本测试
-# 目录下，所以 claim_all 会把它也算进来——这正是我们要的：cleanup 应该清掉本测试
-# 起的所有东西。哨兵的"存活"断言因此必须在 cleanup **之前**做（5.2 已做），
-# 它证明的是"测试运行期间没有别的机制按 basename 误杀它"。
-cleanup
+# 哨兵在清理范围内显式排除；清理后验证存活，再单独按 PID 回收。
+cleanup "$SENTINEL_PID"
+if alive "$SENTINEL_PID"; then
+  ok "统一 cleanup 后独立同名哨兵仍存活"
+else
+  bad "统一 cleanup 误杀同名哨兵"
+fi
+# 哨兵验证结束后按自己的 PID 回收，再检查全部资源。
+kill -TERM "$SENTINEL_PID" 2>/dev/null
+wait "$SENTINEL_PID" 2>/dev/null
 CLEANED=0   # 后面 EXIT trap 还会再兜一次（幂等）
 
 # 5.4 复核：认领范围内一个都不剩。
