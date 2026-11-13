@@ -115,4 +115,15 @@ P2P 已知限制：
 - **退出**：还原终端 → 请求 agent 停机，PTY 子进程由 drop 回收，不残留孤儿进程
 - 交互视图下业务日志默认落 `~/.shell-remote/`，避免刷卡刷屏污染界面；已设 `SR_LOG_DIR` 则尊重其值
 
-窗口 GUI 走 winit X11（纯 Rust 协议 x11rb），libxkbcommon / libGL 运行时 dlopen，二进制保持 musl 全静态；中文显示自动发现系统 CJK 字体（Windows 微软雅黑 / Linux Noto CJK / WQY 等）。
+窗口 GUI 走 winit，X11 后端经 `x11-dl` 在**运行时** `dlopen` libX11 / libxkbcommon / libGL（`eframe→winit→x11-dl`；不是纯 Rust 的 x11rb 协议直连）。因此 **Linux UI 制品必须是 glibc 动态链接**：musl 静态二进制不支持加载共享对象，窗口会直接失败（`Failed to load one of xlib's shared libraries`）。
+
+Linux UI 统一用 Ubuntu 22.04 / glibc 2.35 基线构建（`tools/build-gnu-ui.sh`，Rust
+工具链版本固定在 `GNU_RUST_TOOLCHAIN`），运行要求 **glibc ≥ 2.35 + libX11 /
+libxkbcommon / libGL**，**不能在 Alpine/musl 上直接运行**；CLI 制品仍为 musl
+静态、无此限制。构建产生的 `NEEDED` 是 `libc.so.6`、`libstdc++.so.6`、
+`libgcc_s.so.1`、`libm.so.6`，即目标机器上要装 libstdc++ 运行库（`libstdc++6`
+/ `libstdc++`）。中文显示自动发现系统 CJK 字体（Windows 微软雅黑 / Linux Noto
+CJK / WQY 等）。
+
+Windows 侧的 UI 仍是 mingw 静态链接（含静态 C++ 运行时），不需要额外运行库；
+但**桌面转发必须用 `shell-remote-ui-*.exe`**——CLI 产物不含桌面代码。

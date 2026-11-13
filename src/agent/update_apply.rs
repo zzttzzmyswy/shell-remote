@@ -932,12 +932,12 @@ fn verify_private_file(path: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn restrict_to_current_user(path: &Path) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::GENERIC_ALL;
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
         AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
         InitializeSecurityDescriptor, SetFileSecurityW, SetSecurityDescriptorDacl, TokenUser, ACL,
-        ACL_REVISION, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY,
-        TOKEN_USER,
+        ACL_REVISION, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -949,10 +949,6 @@ fn restrict_to_current_user(path: &Path) -> std::io::Result<()> {
             format!("{what} failed (win32 error {code})"),
         )
     }
-
-    // 对齐到 8 字节：TOKEN_USER / SECURITY_DESCRIPTOR / ACL 都要求指针对齐。
-    #[repr(C, align(8))]
-    struct SecDesc([u8; 32]);
 
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
@@ -998,12 +994,17 @@ fn restrict_to_current_user(path: &Path) -> std::io::Result<()> {
             return Err(last_os_error("AddAccessAllowedAce"));
         }
 
-        let mut sd_backing = SecDesc([0u8; 32]);
-        let sd_ptr = sd_backing.0.as_mut_ptr() as *mut core::ffi::c_void;
-        if InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION) == 0 {
+        // 用 SDK 自己的类型，绝不手写长度：x64 上 SECURITY_DESCRIPTOR 是 40 字节
+        // （Dacl 偏移 32），而这里曾经是一个 `[u8; 32]` 的私有缓冲区。
+        // `InitializeSecurityDescriptor` 会写满整个结构，末尾 8 字节写到缓冲区
+        // 之外——栈上相邻变量被静默踩坏，后续 SetFileSecurityW 报 998
+        // （ERROR_NOACCESS）。类型化之后由编译器保证尺寸与对齐。
+        let mut sd = core::mem::MaybeUninit::<SECURITY_DESCRIPTOR>::uninit();
+        let sd_ptr = sd.as_mut_ptr();
+        if InitializeSecurityDescriptor(sd_ptr.cast(), SECURITY_DESCRIPTOR_REVISION) == 0 {
             return Err(last_os_error("InitializeSecurityDescriptor"));
         }
-        if SetSecurityDescriptorDacl(sd_ptr, 1, acl_ptr, 0) == 0 {
+        if SetSecurityDescriptorDacl(sd_ptr.cast(), 1, acl_ptr, 0) == 0 {
             return Err(last_os_error("SetSecurityDescriptorDacl"));
         }
         let wide: Vec<u16> = {
@@ -1014,10 +1015,9 @@ fn restrict_to_current_user(path: &Path) -> std::io::Result<()> {
                 .collect()
         };
         let info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
-        if SetFileSecurityW(wide.as_ptr(), info, sd_ptr) == 0 {
+        if SetFileSecurityW(wide.as_ptr(), info, sd_ptr.cast()) == 0 {
             return Err(last_os_error("SetFileSecurityW"));
         }
-        let _ = LocalFree(std::ptr::null_mut());
     }
     Ok(())
 }

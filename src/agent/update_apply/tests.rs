@@ -174,8 +174,14 @@ fn test_handoff_roundtrip_preserves_the_overlay_flag() {
     v.as_object_mut().unwrap().remove("overlay");
     let legacy = dir.join(".handoff-legacy.json");
     std::fs::write(&legacy, serde_json::to_vec(&v).unwrap()).unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Unix 上 `read_handoff` 会校验 0600，所以手写的老文件必须先收紧权限；
+    // Windows 的校验走 DACL（非 unix 的 `verify_private_file` 只看普通文件），
+    // 这条 `set_permissions(mode)` 在 Windows 上压根不存在（E0599），必须门控。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let back = RestartContext::read_handoff(&legacy).expect("缺 overlay 字段必须能读");
     assert!(!back.overlay, "老文件的缺省必须是非 overlay");
 }
@@ -1485,7 +1491,13 @@ fn test_command_line_rollback_keeps_its_original_contract() {
     let _ = std::fs::remove_file(&handoff);
 }
 
-// ── 9. 助手日志与残留清理 ──────────────────────────────────────────#[cfg(unix)]
+// ── 9. 助手日志与残留清理 ──────────────────────────────────────────
+//
+// `#[cfg(unix)]` 绝不能和注释写在同一行：属性会变成注释的一部分，Unix 专用
+// 断言（0600/0700 的 mode 位）就会编译进 Windows 测试目标，整个测试二进制
+// 直接编译失败（MYS-2827 实测 `cargo test --target x86_64-pc-windows-gnu`
+// 报 E0433 `could not find unix in os`）。属性必须独占一行。
+#[cfg(unix)]
 #[test]
 fn test_helper_log_is_private_and_never_contains_tokens() {
     let dir = TmpDir::new("logperm");
@@ -2734,6 +2746,13 @@ fn test_pointer_backup_with_wrong_prefix_is_ignored() {
 }
 
 /// 纯判定：backup 必须与 target 同目录且带备份前缀。
+///
+/// `#[cfg(unix)]`：这些字面量是 **Unix 绝对路径**。Windows 上
+/// `Path::new("/usr/local/bin/shell-remote").is_absolute()` 是 `false`
+/// （Windows 的绝对路径需要盘符或 UNC 前缀），于是第一条正例必然失败——
+/// 那是路径语义差异，不是产品缺陷（Windows 侧的备份判定走自己那条路径）。
+/// MYS-2827 起这些用例在 Windows 测试目标上被正确排除。
+#[cfg(unix)]
 #[test]
 fn test_self_rollback_backup_belongs_to_target() {
     let target = Path::new("/usr/local/bin/shell-remote");
@@ -4552,5 +4571,414 @@ fn check_buffered_receipt_after_exit(consumed: bool) {
     } else {
         assert!(result.unwrap_err().contains("not consumed"));
         assert!(handoff.exists());
+    }
+}
+
+// ── Windows 交接文件 DACL（MYS-2821 修复，MYS-2827 补齐可执行性与 SID 断言）──
+//
+// 修复前这里是一个 `#[repr(C, align(8))] struct SecDesc([u8; 32])`：
+// x64 的 SECURITY_DESCRIPTOR 是 40 字节、Dacl 偏移 32，于是
+// `InitializeSecurityDescriptor` 把末尾 8 字节写到缓冲区之外，踩坏栈上相邻
+// 数据，后续 `SetFileSecurityW` 报 998（ERROR_NOACCESS）。
+//
+// 本模块的两个原则（MYS-2827 验收 4）：
+//
+// 1. **调用实际产品路径**：走真正的 `write_private_new` / `restrict_to_current_user`，
+//    不是另写一份 API 调用的复制品。
+// 2. **只断言本平台真的能观测到的**：ACE 数不值钱，ACE 里的 SID 才是"只有当前
+//    用户"的实质。平台不模拟的位（wine 的 `SE_DACL_PROTECTED`）单列未覆盖，
+//    不用"ACE 数是 1"这种弱判据冒充"保护位已验证"。
+//
+// wine 的能力边界由 `dacl_platform_capability` 现场探测，不靠猜：
+// 探针用 SDDL 直接构造 `D:P(A;;GA;;;OW)` 并交给 `SetFileSecurityW`，然后读回
+// 控制位。wine-11.21 上 `SetFileSecurityW` 返回成功、继承位仍是 0（OpenProcessToken
+// 之外还丢了 OWNER 语义，`GetNamedSecurityInfoW` 直接 rc=5），因此保护位在 wine
+// 上**未被验证**，真机由负责人复验。
+#[cfg(windows)]
+mod windows_handoff_dacl {
+    use super::*;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        EqualSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
+        GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
+        AclSizeInformation, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// 当前进程令牌里的用户 SID（Win32 自己返回的那一份，用来和 ACE 比对）。
+    fn current_user_sid() -> Vec<u8> {
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token),
+                0,
+                "OpenProcessToken 失败"
+            );
+            let mut needed = 0u32;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            assert!(needed > 0, "GetTokenInformation 没给出 TOKEN_USER 长度");
+            let mut buf = vec![0u8; needed as usize];
+            assert_ne!(
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buf.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed
+                ),
+                0,
+                "GetTokenInformation(TOKEN_USER) 失败"
+            );
+            let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+            let sid = tu.User.Sid.cast::<u8>();
+            let len = GetLengthSid(tu.User.Sid) as usize;
+            let out = std::slice::from_raw_parts(sid, len).to_vec();
+            windows_sys::Win32::Foundation::CloseHandle(token);
+            out
+        }
+    }
+
+    fn sid_to_string(sid: *mut core::ffi::c_void) -> String {
+        unsafe {
+            let mut raw: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &mut raw) == 0 {
+                return "<ConvertSidToStringSidW 失败>".into();
+            }
+            let mut n = 0usize;
+            while *raw.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(raw, n));
+            windows_sys::Win32::Foundation::LocalFree(raw.cast());
+            s
+        }
+    }
+
+    /// `GetNamedSecurityInfoW` 读出 DACL 的控制位与 ACE 列表（SID 用字符串表示）。
+    fn read_dacl(path: &Path) -> Option<(u16, Vec<String>)> {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut acl = std::ptr::null_mut();
+            let mut sd = std::ptr::null_mut();
+            let rc = GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut acl,
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            if rc != 0 || sd.is_null() {
+                return None;
+            }
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            if GetSecurityDescriptorControl(sd, &mut control, &mut revision) == 0 {
+                windows_sys::Win32::Foundation::LocalFree(sd.cast());
+                return None;
+            }
+            let mut sids = Vec::new();
+            if !acl.is_null() {
+                let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+                if GetAclInformation(
+                    acl.cast(),
+                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    core::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                ) != 0
+                {
+                    for i in 0..info.AceCount {
+                        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                        if GetAce(acl, i, &mut ace) == 0 || ace.is_null() {
+                            continue;
+                        }
+                        let a = &*(ace as *const ACCESS_ALLOWED_ACE);
+                        // ACCESS_ALLOWED_ACE 的 SidStart 是 SID 的第一个 DWORD，
+                        // 所以 SID 指针就是 &SidStart（SDK 的布局约定）。
+                        let sid = std::ptr::addr_of!(a.SidStart) as *mut core::ffi::c_void;
+                        sids.push(sid_to_string(sid));
+                    }
+                }
+            }
+            windows_sys::Win32::Foundation::LocalFree(sd.cast());
+            Some((control, sids))
+        }
+    }
+
+    /// 本进程是否跑在 wine 上（而不是真实 Windows）。
+    ///
+    /// 为什么需要显式判断，而不是"探测到保护位不支持就跳过"：
+    /// 后者会在**真实 Windows 也出问题时静默降级**——那正是最该失败的时刻。
+    /// 所以先把"环境"和"行为"分开：环境是 wine → 保护位单列未覆盖（有明确理由）；
+    /// 环境是真 Windows → 保护位必须成立，不成立就失败。
+    ///
+    /// 判据：wine 的 ntdll.dll 导出 `wine_get_version`（真实 Windows 没有）。
+    /// 两个符号在本地声明，避免为一个测试去改 Cargo 的 windows-sys features。
+    fn running_under_wine() -> bool {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
+        }
+        unsafe {
+            let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+            if ntdll.is_null() {
+                return false;
+            }
+            !GetProcAddress(ntdll, b"wine_get_version\0".as_ptr()).is_null()
+        }
+    }
+
+    /// 把文件 DACL 显式设成一个**受保护、且含 Everyone 全权**的宽 ACL。
+    ///
+    /// 这是权限负面对照的受控输入：不依赖"临时目录的默认 ACL 恰好比较宽"
+    /// （那在不同机器/不同父目录上会变），而是我们自己造一个确定宽松的 DACL，
+    /// 再验证产品的收紧路径确实把它变成了"只有当前用户"。
+    fn set_wide_dacl(path: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // P = 受保护（不继承），WD = Everyone，GA = 全权。
+        let sddl: Vec<u16> = "D:P(A;;GA;;;WD)"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return false;
+            }
+            let ok = windows_sys::Win32::Security::SetFileSecurityW(
+                wide.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                sd,
+            ) != 0;
+            windows_sys::Win32::Foundation::LocalFree(sd);
+            ok
+        }
+    }
+
+    /// wine 会丢弃 `SE_DACL_PROTECTED`，并给落盘 DACL 追加一个 SYSTEM ACE。
+    /// 独立复验这一点（绕开产品代码），作为"保护位未覆盖"的依据。
+    fn wine_drops_protected_bit(dir: &Path) -> bool {
+        let probe = dir.join("dacl-capability-probe.txt");
+        std::fs::write(&probe, b"x").unwrap();
+        let applied = set_wide_dacl(&probe);
+        let readback = read_dacl(&probe);
+        let _ = std::fs::remove_file(&probe);
+        if !applied {
+            return false;
+        }
+        match readback {
+            Some((control, sids)) => control & SE_DACL_PROTECTED == 0 || sids.len() != 1,
+            None => true,
+        }
+    }
+
+    /// 语言无关的"Everyone"SID 字符串，用来验证产品确实收窄了默认权限。
+    const EVERYONE: &str = "S-1-1-0";
+
+    /// SDK 类型必须是 x64 上的 40 字节、Dacl 在偏移 32。手写长度的那版是 32，
+    /// 正好少一个指针——这条断言就是防止有人再把长度写死。
+    #[test]
+    fn security_descriptor_layout_matches_sdk() {
+        assert_eq!(
+            core::mem::size_of::<SECURITY_DESCRIPTOR>(),
+            if cfg!(target_pointer_width = "64") { 40 } else { 20 },
+            "SECURITY_DESCRIPTOR 尺寸必须由 SDK 类型决定，不能手写"
+        );
+        assert_eq!(
+            core::mem::offset_of!(SECURITY_DESCRIPTOR, Dacl),
+            if cfg!(target_pointer_width = "64") { 32 } else { 16 },
+            "Dacl 偏移必须是 SDK 的真实布局"
+        );
+    }
+
+    /// 产品路径写出来的交接文件：当前用户被显式授权，Everyone 被剔除。
+    ///
+    /// 这一条替代了原来"ACE 数 == 1"的弱断言。ACE 数会随平台变化（wine 会多
+    /// 一个 SYSTEM ACE，那是它的对象管理器行为，不是产品缺陷），所以判据落在
+    /// **SID 本身**：
+    ///
+    ///   · 当前用户的 SID 必须在 ACE 里（用 `EqualSid` 逐字节比对，不比字符串）；
+    ///   · 平台若忠实实现受保护 DACL，再要求"恰好一个 ACE + 保护位在"。
+    ///
+    /// "Everyone 被剔除"这一条在两种平台上都成立，且下面那条负向对照证明它
+    /// 是产品代码的效果、不是临时目录的默认值。
+    #[test]
+    fn handoff_file_dacl_grants_exactly_the_current_user() {
+        let dir = TmpDir::new("win-dacl");
+        let path = dir.join("handoff-dacl.json");
+        // 走真实产品路径：restrict_to_current_user 就在 write_private_new 里面。
+        write_private_new(&path, b"{}").expect("write handoff");
+
+        let (control, sids) = read_dacl(&path).expect("GetNamedSecurityInfoW 读不出 DACL");
+        let me = current_user_sid();
+        let want = sid_to_string(me.as_ptr() as *mut core::ffi::c_void);
+
+        // 1) 当前用户必须在 ACE 里，且用 EqualSid 逐字节确认是同一个 SID。
+        assert!(
+            sids.iter().any(|s| *s == want),
+            "交接文件的 DACL 里没有当前用户 {want}：{sids:?}"
+        );
+        unsafe {
+            use std::os::windows::ffi::OsStrExt;
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut acl = std::ptr::null_mut();
+            let mut sd = std::ptr::null_mut();
+            let rc = GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut acl,
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            let mut matched = 0usize;
+            if rc == 0 && !acl.is_null() {
+                let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+                if GetAclInformation(
+                    acl.cast(),
+                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    core::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                ) != 0
+                {
+                    for i in 0..info.AceCount {
+                        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                        if GetAce(acl, i, &mut ace) == 0 || ace.is_null() {
+                            continue;
+                        }
+                        let a = &*(ace as *const ACCESS_ALLOWED_ACE);
+                        let sid = std::ptr::addr_of!(a.SidStart) as *mut core::ffi::c_void;
+                        if EqualSid(sid, me.as_ptr() as *mut core::ffi::c_void) != 0 {
+                            matched += 1;
+                        }
+                    }
+                }
+            }
+            if !sd.is_null() {
+                windows_sys::Win32::Foundation::LocalFree(sd.cast());
+            }
+            assert_eq!(matched, 1, "当前用户应当恰好有一个 ACE，实际 {matched}：{sids:?}");
+        }
+
+        // 2) Everyone 必须被剔除：这是"其它用户读不到"的直接判据，两种平台都成立。
+        assert!(
+            !sids.iter().any(|s| s == EVERYONE),
+            "交接文件的 DACL 仍含 Everyone({EVERYONE})，权限没有收窄：{sids:?}"
+        );
+
+        // 3) 保护位 + "恰好一个 ACE"：
+        //    真实 Windows 上**必须成立**，wine 上单列未覆盖。
+        //
+        //    关键点：跳过与否由**环境**（是否 wine）决定，不由"探测到不支持"决定。
+        //    否则真实 Windows 一旦回归，测试也会静默跳过——那恰好是最该报错的时刻。
+        if running_under_wine() {
+            assert!(
+                wine_drops_protected_bit(dir.path()),
+                "本机是 wine，但独立探针显示它这次保留了 SE_DACL_PROTECTED；\
+                 说明「wine 不支持保护位」这条未覆盖理由已不成立，\
+                 请把下面这条断言改为无条件执行"
+            );
+            eprintln!(
+                "  · 未覆盖（wine 限制，非真实 Windows）：wine 丢弃 SE_DACL_PROTECTED\
+                 并给落盘 DACL 追加 SYSTEM ACE（独立探针已复验）。\
+                 实测交接文件 {sids:?}，control=0x{control:04x}。\
+                 继承保护位必须在真实 Windows 上复验（真机待负责人）。"
+            );
+        } else {
+            // 真实 Windows：这里不许有任何降级路径。
+            assert_ne!(
+                control & SE_DACL_PROTECTED,
+                0,
+                "交接文件的 DACL 必须是受保护的（父目录 ACE 不再继承）"
+            );
+            assert_eq!(
+                sids.len(),
+                1,
+                "受保护 DACL 应当恰好一个 ACE（当前用户），实际 {sids:?}"
+            );
+        }
+
+        // 4) 收紧权限不能把所有者自己锁在外面。
+        let back = std::fs::read(&path).expect("read back handoff");
+        assert_eq!(back, b"{}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 负向对照：对**显式设置成宽 ACL**的文件走一次产品收紧路径。
+    ///
+    /// 上一版这条对照依赖"临时目录的默认 DACL 恰好比较宽"。那在别的机器、
+    /// 别的父目录上会变——一旦默认就很紧，断言就空过了。现在改成自己造输入：
+    /// 先把文件 DACL 设成**受保护、含 Everyone 全权**，确认这个宽权限确实落盘，
+    /// 再调产品的 `restrict_to_current_user`，然后要求 Everyone 消失、当前用户
+    /// 在列。这证明的是"产品代码改变了它"，不是"默认值碰巧一样"。
+    #[test]
+    fn handoff_restriction_narrows_an_explicitly_wide_dacl() {
+        let dir = TmpDir::new("win-dacl-neg");
+        let path = dir.join("wide.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        // 前提：这个平台得能表达"含 Everyone 的 DACL"，否则本用例无从谈起。
+        if !set_wide_dacl(&path) {
+            // wine 上允许出现（同上：是环境能力问题）；真 Windows 上不允许。
+            assert!(
+                running_under_wine(),
+                "真实 Windows 上连宽 ACL 都设不上，本对照失去意义"
+            );
+            eprintln!("  · 未覆盖（wine）：无法设置含 Everyone 的宽 DACL，本对照跳过");
+            return;
+        }
+        let (_, before) = read_dacl(&path).expect("读不出宽 DACL");
+        if !before.iter().any(|s| s == EVERYONE) {
+            // 平台把 Everyone 吞掉了（wine 行为）。真 Windows 上必须出现。
+            assert!(
+                running_under_wine(),
+                "真实 Windows 上设了 Everyone 全权却读不回 Everyone：{before:?}"
+            );
+            eprintln!("  · 未覆盖（wine）：宽 DACL 读回时 Everyone 已被丢弃，本对照跳过");
+            return;
+        }
+
+        // 走产品路径收紧。
+        super::restrict_to_current_user(&path).expect("restrict_to_current_user");
+        let (_, after) = read_dacl(&path).expect("读不出收紧后的 DACL");
+        eprintln!("  收紧前 {before:?} → 收紧后 {after:?}");
+        assert!(
+            !after.iter().any(|s| s == EVERYONE),
+            "产品收紧后 Everyone 仍在：{after:?}（收紧前 {before:?}）"
+        );
+        let me = sid_to_string(current_user_sid().as_ptr() as *mut core::ffi::c_void);
+        assert!(
+            after.iter().any(|s| *s == me),
+            "产品收紧后当前用户 {me} 不在 DACL 里：{after:?}"
+        );
     }
 }

@@ -17,15 +17,54 @@ SRC="${LIBXAOM_SRC:-$CACHE/libaom-src}"
 AOM_TARBALL="$CACHE/libaom.tar.gz"
 AOM_VER="v3.15.0"
 
-if [ ! -d "$SRC" ]; then
+# libaom 源码准备（MYS-2828）：下载/解压失败绝不留下"看起来可用"的半成品。
+#
+# 旧版直接 `curl -o $AOM_TARBALL` 再 `tar xzf`：curl 中途断掉会留下截断的
+# tar.gz，tar 失败后目录里已经躺着一半源码；下一次 `[ ! -d "$SRC" ]` 判为
+# "已存在"直接复用 → 半成品源码被当成有效依赖，编出来的 libaom 可能静默缺
+# 功能（甚至缺 AV1）。这里先下载到 .part、用 gzip -t 校验、解压到临时目录、
+# 结构校验通过后原子 rename；任一步失败都清理干净。
+libaom_src_ok() {
+  [ -f "$1/CMakeLists.txt" ] && [ -f "$1/aom/aom_codec.h" ] && [ -f "$1/aom/aomcx.h" ]
+}
+
+ensure_src() {
+  if libaom_src_ok "$SRC"; then return 0; fi
+  if [ -e "$SRC" ]; then
+    echo "已有 libaom 源码结构不完整，清理后重新解压：$SRC" >&2
+    rm -rf "$SRC"
+  fi
+  if [ -f "$AOM_TARBALL" ] && ! gzip -t "$AOM_TARBALL" 2>/dev/null; then
+    echo "已有 $AOM_TARBALL 校验失败（截断/损坏），重新下载" >&2
+    rm -f "$AOM_TARBALL"
+  fi
   if [ ! -f "$AOM_TARBALL" ]; then
     echo "downloading libaom $AOM_VER ..."
     # aom 官方在 googlesource（GitHub 无官方镜像）。
-    curl -sL -o "$AOM_TARBALL" "https://aomedia.googlesource.com/aom/+archive/$AOM_VER.tar.gz"
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$AOM_TARBALL.part" \
+        "https://aomedia.googlesource.com/aom/+archive/$AOM_VER.tar.gz"; then
+      rm -f "$AOM_TARBALL.part"
+      echo "ERROR: libaom 下载失败（无半成品缓存残留）" >&2; exit 1
+    fi
+    if ! gzip -t "$AOM_TARBALL.part" 2>/dev/null; then
+      rm -f "$AOM_TARBALL.part"
+      echo "ERROR: libaom 下载内容不是有效 gzip（无半成品缓存残留）" >&2; exit 1
+    fi
+    mv -f "$AOM_TARBALL.part" "$AOM_TARBALL"
   fi
-  mkdir -p "$SRC"
-  tar xzf "$AOM_TARBALL" -C "$SRC"
-fi
+  tmp="$SRC.tmp.$$"
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  if ! tar xzf "$AOM_TARBALL" -C "$tmp"; then
+    rm -rf "$tmp"; echo "ERROR: libaom 解压失败（已清理临时目录）" >&2; exit 1
+  fi
+  if ! libaom_src_ok "$tmp"; then
+    rm -rf "$tmp"; echo "ERROR: libaom 解压后结构异常（已清理）" >&2; exit 1
+  fi
+  : > "$tmp/.extracted-ok"
+  rm -rf "$SRC"; mv -f "$tmp" "$SRC"
+}
+
+ensure_src
 
 # target | cc | cxx | ar | cmake toolchain (none = native)
 # libaom 3.x cmake: 交叉编译走 -DCMAKE_SYSTEM_NAME / -DCMAKE_C_COMPILER 等。
@@ -92,9 +131,17 @@ for entry in "${PLATFORMS[@]}"; do
     mkdir -p "$out/lib" "$out/include"
     cp "$out/build/libaom.a" "$out/lib/libaom.a"
     cp -r "$SRC/aom" "$out/include/aom"
+    # 静态库必须真的含 AV1 编码器符号：否则 build.rs 会照常链接一个没有
+    # AV1 的 aom，发布产物就静默降级成只有 H.264（MYS-2828）。
+    if ! grep -q 'aom_codec_av1_cx' <<<"$(nm -g --defined-only "$out/lib/libaom.a" 2>/dev/null)"; then
+      echo "ERROR: $target 的 libaom.a 不含 aom_codec_av1_cx（CONFIG_AV1_ENCODER 未生效）" >&2
+      exit 1
+    fi
     echo "staged $out/lib/libaom.a: $(stat -c%s "$out/lib/libaom.a") bytes"
   else
-    echo "WARNING: no libaom.a produced for $target"
+    # 旧版只 WARNING 就继续，最后产出无 AV1 的制品。缺 AV1 静态库是硬错误。
+    echo "ERROR: $target 未产出 libaom.a —— 拒绝继续（会让该平台发布产物静默无 AV1）" >&2
+    exit 1
   fi
 done
 
