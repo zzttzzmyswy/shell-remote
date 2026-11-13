@@ -1683,6 +1683,10 @@ async fn run_desktop_pipeline(
     let mut br_guard = BitrateGuard::new(1_000_000);
 
     while running.load(Ordering::SeqCst) {
+        // 慢编码时 gap 已超过 min_gap，下面的节拍 sleep 不会执行；持续变化的
+        // 捕获源也不会走无帧 sleep。每拍显式让出执行权，避免同步软编码连续
+        // 占住 Tokio worker，让同线程的上行任务积压数秒后才一次性发帧。
+        tokio::task::yield_now().await;
         // 灰度（AV1 单色）原地重建（MYS-2837）：`desktop:gray` 只更新目标值
         // [`RunShared::mono_target`]，真正的编码器重建在这里做——放在取帧之前，
         // 静止桌面（capture 线程不出新帧）也能立刻生效，不必等下一帧内容。
@@ -4905,6 +4909,52 @@ mod tests {
         fn resolution(&self) -> (usize, usize) {
             (self.w, self.h)
         }
+    }
+
+    /// 每拍的同步工作超过帧间隔时，上行消费者仍必须逐帧获得执行机会。
+    /// 用 post 中的固定同步耗时模拟慢编码，避免依赖宿主 CPU 负载。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipeline_slow_frames_do_not_starve_uplink() {
+        struct ChangingSource(u8);
+        impl capture::FrameSource for ChangingSource {
+            fn next_frame(&mut self) -> Result<capture::Frame, String> {
+                self.0 = self.0.wrapping_add(31);
+                Ok(capture::Frame { width: 160, height: 90, bgra: vec![self.0; 160 * 90 * 4] })
+            }
+            fn resolution(&self) -> (usize, usize) { (160, 90) }
+        }
+        let cfg = DesktopConfig { fps: 60.0, codec: codec_for_test(), ..DesktopConfig::default() };
+        let running = Arc::new(AtomicBool::new(true));
+        let produced = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let stop = running.clone();
+        let count = produced.clone();
+        let post: PostFn = Arc::new(move |v| {
+            if v["type"] != "desktop:video" || v["payload"]["kind"] != "frag" { return; }
+            let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+            tx.send(n).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            if n >= 8 { stop.store(false, Ordering::SeqCst); }
+        });
+        let mut shared = test_shared(post, cfg.max_bps);
+        shared.fps_ctl.store(60, Ordering::SeqCst);
+        shared.codec_target = Arc::new(std::sync::RwLock::new(cfg.codec.clone()));
+        let observed = produced.clone();
+        let consumer = tokio::spawn(async move {
+            let mut backlog = 0;
+            while let Some(n) = rx.recv().await {
+                backlog = backlog.max(observed.load(Ordering::SeqCst) - n + 1);
+            }
+            backlog
+        });
+        let producer = tokio::spawn(run_desktop_pipeline(
+            cfg, running, shared,
+            Box::new(ChangingSource(0)), "test".into(),
+        ));
+        producer.await.unwrap();
+        assert_eq!(produced.load(Ordering::SeqCst), 8);
+        let backlog = consumer.await.unwrap();
+        assert!(backlog <= 2, "uplink stalled while {backlog} frames accumulated");
     }
 
     /// 始终失败的捕获源：模拟 XWayland 下 root GetImage 抛 BadMatch。
