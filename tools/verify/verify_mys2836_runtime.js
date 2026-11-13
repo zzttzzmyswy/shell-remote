@@ -60,6 +60,7 @@ const os = require('os');
 const path = require('path');
 
 const H = require('./mys2836_harness.js');
+const A = require('./mys2836_runtime_adapter.js');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -196,16 +197,23 @@ const PAGE_INIT = function (opts) {
 
   const S = {
     instances: [],
-    frames: 0,               // 全页累计解码/上屏帧数
+    frames: 0,               // WebCodecs 累计解码帧（真实解码输出）
+    framesSource: 'webcodecs',
     decodeErrors: [],
     playerErrors: [],
-    configs: [],             // 每次 configure / addSourceBuffer 的记录
+    configs: [],             // 每次 configure / addSourceBuffer 的记录（尾部保留）
+    configCount: 0,          // 累计条数：configs 会截断，判定必须用这个
     lan: [],                 // LAN 端点响应记录
     lanBytes: 0,
     wsBytes: 0,
     relayBytes: 0,
     rtcAvailable: typeof RTCPeerConnection !== 'undefined',
     transportSamples: [],
+    // MSE 真实呈现帧。presented 为 null = 该环境没有可用的真实帧指标，
+    // 判定层据此明确失败（绝不用 currentTime×FPS 推算补位）。
+    // 流生命周期**不放在页面里**（页面内包装 fetch 会与产品抢同一个
+    // ReadableStream），改由 Playwright 请求事件观测。
+    mse: { presented: null, source: 'none' },
   };
   window.__mys2842 = S;
 
@@ -224,7 +232,9 @@ const PAGE_INIT = function (opts) {
     };
     if (extra) Object.assign(rec, extra);
     S.configs.push(rec);
-    // 配置变了要在 transport 采样里留痕（relay↔lan 切换/重建时会变）
+    S.configCount += 1;
+    // 只保留尾部若干条供排障读取；判定（代次）走 configCount，不受截断影响。
+    if (S.configs.length > 64) S.configs.splice(0, S.configs.length - 64);
     return rec;
   };
 
@@ -278,6 +288,69 @@ const PAGE_INIT = function (opts) {
     Wrapped.isConfigSupported = NativeVD.isConfigSupported && NativeVD.isConfigSupported.bind(NativeVD);
     window.VideoDecoder = Wrapped;
   }
+
+  // ── MSE 观测：真实呈现帧 + 流生命周期 ───────────────────────────
+  // 帧数**只**取浏览器的真实指标：
+  //   - requestVideoFrameCallback（呈现帧回调，最接近"真的上屏了"）
+  //   - 否则 getVideoPlaybackQuality().totalVideoFrames（解码/呈现质量计数）
+  // 两者都不可用 → mse.presented 保持 null，判定层据此明确失败。
+  // 绝不退回 currentTime×FPS 之类的推算：播放时间前进但一帧都没呈现时，
+  // 推算值照样会涨，那就等于伪造证据。
+  (function instrumentMse() {
+    const install = function () {
+      const v = document.getElementById('desktop-video');
+      if (!v || v.__mys2842Observed) return;
+      v.__mys2842Observed = true;
+      let presented = 0;
+      // 同时采样浏览器自己的质量计数，用于**交叉校验** rVFC：
+      // 后台/不可见时 rVFC 会被节流甚至暂停，若两个指标不同步增长，
+      // 就说明"没涨"是 rVFC 被节流而不是真的没出帧——这时判失败会是误报。
+      // 两个指标都不可用才是真的"不可验证"。
+      S.mse.quality = null;
+      if (typeof v.getVideoPlaybackQuality === 'function') {
+        setInterval(function () {
+          try {
+            const q = v.getVideoPlaybackQuality();
+            if (q && typeof q.totalVideoFrames === 'number') S.mse.quality = q.totalVideoFrames;
+          } catch (e) { /* ignore */ }
+        }, 200);
+      }
+      if (typeof v.requestVideoFrameCallback === 'function') {
+        S.mse.source = 'requestVideoFrameCallback';
+        S.mse.presented = 0;
+        const onFrame = function () {
+          presented += 1;
+          S.mse.presented = presented;
+          try { v.requestVideoFrameCallback(onFrame); } catch (e) { /* 视图已销毁 */ }
+        };
+        try { v.requestVideoFrameCallback(onFrame); } catch (e) { /* 降级到质量计数 */ }
+      } else if (typeof v.getVideoPlaybackQuality === 'function') {
+        S.mse.source = 'getVideoPlaybackQuality';
+        S.mse.presented = 0;
+        setInterval(function () {
+          try {
+            const q = v.getVideoPlaybackQuality();
+            if (q && typeof q.totalVideoFrames === 'number') S.mse.presented = q.totalVideoFrames;
+          } catch (e) { /* ignore */ }
+        }, 200);
+      } else {
+        // 明确"不可验证"：不设 presented，让判定层失败而不是伪报通过。
+        S.mse.source = 'none';
+      }
+    };
+    // video 元素在 session.html 里已存在；仍在 DOMContentLoaded 后再兜一次，
+    // 防止脚本先于 DOM 解析完成。
+    install();
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', install, { once: true });
+    }
+  })();
+
+  // 流生命周期**不在这里**观测：页面内包装 fetch 会与产品自己的
+  // getReader() 抢同一个 body（ReadableStream 只能有一个 reader），
+  // 直接把流打死——实测导致 LAN 探测失败退回 p2p、MSE 永远没有首帧。
+  // 改为在 Playwright 层用 request/requestfinished 事件统计（见 runMode），
+  // 完全不碰响应体。
 
   // ── MSE 观测：记录真实 addSourceBuffer 的 mime ──────────────────
   if (typeof MediaSource !== 'undefined' && MediaSource.prototype.addSourceBuffer) {
@@ -405,44 +478,10 @@ const PAGE_INIT = function (opts) {
   });
 };
 
-// 画布平均饱和度（0 = 全灰）。WebCodecs 画在 canvas、MSE 画在 video。
-const PAGE_SATURATION = function () {
-  const c = document.getElementById('desktop-canvas');
-  const active = c && !c.classList.contains('hidden') && c.width && c.height;
-  const src = active ? c : document.getElementById('desktop-video');
-  if (!src) return null;
-  const w = src.videoWidth || src.width || 0;
-  const h = src.videoHeight || src.height || 0;
-  if (!w || !h) return null;
-  const t = document.createElement('canvas');
-  t.width = 64; t.height = 64;
-  const g = t.getContext('2d', { willReadFrequently: true });
-  if (!g) return null;
-  try { g.drawImage(src, 0, 0, 64, 64); } catch (e) { return null; } // video 无帧时抛错
-  const d = g.getImageData(0, 0, 64, 64).data;
-  let sum = 0;
-  for (let i = 0; i < d.length; i += 4) {
-    sum += Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2]);
-  }
-  return +(sum / (d.length / 4)).toFixed(2);
-};
-
-// MSE 用 video.currentTime 判断"真的有画面在推进"；WebCodecs 用帧计数。
-const PAGE_MSE_STATE = function () {
-  const v = document.getElementById('desktop-video');
-  if (!v) return null;
-  let bufEnd = 0;
-  try { if (v.buffered && v.buffered.length) bufEnd = v.buffered.end(v.buffered.length - 1); } catch (e) {}
-  return {
-    currentTime: v.currentTime,
-    readyState: v.readyState,
-    paused: v.paused,
-    bufferedEnd: bufEnd,
-    videoWidth: v.videoWidth,
-    videoHeight: v.videoHeight,
-    src: v.currentSrc || '',
-  };
-};
+// 画布饱和度采样、MSE 真实帧指标、session 适配器都在
+// `mys2836_runtime_adapter.js` 里——那是运行时真正跑的那份接线，同时被
+// `mys2836_harness.test.js` 用假 page 覆盖（第一次验收退回指出：只测纯逻辑
+// 抓不到接线缺失）。
 
 // ── 起一套独立的 relay/agent/Xvfb ────────────────────────────────
 async function startStack(deps, mode) {
@@ -552,170 +591,66 @@ async function openDesktop(page, base) {
 }
 
 /**
- * 把 Playwright 页面包装成 harness 需要的 session 接口。
- * 所有判定都在 harness 里，这里只提供真实观测值。
+ * 等首帧。WebCodecs 看真实解码帧计数；MSE 看真实呈现帧指标
+ * （requestVideoFrameCallback / totalVideoFrames，见适配层的 MSE 观测）。
+ * 返回 boolean。
  */
-function makeSession(page, ctxOpts) {
-  const mode = ctxOpts.mode;
-  const harnessLog = ctxOpts.log || (() => {});
-  let mseLastTime = null;
-  let mseFrameCounter = 0;      // MSE 用播放时间换算出来的"上屏帧数"
-  let lastVideoTime = 0;
-
-  const readState = () => page.evaluate(() => {
-    const S = window.__mys2842 || {};
-    const v = S.instances && S.instances.length ? S.instances[S.instances.length - 1] : null;
-    return {
-      frames: S.frames || 0,
-      decodeErrors: (S.decodeErrors || []).slice(),
-      playerErrors: (S.playerErrors || []).slice(),
-      configs: (S.configs || []).slice(),
-      lan: (S.lan || []).slice(),
-      lanBytes: S.lanBytes || 0,
-      wsBytes: S.wsBytes || 0,
-      rtcAvailable: !!S.rtcAvailable,
-      transportSamples: (S.transportSamples || []).slice(),
-      transport: v && v._transport ? String(v._transport) : 'unknown',
-      lanAddrs: v && Array.isArray(v._lanAddrs) ? v._lanAddrs.slice() : [],
-      instances: (S.instances || []).length,
-      viewMode: (() => {
-        const c = document.getElementById('desktop-canvas');
-        if (c && !c.classList.contains('hidden')) return 'webcodecs';
-        const el = document.getElementById('desktop-video');
-        if (el && !el.classList.contains('hidden')) return 'mse';
-        return 'unknown';
-      })(),
-    };
-  });
-
-  // MSE 下解码帧由 <video> 自己消费，页面里没有计数器：用 currentTime 的
-  // 推进折算帧数。这仍然是"真实上屏"的证据（不是拿同一张静止画面重复采样）。
-  const syncMseFrames = async () => {
-    if (mode !== 'mse') return;
-    const st = await page.evaluate(PAGE_MSE_STATE);
-    if (!st) return;
-    if (st.currentTime > lastVideoTime + 1e-4) {
-      // 以实际帧率折算：只要求"有推进"，不需要精确到帧。
-      mseFrameCounter += Math.max(1, Math.round((st.currentTime - lastVideoTime) * cfg.FPS));
-      lastVideoTime = st.currentTime;
-    }
-  };
-
-  return {
-    mode,
-    async open() {
-      const t0 = now();
-      await openDesktop(page, ctxOpts.base);
-      // 首帧：WebCodecs 看帧计数，MSE 看 readyState + videoWidth。
-      await page.waitForFunction((m) => {
+async function waitFirstFrame(page, mode) {
+  try {
+    await page.waitForFunction((m) => {
+      if (m === 'mse') {
         const S = window.__mys2842 || {};
-        if (m === 'mse') {
-          const v = document.getElementById('desktop-video');
-          return !!(v && v.readyState >= 2 && v.videoWidth > 0);
-        }
-        return (S.frames || 0) > 0;
-      }, mode, { timeout: 40000 }).catch(() => {});
-      const ok = await page.evaluate((m) => {
-        const S = window.__mys2842 || {};
-        if (m === 'mse') {
-          const v = document.getElementById('desktop-video');
-          return !!(v && v.readyState >= 2 && v.videoWidth > 0);
-        }
-        return (S.frames || 0) > 0;
-      }, mode);
-      if (!ok) return { firstFrameMs: null, error: '首帧未出（40s 内）' };
-      if (mode === 'mse') {
-        const st = await page.evaluate(PAGE_MSE_STATE);
-        if (st) lastVideoTime = st.currentTime;
-      }
-      // 等 transport 采样稳定（实例已被 hook 捕获）
-      await sleep(600);
-      return { firstFrameMs: now() - t0 };
-    },
-    async play() {
-      if (mode !== 'mse') return;
-      await page.evaluate(async () => {
+        const mm = S.mse || {};
+        if (typeof mm.presented === 'number') return mm.presented > 0;
         const v = document.getElementById('desktop-video');
-        if (v && v.paused) { try { await v.play(); } catch (e) { /* 自动播放策略 */ } }
-      });
-    },
-    async frames() {
-      await syncMseFrames();
-      const n = await page.evaluate(() => (window.__mys2842 || {}).frames || 0);
-      return mode === 'mse' ? Math.max(n, mseFrameCounter) : n;
-    },
-    async inits() {
-      const st = await readState();
-      return st.configs.length;
-    },
-    async decoder() {
-      const st = await readState();
-      const last = st.configs.length ? st.configs[st.configs.length - 1] : null;
-      if (!last) return { codec: null, config: '', at: 0, accepted: true, kind: mode === 'mse' ? 'mse' : 'webcodecs' };
-      return {
-        kind: last.kind,
-        codec: last.codec,
-        config: last.config,
-        at: last.at,
-        accepted: last.accepted !== false,
-      };
-    },
-    async saturation() {
-      return page.evaluate(PAGE_SATURATION);
-    },
-    async send(cmd) {
-      await page.evaluate((c) => {
-        const seq = (window.__cmdSeq = (window.__cmdSeq || 0) + 1);
-        const type = c.type;
-        const payload = { seq };
-        if (type === 'desktop:gray') payload.enabled = !!c.enabled;
-        if (type === 'desktop:codec') payload.codec = c.codec;
-        window.shellRemote.send(type, payload);
-      }, cmd);
-      harnessLog(`  → ${cmd.type}${cmd.enabled === undefined ? '' : ' enabled=' + cmd.enabled}${cmd.codec ? ' codec=' + cmd.codec : ''}`);
-    },
-    async snapshot() {
-      const st = await readState();
-      const dec = st.configs.length ? st.configs[st.configs.length - 1] : null;
-      // 隔离是否真的生效，取**页面当前实时状态**，不用脚本自己记的"我设置过"。
-      // 否则 setup.p2p-off / setup.webcodecs-off 会变成恒真断言。
-      const support = await page.evaluate(() => ({
-        h264: typeof MediaSource !== 'undefined'
-          && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
-        webcodecs: typeof VideoDecoder !== 'undefined',
-        rtc: typeof RTCPeerConnection !== 'undefined',
-      }));
-      // 实例 hook 没抓到时明确标出来（不能静默当成 relay 通过）
-      const transport = st.instances > 0
-        ? st.transport
-        : (st.transportSamples.length ? st.transportSamples[st.transportSamples.length - 1] : 'unknown');
-      return {
-        transport,
-        lanAddrs: st.lanAddrs,
-        lanResponses: st.lan,
-        lanBytes: st.lanBytes,
-        wsBytes: st.wsBytes,
-        relayBytes: st.wsBytes,
-        rtcAvailable: support.rtc,
-        webcodecs: support.webcodecs,
-        viewMode: st.viewMode,
-        h264Supported: support.h264,
-        decoderKind: dec ? dec.kind : 'none',
-        decoderCodec: dec ? dec.codec : 'none',
-        decoderConfig: dec ? dec.config : '',
-        transportSamples: st.transportSamples,
-        instances: st.instances,
-      };
-    },
-    async health() {
-      const st = await readState();
-      return {
-        decodeErrors: st.decodeErrors,
-        playerErrors: st.playerErrors,
-        streamRestarts: ctxOpts.streamRestarts ? ctxOpts.streamRestarts() : 0,
-      };
-    },
-  };
+        return !!(v && v.readyState >= 2 && v.videoWidth > 0);
+      }
+      const S = window.__mys2842 || {};
+      return (S.frames || 0) > 0;
+    }, mode, { timeout: 40000 });
+    return true;
+  } catch (e) {
+    // MSE 下若真实呈现帧指标不可用，退一步用 readyState 作为"有画面"的前置判据；
+    // 但后续的 frames() 仍返回 null（不可验证），绝不用时间推算补位。
+    if (mode === 'mse') {
+      try {
+        return await page.evaluate(() => {
+          const v = document.getElementById('desktop-video');
+          return !!(v && v.readyState >= 2 && v.videoWidth > 0);
+        });
+      } catch (e2) { return false; }
+    }
+    return false;
+  }
+}
+
+/** 确保 MSE 播放器在播（自动播放策略可能把它留在 paused）。 */
+async function playVideo(page) {
+  await page.evaluate(async () => {
+    const v = document.getElementById('desktop-video');
+    if (v && v.paused) { try { await v.play(); } catch (e) { /* 自动播放策略 */ } }
+  });
+}
+
+/** 发一条桌面控制命令（与产品 UI 走同一个 shellRemote.send）。 */
+async function sendCommand(page, cmd) {
+  await page.evaluate((c) => {
+    const seq = (window.__cmdSeq = (window.__cmdSeq || 0) + 1);
+    const payload = { seq };
+    if (c.type === 'desktop:gray') payload.enabled = !!c.enabled;
+    if (c.type === 'desktop:codec') payload.codec = c.codec;
+    window.shellRemote.send(c.type, payload);
+  }, cmd);
+}
+
+/** 页面侧的编解码能力探测（隔离是否真的生效取实时状态，不用脚本自记）。 */
+async function probeSupport(page) {
+  return page.evaluate(() => ({
+    h264: typeof MediaSource !== 'undefined'
+      && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
+    webcodecs: typeof VideoDecoder !== 'undefined',
+    rtc: typeof RTCPeerConnection !== 'undefined',
+  }));
 }
 
 // ── 单模式执行 ───────────────────────────────────────────────────
@@ -789,7 +724,47 @@ async function runMode(deps, chrome, mode) {
       });
     }
 
-    const session = makeSession(page, { mode, base: stack.base, log });
+    // 流生命周期观测（MSE 不断流断言的数据来源）。
+    // 用 Playwright 的请求事件在**页面之外**统计，绝不碰响应体：
+    // 页面内包装 fetch 再去 read() 会和产品自己的 getReader() 抢同一个
+    // ReadableStream，把流锁死（实测 LAN 退回 p2p、MSE 无首帧）。
+    const lifecycle = { started: 0, finished: 0, failed: 0, connectedAt: 0 };
+    const isDesktopStreamReq = (url) => {
+      try {
+        return /\/agent\/desktop\/(stream|ws)(\?|$)/.test(new URL(url, stack.base).pathname + (url.includes('?') ? '?' : ''));
+      } catch (e) { return /\/agent\/desktop\/(stream|ws)/.test(url); }
+    };
+    page.on('request', (req) => {
+      if (!isDesktopStreamReq(req.url())) return;
+      lifecycle.started += 1;
+      lifecycle.connectedAt = Date.now();
+    });
+    page.on('requestfinished', (req) => {
+      if (!isDesktopStreamReq(req.url())) return;
+      lifecycle.finished += 1;
+    });
+    page.on('requestfailed', (req) => {
+      if (!isDesktopStreamReq(req.url())) return;
+      lifecycle.failed += 1;
+      lifecycle.finished += 1; // 失败的请求同样"结束过"
+    });
+
+    const session = A.makeSession(page, {
+      mode,
+      base: stack.base,
+      log,
+      sleep,
+      openDesktop,
+      waitFirstFrame,
+      playVideo,
+      sendCommand,
+      probeSupport,
+      // 适配层据此计算 MSE 重连次数（见 computeStreamRestarts 的配对语义）
+      streamLifecycle: () => ({
+        started: lifecycle.started,
+        completed: lifecycle.finished,
+      }),
+    });
     const plan = await H.runModePlan(session, {
       deadlineMs: cfg.DEADLINE_MS,
       growthWindowMs: cfg.GROWTH_MS,
