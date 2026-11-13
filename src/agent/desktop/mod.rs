@@ -538,10 +538,31 @@ impl DesktopManager {
         self.backpressure.fetch_add(1, O::Relaxed);
     }
 
+    /// relay 回传 `desktop:congested`：**丢帧即断链**，必须立刻补一颗关键帧。
+    ///
+    /// relay 的 fan-out 在 viewer 缓冲满时丢帧并把该 viewer 置回"等关键帧"
+    /// （`DesktopStream::push_frag` 的 `key_ok=false`）。在下一颗关键帧到达之前
+    /// 这个 viewer 一条 delta 都收不到——只等周期 IDR（静止 [`KF_QUIET_MS`]
+    /// 4s / 活跃 [`KF_ACTIVE_MS`] 6s）就是用户看到的"画面卡住几秒"。
+    ///
+    /// 因此计数与 `request_idr()` 绑在一起：调用方只需调这一个方法，
+    /// 不存在"记了拥塞却忘了补关键帧"的漏网路径。限频由 relay 侧
+    /// （≤1 次 / 5s）保证，不会形成 reqkey 风暴。
+    pub fn on_relay_congested(&self) {
+        self.bump_backpressure();
+        self.request_idr();
+    }
+
     /// 累计 relay 段拥塞次数（面板"relay 拥塞"计数）。
     pub fn backpressure_count(&self) -> u32 {
         use std::sync::atomic::Ordering as O;
         self.backpressure.load(O::Relaxed)
+    }
+
+    /// 是否已挂起"下一拍强制 IDR"（测试与诊断用）。
+    pub fn idr_pending(&self) -> bool {
+        use std::sync::atomic::Ordering as O;
+        self.idr_request.load(O::Relaxed)
     }
 
     /// 请求下一个编码帧立即出关键帧（浏览器接入/解码错误/参考链断裂时调用，
@@ -3092,6 +3113,44 @@ mod tests {
         dm.bump_backpressure();
         dm.bump_backpressure();
         assert_eq!(dm.backpressure_count(), 2);
+    }
+
+    /// **MYS-2837 回归**：relay 回传 congested 必须同时请求关键帧。
+    ///
+    /// relay 的 fan-out 丢帧后会把该 viewer 置回"等关键帧"（`key_ok=false`），
+    /// 在下一颗关键帧到达前它**一帧都收不到**。旧实现只累计拥塞计数、不置
+    /// IDR 请求，viewer 要干等到周期 IDR（静止 4s / 活跃 6s）才恢复——实测
+    /// `noop.gray.frames` 与 `codec.av1-gray-off.*` 就卡在这个窗口里。
+    /// 修复后拥塞通知自带"立刻补关键帧"，两条语义不可拆开。
+    #[test]
+    fn test_relay_congested_requests_idr() {
+        let dm = DesktopManager::new(DesktopConfig::default());
+        assert!(!dm.idr_pending(), "初始不应有待处理的 IDR 请求");
+
+        dm.on_relay_congested();
+
+        assert_eq!(dm.backpressure_count(), 1, "拥塞计数仍要累计（面板/归因用）");
+        assert!(
+            dm.idr_pending(),
+            "relay 丢帧后必须立刻请求关键帧，否则 viewer 要等最多 6s 才恢复"
+        );
+    }
+
+    /// 编码循环消费掉 IDR 请求后，再来一次拥塞仍能重新置位
+    /// （不是一次性的：每次丢帧都要补关键帧，否则第二次拥塞又会卡住）。
+    #[test]
+    fn test_relay_congested_requests_idr_each_time() {
+        use std::sync::atomic::Ordering as O;
+        let dm = DesktopManager::new(DesktopConfig::default());
+
+        dm.on_relay_congested();
+        // 模拟编码循环取走请求（`force_idr` 后清 flag）。
+        dm.idr_request.store(false, O::Relaxed);
+        assert!(!dm.idr_pending());
+
+        dm.on_relay_congested();
+        assert!(dm.idr_pending(), "第二次拥塞必须重新请求关键帧");
+        assert_eq!(dm.backpressure_count(), 2, "计数两次都要记");
     }
 
     #[test]

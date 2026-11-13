@@ -3219,7 +3219,7 @@ async fn run_session(
                                         .get("dropped")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0);
-                                    desktop.bump_backpressure();
+                                    desktop.on_relay_congested();
                                     tracing::warn!(
                                         session = %client.session_id,
                                         dropped,
