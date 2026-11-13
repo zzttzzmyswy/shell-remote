@@ -50,6 +50,10 @@ const cfg = {
   ROUNDS: Number(process.env.ROUNDS || 5),
   DEADLINE_MS: Number(process.env.DEADLINE_MS || 15000),
   FPS: Number(process.env.FPS || 30),
+  // LAN 直连：默认开启（任务卡要求验证可用直连路径）。注意 agent 侧
+  // `--desktop-lan-port 0` 表示**不开启**（不是 OS 分配），所以这里必须给一个
+  // 真实端口；设成负数表示"只测 relay"。
+  LAN_PORT: process.env.LAN_PORT === undefined ? 0 : Number(process.env.LAN_PORT),
   DISPLAY: process.env.DISPLAY || '',
   CHROME: process.env.CHROME || '',
   KEEP: process.env.KEEP === '1',
@@ -170,6 +174,8 @@ function displayUsable(display) {
 
 async function startStack(deps) {
   const port = cfg.PORT || (await freePort());
+  // LAN 端口：显式给 0 时由这里挑一个空闲端口（agent 的 0 = 关闭）。
+  if (cfg.LAN_PORT === 0) cfg.LAN_PORT = await freePort();
   const base = process.env.BASE || `http://127.0.0.1:${port}`;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mys2836-'));
 
@@ -221,7 +227,13 @@ async function startStack(deps) {
   }
 
   const relayLog = path.join(dir, 'relay.log');
-  track('relay', spawn(deps.relay, ['relay', '--no-tls', '--bind', `127.0.0.1:${port}`, '--auth', cfg.TOKEN], {
+  // 独立 settings 文件（任务卡要求）：绝不读写用户真实的
+  // ~/.shell-remote/relay-settings.json——否则本脚本会覆盖运维的带宽配置。
+  const settingsFile = path.join(dir, 'relay-settings.json');
+  track('relay', spawn(deps.relay, [
+    'relay', '--no-tls', '--bind', `127.0.0.1:${port}`, '--auth', cfg.TOKEN,
+    '--settings-file', settingsFile,
+  ], {
     // 排障需要时用 RELAY_LOG/AGENT_LOG 打开 debug（默认 info）。
     env: Object.assign({}, process.env, { RUST_LOG: process.env.RELAY_LOG || 'info' }),
     stdio: ['ignore', fs.openSync(relayLog, 'w'), fs.openSync(relayLog, 'a')],
@@ -232,6 +244,10 @@ async function startStack(deps) {
   track('agent', spawn(deps.ui, [
     'agent', '--relay-url', base, '--key', cfg.TOKEN, '--session-id', 'mys2837',
     '--view', 'headless', '--desktop-capture', 'x11', '--desktop-codec', 'av1', '--desktop-fps', String(cfg.FPS),
+    // LAN 直连监听端口（agent 通过 desktop:capabilities 的 lan_addrs 上报
+    // 实际地址，浏览器自己探测）。0 在 agent 侧等于关闭，所以这里用负数表示
+    // "不测直连"，其余情况给一个真实端口。
+    ...(cfg.LAN_PORT >= 0 ? ['--desktop-lan-port', String(cfg.LAN_PORT)] : []),
   ], {
     env: Object.assign({}, process.env, { DISPLAY: display, RUST_LOG: process.env.AGENT_LOG || 'info' }),
     stdio: ['ignore', fs.openSync(agentLog, 'w'), fs.openSync(agentLog, 'a')],
@@ -259,7 +275,12 @@ const PAGE_INIT = function (cfg) {
           try { init.output(frame); } catch (e) { try { frame.close(); } catch (e2) {} }
         },
         error: function (e) {
-          window.__decodeErrors.push(String(e && e.message).slice(0, 160));
+          // 带上当时的解码器配置串与已解帧数——"Decoding error." 单独一条
+          // 无法区分"参数集不匹配"和"码流本身坏了"，排障必须看到上下文。
+          window.__decodeErrors.push(
+            String(e && e.message).slice(0, 120) +
+            ' | cfg=' + (init && init.codec ? init.codec : '?') +
+            ' | framesBefore=' + window.__frames.length);
           try { init.error(e); } catch (e2) {}
         },
       });
@@ -271,8 +292,30 @@ const PAGE_INIT = function (cfg) {
     Wrapped.isConfigSupported = NativeVD.isConfigSupported && NativeVD.isConfigSupported.bind(NativeVD);
     window.VideoDecoder = Wrapped;
   }
-  // 钉住 relay 路径：灰度与 LAN/P2P 无关，避免把传输方式差异混进来。
-  try { Object.defineProperty(window, 'RTCPeerConnection', { value: undefined, configurable: true }); } catch (e) {}
+  // 捕获 DesktopView 实例：LAN 断言要读 _transport / _lanAddrs。只包构造器，
+  // 不改任何产品逻辑。
+  try {
+    const desc = Object.getOwnPropertyDescriptor(window, 'DesktopView');
+    if (desc && desc.configurable !== false) {
+      let ctor;
+      Object.defineProperty(window, 'DesktopView', {
+        configurable: true,
+        get() { return ctor; },
+        set(C) {
+          const Wrapped = function () {
+            const inst = new C();
+            window.__dv = inst;
+            return inst;
+          };
+          Wrapped.prototype = C.prototype;
+          Object.setPrototypeOf(Wrapped, C);
+          ctor = Wrapped;
+        },
+      });
+    }
+  } catch (e) { /* 拿不到实例时 LAN 断言会显式失败，不静默通过 */ }
+  // 不屏蔽 RTCPeerConnection：_startLan 在 P2P 之前探测，屏蔽 P2P 反而
+  // 改变了回退顺序。灰度与传输方式无关，保持浏览器默认即可。
 };
 
 // 画布平均饱和度（0 = 全灰）。用 64x64 降采样，抗单像素噪声。
@@ -322,6 +365,23 @@ async function waitNewFrame(page, before, deadlineMs) {
   return null;
 }
 
+// 等到画布饱和度满足条件（目标模式真的上屏），而不是"固定 sleep 后采样
+// 一次"。任务卡明确要求"每次目标状态的新帧 15 秒内恢复且持续增长、codec
+// 组合不使用旧队列帧冒充目标模式"——固定 1.2s 后取一次样，采到的很可能
+// 还是切换前的旧画面（AV1 1080p 单帧编码可达 100ms+，队列里还压着旧帧）。
+//
+// 返回 {ok, ms, sat}：在 deadline 内出现过满足条件的画面即 ok。
+async function waitSaturation(page, want, deadlineMs) {
+  const t0 = Date.now();
+  let last = null;
+  while (Date.now() - t0 < deadlineMs) {
+    last = await page.evaluate(PAGE_SATURATION);
+    if (last !== null && want(last)) return { ok: true, ms: Date.now() - t0, sat: last };
+    await sleep(200);
+  }
+  return { ok: false, ms: Date.now() - t0, sat: last };
+}
+
 async function sendGray(page, enabled, seq) {
   await page.evaluate((a) => {
     window.shellRemote.send('desktop:gray', { enabled: a.enabled, seq: a.seq });
@@ -364,6 +424,15 @@ async function main() {
     const ctx = await browser.newContext();
     await ctx.addInitScript(PAGE_INIT, { token: cfg.TOKEN });
     const page = await ctx.newPage();
+    // 记录打到 agent LAN 直连端口的请求（浏览器直连 http://<lan-ip>:<port>）。
+    // 这是"直连路径真的被用上"的客观证据，不依赖页面私有字段。
+    page.__lanHits = [];
+    page.on('request', (r) => {
+      const u = r.url();
+      if (/:\d+\/agent\/desktop\/stream/.test(u) && !u.includes(new URL(stack.base).host)) {
+        page.__lanHits.push(u);
+      }
+    });
     page.on('pageerror', (e) => console.log('  [pageerror]', String(e.message).slice(0, 160)));
 
     await openSession(page, stack.base);
@@ -396,10 +465,12 @@ async function main() {
       check(`1.${round}a 第${round}轮 切灰度后出新解码帧`, onMs !== null,
         onMs === null ? '（超时：卡在拉流）' : `${onMs}ms`);
       if (onMs === null) continue; // 流已卡死，后续断言在这轮没有意义
-      await sleep(1200);           // 让画面稳定到单色
-      const satGray = await page.evaluate(PAGE_SATURATION);
-      check(`1.${round}b 第${round}轮 灰度态画面无色度`, satGray !== null && satGray < GRAY_MAX,
-        `saturation=${satGray}（阈值 ${GRAY_MAX.toFixed(2)}）`);
+      // 灰度必须**真的**上屏：等到画布无色度（而不是固定 sleep 后采一次样，
+      // 那样采到的可能还是切换前的旧画面）。
+      const grayVis = await waitSaturation(page, (v) => v < GRAY_MAX, cfg.DEADLINE_MS);
+      check(`1.${round}b 第${round}轮 灰度态画面无色度（目标模式真的上屏）`, grayVis.ok,
+        grayVis.ok ? `${grayVis.ms}ms 后 saturation=${grayVis.sat}`
+          : `超时 saturation=${grayVis.sat}（阈值 ${GRAY_MAX.toFixed(2)}）`);
 
       // → 彩色
       before = await page.evaluate(() => window.__frames.length);
@@ -409,10 +480,10 @@ async function main() {
       check(`1.${round}c 第${round}轮 切回彩色后出新解码帧`, offMs !== null,
         offMs === null ? '（超时：卡在拉流）' : `${offMs}ms`);
       if (offMs === null) continue;
-      await sleep(1200);
-      const satColor = await page.evaluate(PAGE_SATURATION);
-      check(`1.${round}d 第${round}轮 彩色态画面恢复色度`, satColor !== null && satColor > 2,
-        `saturation=${satColor}`);
+      const colorVis = await waitSaturation(page, (v) => v > colorSat * 0.5, cfg.DEADLINE_MS);
+      check(`1.${round}d 第${round}轮 彩色态画面恢复色度（目标模式真的上屏）`, colorVis.ok,
+        colorVis.ok ? `${colorVis.ms}ms 后 saturation=${colorVis.sat}`
+          : `超时 saturation=${colorVis.sat}`);
     }
     if (Number.isFinite(worstMs)) {
       console.log(`    最慢一次切换恢复：${worstMs}ms（阈值 ${cfg.DEADLINE_MS}ms）`);
@@ -444,10 +515,10 @@ async function main() {
       const h264GrayMs = await waitNewFrame(page, before, cfg.DEADLINE_MS);
       check('3.2 H264 + 灰度 仍出新解码帧', h264GrayMs !== null, h264GrayMs === null ? '超时' : `${h264GrayMs}ms`);
       if (h264GrayMs !== null) {
-        await sleep(1200);
-        const s = await page.evaluate(PAGE_SATURATION);
-        check('3.3 H264 + 灰度 画面无色度', s !== null && s < GRAY_MAX,
-          `saturation=${s}（阈值 ${GRAY_MAX.toFixed(2)}；H264 走 UV=128 有损编码，残差色度非 0）`);
+        const vis = await waitSaturation(page, (v) => v < GRAY_MAX, cfg.DEADLINE_MS);
+        check('3.3 H264 + 灰度 画面无色度（目标模式真的上屏）', vis.ok,
+          vis.ok ? `${vis.ms}ms 后 saturation=${vis.sat}`
+            : `超时 saturation=${vis.sat}（阈值 ${GRAY_MAX.toFixed(2)}；H264 走 UV=128 有损编码）`);
       }
 
       // 灰度仍开着时切回 AV1 —— 这是旧实现失步的经典路径。
@@ -457,10 +528,9 @@ async function main() {
       check('3.4 灰度开着切回 AV1 后出新解码帧', backMs !== null, backMs === null ? '超时' : `${backMs}ms`);
 
       if (backMs !== null) {
-        await sleep(1200);
-        const s = await page.evaluate(PAGE_SATURATION);
-        check('3.5 灰度仍开 → AV1 单色（状态未丢）', s !== null && s < GRAY_MAX,
-          `saturation=${s}（阈值 ${GRAY_MAX.toFixed(2)}）`);
+        const vis = await waitSaturation(page, (v) => v < GRAY_MAX, cfg.DEADLINE_MS);
+        check('3.5 灰度仍开 → AV1 单色（状态未丢）', vis.ok,
+          vis.ok ? `${vis.ms}ms 后 saturation=${vis.sat}` : `超时 saturation=${vis.sat}`);
 
         // 关灰度：必须回到彩色且继续出帧（不残留单色状态）。
         before = await page.evaluate(() => window.__frames.length);
@@ -468,9 +538,9 @@ async function main() {
         const finalMs = await waitNewFrame(page, before, cfg.DEADLINE_MS);
         check('3.6 关灰度后出新解码帧', finalMs !== null, finalMs === null ? '超时' : `${finalMs}ms`);
         if (finalMs !== null) {
-          await sleep(1200);
-          const s2 = await page.evaluate(PAGE_SATURATION);
-          check('3.7 关灰度后画面恢复彩色（无残留单色）', s2 !== null && s2 > 2, `saturation=${s2}`);
+          const vis = await waitSaturation(page, (v) => v > colorSat * 0.5, cfg.DEADLINE_MS);
+          check('3.7 关灰度后画面恢复彩色（无残留单色）', vis.ok,
+            vis.ok ? `${vis.ms}ms 后 saturation=${vis.sat}` : `超时 saturation=${vis.sat}`);
         }
       }
     }
@@ -478,8 +548,45 @@ async function main() {
     const errs = await page.evaluate(() => window.__decodeErrors);
     check('4. 全程无解码器报错', errs.length === 0, errs.length ? errs.slice(0, 3).join(' | ') : '');
 
-    // ── 直连（LAN）路径：未开启 --desktop-lan-port 时明确记录未覆盖 ──
-    skip('LAN 直连路径的灰度切换', 'agent 未以 --desktop-lan-port 启动（relay 路径已完整验证）');
+    // ── 直连（LAN）路径（任务卡要求：可用直连路径必须验证）──────────
+    // 换一个连接周期重新进桌面：清掉钉住 relay 的标记，让 _startLan 真的去
+    // 探测 agent 上报的直连地址。断言 transport 变成 'lan'，再跑一轮灰度
+    // 切换，证明直连路径上灰度同样能恢复。
+    console.log('\n[4] LAN 直连路径');
+    if (cfg.LAN_PORT < 0) {
+      skip('LAN 直连路径的灰度切换', 'LAN_PORT<0：调用方显式关闭（默认开启）');
+    } else {
+      const beforeLan = await page.evaluate(() => window.__frames.length);
+      await page.evaluate(() => {
+        // 清 P2P 拒绝标记 + 强制下一轮 connect 重新探测 LAN。
+        if (window.__dv) { window.__dv._p2pRejected = false; window.__dv._p2pRejectedAt = 0; }
+      });
+      await sendGray(page, false, ++seq);
+      await sleep(500);
+      const lanAddrs = await page.evaluate(() => window._srLanAddrs || null);
+      const lanHits = page.__lanHits || [];
+      const transport = lanHits.length > 0 ? 'lan' : null;
+      check('4.1 agent 上报了 LAN 直连地址', Array.isArray(lanAddrs) && lanAddrs.length > 0,
+        JSON.stringify(lanAddrs));
+      check('4.2 浏览器实际走 LAN 直连（transport=lan）', transport === 'lan',
+        `transport=${transport}`);
+      if (transport === 'lan') {
+        const lanMs = await waitNewFrame(page, beforeLan, cfg.DEADLINE_MS);
+        check('4.3 LAN 直连路径出新解码帧', lanMs !== null, lanMs === null ? '超时' : `${lanMs}ms`);
+        // 直连路径上再做一次灰度往返，证明该路径也能切换。
+        const b2 = await page.evaluate(() => window.__frames.length);
+        await sendGray(page, true, ++seq);
+        const g2 = await waitNewFrame(page, b2, cfg.DEADLINE_MS);
+        check('4.4 LAN 直连路径切灰度后出新解码帧', g2 !== null, g2 === null ? '超时' : `${g2}ms`);
+        if (g2 !== null) {
+          const vis = await waitSaturation(page, (v) => v < GRAY_MAX, cfg.DEADLINE_MS);
+          check('4.5 LAN 直连路径灰度画面无色度', vis.ok,
+            vis.ok ? `${vis.ms}ms 后 saturation=${vis.sat}` : `超时 saturation=${vis.sat}`);
+        }
+        await sendGray(page, false, ++seq);
+        await sleep(500);
+      }
+    }
   } catch (e) {
     console.error('FAIL 验证中断：', e.message);
     if (fails === 0) fails += 1;

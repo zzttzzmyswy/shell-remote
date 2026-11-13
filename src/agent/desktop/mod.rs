@@ -1667,14 +1667,25 @@ async fn run_desktop_pipeline(
                 Ok((new_enc, actual)) => {
                     enc = new_enc;
                     cfg.monochrome = want_mono;
+                    cfg.codec = actual.clone();
+                    // MYS-2837（返修）：回退成功后必须把**目标**收敛到实际
+                    // 生效的 codec。判据是 `want_codec != cfg.codec`；若只改
+                    // cfg.codec 而把目标留在 `want_codec`，下一帧又判定"目标
+                    // 与现状不符"→ 每帧重建编码器、每帧把 seq 归 1、每帧重发
+                    // init（relay 侧 viewer 被反复重置，流等于不可用）。
+                    // 语义上也该收敛：用户要的 codec 不可用时已经降级成功，
+                    // 每帧重试既救不回来、也在空转；用户再次显式切换会重写
+                    // 目标（`set_codec`），届时再试。
                     if actual != want_codec {
                         tracing::warn!(
                             requested = %want_codec,
                             actual = %actual,
-                            "desktop codec fell back during runtime rebuild"
+                            "desktop codec fell back during runtime rebuild — target converged to actual"
                         );
+                        if let Ok(mut c) = codec_target.write() {
+                            *c = actual;
+                        }
                     }
-                    cfg.codec = actual;
                     // 参数集变了：下个关键帧必须重新携带并广播 init 给所有
                     // viewer（与"分辨率变更重配"同一条路径）。
                     mp4_cfg = None;
@@ -4232,6 +4243,76 @@ mod tests {
                 inits_after_repeat, inits_after_first,
                 "重复设置相同 gray 必须是 no-op（不得重建编码器/重发 init），\
                  before={inits_after_first} after={inits_after_repeat}"
+            );
+        });
+    }
+
+    /// MYS-2837 返修回归：**目标 codec 不可用、回退成功** 之后目标必须收敛
+    /// 到实际生效的 codec，不能每帧重建编码器/重置 seq/重发 init。
+    ///
+    /// 缺陷点（修复前 `mod.rs:1657-1696` 的成功分支）：只写 `cfg.codec`，
+    /// 目标 `codec_target` 仍停在用户请求的不可用值。判据是
+    /// `want_codec != cfg.codec`，于是**每一帧**都重新 `create_encoder_fallback`
+    /// → 每帧 `mp4_cfg=None` / `seq=1` / `force_idr`，relay 侧 viewer 被反复
+    /// 重置，桌面流等于不可用。
+    ///
+    /// 复现方式：先把目标 codec 设成一个 `DesktopConfig::supports_codec`
+    /// 认可、但编码器工厂不认识的别名（`h264` 的大小写/空白变体走同一条
+    /// 归一化路径，这里直接用未知串以命中 fallback 链），回退链会落到 h264
+    /// 成功；断言后续帧不再产生新的 init。
+    #[test]
+    fn test_codec_fallback_converges_target_and_stops_rebuilding() {
+        let cfg = DesktopConfig {
+            fps: 15.0,
+            codec: "av1".to_string(),
+            capture: "x11".to_string(),
+            ..DesktopConfig::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let posted: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let p2 = posted.clone();
+        let post: PostFn = Arc::new(move |v| p2.lock().unwrap().push(v));
+        let r2 = running.clone();
+        let shared = test_shared(post, cfg.max_bps);
+        let codec_target = shared.codec_target.clone();
+        let src: Box<dyn capture::FrameSource> = Box::new(ModerateSource { w: 320, h: 180, t: 0 });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = tokio::spawn(run_desktop_pipeline(
+                cfg, r2, shared, src, "test".to_string(),
+            ));
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let inits_before = count_inits(&posted);
+
+            // 目标设成一个编码器工厂不认识、但 fallback 链能降到 h264 的值。
+            // `create_encoder_fallback` 对未知 codec 的链是 [other, "h264"]，
+            // 所以 other 失败后会成功建出 h264 —— 正是"成功回退"分支。
+            *codec_target.write().unwrap() = "av1-mono-unsupported".to_string();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+
+            // 回退成功：目标应已收敛到 h264。
+            let converged = codec_target.read().unwrap().clone();
+            let inits_after_fallback = count_inits(&posted);
+
+            // 再等一段时间：若每帧重建，init 会继续增长。
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let inits_settled = count_inits(&posted);
+
+            running.store(false, Ordering::SeqCst);
+            let _ = handle.await;
+
+            assert_eq!(
+                converged, "h264",
+                "回退成功后目标必须收敛到实际 codec，否则每帧重建"
+            );
+            assert!(
+                inits_after_fallback > inits_before,
+                "回退重建必须重发一次 init：{inits_before} → {inits_after_fallback}"
+            );
+            assert_eq!(
+                inits_settled, inits_after_fallback,
+                "目标收敛后不得再产生新的 init（每帧重建会让它持续增长）：\
+                 after_fallback={inits_after_fallback} settled={inits_settled}"
             );
         });
     }

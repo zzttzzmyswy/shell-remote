@@ -76,8 +76,10 @@
       this._lastSeq = 0;        // 最近收到的帧号（seqn box）
       // 参数集代际跟踪（MYS-2837）：agent 重建编码器后 seq 归 1 并重发 init；
       // 若新 init 被上行积压丢掉，靠它触发 reinit 重取参数集。
-      this._awaitingInit = false;
-      this._awaitingInitAt = 0;
+      // 换代跟踪：`_lastInitAt` = 最近一次 init 到达的本地时刻；`_genStaleAt`
+      // = 检测到"换代但没收到 init"的时刻（0 = 无此情况）。
+      this._lastInitAt = 0;
+      this._genStaleAt = 0;
       this._seqDrop = 0;        // 真实上行丢帧数（seq gap 累计）
       this._arrivals = [];      // 帧到达间隔窗口（jitter 计算）
       this._lastArrival = 0;
@@ -1019,8 +1021,9 @@
     }
 
     _handleMoov(body) {
-      // 新一代参数集到了：清掉"等 init"标记（MYS-2837）。
-      this._awaitingInit = false;
+      // 新一代参数集到了（MYS-2837）：记下时刻，并清掉"换代没 init"的判定。
+      this._lastInitAt = Date.now();
+      this._genStaleAt = 0;
       // 找 codec 配置 box：先扫 avcC（H.264），再扫 av1C（AV1）。
       //   avcC payload: [i+4]=1(version) [i+5..i+7]=profile/compat/level
       //   av1C payload: [i+4]=0x81(marker+version) [i+5]=profile(3)|level(5)
@@ -1212,21 +1215,29 @@
       if (!sawTrun || sampleSize === 0) return;
       // 真实上行丢帧统计：TCP 有序，seq gap 只能来自上游丢弃（上传队列丢旧/
       // relay 丢旧）。对齐 rustdesk 控制端丢帧口径。
-      // 参数集过期判定（MYS-2837）：agent 每次重建编码器（切灰度/切 codec/
-      // 换分辨率）都把 Moof seq 归 1 并重发 init。因此"seq 回退到比已见值
-      // 还小的数"= 码流换了一代参数集。若这一代的新 init 没到达（agent 上行
-      // 积压会把 init 和媒体帧一起丢旧保新），手上的参数集就是上一代的：
-      // 单色/彩色或 av1/h264 对不上，解码器报错或一帧都解不出。
-      // 必须在下面对 `_lastSeq` 取 max 之前比较——取 max 之后永远看不到回退。
-      if (frameSeq > 0 && this._lastSeq > 0 && frameSeq < this._lastSeq) {
-        if (!this._awaitingInit) this._awaitingInitAt = Date.now();
-        this._awaitingInit = true;
-      }
+      // 参数集代际（MYS-2837）：agent 每次重建编码器（切灰度/切 codec/换
+      // 分辨率）都把 Moof seq 归 1 并重发 init。所以"seq 比上一帧小"表示
+      // 码流换代了，此时**上一代的 _lastSeq 立刻作废**。
+      //
+      // 这里必须无条件接受回退后的 `_lastSeq = frameSeq`：只要这一代的 init
+      // 已经收到，一个更小的 seq 就是合法的"新代第 N 帧"，不是缺 init。
+      // 旧实现保留 `max(old, new)` 并把回退判成缺 init，导致每次灰度/编码
+      // 切换后都误发一次多余的 reinit。
+      //
+      // 换代是否缺 init 用时间判定：agent 重建时总是先发 init 再发关键帧，
+      // 所以回退前 2s 内见过 init 就说明这一代的参数集已到手；超过 2s 说明
+      // init 在上行积压里被丢了（relay 让 viewer 干等），此时记下
+      // `_genStaleAt` 交给看门狗限频重取。
       if (frameSeq > 0) {
-        if (this._lastSeq > 0 && frameSeq > this._lastSeq + 1) {
+        if (this._lastSeq > 0 && frameSeq < this._lastSeq) {
+          // 换代：重置帧号基线。跨代 seq 本来就不可比，回退不计成丢帧。
+          const initFresh = this._lastInitAt > 0 &&
+            (Date.now() - this._lastInitAt) < 2000;
+          if (!initFresh && !this._genStaleAt) this._genStaleAt = Date.now();
+        } else if (this._lastSeq > 0 && frameSeq > this._lastSeq + 1) {
           this._seqDrop += frameSeq - this._lastSeq - 1;
         }
-        this._lastSeq = Math.max(this._lastSeq, frameSeq);
+        this._lastSeq = frameSeq;
       }
       this._pending = { ptsUs: ptsUs, isKey: isKey, captureMs: captureMs, size: sampleSize };
     }
@@ -1488,8 +1499,10 @@
       this._reqKeyWindowStart = 0;
       this._lastSeq = 0;
       this._seqDrop = 0;
-      this._awaitingInit = false;
-      this._awaitingInitAt = 0;
+      // 换代跟踪：`_lastInitAt` = 最近一次 init 到达的本地时刻；`_genStaleAt`
+      // = 检测到"换代但没收到 init"的时刻（0 = 无此情况）。
+      this._lastInitAt = 0;
+      this._genStaleAt = 0;
       this._lastInitReq = 0;
       this._arrivals = [];
       this._lastArrival = 0;
@@ -1689,9 +1702,10 @@
               (nowMs - self._lastDataAt) < 3000;
             const decodedButStalled = self._codecKind && self._lastNewFrameAt > 0 &&
               (nowMs - (self._lastNewFrameAt) > 3000);
-            // 最常见的一种：agent 换了参数集（seq 归 1）但新 init 没到。
-            const staleParamSets = self._awaitingInit === true &&
-              (nowMs - (self._awaitingInitAt || 0)) > 800;
+            // agent 换了参数集（seq 回退）但这一代的 init 没到：relay 那侧
+            // viewer 会一直等参数集，这里限频要一次 reinit 把 init 带回来。
+            const staleParamSets = self._genStaleAt > 0 &&
+              (nowMs - self._genStaleAt) > 800;
             if ((noInitButData || decodedButStalled || staleParamSets) &&
               (nowMs - (self._lastInitReq || 0)) > 4000) {
               self._lastInitReq = nowMs;

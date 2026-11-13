@@ -1417,6 +1417,176 @@ where
     }
 }
 
+// ── 桌面视频上行批处理（MYS-2837）──────────────────────────────────
+//
+// 桌面编码循环把 `desktop:video` 塞进一条 **unbounded** 队列，由独立发送
+// 任务成批取出发往 relay。队列无界，编码快于上行时会无限积压（MYS-886
+// 实测稳态积压 ~4s），所以发送任务必须主动"丢旧保新"把端到端延时压回有界。
+//
+// 老实现把 `desktop:video` 一律当可丢媒体帧，**包括 `kind=init`**。而 init
+// 是解码前提、不是媒体帧：丢了它 relay 永远等不到参数集，
+// `/agent/desktop/stream` 的 viewer 就一直卡在"正在通过中继（Relay）拉流…"。
+// 灰度/编码切换会重建编码器并重发 init，正是最容易被这条规则丢掉的时刻。
+//
+// 这里把丢弃策略抽成纯函数，让"哪些消息不可丢""跨代怎么排"能被单测直接
+// 覆盖（不必起 relay 才能验证）；WS binary 与 HTTP 批量两条路径共用它，
+// 因此两条路径的丢弃语义不会各自漂移。
+
+/// 单批最多保留的媒体帧数（≈30fps×0.8s，与历史 `MAX_PENDING_FRAMES` 一致）。
+///
+/// `kind=init`（参数集）**不计入**这个额度、永不丢弃：突发重建时宁可让这一批
+/// 多一条，也不能把解码前提丢掉。
+#[cfg(feature = "desktop")]
+const MAX_BATCH_MEDIA: usize = 24;
+
+/// 一条消息是否属于"不会被背压丢弃"的类别。
+///
+/// - 非 `desktop:video`：控制面消息（started/stopped/error）一律保留。
+/// - `kind == "init"`：参数集。丢了 relay 就永远拿不到 init。
+/// - `key == true`：关键帧。它不与 delta 一起被丢（丢它等于让整段 GOP 花屏），
+///   但同一批里出现更新的关键帧时它可以被**取代**——这不是背压丢弃，而是
+///   用更靠后的完整随机访问点顶替更早的那个（见 [`plan_uplink_batch`]）。
+#[cfg(feature = "desktop")]
+fn is_uplink_protected(msg: &serde_json::Value) -> bool {
+    if msg["type"] != "desktop:video" {
+        return true;
+    }
+    if msg["payload"]["kind"].as_str() == Some("init") {
+        return true;
+    }
+    msg["payload"]["key"].as_bool().unwrap_or(false)
+}
+
+/// 一批上行消息的规划结果。
+#[cfg(feature = "desktop")]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UplinkPlan {
+    /// 本批实际要发送的消息（控制消息在前，媒体按代次排好序）。
+    send: Vec<serde_json::Value>,
+    /// 被丢弃的可丢媒体帧数（背压证据，供日志与测试断言）。
+    dropped: usize,
+}
+
+/// 规划一批上行消息（保持到达顺序的 `batch` → 实际发送内容）。
+///
+/// 规则（每一代内部都保持 init → 关键帧 → 后续 delta 的顺序）：
+/// 1. 控制消息（非 `desktop:video`）原样保留在**最前面**：started/stopped
+///    决定 relay 侧流的生命周期，必须先到。
+/// 2. 媒体帧按**代次**截断：以最后一个 `kind=init` 为界，它之前的媒体帧
+///    一律不发。重建编码器后 seq 从 1 重新计数，旧代帧对新解码器无意义，
+///    而且会让 relay 的 `key_ok` 被旧帧重新打开、浏览器拿新参数集解旧码流。
+///    这不是"把 init 提到最前面继续发旧媒体"——旧媒体是被**丢掉**的。
+/// 3. 代内只保留最新 [`MAX_BATCH_MEDIA`] 条。窗口开头若落在 GOP 中间，那些
+///    delta 的参考帧不在本批里——但 relay 的 viewer 早已持有那条参考链，所以
+///    这时**保持窗口原样**，只把起点**向前**收缩到窗口内的第一个关键帧
+///    （批只会更小）。**不能**向后扩到"上一个关键帧"：实测 186 帧积压时那样
+///    只发出 16 条并跳掉 100 个 seq，relay 的 viewer 通道只有 16 帧深，多出来
+///    的全被丢弃 → 画面整段停住。
+/// 4. `init` 不占用上面的额度，永不丢弃。
+/// 5. 高频装饰类控制消息（`desktop:cursor`，100ms 节流）参与同一个额度，
+///    否则一次积压能把整批撑到几百条，同样撑爆 viewer 通道。
+///
+/// 批因此有界（控制面 + ≤ [`MAX_BATCH_MEDIA`] 条媒体），既不会用无限积压换
+/// 恢复，也不会把成串的 delta 连同它们的关键帧一起丢掉。
+#[cfg(feature = "desktop")]
+fn plan_uplink_batch(batch: Vec<serde_json::Value>) -> UplinkPlan {
+    let mut ctrl: Vec<serde_json::Value> = Vec::new();
+    let mut media: Vec<serde_json::Value> = Vec::new();
+    for m in batch {
+        if m["type"] == "desktop:video" {
+            media.push(m);
+        } else {
+            ctrl.push(m);
+        }
+    }
+
+    let mut dropped = 0usize;
+
+    // 1) 代边界：以最后一个 init 为界，之前的媒体帧整段丢弃。重建编码器后
+    //    seq 从 1 重新计数，旧代帧对新解码器无意义，且会让 relay 的 key_ok
+    //    被旧帧重新打开。
+    let gen: &[serde_json::Value] = match media
+        .iter()
+        .rposition(|m| m["payload"]["kind"].as_str() == Some("init"))
+    {
+        Some(cut) => {
+            dropped += cut;
+            &media[cut..]
+        }
+        None => &media[..],
+    };
+
+    // 2) 把 init 单独摘出来（永不丢弃、不占额度），其余帧走窗口裁剪。
+    let init_msg = gen
+        .iter()
+        .find(|m| m["payload"]["kind"].as_str() == Some("init"))
+        .cloned();
+    let frames: Vec<&serde_json::Value> = gen
+        .iter()
+        .filter(|m| m["payload"]["kind"].as_str() != Some("init"))
+        .collect();
+
+    // 3) 只保留最新 MAX_BATCH_MEDIA 帧，并把窗口起点对齐到窗口内第一个关键帧。
+    //    窗口开头落在 GOP 中间时，那些 delta 的参考帧不在本批里，发过去只会
+    //    花屏——收缩到第一个关键帧，宁可少发几条。
+    //
+    //    收缩只能**向前**（丢掉窗口开头的孤儿 delta），绝不能向后扩：向后扩
+    //    会把批撑过额度，等于放弃有界性（任务卡明确禁止）。
+    let window = MAX_BATCH_MEDIA.min(frames.len());
+    let mut start_idx = frames.len() - window;
+    if let Some(p) = frames[start_idx..]
+        .iter()
+        .position(|m| m["payload"]["key"].as_bool().unwrap_or(false))
+    {
+        // 窗口内有关键帧：从它开始（丢掉窗口开头那几条参考帧已不在批里的
+        // 孤儿 delta）。这是**向前**收缩，批只会更小。
+        start_idx += p;
+    }
+    // 窗口内没有关键帧时保持窗口原样：这些 delta 的参考帧虽然不在本批里，
+    // 但 relay 的 viewer 早就持有上一条关键帧后的参考链（我们只是这一批没
+    // 带上它）。反过来向后扩到"上一个关键帧"会把批撑到上百帧——relay 的
+    // viewer 通道只有 16 帧深，多出来的全被丢弃，反而整段画面停住
+    // （实测：186 帧积压按旧逻辑只发 16 条并跳掉 100 个 seq）。
+    dropped += start_idx;
+
+    // 4) 控制面的高频类消息（`desktop:cursor` 是 100ms 节流的纯装饰）不参与
+    //    排序价值，也要占额度：否则一次大积压会把整批撑到几百条，relay 的
+    //    viewer 通道只有 16 帧，除了最前面几条全被丢光——批再"正确"也没用。
+    //    started/stopped/error 这类生命周期消息仍然全留（数量是常数级）。
+    //    只丢最旧的 cursor，**其余控制消息保持原始相对顺序**（started 必须先于
+    //    stopped 之类），因此只对 cursor 做"保留最新 N 条"的裁剪。
+    let cursor_idx: Vec<usize> = ctrl
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["type"].as_str() == Some("desktop:cursor"))
+        .map(|(i, _)| i)
+        .collect();
+    let cursor_budget = MAX_BATCH_MEDIA.saturating_sub(frames.len() - start_idx);
+    let mut drop_cursor: Vec<usize> = Vec::new();
+    if cursor_idx.len() > cursor_budget {
+        drop_cursor.extend(
+            cursor_idx
+                .iter()
+                .take(cursor_idx.len() - cursor_budget)
+                .copied(),
+        );
+        dropped += drop_cursor.len();
+    }
+
+    let mut send: Vec<serde_json::Value> = Vec::with_capacity(ctrl.len() + frames.len());
+    for (i, m) in ctrl.into_iter().enumerate() {
+        if !drop_cursor.contains(&i) {
+            send.push(m);
+        }
+    }
+    if let Some(m) = init_msg {
+        send.push(m);
+    }
+    send.extend(frames[start_idx..].iter().map(|m| (*m).clone()));
+
+    UplinkPlan { send, dropped }
+}
+
 async fn run_session(
     relay_url: &str,
     key: &Option<String>,
@@ -1820,9 +1990,9 @@ async fn run_session(
             // 握手、无 80ms 攒批窗口、拥塞窗口跨帧保持热态，公网/弱网下
             // 桌面帧的单帧上行时延显著低于批量 POST。WS 不可用（老 relay）
             // 或连接失败时自动回退到 HTTP 批量 POST 路径。
-            // 积压保护仍保留：队列深度超过阈值时丢最旧的非关键帧，
-            // 控制消息（started/stopped/error）绝不丢弃。
-            const MAX_PENDING_FRAMES: usize = 24; // ≈ 30fps×0.8s：稳态积压有界（旧 90 ≈3s）
+            // 积压保护：丢弃策略统一在 [`plan_uplink_batch`]（MYS-2837）。
+            // 控制消息（started/stopped/error）绝不丢弃；init 与关键帧同样
+            // 不可丢——它们是解码前提，不是可牺牲的媒体帧。
             let ws_url = {
                 // 配置是 http/https，视频上行内部映射 http→ws / https→wss。
                 let mut u = base.replace("http://", "ws://").replace("https://", "wss://");
@@ -1866,49 +2036,30 @@ async fn run_session(
                         }
                     }
                 }
-                // 跨批丢帧（MYS-886 延迟修复）: channel 是 unbounded 的, 生产端
-                // （编码循环 60fps）持续快于消费端（WS send / relay 逐条路由）
-                // 时会**无限积压**——实测 Windows GDI 路径稳态积压 ~4s, 表现为
-                // 端到端延迟 4s 且不增长（生产消费恰好平衡在积压点）。批内
-                // MAX_PENDING_FRAMES 检查永远看不到跨批积压。这里在每轮发送前
-                // 主动排水: 队列深度超过 90 帧时丢掉最旧的 media 帧（控制消息
-                // 保留）, 保证上行端到端延迟上限 ≈ 1.5s 而非无界。
-                if post_rx.len() > MAX_PENDING_FRAMES {
-                    let mut dropped = 0usize;
-                    while post_rx.len() > MAX_PENDING_FRAMES {
+                // 跨批积压：队列无界而编码可能快于上行，堆积起来只会把端到端
+                // 延时推高。把队列里多余的先取出来并入本批，统一交给
+                // [`plan_uplink_batch`] 决策——**不能**在这里按"是不是
+                // desktop:video"就丢，init 也是 desktop:video（MYS-2837）。
+                if post_rx.len() > MAX_BATCH_MEDIA {
+                    while post_rx.len() > MAX_BATCH_MEDIA && batch.len() < 256 {
                         match post_rx.try_recv() {
-                            Ok(m) => {
-                                if m["type"] == "desktop:video" {
-                                    dropped += 1;
-                                } else {
-                                    // 控制消息插回本批发送（数量少, 不会放大）。
-                                    batch.push(m);
-                                }
-                            }
+                            Ok(m) => batch.push(m),
                             Err(_) => break,
                         }
                     }
-                    if dropped > 0 {
-                        tracing::debug!("uplink drained {dropped} stale frames (cross-batch backpressure)");
-                    }
                 }
-                // 丢旧保新：media 只留最新 N 条，控制消息全保留。
-                let mut media: Vec<serde_json::Value> = Vec::new();
-                let mut ctrl: Vec<serde_json::Value> = Vec::new();
-                for m in batch {
-                    if m["type"] == "desktop:video" {
-                        media.push(m);
-                    } else {
-                        ctrl.push(m);
-                    }
+                // 统一丢弃策略（WS binary 与 HTTP 批量共用）：控制消息全留且
+                // 排在最前；媒体按代次截断（新 init 之前一律不发）；只有 delta
+                // 参与额度丢弃，init 与关键帧永不丢。
+                let plan = plan_uplink_batch(batch);
+                let mut out = plan.send;
+                if plan.dropped > 0 {
+                    tracing::debug!(
+                        dropped = plan.dropped,
+                        "uplink dropped {} stale media frames (backpressure, init/keyframes preserved)",
+                        plan.dropped
+                    );
                 }
-                if media.len() > MAX_PENDING_FRAMES {
-                    let drop = media.len() - MAX_PENDING_FRAMES;
-                    media.drain(..drop);
-                    tracing::debug!("uplink dropped {drop} oldest media frames (backpressure)");
-                }
-                let mut out: Vec<serde_json::Value> = ctrl;
-                out.extend(media);
                 if out.is_empty() {
                     continue;
                 }
@@ -2064,7 +2215,7 @@ async fn run_session(
                     }
                 }
                 if sent_via_ws {
-                    continue;
+                        continue;
                 }
                 // HTTP 批量回退（老 relay / WS 持续失败）。
                 let batch: serde_json::Value = serde_json::Value::Array(out);
@@ -5528,5 +5679,254 @@ mod tests {
         assert_eq!(program, probed.to_string_lossy());
         let (program, _) = build_windows_invocation(WinShell::PowerShell, None, "echo hi");
         assert_eq!(program, "powershell.exe");
+    }
+
+    // ── 桌面视频上行批处理（MYS-2837）────────────────────────────────
+    //
+    // 这组用例覆盖验收要求的"队列饱和回归"：让批内/跨批都超过阈值，并
+    // 穿插连续两代 init、关键帧与普通帧。WS binary 与 HTTP 批量两条路径
+    // 共用 `plan_uplink_batch`，所以这里断言的就是两条路径的行为。
+
+    #[cfg(feature = "desktop")]
+    fn up_init(gen: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "desktop:video",
+            "payload": { "kind": "init", "data": format!("init-{gen}") }
+        })
+    }
+
+    #[cfg(feature = "desktop")]
+    fn up_key(seq: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "desktop:video",
+            "payload": { "kind": "frag", "key": true, "seq": seq }
+        })
+    }
+
+    #[cfg(feature = "desktop")]
+    fn up_delta(seq: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "desktop:video",
+            "payload": { "kind": "frag", "key": false, "seq": seq }
+        })
+    }
+
+    #[cfg(feature = "desktop")]
+    fn up_ctrl(ty: &str) -> serde_json::Value {
+        serde_json::json!({ "type": ty, "payload": {} })
+    }
+
+    /// 把消息序列压成可读的标签，便于断言顺序。
+    #[cfg(feature = "desktop")]
+    fn up_kinds(v: &[serde_json::Value]) -> Vec<String> {
+        v.iter()
+            .map(|m| {
+                if m["type"] != "desktop:video" {
+                    return m["type"].as_str().unwrap_or("?").to_string();
+                }
+                let kind = m["payload"]["kind"].as_str().unwrap_or("");
+                if kind == "init" {
+                    "init".to_string()
+                } else if m["payload"]["key"].as_bool() == Some(true) {
+                    "key".to_string()
+                } else {
+                    "delta".to_string()
+                }
+            })
+            .collect()
+    }
+
+    /// 队列饱和：批内远超阈值时，init 一条都不能丢，且必须带上一颗关键帧
+    /// （否则批里的 delta 全无参考帧）。批本身必须有界。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_saturation_never_drops_init_and_stays_bounded() {
+        // 真实的 30fps 桌面流里关键帧是周期性出现的（活跃 6s / 静止 4s 一颗），
+        // 所以一个 70+ 帧的积压批里**必然**有多颗关键帧。构造时按这个形状来，
+        // 而不是造一条 72 帧都没有关键帧的假流。
+        let mut batch = vec![up_ctrl("desktop:started"), up_init(1)];
+        for s in 0..(MAX_BATCH_MEDIA * 3) {
+            // 每 15 帧来一颗关键帧（接近静止桌面 4s@30fps 的节奏）。
+            batch.push(if s % 15 == 0 { up_key(s as u64) } else { up_delta(s as u64) });
+        }
+        let plan = plan_uplink_batch(batch);
+        let kinds = up_kinds(&plan.send);
+        assert_eq!(kinds[0], "desktop:started", "控制消息必须最先发: {kinds:?}");
+        assert!(kinds.iter().any(|k| k == "init"), "init 不得被丢: {kinds:?}");
+        assert!(
+            kinds.iter().any(|k| k == "key"),
+            "批里必须带关键帧，否则后续 delta 无参考帧: {kinds:?}"
+        );
+        assert!(
+            kinds.len() <= MAX_BATCH_MEDIA + 2,
+            "批必须有界（init/控制消息不占额度）: {} 条",
+            kinds.len()
+        );
+        assert!(plan.dropped > 0, "确实发生了丢弃，否则断言无意义");
+    }
+
+    /// 跨代有序：连续两代 init 同批到达时，旧代帧（含旧代关键帧）必须整段
+    /// 丢弃——不能"把 init 提到前面、旧媒体照发"。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_two_generations_keep_only_newest_and_ordered() {
+        let batch = vec![
+            up_init(1),
+            up_key(2),
+            up_delta(3),
+            up_delta(4),
+            up_init(2), // 灰度/编码切换后重建：seq 归 1
+            up_key(2),
+            up_delta(3),
+        ];
+        let plan = plan_uplink_batch(batch);
+        assert_eq!(
+            up_kinds(&plan.send),
+            vec!["init", "key", "delta"],
+            "只发最后一代，且顺序是 init→key→delta"
+        );
+        // 旧代整段丢弃：init + 2 key/delta 前后各一条 → 4 条（含旧代 init）。
+        assert_eq!(plan.dropped, 4, "旧代全段丢弃（含旧 init）");
+    }
+
+    /// 旧代关键帧排在新 init 之前时也必须丢——否则 relay 的 key_ok 会被
+    /// 旧帧重新打开，浏览器拿新参数集解旧码流。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_stale_keyframe_before_new_init_is_dropped() {
+        let plan = plan_uplink_batch(vec![up_key(10), up_delta(11), up_init(2), up_delta(1)]);
+        assert_eq!(up_kinds(&plan.send), vec!["init", "delta"]);
+        assert_eq!(plan.dropped, 2);
+    }
+
+    /// 没有 init 的普通流：只按额度丢最旧 delta，关键帧保留。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_no_init_bounds_deltas_but_keeps_keyframes() {
+        let mut batch = vec![up_key(1)];
+        for s in 2..(2 + MAX_BATCH_MEDIA + 5) {
+            batch.push(up_delta(s as u64));
+        }
+        let plan = plan_uplink_batch(batch);
+        let kinds = up_kinds(&plan.send);
+        assert!(
+            kinds.len() <= MAX_BATCH_MEDIA,
+            "批内帧数不得超过额度（有界性优先）: {} > {MAX_BATCH_MEDIA}",
+            kinds.len()
+        );
+        assert!(plan.dropped > 0, "超额部分必须被丢弃");
+    }
+
+    /// 连续多代 init：只保留最后一代，中间各代全部丢弃。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_repeated_generations_keep_last_only() {
+        let mut batch = Vec::new();
+        for gen in 0..8u64 {
+            batch.push(up_init(gen));
+            batch.push(up_key(gen * 10));
+            for s in 0..5u64 {
+                batch.push(up_delta(gen * 10 + s));
+            }
+        }
+        let plan = plan_uplink_batch(batch);
+        let kinds = up_kinds(&plan.send);
+        assert_eq!(
+            kinds,
+            vec!["init", "key", "delta", "delta", "delta", "delta", "delta"],
+            "只保留最后一代: {kinds:?}"
+        );
+    }
+
+    /// 批必须有界：受保护的关键帧不能成为"无限积压"的通道。
+    /// 极端情况——一大批每帧都是关键帧（高熵/频繁 force_idr）：只保留最后
+    /// 一颗及其后续，前面的被取代。任务卡明确禁止用无限积压换恢复。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_batch_is_bounded_even_with_many_keyframes() {
+        let mut batch = vec![up_init(1)];
+        for s in 0..500u64 {
+            batch.push(up_key(s));
+        }
+        let plan = plan_uplink_batch(batch);
+        let kinds = up_kinds(&plan.send);
+        assert_eq!(kinds[0], "init", "init 必须保留");
+        assert!(
+            kinds.len() - 1 <= MAX_BATCH_MEDIA,
+            "即使每帧都是关键帧，批也必须有界: {} > {MAX_BATCH_MEDIA}",
+            kinds.len() - 1
+        );
+        assert!(
+            kinds.iter().skip(1).all(|k| k == "key"),
+            "保留的都应是最新那批关键帧"
+        );
+        assert_eq!(plan.dropped, 500 - (kinds.len() - 1), "其余被丢弃");
+    }
+
+    /// 关键帧之后还有 delta 时，整段都要保留（关键帧是随机访问点，
+    /// 后续 delta 依赖它）。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_keyframe_tail_is_kept() {
+        let plan = plan_uplink_batch(vec![
+            up_init(1),
+            up_key(2),
+            up_delta(3),
+            up_key(10),
+            up_delta(11),
+            up_delta(12),
+        ]);
+        assert_eq!(
+            up_kinds(&plan.send),
+            vec!["init", "key", "delta", "key", "delta", "delta"],
+            "批未超额时整段保留（含两颗关键帧）：没有丢弃的理由"
+        );
+    }
+
+    /// 高频 cursor 裁剪不得打乱其它控制消息的相对顺序（started 必须先于
+    /// stopped 到达 relay，否则流生命周期会错乱）。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_cursor_trim_keeps_control_order() {
+        let mut batch = vec![up_ctrl("desktop:started")];
+        for _ in 0..200 {
+            batch.push(up_ctrl("desktop:cursor"));
+        }
+        batch.push(up_ctrl("desktop:stopped"));
+        let plan = plan_uplink_batch(batch);
+        let kinds = up_kinds(&plan.send);
+        assert_eq!(kinds.first().map(|s| s.as_str()), Some("desktop:started"));
+        assert_eq!(kinds.last().map(|s| s.as_str()), Some("desktop:stopped"));
+        assert!(
+            kinds.len() <= MAX_BATCH_MEDIA + 2,
+            "cursor 必须被裁到额度内: {} 条",
+            kinds.len()
+        );
+        assert!(plan.dropped > 0);
+    }
+
+    /// 只有控制消息时全部原序保留，且不产生丢弃。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_control_only_preserved_in_order() {
+        let plan = plan_uplink_batch(vec![
+            up_ctrl("desktop:started"),
+            up_ctrl("desktop:cursor"),
+            up_ctrl("desktop:stopped"),
+        ]);
+        assert_eq!(
+            up_kinds(&plan.send),
+            vec!["desktop:started", "desktop:cursor", "desktop:stopped"]
+        );
+        assert_eq!(plan.dropped, 0);
+    }
+
+    /// 空批不 panic。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_empty_batch() {
+        let plan = plan_uplink_batch(Vec::new());
+        assert!(plan.send.is_empty());
+        assert_eq!(plan.dropped, 0);
     }
 }
