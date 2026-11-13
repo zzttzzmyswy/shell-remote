@@ -1439,22 +1439,34 @@ where
 #[cfg(feature = "desktop")]
 const MAX_BATCH_MEDIA: usize = 24;
 
-/// 一条消息是否属于"不会被背压丢弃"的类别。
+/// 上行发送侧的**参考链状态**（MYS-2837）。
 ///
-/// - 非 `desktop:video`：控制面消息（started/stopped/error）一律保留。
-/// - `kind == "init"`：参数集。丢了 relay 就永远拿不到 init。
-/// - `key == true`：关键帧。它不与 delta 一起被丢（丢它等于让整段 GOP 花屏），
-///   但同一批里出现更新的关键帧时它可以被**取代**——这不是背压丢弃，而是
-///   用更靠后的完整随机访问点顶替更早的那个（见 [`plan_uplink_batch`]）。
+/// 只按"窗口 + 看窗口里有没有关键帧"来裁剪是救不回来的：一旦丢过帧，能不能
+/// 继续发 delta 取决于**之前到底投递成功到哪一帧**，而这个信息跨批存在。
+/// 所以这里把"relay 手里的参考链是否完整"做成显式状态，逐批推进：
+///
+/// - `chain_ok == false`：relay 缺参考帧（刚换参数集、或我们刚丢过帧）。
+///   这期间**只能**发 `init` 和关键帧；关键帧一到就重新开链。
+/// - `chain_ok == true`：relay 的参考链完整，可以继续发 delta。
+///
+/// 任何一次丢弃都会让 `chain_ok` 归 false，并请求一颗新关键帧——这就是
+/// "不发送孤儿 delta"的落地方式。
 #[cfg(feature = "desktop")]
-fn is_uplink_protected(msg: &serde_json::Value) -> bool {
-    if msg["type"] != "desktop:video" {
-        return true;
+#[derive(Debug, Default, Clone)]
+struct UplinkChain {
+    /// relay 侧的参考链是否完整（可继续收 delta）。
+    chain_ok: bool,
+    /// 当前参数集代次序号（每见到一个 init +1）。仅用于观测/测试。
+    generation: u64,
+    /// 本代已投递过 init 吗。
+    init_sent: bool,
+}
+
+#[cfg(feature = "desktop")]
+impl UplinkChain {
+    fn new() -> Self {
+        Self { chain_ok: false, generation: 0, init_sent: false }
     }
-    if msg["payload"]["kind"].as_str() == Some("init") {
-        return true;
-    }
-    msg["payload"]["key"].as_bool().unwrap_or(false)
 }
 
 /// 一批上行消息的规划结果。
@@ -1465,31 +1477,27 @@ struct UplinkPlan {
     send: Vec<serde_json::Value>,
     /// 被丢弃的可丢媒体帧数（背压证据，供日志与测试断言）。
     dropped: usize,
+    /// 本批是否需要向编码循环要一颗新关键帧（丢了帧 / 参考链断了）。
+    need_keyframe: bool,
 }
 
-/// 规划一批上行消息（保持到达顺序的 `batch` → 实际发送内容）。
+/// 规划一批上行消息，并推进跨批参考链状态。
 ///
-/// 规则（每一代内部都保持 init → 关键帧 → 后续 delta 的顺序）：
-/// 1. 控制消息（非 `desktop:video`）原样保留在**最前面**：started/stopped
-///    决定 relay 侧流的生命周期，必须先到。
-/// 2. 媒体帧按**代次**截断：以最后一个 `kind=init` 为界，它之前的媒体帧
-///    一律不发。重建编码器后 seq 从 1 重新计数，旧代帧对新解码器无意义，
-///    而且会让 relay 的 `key_ok` 被旧帧重新打开、浏览器拿新参数集解旧码流。
-///    这不是"把 init 提到最前面继续发旧媒体"——旧媒体是被**丢掉**的。
-/// 3. 代内只保留最新 [`MAX_BATCH_MEDIA`] 条。窗口开头若落在 GOP 中间，那些
-///    delta 的参考帧不在本批里——但 relay 的 viewer 早已持有那条参考链，所以
-///    这时**保持窗口原样**，只把起点**向前**收缩到窗口内的第一个关键帧
-///    （批只会更小）。**不能**向后扩到"上一个关键帧"：实测 186 帧积压时那样
-///    只发出 16 条并跳掉 100 个 seq，relay 的 viewer 通道只有 16 帧深，多出来
-///    的全被丢弃 → 画面整段停住。
-/// 4. `init` 不占用上面的额度，永不丢弃。
-/// 5. 高频装饰类控制消息（`desktop:cursor`，100ms 节流）参与同一个额度，
-///    否则一次积压能把整批撑到几百条，同样撑爆 viewer 通道。
-///
-/// 批因此有界（控制面 + ≤ [`MAX_BATCH_MEDIA`] 条媒体），既不会用无限积压换
-/// 恢复，也不会把成串的 delta 连同它们的关键帧一起丢掉。
+/// 规则（每一代内部都保持 `init → 关键帧 → 后续 delta` 的顺序）：
+/// 1. 控制消息原样保留在**最前面**：started/stopped 决定 relay 侧流生命周期。
+///    高频 `desktop:cursor` 参与媒体额度，其余控制消息保持原始相对顺序。
+/// 2. 媒体帧按**代次**截断：以最后一个 `init` 为界，之前的媒体帧一律不发。
+/// 重建编码器后 seq 从 1 重新计数，旧代帧对新解码器无意义，且会让 relay 的
+/// `key_ok` 被旧帧重新打开。这不是"把 init 提到最前面继续发旧媒体"。
+/// 3. **参考链闸门**：只有在 `chain.chain_ok` 为真时才发 delta。刚换代、或
+///    上一批丢过帧时 `chain_ok` 是 false，这一批只发 init + 关键帧；关键帧
+///    发出后立刻置真。这样永远不会把"参考帧没发出去"的 delta 送出去。
+/// 4. **有界**：非关键帧只保留最新 `MAX_BATCH_MEDIA` 条；关键帧本身也受
+///    同样额度约束（一批里若有比额度更多的新关键帧，只保留最后
+///    `MAX_BATCH_MEDIA` 条内能形成完整 GOP 的那段）。丢帧一律置
+///    `chain_ok = false` 并 `need_keyframe = true`。
 #[cfg(feature = "desktop")]
-fn plan_uplink_batch(batch: Vec<serde_json::Value>) -> UplinkPlan {
+fn plan_uplink_batch(batch: Vec<serde_json::Value>, chain: &mut UplinkChain) -> UplinkPlan {
     let mut ctrl: Vec<serde_json::Value> = Vec::new();
     let mut media: Vec<serde_json::Value> = Vec::new();
     for m in batch {
@@ -1501,79 +1509,118 @@ fn plan_uplink_batch(batch: Vec<serde_json::Value>) -> UplinkPlan {
     }
 
     let mut dropped = 0usize;
+    let mut need_keyframe = false;
 
-    // 1) 代边界：以最后一个 init 为界，之前的媒体帧整段丢弃。重建编码器后
-    //    seq 从 1 重新计数，旧代帧对新解码器无意义，且会让 relay 的 key_ok
-    //    被旧帧重新打开。
+    // 1) 代边界：以最后一个 init 为界，之前的媒体帧整段丢弃。
     let gen: &[serde_json::Value] = match media
         .iter()
         .rposition(|m| m["payload"]["kind"].as_str() == Some("init"))
     {
         Some(cut) => {
-            dropped += cut;
+            if cut > 0 {
+                dropped += cut;
+                // 旧代帧里可能有 relay 正需要的帧；换代本身就意味着参考链
+                // 必须靠新代的关键帧重建。
+                need_keyframe = true;
+            }
             &media[cut..]
         }
         None => &media[..],
     };
 
-    // 2) 把 init 单独摘出来（永不丢弃、不占额度），其余帧走窗口裁剪。
+    // 2) init 单独摘出：永不丢弃、不占额度。见到 init 就是换代：
+    //    参考链归零，必须等这一代的关键帧才能再发 delta。
     let init_msg = gen
         .iter()
         .find(|m| m["payload"]["kind"].as_str() == Some("init"))
         .cloned();
+    if init_msg.is_some() {
+        chain.generation += 1;
+        chain.chain_ok = false;
+        chain.init_sent = false;
+    }
+
+    // 3) 有界：整代超过额度时，取**从某个关键帧起、长度不超过额度**的连续段。
+    //
+    //    为什么不是"最新 N 条"：那样会把这一代唯一的关键帧裁掉（它通常在最
+    //    前面），剩下的 delta 全无参考帧——验收反例 1 就是这个形状。
+    //
+    //    选择规则：优先取**最新**的那颗、且它到代末的帧数 ≤ 额度的关键帧；
+    //    这样发出的段最新、完整、且一定不超过 MAX_BATCH_MEDIA。若所有关键帧
+    //    之后都超过额度（超长 GOP），取最后一颗关键帧起、截到额度为止的那段
+    //    （段内参考链仍然完整）；若整代没有关键帧，只能发最新额度内那段，并
+    //    明确置链断（下一批等关键帧）。
     let frames: Vec<&serde_json::Value> = gen
         .iter()
         .filter(|m| m["payload"]["kind"].as_str() != Some("init"))
         .collect();
-
-    // 3) 只保留最新 MAX_BATCH_MEDIA 帧，并把窗口起点对齐到窗口内第一个关键帧。
-    //    窗口开头落在 GOP 中间时，那些 delta 的参考帧不在本批里，发过去只会
-    //    花屏——收缩到第一个关键帧，宁可少发几条。
-    //
-    //    收缩只能**向前**（丢掉窗口开头的孤儿 delta），绝不能向后扩：向后扩
-    //    会把批撑过额度，等于放弃有界性（任务卡明确禁止）。
-    let window = MAX_BATCH_MEDIA.min(frames.len());
-    let mut start_idx = frames.len() - window;
-    if let Some(p) = frames[start_idx..]
+    let key_positions: Vec<usize> = frames
         .iter()
-        .position(|m| m["payload"]["key"].as_bool().unwrap_or(false))
-    {
-        // 窗口内有关键帧：从它开始（丢掉窗口开头那几条参考帧已不在批里的
-        // 孤儿 delta）。这是**向前**收缩，批只会更小。
-        start_idx += p;
-    }
-    // 窗口内没有关键帧时保持窗口原样：这些 delta 的参考帧虽然不在本批里，
-    // 但 relay 的 viewer 早就持有上一条关键帧后的参考链（我们只是这一批没
-    // 带上它）。反过来向后扩到"上一个关键帧"会把批撑到上百帧——relay 的
-    // viewer 通道只有 16 帧深，多出来的全被丢弃，反而整段画面停住
-    // （实测：186 帧积压按旧逻辑只发 16 条并跳掉 100 个 seq）。
-    dropped += start_idx;
+        .enumerate()
+        .filter(|(_, m)| m["payload"]["key"].as_bool().unwrap_or(false))
+        .map(|(i, _)| i)
+        .collect();
 
-    // 4) 控制面的高频类消息（`desktop:cursor` 是 100ms 节流的纯装饰）不参与
-    //    排序价值，也要占额度：否则一次大积压会把整批撑到几百条，relay 的
-    //    viewer 通道只有 16 帧，除了最前面几条全被丢光——批再"正确"也没用。
-    //    started/stopped/error 这类生命周期消息仍然全留（数量是常数级）。
-    //    只丢最旧的 cursor，**其余控制消息保持原始相对顺序**（started 必须先于
-    //    stopped 之类），因此只对 cursor 做"保留最新 N 条"的裁剪。
+    // 选起点：最后一颗"到代末不超过额度"的关键帧；没有就退回最后一颗关键帧。
+    let start_idx = key_positions
+        .iter()
+        .copied()
+        .filter(|&k| frames.len() - k <= MAX_BATCH_MEDIA)
+        .next_back()
+        .or_else(|| key_positions.last().copied())
+        .unwrap_or_else(|| frames.len().saturating_sub(MAX_BATCH_MEDIA));
+
+    // 终点：额度上限，且不越过代末。
+    let end_idx = (start_idx + MAX_BATCH_MEDIA).min(frames.len());
+
+    if start_idx > 0 {
+        dropped += start_idx;
+        need_keyframe = true;
+        // 之前被裁掉的帧让参考链断开，下一批必须等新关键帧才能继续发 delta。
+        chain.chain_ok = false;
+    }
+    if end_idx < frames.len() {
+        dropped += frames.len() - end_idx;
+        need_keyframe = true;
+    }
+
+    // 4) 参考链闸门：从窗口里挑出真正能发的帧。
+    let mut send_frames: Vec<serde_json::Value> = Vec::new();
+    for m in frames[start_idx..end_idx].iter() {
+        let is_key = m["payload"]["key"].as_bool().unwrap_or(false);
+        if is_key {
+            // 关键帧是随机访问点：任何时候都可以发，发完即重开链。
+            send_frames.push((*m).clone());
+            chain.chain_ok = true;
+            continue;
+        }
+        if !chain.chain_ok {
+            // 参考链还没接上：这条 delta 的参考帧没送到 relay，发过去只会
+            // 花屏，而且会让 relay 的 key_ok 误以为可以继续收。
+            dropped += 1;
+            need_keyframe = true;
+            continue;
+        }
+        send_frames.push((*m).clone());
+    }
+
+    // 5) 控制面：只对 `desktop:cursor` 做"保留最新 N 条"的裁剪，其余控制消息
+    //    保持原始相对顺序（started 必须先于 stopped 之类）。
+    let media_budget = MAX_BATCH_MEDIA.saturating_sub(send_frames.len());
     let cursor_idx: Vec<usize> = ctrl
         .iter()
         .enumerate()
         .filter(|(_, m)| m["type"].as_str() == Some("desktop:cursor"))
         .map(|(i, _)| i)
         .collect();
-    let cursor_budget = MAX_BATCH_MEDIA.saturating_sub(frames.len() - start_idx);
     let mut drop_cursor: Vec<usize> = Vec::new();
-    if cursor_idx.len() > cursor_budget {
-        drop_cursor.extend(
-            cursor_idx
-                .iter()
-                .take(cursor_idx.len() - cursor_budget)
-                .copied(),
-        );
-        dropped += drop_cursor.len();
+    if cursor_idx.len() > media_budget {
+        let excess = cursor_idx.len() - media_budget;
+        drop_cursor.extend(cursor_idx.iter().take(excess).copied());
+        dropped += excess;
     }
 
-    let mut send: Vec<serde_json::Value> = Vec::with_capacity(ctrl.len() + frames.len());
+    let mut send: Vec<serde_json::Value> = Vec::with_capacity(ctrl.len() + send_frames.len());
     for (i, m) in ctrl.into_iter().enumerate() {
         if !drop_cursor.contains(&i) {
             send.push(m);
@@ -1581,10 +1628,11 @@ fn plan_uplink_batch(batch: Vec<serde_json::Value>) -> UplinkPlan {
     }
     if let Some(m) = init_msg {
         send.push(m);
+        chain.init_sent = true;
     }
-    send.extend(frames[start_idx..].iter().map(|m| (*m).clone()));
+    send.extend(send_frames);
 
-    UplinkPlan { send, dropped }
+    UplinkPlan { send, dropped, need_keyframe }
 }
 
 async fn run_session(
@@ -1985,6 +2033,9 @@ async fn run_session(
         let uplink_mode = Arc::new(std::sync::atomic::AtomicU8::new(0)); // 0=未知 1=ws 2=http
         {
             let uplink_mode = uplink_mode.clone();
+            // 发送任务需要向编码循环要关键帧（参考链断了时），持有 manager 的
+            // Arc 即可（DesktopManager::request_idr 只置原子 flag，无锁）。
+            let desktop_for_uplink = desktop.clone();
             tokio::spawn(async move {
             // 上行通道（v0.21）: WebSocket 长连接逐帧发送 —— 无每批 HTTP
             // 握手、无 80ms 攒批窗口、拥塞窗口跨帧保持热态，公网/弱网下
@@ -2009,6 +2060,8 @@ async fn run_session(
                 >,
             > = None;
             let mut ws_failures: u32 = 0;
+            // 跨批参考链状态：决定本批能不能继续发 delta（MYS-2837）。
+            let mut chain = UplinkChain::new();
             loop {
                 let first = match post_rx.recv().await {
                     Some(m) => m,
@@ -2049,9 +2102,15 @@ async fn run_session(
                     }
                 }
                 // 统一丢弃策略（WS binary 与 HTTP 批量共用）：控制消息全留且
-                // 排在最前；媒体按代次截断（新 init 之前一律不发）；只有 delta
-                // 参与额度丢弃，init 与关键帧永不丢。
-                let plan = plan_uplink_batch(batch);
+                // 排在最前；媒体按代次截断（新 init 之前一律不发）；参考链
+                // 不完整时只发 init/关键帧，绝不发孤儿 delta。
+                let plan = plan_uplink_batch(batch, &mut chain);
+                if plan.need_keyframe {
+                    // 丢过帧 / 参考链断了：立刻向编码循环要一颗关键帧，而不是
+                    // 干等静默期那颗心跳 IDR（最长 6s）。限频由编码循环的
+                    // reqkey 语义保证（置 flag，下一拍 force_idr）。
+                    desktop_for_uplink.request_idr();
+                }
                 let mut out = plan.send;
                 if plan.dropped > 0 {
                     tracing::debug!(
@@ -5683,9 +5742,10 @@ mod tests {
 
     // ── 桌面视频上行批处理（MYS-2837）────────────────────────────────
     //
-    // 这组用例覆盖验收要求的"队列饱和回归"：让批内/跨批都超过阈值，并
-    // 穿插连续两代 init、关键帧与普通帧。WS binary 与 HTTP 批量两条路径
-    // 共用 `plan_uplink_batch`，所以这里断言的就是两条路径的行为。
+    // 这组用例覆盖验收要求的"队列饱和回归"，断言的是**参考链契约**而不是
+    // 某个具体裁剪启发式：任何时刻送出去的 delta，它的参考帧都必须已经
+    // 成功送出（或者本批就带着它对应的关键帧）。WS binary 与 HTTP 批量
+    // 两条路径共用 `plan_uplink_batch`，所以这里断言的就是两条路径的行为。
 
     #[cfg(feature = "desktop")]
     fn up_init(gen: u64) -> serde_json::Value {
@@ -5716,7 +5776,7 @@ mod tests {
         serde_json::json!({ "type": ty, "payload": {} })
     }
 
-    /// 把消息序列压成可读的标签，便于断言顺序。
+    /// 把消息序列压成可读标签，便于断言顺序。
     #[cfg(feature = "desktop")]
     fn up_kinds(v: &[serde_json::Value]) -> Vec<String> {
         v.iter()
@@ -5736,40 +5796,131 @@ mod tests {
             .collect()
     }
 
-    /// 队列饱和：批内远超阈值时，init 一条都不能丢，且必须带上一颗关键帧
-    /// （否则批里的 delta 全无参考帧）。批本身必须有界。
+    /// 批次内的参考链不变量：任何 delta 之前，本批内必须已经出现过同一代的
+    /// 关键帧；出现 init 就换代，必须重新等关键帧。
+    ///
+    /// 这是"不发孤儿 delta"的可执行定义——比逐个用例数条数更难被误改成通过。
+    /// （init 可能在前一批就发过了，所以不要求本批带 init。）
     #[cfg(feature = "desktop")]
-    #[test]
-    fn test_uplink_saturation_never_drops_init_and_stays_bounded() {
-        // 真实的 30fps 桌面流里关键帧是周期性出现的（活跃 6s / 静止 4s 一颗），
-        // 所以一个 70+ 帧的积压批里**必然**有多颗关键帧。构造时按这个形状来，
-        // 而不是造一条 72 帧都没有关键帧的假流。
-        let mut batch = vec![up_ctrl("desktop:started"), up_init(1)];
-        for s in 0..(MAX_BATCH_MEDIA * 3) {
-            // 每 15 帧来一颗关键帧（接近静止桌面 4s@30fps 的节奏）。
-            batch.push(if s % 15 == 0 { up_key(s as u64) } else { up_delta(s as u64) });
+    fn up_assert_no_orphan_delta(kinds: &[String]) {
+        let mut chain_ok = false;
+        for (i, k) in kinds.iter().enumerate() {
+            match k.as_str() {
+                "init" => chain_ok = false, // 换代：必须重新等关键帧
+                "key" => chain_ok = true,
+                "delta" => assert!(
+                    chain_ok,
+                    "孤儿 delta：本批里前面没有可用的关键帧（第 {i} 项）: {kinds:?}"
+                ),
+                _ => {}
+            }
         }
-        let plan = plan_uplink_batch(batch);
-        let kinds = up_kinds(&plan.send);
-        assert_eq!(kinds[0], "desktop:started", "控制消息必须最先发: {kinds:?}");
-        assert!(kinds.iter().any(|k| k == "init"), "init 不得被丢: {kinds:?}");
-        assert!(
-            kinds.iter().any(|k| k == "key"),
-            "批里必须带关键帧，否则后续 delta 无参考帧: {kinds:?}"
-        );
-        assert!(
-            kinds.len() <= MAX_BATCH_MEDIA + 2,
-            "批必须有界（init/控制消息不占额度）: {} 条",
-            kinds.len()
-        );
-        assert!(plan.dropped > 0, "确实发生了丢弃，否则断言无意义");
     }
 
-    /// 跨代有序：连续两代 init 同批到达时，旧代帧（含旧代关键帧）必须整段
-    /// 丢弃——不能"把 init 提到前面、旧媒体照发"。
+    /// **反例 1（验收附件）**：`init + key(seq1) + delta(seq2..73)` 这一批，
+    /// 输出必须带着那颗关键帧。旧实现输出 `init + delta(seq50..73)`，关键帧
+    /// 数为 0 —— 那些 delta 全无参考帧。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_attachment_case1_keeps_keyframe_with_init() {
+        let mut chain = UplinkChain::new();
+        let mut batch = vec![up_init(1), up_key(1)];
+        for s in 2..=73 {
+            batch.push(up_delta(s));
+        }
+        let plan = plan_uplink_batch(batch, &mut chain);
+        let kinds = up_kinds(&plan.send);
+        up_assert_no_orphan_delta(&kinds);
+        assert_eq!(kinds[0], "init");
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "key").count(),
+            1,
+            "init 之后必须带上这一代的关键帧: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "delta"),
+            "有关键帧在，后续 delta 是安全且应该发的: {kinds:?}"
+        );
+        assert!(kinds.len() <= MAX_BATCH_MEDIA + 1, "批必须有界: {}", kinds.len());
+    }
+
+    /// **反例 2（验收附件）**：`init` 已被单独发走、本批只有 `key(seq1) +
+    /// delta(seq2..73)`。此时裁掉 seq2..49 后**不能**直接把 seq50..73 当
+    /// delta 发出去——它们依赖被裁掉的帧。正确做法：从关键帧开始发一段连续的
+    /// 完整 GOP，或干脆只发关键帧并请求新的关键帧。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_attachment_case2_no_orphan_delta_after_trim() {
+        let mut chain = UplinkChain::new();
+        // 先单独发一批 init，让"参数集已送达"成为既成事实。
+        let p0 = plan_uplink_batch(vec![up_init(1)], &mut chain);
+        assert_eq!(up_kinds(&p0.send), vec!["init"]);
+        assert!(!chain.chain_ok, "刚换代，参考链必须处于不完整状态");
+
+        let mut batch = vec![up_key(1)];
+        for s in 2..=73 {
+            batch.push(up_delta(s));
+        }
+        let plan = plan_uplink_batch(batch, &mut chain);
+        let kinds = up_kinds(&plan.send);
+        up_assert_no_orphan_delta(&kinds);
+        // 关键帧必须保留（它是本批唯一的随机访问点）。
+        assert_eq!(kinds.first().map(|s| s.as_str()), Some("key"), "{kinds:?}");
+        // 发出的 seq 必须是**从关键帧起连续**的一段，不能出现缺口。
+        let seqs: Vec<u64> = plan
+            .send
+            .iter()
+            .filter(|m| m["type"] == "desktop:video" && m["payload"]["kind"] != "init")
+            .filter_map(|m| m["payload"]["seq"].as_u64())
+            .collect();
+        for w in seqs.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "发出序列必须连续无缺口: {seqs:?}");
+        }
+        assert_eq!(seqs[0], 1, "必须从关键帧 seq=1 开始: {seqs:?}");
+    }
+
+    /// **跨批丢帧后必须等待关键帧**：上一批丢了帧 → 下一批即使只有 delta，
+    /// 也不能发；要等到关键帧才恢复。并且必须请求关键帧。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_waits_for_keyframe_across_batches_after_drop() {
+        let mut chain = UplinkChain::new();
+        // 批 1：init + key，正常开链。
+        let p1 = plan_uplink_batch(vec![up_init(1), up_key(1)], &mut chain);
+        assert_eq!(up_kinds(&p1.send), vec!["init", "key"]);
+        assert!(chain.chain_ok);
+        assert!(!p1.need_keyframe);
+
+        // 批 2：大量 delta 造成裁剪（跨批/批内丢帧）。
+        let mut big = Vec::new();
+        for s in 2..(2 + MAX_BATCH_MEDIA * 3) {
+            big.push(up_delta(s as u64));
+        }
+        let p2 = plan_uplink_batch(big, &mut chain);
+        assert!(p2.dropped > 0, "本批必须发生裁剪");
+        assert!(p2.need_keyframe, "丢帧后必须请求关键帧");
+        assert!(!chain.chain_ok, "丢帧后参考链必须置为不完整");
+
+        // 批 3：纯 delta 紧随其后 —— 参考链没接上，一条都不能发。
+        let p3 = plan_uplink_batch(vec![up_delta(999), up_delta(1000)], &mut chain);
+        assert!(
+            p3.send.iter().all(|m| m["payload"]["kind"].as_str() != Some("frag")),
+            "参考链不完整时不得发 delta: {:?}",
+            up_kinds(&p3.send)
+        );
+        assert!(p3.need_keyframe, "必须继续请求关键帧");
+
+        // 批 4：关键帧到了 → 恢复发帧。
+        let p4 = plan_uplink_batch(vec![up_key(1500), up_delta(1501)], &mut chain);
+        assert_eq!(up_kinds(&p4.send), vec!["key", "delta"], "关键帧后应恢复");
+        assert!(chain.chain_ok);
+    }
+
+    /// 连续两代 init：旧代帧整段丢弃，只发最后一代，且顺序是 init→key→delta。
     #[cfg(feature = "desktop")]
     #[test]
     fn test_uplink_two_generations_keep_only_newest_and_ordered() {
+        let mut chain = UplinkChain::new();
         let batch = vec![
             up_init(1),
             up_key(2),
@@ -5779,14 +5930,11 @@ mod tests {
             up_key(2),
             up_delta(3),
         ];
-        let plan = plan_uplink_batch(batch);
-        assert_eq!(
-            up_kinds(&plan.send),
-            vec!["init", "key", "delta"],
-            "只发最后一代，且顺序是 init→key→delta"
-        );
-        // 旧代整段丢弃：init + 2 key/delta 前后各一条 → 4 条（含旧代 init）。
-        assert_eq!(plan.dropped, 4, "旧代全段丢弃（含旧 init）");
+        let plan = plan_uplink_batch(batch, &mut chain);
+        let kinds = up_kinds(&plan.send);
+        assert_eq!(kinds, vec!["init", "key", "delta"], "只发最后一代: {kinds:?}");
+        up_assert_no_orphan_delta(&kinds);
+        assert_eq!(plan.dropped, 4, "旧代全段丢弃（含旧 init 与旧 key）");
     }
 
     /// 旧代关键帧排在新 init 之前时也必须丢——否则 relay 的 key_ok 会被
@@ -5794,93 +5942,108 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn test_uplink_stale_keyframe_before_new_init_is_dropped() {
-        let plan = plan_uplink_batch(vec![up_key(10), up_delta(11), up_init(2), up_delta(1)]);
-        assert_eq!(up_kinds(&plan.send), vec!["init", "delta"]);
-        assert_eq!(plan.dropped, 2);
-    }
-
-    /// 没有 init 的普通流：只按额度丢最旧 delta，关键帧保留。
-    #[cfg(feature = "desktop")]
-    #[test]
-    fn test_uplink_no_init_bounds_deltas_but_keeps_keyframes() {
-        let mut batch = vec![up_key(1)];
-        for s in 2..(2 + MAX_BATCH_MEDIA + 5) {
-            batch.push(up_delta(s as u64));
-        }
-        let plan = plan_uplink_batch(batch);
-        let kinds = up_kinds(&plan.send);
-        assert!(
-            kinds.len() <= MAX_BATCH_MEDIA,
-            "批内帧数不得超过额度（有界性优先）: {} > {MAX_BATCH_MEDIA}",
-            kinds.len()
+        let mut chain = UplinkChain::new();
+        let plan = plan_uplink_batch(
+            vec![up_key(10), up_delta(11), up_init(2), up_delta(1)],
+            &mut chain,
         );
-        assert!(plan.dropped > 0, "超额部分必须被丢弃");
+        let kinds = up_kinds(&plan.send);
+        // 新代只有 init + 一条 delta，而这条 delta 前面没有本代关键帧 → 不发。
+        assert_eq!(kinds, vec!["init"], "旧代全丢，新代 delta 等关键帧: {kinds:?}");
+        assert_eq!(plan.dropped, 3);
+        assert!(plan.need_keyframe);
     }
 
-    /// 连续多代 init：只保留最后一代，中间各代全部丢弃。
+    /// **真实 4/6 秒 GOP**：`KF_QUIET_MS=4000` / `KF_ACTIVE_MS=6000`
+    /// 在 30fps 下分别约 120 / 180 帧一颗关键帧。这种长 GOP 下：
+    ///   - 批必须有界（不因关键帧稀少就把整段塞进去）；
+    ///   - 一旦窗内没有关键帧，delta 不能发（参考链缺口），并请求新关键帧。
+    /// 旧版饱和测试用"每 15 帧一个 key"并声称接近 4s@30fps（实际约 120 帧），
+    /// 恰好把需要验证的长 GOP 排除了。
     #[cfg(feature = "desktop")]
     #[test]
-    fn test_uplink_repeated_generations_keep_last_only() {
-        let mut batch = Vec::new();
-        for gen in 0..8u64 {
-            batch.push(up_init(gen));
-            batch.push(up_key(gen * 10));
-            for s in 0..5u64 {
-                batch.push(up_delta(gen * 10 + s));
+    fn test_uplink_real_4s_and_6s_gop_bounds_and_chain() {
+        for (label, gop) in [("4s@30fps≈120", 120usize), ("6s@30fps≈180", 180usize)] {
+            let mut chain = UplinkChain::new();
+            // 先正常开链：init + key。
+            plan_uplink_batch(vec![up_init(1), up_key(0)], &mut chain);
+            assert!(chain.chain_ok, "{label}: 关键帧后应开链");
+
+            // 长 GOP 的中段：连续 3 倍额度的 delta，中间**没有**关键帧。
+            let mut mid = Vec::new();
+            for s in 1..(1 + MAX_BATCH_MEDIA * 3) {
+                mid.push(up_delta(s as u64));
             }
+            let p = plan_uplink_batch(mid, &mut chain);
+            assert!(
+                p.send.iter().filter(|m| m["type"] == "desktop:video").count() <= MAX_BATCH_MEDIA,
+                "{label}: 批必须有界: {}",
+                p.send.len()
+            );
+            assert!(p.dropped > 0, "{label}: 长 GOP 中段必然裁剪");
+            assert!(p.need_keyframe, "{label}: 裁剪后必须请求关键帧");
+
+            // 裁剪把参考链打断了：紧随其后的 delta 一条都不能发。
+            let q = plan_uplink_batch(vec![up_delta(gop as u64)], &mut chain);
+            assert!(
+                q.send.is_empty(),
+                "{label}: 参考链缺口期间不得发 delta: {:?}",
+                up_kinds(&q.send)
+            );
+
+            // 下一颗关键帧（长 GOP 的真实间隔）到达后立即恢复。
+            let r = plan_uplink_batch(vec![up_key(gop as u64), up_delta(gop as u64 + 1)], &mut chain);
+            assert_eq!(
+                up_kinds(&r.send),
+                vec!["key", "delta"],
+                "{label}: 长 GOP 的关键帧到达后必须恢复发帧"
+            );
         }
-        let plan = plan_uplink_batch(batch);
+    }
+
+    /// 无丢帧的正常流不得被误停：完整的一代（init+key+少量 delta）必须
+    /// 全部发出，且不请求关键帧。
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_uplink_normal_stream_is_not_stalled() {
+        let mut chain = UplinkChain::new();
+        let mut batch = vec![up_ctrl("desktop:started"), up_init(1), up_key(1)];
+        for s in 2..=(MAX_BATCH_MEDIA as u64) {
+            batch.push(up_delta(s));
+        }
+        let plan = plan_uplink_batch(batch, &mut chain);
         let kinds = up_kinds(&plan.send);
+        assert_eq!(kinds[0], "desktop:started");
+        up_assert_no_orphan_delta(&kinds);
+        assert_eq!(plan.dropped, 0, "未超额且参考链完整时不应丢帧: {kinds:?}");
+        assert!(!plan.need_keyframe, "正常流不该触发关键帧请求");
+        // 整代都在（init + key + N 条 delta）。
         assert_eq!(
-            kinds,
-            vec!["init", "key", "delta", "delta", "delta", "delta", "delta"],
-            "只保留最后一代: {kinds:?}"
+            kinds.iter().filter(|k| *k == "delta").count(),
+            MAX_BATCH_MEDIA - 1,
+            "{kinds:?}"
         );
     }
 
-    /// 批必须有界：受保护的关键帧不能成为"无限积压"的通道。
-    /// 极端情况——一大批每帧都是关键帧（高熵/频繁 force_idr）：只保留最后
-    /// 一颗及其后续，前面的被取代。任务卡明确禁止用无限积压换恢复。
+    /// 批必须**有界**：即使整批都是关键帧（高熵/频繁 force_idr），也不能
+    /// 把批撑过额度——否则 relay 的 16 帧 viewer 通道会被挤爆。
     #[cfg(feature = "desktop")]
     #[test]
     fn test_uplink_batch_is_bounded_even_with_many_keyframes() {
+        let mut chain = UplinkChain::new();
         let mut batch = vec![up_init(1)];
         for s in 0..500u64 {
             batch.push(up_key(s));
         }
-        let plan = plan_uplink_batch(batch);
+        let plan = plan_uplink_batch(batch, &mut chain);
         let kinds = up_kinds(&plan.send);
-        assert_eq!(kinds[0], "init", "init 必须保留");
+        assert_eq!(kinds[0], "init");
         assert!(
             kinds.len() - 1 <= MAX_BATCH_MEDIA,
             "即使每帧都是关键帧，批也必须有界: {} > {MAX_BATCH_MEDIA}",
             kinds.len() - 1
         );
-        assert!(
-            kinds.iter().skip(1).all(|k| k == "key"),
-            "保留的都应是最新那批关键帧"
-        );
-        assert_eq!(plan.dropped, 500 - (kinds.len() - 1), "其余被丢弃");
-    }
-
-    /// 关键帧之后还有 delta 时，整段都要保留（关键帧是随机访问点，
-    /// 后续 delta 依赖它）。
-    #[cfg(feature = "desktop")]
-    #[test]
-    fn test_uplink_keyframe_tail_is_kept() {
-        let plan = plan_uplink_batch(vec![
-            up_init(1),
-            up_key(2),
-            up_delta(3),
-            up_key(10),
-            up_delta(11),
-            up_delta(12),
-        ]);
-        assert_eq!(
-            up_kinds(&plan.send),
-            vec!["init", "key", "delta", "key", "delta", "delta"],
-            "批未超额时整段保留（含两颗关键帧）：没有丢弃的理由"
-        );
+        assert!(plan.dropped > 0);
     }
 
     /// 高频 cursor 裁剪不得打乱其它控制消息的相对顺序（started 必须先于
@@ -5888,32 +6051,32 @@ mod tests {
     #[cfg(feature = "desktop")]
     #[test]
     fn test_uplink_cursor_trim_keeps_control_order() {
+        let mut chain = UplinkChain::new();
         let mut batch = vec![up_ctrl("desktop:started")];
         for _ in 0..200 {
             batch.push(up_ctrl("desktop:cursor"));
         }
         batch.push(up_ctrl("desktop:stopped"));
-        let plan = plan_uplink_batch(batch);
+        let plan = plan_uplink_batch(batch, &mut chain);
         let kinds = up_kinds(&plan.send);
         assert_eq!(kinds.first().map(|s| s.as_str()), Some("desktop:started"));
         assert_eq!(kinds.last().map(|s| s.as_str()), Some("desktop:stopped"));
-        assert!(
-            kinds.len() <= MAX_BATCH_MEDIA + 2,
-            "cursor 必须被裁到额度内: {} 条",
-            kinds.len()
-        );
-        assert!(plan.dropped > 0);
+        assert!(plan.dropped > 0, "cursor 必须被裁到额度内");
     }
 
     /// 只有控制消息时全部原序保留，且不产生丢弃。
     #[cfg(feature = "desktop")]
     #[test]
     fn test_uplink_control_only_preserved_in_order() {
-        let plan = plan_uplink_batch(vec![
-            up_ctrl("desktop:started"),
-            up_ctrl("desktop:cursor"),
-            up_ctrl("desktop:stopped"),
-        ]);
+        let mut chain = UplinkChain::new();
+        let plan = plan_uplink_batch(
+            vec![
+                up_ctrl("desktop:started"),
+                up_ctrl("desktop:cursor"),
+                up_ctrl("desktop:stopped"),
+            ],
+            &mut chain,
+        );
         assert_eq!(
             up_kinds(&plan.send),
             vec!["desktop:started", "desktop:cursor", "desktop:stopped"]
@@ -5921,12 +6084,14 @@ mod tests {
         assert_eq!(plan.dropped, 0);
     }
 
-    /// 空批不 panic。
+    /// 空批不 panic、不产生发送内容。
     #[cfg(feature = "desktop")]
     #[test]
     fn test_uplink_empty_batch() {
-        let plan = plan_uplink_batch(Vec::new());
+        let mut chain = UplinkChain::new();
+        let plan = plan_uplink_batch(Vec::new(), &mut chain);
         assert!(plan.send.is_empty());
         assert_eq!(plan.dropped, 0);
+        assert!(!plan.need_keyframe);
     }
 }

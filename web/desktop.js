@@ -76,10 +76,15 @@
       this._lastSeq = 0;        // 最近收到的帧号（seqn box）
       // 参数集代际跟踪（MYS-2837）：agent 重建编码器后 seq 归 1 并重发 init；
       // 若新 init 被上行积压丢掉，靠它触发 reinit 重取参数集。
-      // 换代跟踪：`_lastInitAt` = 最近一次 init 到达的本地时刻；`_genStaleAt`
-      // = 检测到"换代但没收到 init"的时刻（0 = 无此情况）。
-      this._lastInitAt = 0;
-      this._genStaleAt = 0;
+      // 参数集代次覆盖状态（MYS-2837）。**显式状态，不用时间阈值**：
+      //   `_genSeq`      当前已知的最新代次（每收到一个 init +1）
+      //   `_initGen`     最近一次 init 覆盖到的代次（0 = 还没收到过 init）
+      //   `_awaitGen`    已见过帧、但还没等到 init 的那一代（0 = 无缺口）
+      // 判据是 `_initGen >= _genSeq` 而不是"init 是不是 2 秒内到的"——
+      // 首帧解码慢、上行排队久都不会让状态失真。
+      this._genSeq = 0;
+      this._initGen = 0;
+      this._awaitGen = 0;
       this._seqDrop = 0;        // 真实上行丢帧数（seq gap 累计）
       this._arrivals = [];      // 帧到达间隔窗口（jitter 计算）
       this._lastArrival = 0;
@@ -1021,9 +1026,11 @@
     }
 
     _handleMoov(body) {
-      // 新一代参数集到了（MYS-2837）：记下时刻，并清掉"换代没 init"的判定。
-      this._lastInitAt = Date.now();
-      this._genStaleAt = 0;
+      // 新一代参数集到了（MYS-2837）：代次 +1 并标记"这一代已被 init 覆盖"。
+      // 注意不是记时间戳——用状态判定才不会因为首帧解码慢而误判。
+      this._genSeq += 1;
+      this._initGen = this._genSeq;
+      this._awaitGen = 0; // 缺口已补上
       // 找 codec 配置 box：先扫 avcC（H.264），再扫 av1C（AV1）。
       //   avcC payload: [i+4]=1(version) [i+5..i+7]=profile/compat/level
       //   av1C payload: [i+4]=0x81(marker+version) [i+5]=profile(3)|level(5)
@@ -1224,16 +1231,29 @@
       // 旧实现保留 `max(old, new)` 并把回退判成缺 init，导致每次灰度/编码
       // 切换后都误发一次多余的 reinit。
       //
-      // 换代是否缺 init 用时间判定：agent 重建时总是先发 init 再发关键帧，
-      // 所以回退前 2s 内见过 init 就说明这一代的参数集已到手；超过 2s 说明
-      // init 在上行积压里被丢了（relay 让 viewer 干等），此时记下
-      // `_genStaleAt` 交给看门狗限频重取。
+      // seq 回退 = 码流换代（agent 重建编码器后 seq 归 1）。
+      //
+      // 判"这一代有没有拿到 init"只看状态 `_initGen >= _genSeq`，与时间无关：
+      // 首帧解码慢、上行排队久都不会让一个**已经收到**的 init 失效（旧实现
+      // 的"2 秒内见过 init"启发式在 2100ms 后就会误判）。
+      //
+      // 关键区分：
+      //   - 收到过 init（`_genSeq > 0`）且不是回退 → 只是同代序号前进/跳号；
+      //   - seq 回退且 `_initGen >= _genSeq` → 这一代的 init 已经到手，
+      //     只是新代第 N 帧，正常继续（不请求 reinit）；
+      //   - seq 回退且 `_initGen < _genSeq` 或从未收到 init → 真的缺参数集，
+      //     记 `_awaitGen` 交给看门狗限频 reinit。
       if (frameSeq > 0) {
-        if (this._lastSeq > 0 && frameSeq < this._lastSeq) {
-          // 换代：重置帧号基线。跨代 seq 本来就不可比，回退不计成丢帧。
-          const initFresh = this._lastInitAt > 0 &&
-            (Date.now() - this._lastInitAt) < 2000;
-          if (!initFresh && !this._genStaleAt) this._genStaleAt = Date.now();
+        const rolledBack = this._lastSeq > 0 && frameSeq < this._lastSeq;
+        if (rolledBack) {
+          // 帧告诉我们换代了：如果 init 已经把它覆盖到，那没事；否则这一代
+          // 缺参数集。两种情况都把 seq 基线重置（跨代 seq 不可比）。
+          if (this._initGen < this._genSeq) {
+            if (!this._awaitGen) this._awaitGen = this._genSeq;
+          } else if (this._genSeq === 0 || this._initGen === 0) {
+            // 从没收到过 init 却收到回退帧：同样视为缺参数集。
+            if (!this._awaitGen) this._awaitGen = Math.max(this._genSeq, 1);
+          }
         } else if (this._lastSeq > 0 && frameSeq > this._lastSeq + 1) {
           this._seqDrop += frameSeq - this._lastSeq - 1;
         }
@@ -1499,10 +1519,15 @@
       this._reqKeyWindowStart = 0;
       this._lastSeq = 0;
       this._seqDrop = 0;
-      // 换代跟踪：`_lastInitAt` = 最近一次 init 到达的本地时刻；`_genStaleAt`
-      // = 检测到"换代但没收到 init"的时刻（0 = 无此情况）。
-      this._lastInitAt = 0;
-      this._genStaleAt = 0;
+      // 参数集代次覆盖状态（MYS-2837）。**显式状态，不用时间阈值**：
+      //   `_genSeq`      当前已知的最新代次（每收到一个 init +1）
+      //   `_initGen`     最近一次 init 覆盖到的代次（0 = 还没收到过 init）
+      //   `_awaitGen`    已见过帧、但还没等到 init 的那一代（0 = 无缺口）
+      // 判据是 `_initGen >= _genSeq` 而不是"init 是不是 2 秒内到的"——
+      // 首帧解码慢、上行排队久都不会让状态失真。
+      this._genSeq = 0;
+      this._initGen = 0;
+      this._awaitGen = 0;
       this._lastInitReq = 0;
       this._arrivals = [];
       this._lastArrival = 0;
@@ -1704,8 +1729,8 @@
               (nowMs - (self._lastNewFrameAt) > 3000);
             // agent 换了参数集（seq 回退）但这一代的 init 没到：relay 那侧
             // viewer 会一直等参数集，这里限频要一次 reinit 把 init 带回来。
-            const staleParamSets = self._genStaleAt > 0 &&
-              (nowMs - self._genStaleAt) > 800;
+            // 判据是显式状态 `_awaitGen`（缺哪一代就等哪一代），不是时间窗。
+            const staleParamSets = self._awaitGen > 0 && self._initGen < self._awaitGen;
             if ((noInitButData || decodedButStalled || staleParamSets) &&
               (nowMs - (self._lastInitReq || 0)) > 4000) {
               self._lastInitReq = nowMs;

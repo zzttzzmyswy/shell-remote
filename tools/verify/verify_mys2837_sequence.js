@@ -61,7 +61,8 @@ function makeSandboxView(FakeDate, overrides) {
   vm.runInContext(fs.readFileSync(SRC, 'utf8'), c);
   const v = Object.create(c.window.DesktopView.prototype);
   Object.assign(v, {
-    _lastSeq: 0, _seqDrop: 0, _lastInitAt: 0, _genStaleAt: 0, _lastInitReq: 0,
+    _lastSeq: 0, _seqDrop: 0, _lastInitReq: 0,
+    _genSeq: 0, _initGen: 0, _awaitGen: 0,
     _codecKind: null, _av1Mono: 0, _dec: null, _initDecoder() {},
   });
   if (overrides) Object.assign(v, overrides);
@@ -115,10 +116,10 @@ test('有效新 init 后 seq 100→1 不进入"等 init"状态', () => {
   // 有效的新一代 init（agent 重建编码器后重发）。
   v._handleMoov(av1c());
   assert.strictEqual(v._codecKind, 'av1', 'init 应被解析为 av1');
-  assert.ok(v._lastInitAt > 0, 'init 到达时刻应被记录');
+  assert.strictEqual(v._initGen, 1, 'init 应把代次覆盖标记为 1');
   // 新一代第 1 帧（seq 从 1 重新计数）。
   v._handleMoof(moof(1, true));
-  assert.strictEqual(v._genStaleAt, 0, '有有效新 init 时不得判定缺 init');
+  assert.strictEqual(v._awaitGen, 0, '有有效新 init 时不得判定缺 init');
   assert.strictEqual(v._lastSeq, 1, 'seq 基线应接受回退到 1（旧实现保留 100）');
 });
 
@@ -128,7 +129,7 @@ test('缺 init 的 seq 回退会被标记，等待限频 reinit', () => {
   const v = makeSandboxView(clock.Date, { _lastSeq: 100, _codecKind: 'av1' });
   // 没有任何 init 到达（_lastInitAt = 0），seq 从 100 掉回 1。
   v._handleMoof(moof(1, true));
-  assert.ok(v._genStaleAt > 0, '缺 init 的换代必须被标记，否则看门狗无法恢复');
+  assert.ok(v._awaitGen > 0, '缺 init 的换代必须被标记，否则看门狗无法恢复');
 });
 
 // ── 用例 3：正常单调流里的跳号只计丢帧，不误判换代 ─────────────────
@@ -136,7 +137,7 @@ test('单调 seq 的跳号计入丢帧且不误判缺 init', () => {
   const v = makeSandboxView(Date, { _lastSeq: 10, _codecKind: 'av1' });
   v._handleMoof(moof(14, false)); // 10 → 14：中间 11/12/13 丢了
   assert.strictEqual(v._seqDrop, 3, '跳号应计 3 条丢帧');
-  assert.strictEqual(v._genStaleAt, 0, '单调前进不得误判换代');
+  assert.strictEqual(v._awaitGen, 0, '单调前进不得误判换代');
   assert.strictEqual(v._lastSeq, 14);
 });
 
@@ -147,7 +148,7 @@ test('近期收到过 init 时，小幅回退不触发缺 init', () => {
   v._handleMoov(av1c());          // 刚收到 init
   clock.advance(200);
   v._handleMoof(moof(3, true));   // 200ms 后回退 → 属同一代
-  assert.strictEqual(v._genStaleAt, 0, '近期有 init 时不得判成缺 init');
+  assert.strictEqual(v._awaitGen, 0, '已收到该代 init 时不得判成缺 init');
   assert.strictEqual(v._lastSeq, 3, '基线应接受换代后的新序号');
 });
 
@@ -164,6 +165,40 @@ test('换代后旧代迟到帧不会把 seq 基线抬回旧值', () => {
   // 回到新一代的下一帧时必须能被正确接受，而不是"永远回退"。
   v._handleMoof(moof(3, false));
   assert.strictEqual(v._lastSeq, 3, '跨代序号不可比，不能被旧号永久锁死');
+});
+
+// ── 用例 6（验收新增）：有效 init 后隔 2100ms 才来 seq=1，不得误判缺 init ──
+// 旧实现用"回退前 2s 内见过 init"的启发式，2100ms 就会失效。改用显式代次
+// 状态后，首帧解码慢多久都不影响判定。
+test('有效 init 后 2100ms 才到 seq=1 不误判缺 init', () => {
+  const clock = makeClock(1_700_000_000_000);
+  const v = makeSandboxView(clock.Date, { _lastSeq: 100, _codecKind: 'av1' });
+  v._handleMoov(av1c());          // 新代 init
+  clock.advance(2100);            // 首帧解码慢 / 上行排队久
+  v._handleMoof(moof(1, true));   // 新代第 1 帧
+  assert.strictEqual(v._awaitGen, 0, '2100ms 后仍不得判成缺 init');
+  assert.strictEqual(v._lastSeq, 1, 'seq 基线应接受回退');
+});
+
+// ── 用例 7（验收新增）：真正缺 init 时仍要能限频 reinit ────────────────
+test('真正缺 init 时置 _awaitGen，供看门狗限频 reinit', () => {
+  const clock = makeClock(1_700_000_000_000);
+  const v = makeSandboxView(clock.Date, { _lastSeq: 100, _codecKind: 'av1' });
+  // 没有任何 init，直接收到回退帧。
+  v._handleMoof(moof(1, true));
+  assert.ok(v._awaitGen > 0, '缺 init 必须被标记');
+  assert.ok(v._initGen < v._awaitGen, '判据应为"init 代次 < 等待代次"');
+});
+
+// ── 用例 8：收到 init 后缺口必须被清掉（普通 reqkey 不能把 reinit 挤掉）──
+test('迟到的 init 会清掉缺口标记', () => {
+  const clock = makeClock(1_700_000_000_000);
+  const v = makeSandboxView(clock.Date, { _lastSeq: 100, _codecKind: 'av1' });
+  v._handleMoof(moof(1, true));   // 先缺 init
+  assert.ok(v._awaitGen > 0);
+  v._handleMoov(av1c());          // init 迟到但到了
+  assert.strictEqual(v._awaitGen, 0, 'init 到达后缺口必须清零');
+  assert.ok(v._initGen >= v._genSeq, '代次覆盖关系必须成立');
 });
 
 console.log('\n' + (fails.length === 0
