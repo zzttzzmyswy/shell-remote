@@ -120,7 +120,7 @@ An SSL certificate error occurred when fetching the script.
 
 注意别把上面那行 fetch 读成“fetch 不校验证书”：实测从受信源**跨源** `fetch` 这个 https 地址会直接 `Failed to fetch`。差别在于用户点“继续前往”时为**那个源**建立了一次性例外，普通请求沿用该例外，而 SW 脚本的校验不吃这个例外。
 
-浏览器对 SW 脚本单独做一次严格校验，这是刻意的：SW 一旦激活就能拦截整个源的请求，所以不接受“用户临时放行”的证书。想用完整模式，就必须真的把证书装进信任库，或者改用受信证书/`http://`。
+浏览器对 SW 脚本单独做一次严格校验，这是刻意的：SW 一旦激活就能拦截整个源的请求，所以不接受“用户临时放行”的证书。想用完整模式，就必须真的把证书装进信任库，或者改用其他受信 HTTPS 证书。
 
 ### 最短修复路径
 
@@ -179,7 +179,7 @@ openssl verify -CAfile ca.pem -verify_hostname "$ADDR" relay-cert.pem
 openssl x509 -in relay-cert.pem -noout -subject -ext subjectAltName
 ```
 
-两条 `verify` 都要看到 `OK` 才算对，输出 `IP address mismatch` / `hostname mismatch` 说明 SAN 写错了类型或写了别的地址。实测（OpenSSL 4.1.0）：
+所选地址对应的 `verify` 命令应输出 `OK`；若同时配置 IP 和域名，用各自的实际值分别验证，输出 `IP address mismatch` / `hostname mismatch` 说明 SAN 写错了类型或写了别的地址。实测（OpenSSL 4.1.0）：
 
 ```
 # IP 证书
@@ -191,7 +191,7 @@ DNS:relay.example.test
 relay-cert.pem: OK                     ← verify_hostname relay.example.test
 ```
 
-> `-days 397` 是当前公有 CA 通行的上限惯例；自签根签发的证书不受浏览器这条策略约束——实测 Chrome 158 对 825 天、826 天、1000 天的证书均正常接受。这里取 397 只是留出常规续签节奏，你按需要改。
+> `-days 397` 是这里示例的有效期；实测 Chrome 158 对 825 天、826 天、1000 天的证书均正常接受。这里取 397 只是留出常规续签节奏，你按需要改。
 
 **第 3 步：让 relay 用这张证书**
 
@@ -210,7 +210,7 @@ relay-cert.pem: OK                     ← verify_hostname relay.example.test
 |--------------|------|---------|
 | Windows（Chrome / Edge） | 双击 `ca.pem` → 安装证书 → **本地计算机** → “受信任的根证书颁发机构” | 该机器全部用户与 Chromium 系浏览器 |
 | macOS（Safari / Chrome） | 钥匙串访问 → 系统 → 导入 `ca.pem` → 双击 → 信任 → “始终信任” | 该机器系统信任库 |
-| Linux + Chromium 系 | 把 `ca.pem` 放进发行版的信任锚目录后刷新系统库（Arch/Fedora：`/etc/ca-certificates/trust-source/anchors/` + `update-ca-trust`；Debian/Ubuntu：`/usr/local/share/ca-certificates/` + `update-ca-certificates`） | 系统信任库。**实测**：NSS 库为空时 Chromium 158 会读取系统库并接受该 CA（命名空间内导入验证，未改动宿主机） |
+| Linux + Chromium 系 | 把 `ca.pem` 放进发行版的信任锚目录后刷新系统库（Arch：`/etc/ca-certificates/trust-source/anchors/`；Fedora：`/etc/pki/ca-trust/source/anchors/`，两者均执行 `update-ca-trust`；Debian/Ubuntu：保存为 `/usr/local/share/ca-certificates/shell-remote-ca.crt`，执行 `update-ca-certificates`） | 系统信任库。**实测**：NSS 库为空时 Chromium 158 会读取系统库并接受该 CA（命名空间内导入验证，未改动宿主机） |
 | Firefox（全平台） | 设置 → 隐私与安全 → 证书 → 查看证书 → 证书颁发机构 → 导入 | **只影响 Firefox**，用它自己的库 |
 
 Linux 下给 Chromium 单独配 NSS 库（与系统库二选一即可，两者都会生效）：
