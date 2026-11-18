@@ -9,21 +9,27 @@
 //       iframe 里脚本真的执行、动态请求成功；
 //   [2] 同一张证书**未**被信任时 → 注册失败，状态区给出**证书**提示（不是笼统的
 //       “无法注册 Service Worker”），且不谎称“已回退静态模式”；
-//   [3] 证书被信任、但访问地址不在 SAN 里 → 浏览器在导航阶段就拒绝；
+//   [3] 证书被信任、但访问地址不在 SAN 里 → 浏览器在导航阶段以**名字不匹配**拒绝；
 //   [4] 只读 Token 仍然回退静态模式（原有行为不被破坏）。
 //
-// 隔离要求（任务卡明确要求）：
+// 隔离要求：
+//   - 网络：所有服务只绑 127.0.0.1。测试站点里跑着**真实 shell**，绝不对外暴露。
+//     访问名用 `localhost`（DNS SAN）与 `127.0.0.1`（IP SAN），两者都由系统本地
+//     解析，不改 /etc/hosts、不需要非回环网卡，SAN 与信任链照样被真实校验
 //   - 信任库：给 Chromium 独立的 HOME（`$HOME/.pki/nssdb`），用 certutil 只往这个
 //     库里导入临时 CA；**不碰**用户/系统的信任库
 //   - 不加 `--ignore-certificate-errors`，**不用** CDP 忽略证书错误
 //   - 每个场景用全新的浏览器 profile/HOME，避免上一次的例外残留
+//   - 凭据每次运行随机生成；证书/私钥只写进本次运行的 mkdtemp，不覆盖预存材料
 //
 // 用法（先构建）：
 //   cargo build --bin shell-remote
 //   xvfb-run -a node tools/verify/verify_web_map_tls.js
 //
-// 环境变量：BIN / CA_DIR（复用已有 CA）/ KEEP_TLS_DIR（保留临时目录便于排查）/
-//   SITE_PORT / RW_PORT / RO_PORT / OUT。
+// 环境变量：BIN / KEEP_TLS_DIR（保留临时目录便于排查）/ SITE_PORT / RW_PORT /
+//   RO_PORT / MISMATCH_PORT / OUT。
+// 凭据每次运行随机生成；证书与私钥只写进本次运行的临时目录，不会覆盖任何
+// 预存材料（早先的 CA_DIR 复用入口已移除，避免误写到已有 CA 上）。
 // 依赖：openssl、certutil（libnss3-tools）。缺任一则**明确失败**而不是跳过——
 // 跳过会让“证书没验过”看起来像通过。
 
@@ -45,11 +51,21 @@ try {
 const ROOT = path.dirname(path.dirname(path.dirname(fs.realpathSync(__filename))));
 const BIN = process.env.BIN || path.join(ROOT, 'target', 'debug', 'shell-remote');
 const OUT = process.env.OUT || path.join(ROOT, 'artifacts', 'mys2945-tls');
-const AUTH = process.env.RELAY_PASSWORD || 'tls-e2e-pass';
-const RW_KEY = 'tlse2erw01';
-const RO_KEY = 'tlse2ero01';
-const RW_SID = 'tlse2edev1';
-const RO_SID = 'tlse2edev2';
+
+// 每次运行都换一套随机凭据：源码里不留可用口令，复跑之间也不会互相顶替
+// 会话（同一个 --key/--session-id 重复注册会让上一个 agent 掉线）。
+const RAND = crypto.randomBytes(6).toString('hex');
+const AUTH = process.env.RELAY_PASSWORD || `tls-e2e-${RAND}`;
+const RW_KEY = `rw${RAND}`;
+const RO_KEY = `ro${RAND}`;
+const RW_SID = `tsd${RAND.slice(0, 8)}`;
+const RO_SID = `tsr${RAND.slice(0, 8)}`;
+
+// 测试只监听回环。用 localhost 同时验证两种 SAN 类型：
+//   127.0.0.1 → IP SAN     localhost → DNS SAN
+// 两者都由系统本地解析，不需要改 /etc/hosts，也不需要任何非回环网卡。
+const HOST_IP = '127.0.0.1';
+const HOST_DNS = 'localhost';
 
 let checks = 0;
 const fails = [];
@@ -82,22 +98,10 @@ function run(cmd, args, opts) {
   return r.stdout;
 }
 
-/// 本机用于访问 relay 的地址。必须**真的**落在证书 SAN 里，否则浏览器在导航
-/// 阶段就拒绝，测不到 SW 注册。
-function lanAddress() {
-  const out = process.env.SR_TEST_ADDR || '';
-  if (out) return out;
-  try {
-    const txt = run('sh', ['-c',
-      "ip -4 addr show scope global 2>/dev/null | grep -oE 'inet[[:space:]]+[0-9.]+' | awk '{print $2}' | head -1"]);
-    const ip = String(txt).trim();
-    if (ip) return ip;
-  } catch (e) {}
-  return '127.0.0.1';
-}
-
-/// 建临时 CA 与两张服务器证书：SAN 匹配的、以及 SAN 故意不匹配的。
-function makeCerts(dir, addr) {
+/// 建临时 CA 与服务器证书：
+///   - matched：SAN 同时含 IP 与 DNS 两种类型，覆盖访问用的两个名字
+///   - mismatched：SAN 故意只写别的地址——证书被信任也仍然名字不匹配
+function makeCerts(dir, ip, dns) {
   fs.mkdirSync(dir, { recursive: true });
   const ca = path.join(dir, 'ca.pem');
   const caKey = path.join(dir, 'ca-key.pem');
@@ -107,26 +111,28 @@ function makeCerts(dir, addr) {
     '-addext', 'basicConstraints=critical,CA:TRUE',
     '-addext', 'keyUsage=critical,keyCertSign,cRLSign']);
 
-  const sign = (prefix, san) => {
+  // SAN 里 IP 与 DNS 必须用各自的类型前缀，混用会让 openssl 直接报
+  // `bad ip address`（这正是文档里那个错误的来源）。
+  const sign = (prefix, san, cn, days) => {
     const key = path.join(dir, `${prefix}-key.pem`);
     const csr = path.join(dir, `${prefix}.csr`);
     const crt = path.join(dir, `${prefix}.pem`);
     run('openssl', ['req', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
-      '-out', csr, '-subj', `/CN=${addr}`]);
+      '-out', csr, '-subj', `/CN=${cn}`]);
     const ext = path.join(dir, `${prefix}-ext.cnf`);
     fs.writeFileSync(ext, `subjectAltName=${san}\n` +
       'basicConstraints=CA:FALSE\n' +
       'keyUsage=critical,digitalSignature,keyEncipherment\n' +
       'extendedKeyUsage=serverAuth\n');
     run('openssl', ['x509', '-req', '-in', csr, '-CA', ca, '-CAkey', caKey,
-      '-CAcreateserial', '-out', crt, '-days', '30', '-extfile', ext]);
+      '-CAcreateserial', '-out', crt, '-days', String(days || 30), '-extfile', ext]);
     return { cert: crt, key };
   };
 
-  const matched = sign('srv-matched', `IP:${addr},DNS:${addr},DNS:localhost`);
-  // SAN 故意只写一个别的地址：证书被信任也仍然名字不匹配。
-  const mismatched = sign('srv-mismatched', 'IP:203.0.113.77,DNS:not-this-host.invalid');
-  return { ca, matched, mismatched };
+  const matched = sign('srv-matched', `IP:${ip},DNS:${dns}`, ip);
+  const mismatched = sign('srv-mismatched', 'IP:203.0.113.77,DNS:not-this-host.invalid',
+    '203.0.113.77');
+  return { ca, caKey, matched, mismatched };
 }
 
 /// 隔离的浏览器 HOME + 其中的 NSS 库；`trustCa` 为真时把 CA 导入该库。
@@ -255,24 +261,6 @@ function waitTlsPort(host, port, timeout) {
   });
 }
 
-function httpReq(url, opts) {
-  opts = opts || {};
-  return new Promise((resolve) => {
-    const u = new URL(url);
-    const req = http.request({
-      hostname: u.hostname, port: u.port, path: u.pathname + u.search,
-      method: opts.method || 'GET', headers: opts.headers || {},
-    }, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers,
-        body: Buffer.concat(chunks) }));
-    });
-    req.on('error', () => resolve({ status: 0, headers: {}, body: Buffer.alloc(0) }));
-    req.end(opts.body);
-  });
-}
-
 /// 用给定 HOME（=独立信任库）启动 Chromium。**不加**任何忽略证书错误的参数。
 async function launchBrowser(home, exe) {
   const opts = {
@@ -366,21 +354,36 @@ async function frameEval(page, fn, arg) {
   }
   check('openssl / certutil / 二进制齐备', true);
 
-  const ADDR = lanAddress();
-  console.log(`  · 访问地址 ${ADDR}（证书 SAN 会包含它）`);
+  const BIND = HOST_IP;   // 只绑回环：测试服务里跑着真实 shell，绝不对外暴露
+  console.log(`  · 监听 ${BIND}（仅回环）；测试域名 ${HOST_DNS} 由系统本地解析`);
 
-  const TLS_DIR = process.env.CA_DIR || fs.mkdtempSync(path.join(os.tmpdir(), 'sr2945-ca-'));
-  const certs = makeCerts(TLS_DIR, ADDR);
-  check('临时私有 CA + SAN 匹配证书已生成',
+  // 证书与私钥只写进本次运行自己的临时目录：每次都是新建的 mkdtemp，
+  // 从结构上就不可能覆盖任何预存材料。
+  const TLS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sr2945-ca-'));
+  const certs = makeCerts(TLS_DIR, HOST_IP, HOST_DNS);
+  check('临时私有 CA + SAN 匹配证书已生成（IP 与 DNS 两种类型）',
     fs.existsSync(certs.ca) && fs.existsSync(certs.matched.cert));
+  // 自检 SAN 真的两种类型都在，且 openssl 逐项校验通过——与文档里教的命令一致。
+  const sanText = run('openssl', ['x509', '-in', certs.matched.cert, '-noout', '-ext',
+    'subjectAltName']);
+  check('证书 SAN 含 IP 与 DNS 两种类型',
+    /IP Address:127\.0\.0\.1/.test(sanText) && /DNS:localhost/.test(sanText), sanText.trim());
+  check('openssl verify -verify_ip 通过',
+    /OK/.test(run('openssl', ['verify', '-CAfile', certs.ca, '-verify_ip', HOST_IP,
+      certs.matched.cert])));
+  check('openssl verify -verify_hostname 通过',
+    /OK/.test(run('openssl', ['verify', '-CAfile', certs.ca, '-verify_hostname', HOST_DNS,
+      certs.matched.cert])));
 
   const SITE_PORT = Number(process.env.SITE_PORT || 19520);
   const RW_PORT = Number(process.env.RW_PORT || 19521);
   const RO_PORT = Number(process.env.RO_PORT || 19522);
   const MISMATCH_PORT = Number(process.env.MISMATCH_PORT || 19523);
-  const RW_BASE = `https://${ADDR}:${RW_PORT}`;
-  const RO_BASE = `https://${ADDR}:${RO_PORT}`;
-  const MISMATCH_BASE = `https://${ADDR}:${MISMATCH_PORT}`;
+  // 用 localhost（DNS SAN）访问，另一路用 127.0.0.1（IP SAN）验证 Trust。
+  const RW_BASE = `https://${HOST_DNS}:${RW_PORT}`;
+  const RO_BASE = `https://${HOST_DNS}:${RO_PORT}`;
+  const RW_BASE_IP = `https://${HOST_IP}:${RW_PORT}`;
+  const MISMATCH_BASE = `https://${HOST_DNS}:${MISMATCH_PORT}`;
   const SITE = `http://127.0.0.1:${SITE_PORT}`;
 
   const site = await startSite(SITE_PORT);
@@ -390,18 +393,18 @@ async function frameEval(page, fn, arg) {
 
   try {
     // ── relay ×3：受信证书 / ro / SAN 不匹配证书，全部 HTTPS ──
-    const relayRw = startProc(['relay', '--bind', `0.0.0.0:${RW_PORT}`, '--auth', AUTH,
+    const relayRw = startProc(['relay', '--bind', `${BIND}:${RW_PORT}`, '--auth', AUTH,
       '--tls-cert', certs.matched.cert, '--tls-key', certs.matched.key,
       '--settings-file', path.join(roots, 'rw-settings.json')], 'relay-rw');
-    const relayRo = startProc(['relay', '--bind', `0.0.0.0:${RO_PORT}`, '--auth', AUTH,
+    const relayRo = startProc(['relay', '--bind', `${BIND}:${RO_PORT}`, '--auth', AUTH,
       '--tls-cert', certs.matched.cert, '--tls-key', certs.matched.key,
       '--settings-file', path.join(roots, 'ro-settings.json')], 'relay-ro');
-    const relayMm = startProc(['relay', '--bind', `0.0.0.0:${MISMATCH_PORT}`, '--auth', AUTH,
+    const relayMm = startProc(['relay', '--bind', `${BIND}:${MISMATCH_PORT}`, '--auth', AUTH,
       '--tls-cert', certs.mismatched.cert, '--tls-key', certs.mismatched.key,
       '--settings-file', path.join(roots, 'mm-settings.json')], 'relay-mismatch');
     procs.push(relayRw, relayRo, relayMm);
     const up = await Promise.all([
-      waitTlsPort(ADDR, RW_PORT), waitTlsPort(ADDR, RO_PORT), waitTlsPort(ADDR, MISMATCH_PORT),
+      waitTlsPort(BIND, RW_PORT), waitTlsPort(BIND, RO_PORT), waitTlsPort(BIND, MISMATCH_PORT),
     ]);
     check('三个 HTTPS relay 都已监听', up.every(Boolean), up);
     // 端口通不等于“我们起的那个 relay 在跑”：端口被别的进程占着时，它照样通。
@@ -455,12 +458,18 @@ async function frameEval(page, fn, arg) {
     check('模式徽标是「完整模式」', modeInfo.badge === '完整模式', modeInfo.badge);
     check('v2 下 iframe 去掉 sandbox', modeInfo.sandbox === null, modeInfo.sandbox);
 
-    // SW 真的注册并激活了吗（直接问浏览器，而不是只看 UI）
+    // SW 真的注册并激活了吗（直接问浏览器，而不是只看 UI）。
+    // `navigator.serviceWorker.ready` 在 SW 永远激活不了时会**一直挂着**，
+    // 不设上限就会让整个脚本卡死而不是失败退出——这里显式超时并记成失败。
     const sw1 = await page1.evaluate(async () => {
       const out = { hasSw: !!navigator.serviceWorker };
       if (!navigator.serviceWorker) return out;
+      const withTimeout = (p, ms) => Promise.race([
+        p,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout-waiting-ready')), ms)),
+      ]);
       try {
-        const reg = await navigator.serviceWorker.ready;
+        const reg = await withTimeout(navigator.serviceWorker.ready, 15000);
         out.scope = reg.scope;
         out.active = !!(reg.active && reg.active.state === 'activated');
         const all = await navigator.serviceWorker.getRegistrations();
@@ -470,7 +479,8 @@ async function frameEval(page, fn, arg) {
       }
       return out;
     });
-    check('Service Worker 已注册且状态为 activated', sw1.active === true, sw1);
+    check('Service Worker 已注册且状态为 activated（15s 上限内）',
+      sw1.active === true, sw1);
     check('激活的脚本就是 sr-web-sw.js',
       Array.isArray(sw1.scripts) && sw1.scripts.some((s) => /\/sr-web-sw\.js$/.test(s)), sw1.scripts);
 
@@ -508,11 +518,34 @@ async function frameEval(page, fn, arg) {
       /已加载/.test(status1) && !/证书|无法注册/.test(status1), status1);
     await page1.screenshot({ path: path.join(OUT, 'trusted-full-mode.png') });
 
-    // shell-remote 自身在 SW 激活后仍正常（SW 不该劫持自己的页面）
-    const selfOk = await httpReq(`${RW_BASE.replace('https:', 'http:')}/sr-web-sw.js`)
-      .then((r) => r.status);
-    check('SW 脚本路径本身可访问（http 探针，与证书无关）', selfOk === 200 || selfOk === 0,
-      selfOk);
+    // SW 脚本必须能被**受信浏览器**真正取到（走真实 HTTPS，不是 http 探针）。
+    // 这条同时覆盖两件事：脚本路径没被 relay 挡掉，且证书链在该浏览器里真的受信。
+    const swFetch = await page1.evaluate(async () => {
+      try {
+        const r = await fetch('/sr-web-sw.js', { cache: 'no-store' });
+        return { status: r.status, ct: r.headers.get('content-type'),
+          body: (await r.text()).length };
+      } catch (e) { return { err: String(e && e.message) }; }
+    });
+    check('受信浏览器经 HTTPS 取到 sr-web-sw.js（200 + JS 类型 + 非空）',
+      swFetch.status === 200 && /javascript/i.test(String(swFetch.ct)) && swFetch.body > 0,
+      swFetch);
+
+    // 证书链在浏览器侧确实可信：用**另一个**访问名（IP SAN）再走一遍，
+    // 证明 IP 与 DNS 两种 SAN 都真的被接受，而不只是站点根文档能打开。
+    const ipPage = await page1.context().newPage();
+    let ipErr = null;
+    await ipPage.goto(`${RW_BASE_IP}/session`, { waitUntil: 'domcontentloaded' })
+      .catch((e) => { ipErr = e.message.split('\n')[0]; });
+    const ipTrusted = !ipErr && await ipPage.evaluate(async () => {
+      try {
+        await navigator.serviceWorker.register('/sr-web-sw.js',
+          { scope: '/', updateViaCache: 'none' });
+        return true;
+      } catch (e) { return false; }
+    });
+    check('同一证书用 IP SAN（127.0.0.1）访问也能注册 SW', ipTrusted, ipErr);
+    await ipPage.close();
 
     await ctx1.close();
 
@@ -618,8 +651,19 @@ async function frameEval(page, fn, arg) {
       check('提示不再谎称“已回退静态模式”',
         !/已回退静态模式/.test(ui2.status), ui2.status);
       // 实测：注册失败时 iframe 根本没被指向目标页，所以不能说“已回退”。
-      check('失败时 iframe 没有被指向目标页（印证“未回退”）',
-        !ui2.src || ui2.src === 'about:blank' || ui2.srcdoc === '', ui2);
+      // src 与 srcdoc 都要查——只查一个，另一个残留旧内容就会漏判。
+      check('失败时 iframe 既无目标 src 也无注入 srcdoc（印证“未回退”）',
+        (!ui2.src || ui2.src === 'about:blank') && !ui2.srcdoc, ui2);
+      // toast 与状态区必须口径一致：这一例是**确证**的证书失败（SW_TLS），
+      // 所以 toast 可以说证书；而通用 SecurityError（SW_BLOCKED）只允许中性
+      // 措辞——那条分支由 test_webview.js 的分类断言覆盖。
+      const toastText = await page2.evaluate(() => {
+        const el = document.getElementById('toast');
+        if (!el || el.classList.contains('hidden')) return '';
+        return el.textContent || '';
+      });
+      check('证书确证时 toast 指向证书（与状态区一致）',
+        /证书/.test(toastText), toastText || '(无 toast)');
       await page2.screenshot({ path: path.join(OUT, 'untrusted-sw-error.png') });
       if (page2._client) {
         const cdp = await ctx2.newCDPSession(page2).catch(() => null);
@@ -639,9 +683,11 @@ async function frameEval(page, fn, arg) {
     let mmErr = null;
     await page3.goto(`${MISMATCH_BASE}/session`, { waitUntil: 'domcontentloaded' })
       .catch((e) => { mmErr = e.message.split('\n')[0]; });
-    // 这张证书的 SAN 里没有 ADDR：即使 CA 已受信，名字也对不上。
-    check('SAN 不含访问地址时导航被拒（名字不匹配）',
-      /ERR_CERT_COMMON_NAME_INVALID|ERR_CERT/i.test(String(mmErr || '')), mmErr || page3.url());
+    // 这张证书的 SAN 里没有访问用的名字：即使 CA 已受信，名字也对不上。
+    // 必须**精确**判域名不匹配——把任何 ERR_CERT 都算通过，会让“证书根本没被
+    // 信任”“证书过期”之类完全不同的故障也冒充这一项通过。
+    check('SAN 不含访问地址时导航被拒，且是名字不匹配（ERR_CERT_COMMON_NAME_INVALID）',
+      /ERR_CERT_COMMON_NAME_INVALID/.test(String(mmErr || '')), mmErr || page3.url());
     await ctx3.close();
 
     // ══════════════ [4] 只读 Token 仍回退静态模式 ══════════════
@@ -672,7 +718,7 @@ async function frameEval(page, fn, arg) {
     for (const b of browsers) { try { await b.close(); } catch (e) {} }
     for (const p of procs) { try { p.kill('SIGKILL'); } catch (e) {} }
     try { site.close(); } catch (e) {}
-    if (!process.env.KEEP_TLS_DIR && !process.env.CA_DIR) {
+    if (!process.env.KEEP_TLS_DIR) {
       try { fs.rmSync(TLS_DIR, { recursive: true, force: true }); } catch (e) {}
     }
   }

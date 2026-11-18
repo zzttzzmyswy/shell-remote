@@ -100,7 +100,7 @@ location /agent/web/m/ {
 
 ## 自签名证书与完整模式
 
-保留自签名 HTTPS 时，让完整模式工作只有一条路：**让浏览器真正信任 relay 的证书，并且证书里的名字与地址栏里的地址一致**。本节的所有结论都在 Chrome 157 与 Firefox 1495 上实测过（复跑方法见文末）。
+保留自签名 HTTPS 时，让完整模式工作只有一条路：**让浏览器真正信任 relay 的证书，并且证书里的名字与地址栏里的地址一致**。本节结论在 Google Chrome for Testing 158.0.8127.18 与 Mozilla Firefox 142.0.1 上实测（复跑方法见文末）。
 
 ### 先认清一件事：“继续前往” ≠ 信任证书
 
@@ -115,8 +115,10 @@ An SSL certificate error occurred when fetching the script.
 | 页面能力 | 点“继续前往”之后 |
 |---------|-----------------|
 | 页面加载 / SSE / 终端 | 正常 |
-| `fetch('/sr-web-sw.js')` | 200（普通请求不校验证书链的信任） |
+| 同源 `fetch('/sr-web-sw.js')` | 200——该源已被用户放行，这是**放行的结果**，不是“普通请求不校验证书” |
 | `navigator.serviceWorker.register(...)` | **拒绝**：`SecurityError` + 上述文案 |
+
+注意别把上面那行 fetch 读成“fetch 不校验证书”：实测从受信源**跨源** `fetch` 这个 https 地址会直接 `Failed to fetch`。差别在于用户点“继续前往”时为**那个源**建立了一次性例外，普通请求沿用该例外，而 SW 脚本的校验不吃这个例外。
 
 浏览器对 SW 脚本单独做一次严格校验，这是刻意的：SW 一旦激活就能拦截整个源的请求，所以不接受“用户临时放行”的证书。想用完整模式，就必须真的把证书装进信任库，或者改用受信证书/`http://`。
 
@@ -137,22 +139,59 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout ca-key.pem -out ca.pem -days 3
 
 **第 2 步：用实际访问的地址签发服务器证书**
 
-`ADDR` 必须填**你在浏览器里输入的地址**——用公网 IP 访问就填公网 IP，用域名访问就填域名。多写几个进 SAN 可以一次覆盖（下面的写法同时放 IP 与 DNS）。
+`SAN` 必须写**你在浏览器里输入的地址**，而且**类型前缀不能混用**：IP 只能放 `IP:`，域名只能放 `DNS:`。把域名写进 `IP:`（或反过来）会让 `openssl` 直接报 `bad ip address`；即使侥幸签出来，浏览器也会按类型比对而判定不匹配。
+
+按你的访问方式选一种：
 
 ```bash
-ADDR=203.0.113.10                 # ← 改成你实际访问 relay 用的 IP 或域名
 cd ~/sr-ca
+
+# ── 方式 A：用 IP 访问 ──
+ADDR=203.0.113.10
+SAN="IP:$ADDR"
+
+# ── 方式 B：用域名访问 ──
+# ADDR=relay.example.test
+# SAN="DNS:$ADDR"
+
+# 想同时覆盖一个 IP 和一个域名（两段都用对应前缀）：
+# SAN="IP:203.0.113.10,DNS:relay.example.test"
+
 openssl req -newkey rsa:2048 -nodes -keyout relay-key.pem -out relay.csr -subj "/CN=$ADDR"
 cat > relay-ext.cnf <<EOF
-subjectAltName=IP:$ADDR,DNS:$ADDR
+subjectAltName=$SAN
 basicConstraints=CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
 EOF
 openssl x509 -req -in relay.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
-  -out relay-cert.pem -days 825 -extfile relay-ext.cnf
+  -out relay-cert.pem -days 397 -extfile relay-ext.cnf
+```
+
+签完先自检，**用与 SAN 类型对应的那条命令**——类型用错会直接报 mismatch：
+
+```bash
+# 方式 A（IP）
+openssl verify -CAfile ca.pem -verify_ip "$ADDR" relay-cert.pem
+# 方式 B（域名）
+openssl verify -CAfile ca.pem -verify_hostname "$ADDR" relay-cert.pem
+
 openssl x509 -in relay-cert.pem -noout -subject -ext subjectAltName
 ```
+
+两条 `verify` 都要看到 `OK` 才算对，输出 `IP address mismatch` / `hostname mismatch` 说明 SAN 写错了类型或写了别的地址。实测（OpenSSL 4.1.0）：
+
+```
+# IP 证书
+IP Address:203.0.113.10
+relay-cert.pem: OK                     ← verify_ip 203.0.113.10
+
+# 域名证书
+DNS:relay.example.test
+relay-cert.pem: OK                     ← verify_hostname relay.example.test
+```
+
+> `-days 397` 是当前公有 CA 通行的上限惯例；自签根签发的证书不受浏览器这条策略约束——实测 Chrome 158 对 825 天、826 天、1000 天的证书均正常接受。这里取 397 只是留出常规续签节奏，你按需要改。
 
 **第 3 步：让 relay 用这张证书**
 
@@ -165,45 +204,84 @@ openssl x509 -in relay-cert.pem -noout -subject -ext subjectAltName
 
 **第 4 步：把根证书导入**发起访问的那台机器**的信任库**
 
-> 这一步改的是**你自己的电脑**，不是 relay 服务器，也不是线上服务。导入前请自己核对指纹，见下面的“核对指纹”。
+> 这一步改的是**你自己的电脑**（浏览器所在机器），不是 relay 服务器，也不是线上服务。要装的是**根证书 `ca.pem`**，不是服务器证书。
 
 | 系统 / 浏览器 | 做法 | 生效范围 |
 |--------------|------|---------|
-| Windows（Chrome / Edge / IE） | 双击 `ca.pem` → 安装证书 → **本地计算机** → “受信任的根证书颁发机构” | 该机器的所有用户与该系统的 Chromium 系浏览器；Firefox 见下一行 |
-| macOS（Safari / Chrome） | 钥匙串访问 → 系统 → 导入 `ca.pem` → 双击 → 信任 → “始终信任” | 该机器的系统信任库 |
-| Linux + Chromium 系 | 拷到 `/usr/local/share/ca-certificates/sr-ca.crt` 后 `sudo update-ca-certificates` | 系统信任库，Chromium 会读取 |
+| Windows（Chrome / Edge） | 双击 `ca.pem` → 安装证书 → **本地计算机** → “受信任的根证书颁发机构” | 该机器全部用户与 Chromium 系浏览器 |
+| macOS（Safari / Chrome） | 钥匙串访问 → 系统 → 导入 `ca.pem` → 双击 → 信任 → “始终信任” | 该机器系统信任库 |
+| Linux + Chromium 系 | 把 `ca.pem` 放进发行版的信任锚目录后刷新系统库（Arch/Fedora：`/etc/ca-certificates/trust-source/anchors/` + `update-ca-trust`；Debian/Ubuntu：`/usr/local/share/ca-certificates/` + `update-ca-certificates`） | 系统信任库。**实测**：NSS 库为空时 Chromium 158 会读取系统库并接受该 CA（命名空间内导入验证，未改动宿主机） |
 | Firefox（全平台） | 设置 → 隐私与安全 → 证书 → 查看证书 → 证书颁发机构 → 导入 | **只影响 Firefox**，用它自己的库 |
+
+Linux 下给 Chromium 单独配 NSS 库（与系统库二选一即可，两者都会生效）：
+
+```bash
+mkdir -p ~/.pki/nssdb && certutil -d sql:$HOME/.pki/nssdb -N --empty-password   # 首次
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "shell-remote private CA" -i ca.pem
+certutil -d sql:$HOME/.pki/nssdb -L        # 应能看到刚导入的项
+```
+
+> `certutil` 来自发行版的 `nss` / `libnss3-tools` 包；这条路径只影响当前用户。仓库的 E2E 测试就是用这种方式做隔离的，因此它能验证「证书被信任后完整模式可用」，而不碰宿主机信任库。
 
 **第 5 步：重启浏览器再打开会话页**。地址栏应显示正常的锁标（而不是“不安全”），此时打开网页视图才是“完整模式”。
 
-### 什么时候可以不走私有 CA
+### 根私钥留在签发端，relay 只拿服务端证书
 
-relay 未给 `--tls-cert` 时会自动生成一张自签证书，持久化在 `~/.shell-remote/self-signed/`，SAN 覆盖 `localhost` + 本机主机名 + 本机全部 IPv4。理论上也可以**把这张叶证书本身当信任锚**导入（实测 Chrome 与 Firefox 都能接受，直接信任叶证书后 SW 注册成功）。
+一次签发产出的四样东西，**归属不同机器**：
 
-但它有两个实际障碍，所以在多数场景下私有 CA 更省事：
+| 文件 | 放哪 | 说明 |
+|------|------|------|
+| `ca-key.pem`（根私钥） | **只留在签发端**（你的工作站） | 拿到它就能签发任何域名的受信证书。**绝不要**拷到 relay |
+| `ca.pem`（根证书） | 签发端 + 每一台要访问 relay 的浏览器机器 | 这是要被导入信任库的那张 |
+| `relay-cert.pem` | relay 服务器 | 服务端证书 |
+| `relay-key.pem` | relay 服务器 | 服务端私钥，与证书配对 |
 
-- SAN 只含**生成时**那台机器的地址。用公网 IP 或内网 NAT 之外的地址访问就对不上——证书里没有这个名字，浏览器直接不给例外之外的任何余地
-- 每台 relay 各生成一张，多设备时要在浏览器里逐个导入，且换机器/重装就要重来
+所以**不要把 `~/sr-ca/` 整个目录拷到 relay**——那会把根私钥一起带过去，等于把“签发任意受信证书”的能力放在了对外暴露的机器上。迁移 relay 时只带 `relay-cert.pem` 与 `relay-key.pem`；迁移签发端时才需要 `ca.pem` + `ca-key.pem`（并继续保持私钥离线保管）。
 
-只有在“单台设备 + 用本机地址访问 + 只在一台电脑上打开”时，才建议直接导入 `~/.shell-remote/self-signed/relay-cert.pem`。
+用同一张根证书给新地址**续签或补签**时，只要 SAN 与新地址匹配，浏览器里已装的根**不需要重装**——它信任的是根，不是某一张叶证书。根证书本身到期换新时才需要重新导入。
 
 ### 核对指纹（导入前必做）
 
-自签证书的安全前提是“你导入的确实是这台 relay 的那张证书”。导入前把两边的 SHA-256 指纹对齐：
+自签体系的安全前提是“你导入的确实是那台签发端的根证书”。**要比对的是即将安装的那张 `ca.pem` 本身**，不是服务器证书：拿 `relay-cert.pem` 的指纹去对 `ca.pem`，对上的概率为零，反而会让人以为搞错了。
+
+在**签发端**取指纹（这是可信来源）：
 
 ```bash
-# 在 relay 机器上
-openssl x509 -in ~/sr-ca/relay-cert.pem -noout -fingerprint -sha256
+openssl x509 -in ~/sr-ca/ca.pem -noout -fingerprint -sha256
 ```
 
-浏览器里点地址栏的锁标/证书信息可以看到同一串指纹。两边一致再导入。指纹不一致说明连到了别的服务或证书被替换过。
+把 `ca.pem` 传到接收端后，**在接收端对同一份文件**再算一次，两边必须逐字符一致：
+
+```bash
+openssl x509 -in ca.pem -noout -fingerprint -sha256
+```
+
+一致再导入。不一致说明传输过程被替换或拿错了文件。若你是通过某个网页/仓库拿到这张 CA 的，也应回到签发端核对同一串指纹，而不是信任分发渠道自报的值。
+
+顺带可以确认它确实是 CA 而不是叶证书：
+
+```bash
+openssl x509 -in ca.pem -noout -ext basicConstraints    # 必须看到 CA:TRUE
+```
+
+### 直接信任叶证书（另一种做法）
+
+不做私有 CA 时，relay 未给 `--tls-cert` 会自动生成一张自签证书落在 `~/.shell-remote/self-signed/`（`relay-cert.pem` / `relay-key.pem`），SAN 覆盖 `localhost` + 本机主机名 + 本机全部 IPv4。可以**把这张叶证书本身当信任锚**导入——实测 Chromium 与 Firefox 接受后 SW 注册成功。
+
+这条路要注意：
+
+- 要导入并核对的是 **`relay-cert.pem`**（叶证书自签，自己就是锚），不是别的文件
+- SAN 只含**生成时**那台机器的地址，换访问地址就对不上
+- 每台 relay 各生成一张，多设备要逐个导入；重装/清数据目录后证书变了，要重新导入
+
+只在“单台设备 + 用本机地址访问 + 只在一台电脑上打开”时够用；多设备或需要长期可续签时用私有 CA。
 
 ### 其他会影响完整模式的情况
 
 - **代理/网关终止 TLS**：如果前置 nginx、Caddy 或云负载均衡在**外层**做 HTTPS 终结再转发给 relay，那么浏览器看到的是**它**的证书，不是 relay 的。此时要么给外层配受信证书（`--tls-cert` 给 relay 就没有意义了），要么让外层直接透传 443 给 relay。在哪一层做 TLS，证书就要配在哪一层
 - **代理里跑着别的路径**：`/sr-web-sw.js` 必须由 relay 提供（不能被 SPA fallback 或缓存规则吃掉），否则报 `SW_HTTP_404`；响应类型必须是 `application/javascript`，否则报 `SW_MIME`
-- **自签证书的重启与迁移**：证书文件不变则重启不影响已建立的例外；但**换了证书文件**（重新生成、或把数据目录清掉）等于换了一张新证书，之前导入的信任或例外都不再匹配，浏览器会重新告警。迁移 relay 时把 `~/sr-ca/` 一起带走即可保持连续
-- **证书有效期**：上面命令给根 CA 3650 天、服务器证书 825 天（这是 Chrome 接受的最长有效期）。服务器证书过期后要重新签发（第 2 步），根 CA 不用动
+- **自签证书的重启与迁移**：证书文件不变则重启不影响已建立的信任；但**换了证书文件**（重新生成、或把数据目录清掉）等于换了一张新证书，之前导入的信任或例外都不再匹配，浏览器会重新告警。迁移 relay 时只带 `relay-cert.pem` + `relay-key.pem`（见上文“根私钥留在签发端”）；同一张根下重签且 SAN 匹配时，浏览器无需重装根
+- **证书有效期**：上面命令给根 CA 3650 天、服务器证书 397 天。服务器证书过期前用同一张根按第 2 步重签即可，浏览器已装的根不用动。实测 Chrome 158 对 825 / 826 / 1000 天的自签服务器证书均正常接受，所以 397 只是续签节奏的选择，不是硬上限
 
 ### 怎么判断是证书问题还是别的问题
 
@@ -215,7 +293,6 @@ openssl x509 -in ~/sr-ca/relay-cert.pem -noout -fingerprint -sha256
 | 地址栏锁标正常但仍是静态模式 | 多半是 ro Token、旧 agent，或浏览器禁用了 SW（隐私/无痕模式）——状态区会写明 |
 | 状态区提示 HTTP 404 / 响应类型不对 | 前置代理拦了或改写了 `/sr-web-sw.js`，与证书无关 |
 | 只有 Firefox 报 `The operation is insecure.` | Firefox 对策略类失败只给这一句，无法细分；先按证书核对一遍，再排查 SW 是否被策略禁用 |
-
 ### 复跑这些结论
 
 `tools/verify/verify_web_map_tls.js` 用临时 CA + 独立浏览器 profile 复跑上面全部判断，不改你机器上的任何信任设置：

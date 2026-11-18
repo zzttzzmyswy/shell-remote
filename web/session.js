@@ -549,9 +549,10 @@
                 if (isSwRegistrationFailure(res.code)) {
                     // 状态区已经写明原因与修复步骤（webview.js 的 describeMapError），
                     // 这里只用 toast 把用户引到状态区，避免两处说法不一致。
-                    // 只有“证书/策略被拒”这类用户能自己修的情况才提示证书；
-                    // 404 / 响应类型不对属于服务端配置问题，别误导去装证书。
-                    showToast(isTrustFailure(res.code)
+                    // 只有**确证**是证书（SW_TLS）才说证书。SW_BLOCKED 是浏览器只给了
+                    // 通用 SecurityError、分不清证书还是策略的情况，必须保留中性措辞——
+                    // 否则等于替浏览器断言了一个我们并不知道的结论。
+                    showToast(res.code === 'SW_TLS'
                         ? '完整模式需要浏览器信任的 HTTPS 证书，详见状态区提示'
                         : '完整模式无法启用，原因见状态区提示', 'warning');
                 }
@@ -567,13 +568,9 @@
     /// Service Worker 注册阶段的失败码（webview.js classifySwError 产出）：
     /// 这些不是能力/权限问题，切模式解决不了，只能把原因说清。
     function isSwRegistrationFailure(code) {
-        return isTrustFailure(code) || code === 'NO_SW' || code === 'SW_MIME' ||
-            code === 'SW_EVAL' || /^SW_HTTP_\d+$/.test(String(code || ''));
-    }
-
-    /// 文案里可以归到“证书/浏览器策略”的那两类。
-    function isTrustFailure(code) {
-        return code === 'SW_TLS' || code === 'SW_BLOCKED';
+        return code === 'SW_TLS' || code === 'SW_BLOCKED' ||
+            code === 'NO_SW' || code === 'SW_MIME' || code === 'SW_EVAL' ||
+            /^SW_HTTP_\d+$/.test(String(code || ''));
     }
 
     // 能力门控：`session:capabilities` 给出的能力数组决定模式，模式决定入口是否
