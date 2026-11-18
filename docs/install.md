@@ -80,7 +80,7 @@ cargo build --release --no-default-features
 | `--bind` | `0.0.0.0:3000` | 监听地址 |
 | `--auth` | 无默认值 | 服务器密码，**必填**（为空或缺失时 relay 拒绝启动） |
 | `--no-tls` | 关闭 | 关闭 TLS，在监听端口提供纯 HTTP。默认走 HTTPS，未给证书时自动生成自签证书并持久化到 `~/.shell-remote/self-signed/`（`relay-cert.pem` / `relay-key.pem`），后续重启复用 |
-| `--tls-cert` / `--tls-key` | 无 | 自定义 PEM 证书与私钥，必须成对提供 |
+| `--tls-cert` / `--tls-key` | 无 | 自定义 PEM 证书与私钥，必须成对提供。**网页映射完整模式需要浏览器信任的证书**，默认自签证书不够用——见 [web-map.md 的“自签名证书与完整模式”](web-map.md#自签名证书与完整模式) |
 | `--admin-path` | 无 | 管理后台的秘密子路径（如 `/sr-admin-x7k`）。不设则后台完全不注册路由 |
 | `--admin-user` | 设了 `--admin-path` 后为 `admin` | 后台登录用户名 |
 | `--admin-pass` | 无 | 后台登录密码，设 `--admin-path` 时必填 |

@@ -531,7 +531,9 @@
     }
 
     /// 按当前模式打开地址。v2 失败时按错误码决定是否回退到 v1：
-    /// 404/405（旧 relay 或旧 agent）与 403（只读 token）都回退静态模式并提示。
+    /// 404/405（旧 relay 或旧 agent）与 403（只读 token）回退静态模式并提示；
+    /// 本次浏览里临时不可用的（Service Worker 注册失败）保持 v2 模式，但如实
+    /// 提示——证书修好后直接重开即可，不用重连。
     function navigateWeb(raw) {
         if (webMode === 'v2' && webMapV2) {
             return webMapV2.open(raw).then(function (res) {
@@ -544,6 +546,15 @@
                     setWebMode('v1', res.code === 'V2_READONLY' ? 'read-only' : 'agent-version');
                     return navigateWeb(raw);
                 }
+                if (isSwRegistrationFailure(res.code)) {
+                    // 状态区已经写明原因与修复步骤（webview.js 的 describeMapError），
+                    // 这里只用 toast 把用户引到状态区，避免两处说法不一致。
+                    // 只有“证书/策略被拒”这类用户能自己修的情况才提示证书；
+                    // 404 / 响应类型不对属于服务端配置问题，别误导去装证书。
+                    showToast(isTrustFailure(res.code)
+                        ? '完整模式需要浏览器信任的 HTTPS 证书，详见状态区提示'
+                        : '完整模式无法启用，原因见状态区提示', 'warning');
+                }
                 return res;
             });
         }
@@ -551,6 +562,18 @@
             return { ok: !!ok };
         });
         return Promise.resolve({ ok: false, code: 'NO_VIEW' });
+    }
+
+    /// Service Worker 注册阶段的失败码（webview.js classifySwError 产出）：
+    /// 这些不是能力/权限问题，切模式解决不了，只能把原因说清。
+    function isSwRegistrationFailure(code) {
+        return isTrustFailure(code) || code === 'NO_SW' || code === 'SW_MIME' ||
+            code === 'SW_EVAL' || /^SW_HTTP_\d+$/.test(String(code || ''));
+    }
+
+    /// 文案里可以归到“证书/浏览器策略”的那两类。
+    function isTrustFailure(code) {
+        return code === 'SW_TLS' || code === 'SW_BLOCKED';
     }
 
     // 能力门控：`session:capabilities` 给出的能力数组决定模式，模式决定入口是否

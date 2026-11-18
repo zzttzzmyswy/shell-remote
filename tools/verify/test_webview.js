@@ -330,6 +330,234 @@ function makeHarness(handlers) {
   return { wv, calls, statuses };
 }
 
+// ══════════════════════ Service Worker 注册失败分类（MYS-2945）══════════════════════
+//
+// 期望值全部来自本机实测（Chrome 157 / Firefox 1495），不是按浏览器官网文档猜的：
+//   - Chromium 证书错误 → SecurityError + “An SSL certificate error occurred…”
+//   - Chromium 404      → TypeError + “A bad HTTP response code (404)…”
+//   - Chromium MIME     → SecurityError + “unsupported MIME type”
+//   - Chromium 求值抛错 → TypeError + “evaluation failed”
+//   - Firefox 策略类    → SecurityError + “The operation is insecure.”（无法细分）
+//
+// 判据的核心要求：**只有文案真的指向证书才判 SW_TLS**，不能把所有失败都归咎于证书。
+
+/// 注入一个假的 navigator.serviceWorker，让 ensureServiceWorker 走给定的失败/成功路径。
+function makeSwContainer(outcome) {
+  const reg = {
+    scope: 'https://relay.example/',
+    active: { state: 'activated', postMessage() {} },
+    waiting: null,
+    installing: null
+  };
+  const container = {
+    registerCalls: 0,
+    addEventListener() {},
+    removeEventListener() {},
+    register(script, opts) {
+      container.registerCalls += 1;
+      container.lastArgs = { script, opts };
+      if (outcome.error) return Promise.reject(outcome.error);
+      return Promise.resolve(reg);
+    },
+    ready: outcome.readyError ? Promise.reject(outcome.readyError) : Promise.resolve(reg)
+  };
+  return container;
+}
+
+async function swClassifyTests() {
+  console.log('\n[8] Service Worker 注册失败分类（实测文案）');
+
+  const CASES = [
+    ['Chromium 证书未信任 → SW_TLS', 'SW_TLS', {
+      name: 'SecurityError',
+      message: "Failed to register a ServiceWorker for scope ('https://172.26.13.24:19443/') " +
+        "with script ('https://172.26.13.24:19443/sr-web-sw.js'): " +
+        'An SSL certificate error occurred when fetching the script.'
+    }],
+    ['Chromium 404 → SW_HTTP_404', 'SW_HTTP_404', {
+      name: 'TypeError',
+      message: "Failed to register a ServiceWorker for scope ('https://h/') with script " +
+        "('https://h/sr-web-sw.js'): A bad HTTP response code (404) was received when fetching the script."
+    }],
+    ['Chromium MIME 不符 → SW_MIME', 'SW_MIME', {
+      name: 'SecurityError',
+      message: "Failed to register a ServiceWorker for scope ('https://h/') with script " +
+        "('https://h/sr-web-sw.js'): The script has an unsupported MIME type ('text/html')."
+    }],
+    ['Chromium 脚本求值抛错 → SW_EVAL', 'SW_EVAL', {
+      name: 'TypeError',
+      message: "Failed to register a ServiceWorker for scope ('https://h/') with script " +
+        "('https://h/sr-web-sw.js'): ServiceWorker script evaluation failed"
+    }],
+    ['Firefox 404 → 不归为证书', 'NO_SW', {
+      name: 'TypeError',
+      message: 'ServiceWorker script at https://h/sr-web-sw.js for scope https://h/ ' +
+        'encountered an error during installation.'
+    }],
+    ['Firefox 脚本求值抛错 → SW_EVAL', 'SW_EVAL', {
+      name: 'TypeError',
+      message: 'ServiceWorker script at https://h/sr-web-sw.js for scope https://h/ ' +
+        'threw an exception during script evaluation.'
+    }],
+    // Firefox 对 MIME/策略问题只给一句通用异常：必须仍然给出提示，但**不能**
+    // 断言是证书问题（文案里要留出“浏览器策略”的可能）。
+    ['Firefox 通用 SecurityError → SW_BLOCKED', 'SW_BLOCKED', {
+      name: 'SecurityError', message: 'The operation is insecure.'
+    }],
+    ['未知异常 → NO_SW', 'NO_SW', { name: 'Error', message: 'boom' }]
+  ];
+
+  for (const [label, expectCode, err] of CASES) {
+    check(label, () => {
+      eq(WV.classifySwError(err).code, expectCode);
+    });
+  }
+
+  check('非证书失败不出现“证书未被信任”的断言', () => {
+    ['SW_HTTP_404', 'SW_MIME', 'SW_EVAL', 'NO_SW', 'SW_BLOCKED'].forEach((code) => {
+      const text = WV.describeMapError(code, 'x');
+      eq(/证书未被浏览器信任/.test(text), false, code + ' → ' + text);
+    });
+  });
+  check('只有 SW_TLS 的文案说明证书修法', () => {
+    const tls = WV.describeMapError('SW_TLS');
+    eq(/证书未被浏览器信任/.test(tls), true);
+    eq(/docs\/web-map\.md/.test(tls), true, '应指向文档');
+    // 用户最容易误解的一点：点“继续前往”不等于信任.
+    eq(/继续前往/.test(tls), true);
+  });
+  check('Firefox 通用失败同时提到证书与浏览器策略', () => {
+    const t = WV.describeMapError('SW_BLOCKED', 'The operation is insecure.');
+    eq(/证书未被信任/.test(t), true);
+    eq(/浏览器策略/.test(t), true);
+  });
+  check('文案不再谎称“已回退静态模式”', () => {
+    // 实测：注册失败时 iframe 仍是 about:blank，没有真的回退——说“已回退”会
+    // 让用户以为页面只是降级渲染，而不是根本没打开。
+    ['SW_TLS', 'SW_BLOCKED', 'SW_MIME', 'SW_HTTP_404', 'SW_EVAL', 'NO_SW'].forEach((code) => {
+      eq(/已回退静态模式/.test(WV.describeMapError(code, 'x')), false, code);
+    });
+  });
+  check('详情里的浏览器前缀被剥掉', () => {
+    const d = WV.classifySwError({
+      name: 'SecurityError',
+      message: "Failed to register a ServiceWorker for scope ('https://h/') with script " +
+        "('https://h/sr-web-sw.js'): An SSL certificate error occurred when fetching the script."
+    }).detail;
+    eq(d, 'An SSL certificate error occurred when fetching the script.');
+  });
+  check('classifySwError 容忍 null/undefined', () => {
+    eq(WV.classifySwError(null).code, 'NO_SW');
+    eq(WV.classifySwError(undefined).code, 'NO_SW');
+  });
+
+  // ── ensureServiceWorker 把分类结果透出为错误码 ──
+  console.log('\n[9] ensureServiceWorker 的错误码映射');
+
+  {
+    const container = makeSwContainer({
+      error: {
+        name: 'SecurityError',
+        message: "Failed to register a ServiceWorker for scope ('https://relay.example/') with " +
+          "script ('https://relay.example/sr-web-sw.js'): " +
+          'An SSL certificate error occurred when fetching the script.'
+      }
+    });
+    const ctrl = new WV.WebMapV2({ swContainer: container });
+    const err = await ctrl.ensureServiceWorker().then(() => null, (e) => e);
+    check('证书错误 → 抛出 code=SW_TLS（不再是笼统的 NO_SW）', () => {
+      eq(err && err.code, 'SW_TLS');
+      eq(err && err.detail, 'An SSL certificate error occurred when fetching the script.');
+      eq(ctrl.ready, false);
+    });
+    check('注册仍用相对路径 + scope / + updateViaCache none', () => {
+      eq(container.lastArgs.script, WV.SW_PATH);
+      eq(container.lastArgs.opts.scope, '/');
+      eq(container.lastArgs.opts.updateViaCache, 'none');
+    });
+  }
+
+  {
+    const container = makeSwContainer({});
+    const ctrl = new WV.WebMapV2({ swContainer: container });
+    const reg = await ctrl.ensureServiceWorker();
+    check('注册成功时 ready=true 且复用同一个 registration', async () => {
+      eq(!!reg, true);
+      eq(ctrl.ready, true);
+    });
+    await ctrl.ensureServiceWorker();
+    check('已就绪后不重复注册', () => {
+      eq(container.registerCalls, 1);
+    });
+  }
+
+  {
+    // DOMException 的 `code` 是数字（SecurityError=18）。曾经因为用“有 code”
+    // 判断“是不是我们自己的错误码”，浏览器异常被原样抛出，导致界面显示
+    // “加载失败（18）”。这里锁住这个行为。
+    const domEx = new Error('x');
+    domEx.name = 'SecurityError';
+    domEx.code = 18;
+    domEx.message = "Failed to register a ServiceWorker for scope ('https://relay.example/') " +
+      "with script ('https://relay.example/sr-web-sw.js'): " +
+      'An SSL certificate error occurred when fetching the script.';
+    const ctrl = new WV.WebMapV2({ swContainer: makeSwContainer({ error: domEx }) });
+    const err = await ctrl.ensureServiceWorker().then(() => null, (e) => e);
+    check('DOMException 的数字 code 不会顶掉分类结果', () => {
+      eq(err && err.code, 'SW_TLS');
+    });
+  }
+
+  {
+    const noSw = new WV.WebMapV2({ swContainer: null });
+    const err = await noSw.ensureServiceWorker().then(() => null, (e) => e);
+    check('浏览器没有 serviceWorker 时仍是 NO_SW', () => {
+      eq(err && err.code, 'NO_SW');
+    });
+  }
+
+  {
+    // ready 永不 resolve 的浏览器（scope 里没有 active worker）：属于通用失败。
+    const container = makeSwContainer({ readyError: new Error('no active worker') });
+    const ctrl = new WV.WebMapV2({ swContainer: container });
+    const err = await ctrl.ensureServiceWorker().then(() => null, (e) => e);
+    check('sw.ready 失败时归为 NO_SW 而不是证书问题', () => {
+      eq(err && err.code, 'NO_SW');
+    });
+  }
+
+  // open() 要把分类结果写进状态区（用户唯一能看到的诊断面）。
+  {
+    const container = makeSwContainer({
+      error: {
+        name: 'SecurityError',
+        message: "Failed to register a ServiceWorker for scope ('https://relay.example/') with " +
+          "script ('https://relay.example/sr-web-sw.js'): " +
+          'An SSL certificate error occurred when fetching the script.'
+      }
+    });
+    const statuses = [];
+    const ctrl = new WV.WebMapV2({
+      swContainer: container,
+      origin: ORIGIN,
+      token: SESSION_TOKEN,
+      fetch: () => Promise.resolve(fakeResponse({ body: '{}' })),
+      onStatus: (text, kind) => statuses.push({ text, kind })
+    });
+    const res = await ctrl.open('http://127.0.0.1/');
+    check('open() 返回 SW_TLS 且在状态区给出证书提示', () => {
+      eq(res.ok, false);
+      eq(res.code, 'SW_TLS');
+      const last = statuses[statuses.length - 1];
+      eq(last.kind, 'error');
+      eq(/证书未被浏览器信任/.test(last.text), true, last.text);
+    });
+    check('证书失败时不会去建映射（省掉一次必然白跑的请求）', () => {
+      eq(ctrl.mapId, '');
+    });
+  }
+}
+
 async function asyncTests() {
   console.log('\n[7] WebView ticket 签发与失效重取');
 
@@ -545,7 +773,7 @@ async function asyncTests() {
   }
 }
 
-asyncTests().then(() => {
+asyncTests().then(() => swClassifyTests()).then(() => {
   console.log('\n' + (fails.length === 0
     ? `全部通过：${checks} 项`
     : `失败 ${fails.length}/${checks} 项：\n  - ` + fails.join('\n  - ')));

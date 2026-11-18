@@ -83,7 +83,7 @@ fetch 事件分流（判定"不属于映射"时**直接 `return`、不 `respondW
 
 ## 部署要求
 
-1. **安全上下文**：Service Worker 只能在受信证书的 https，或 `http://localhost` / `http://127.0.0.1` 下注册。用 relay 默认自签证书访问时浏览器不认，自动回落到 v1 静态模式
+1. **安全上下文**：Service Worker 只能在受信证书的 https，或 `http://localhost` / `http://127.0.0.1` 下注册。relay 默认自签证书浏览器不认，完整模式不可用——按下一节配置证书
 2. **前置 nginx 必须透传 WebSocket 并关闭缓冲**（否则 WS 握手 400、HTML 注入因缓冲而延迟）：
 
 ```nginx
@@ -97,6 +97,135 @@ location /agent/web/m/ {
 ```
 
 `/sr-web-sw.js` 与 `/sr-web-shim.js` 走普通静态路径即可，但**不要**加 `Cache-Control: immutable` 长缓存——SW 脚本用 `updateViaCache: 'none'` 注册，服务端按内容 ETag + `no-cache` 返回。
+
+## 自签名证书与完整模式
+
+保留自签名 HTTPS 时，让完整模式工作只有一条路：**让浏览器真正信任 relay 的证书，并且证书里的名字与地址栏里的地址一致**。本节的所有结论都在 Chrome 157 与 Firefox 1495 上实测过（复跑方法见文末）。
+
+### 先认清一件事：“继续前往” ≠ 信任证书
+
+点过证书警告页的「高级 → 继续前往（不安全）」之后，页面能加载、`window.isSecureContext` 也是 `true`，但**Service Worker 仍然注册失败**，控制台报：
+
+```
+An SSL certificate error occurred when fetching the script.
+```
+
+实测对比（同一张未受信证书）：
+
+| 页面能力 | 点“继续前往”之后 |
+|---------|-----------------|
+| 页面加载 / SSE / 终端 | 正常 |
+| `fetch('/sr-web-sw.js')` | 200（普通请求不校验证书链的信任） |
+| `navigator.serviceWorker.register(...)` | **拒绝**：`SecurityError` + 上述文案 |
+
+浏览器对 SW 脚本单独做一次严格校验，这是刻意的：SW 一旦激活就能拦截整个源的请求，所以不接受“用户临时放行”的证书。想用完整模式，就必须真的把证书装进信任库，或者改用受信证书/`http://`。
+
+### 最短修复路径
+
+仓库里**没有**现成的证书签发脚本（按任务范围不新增）。下面两段可以直接复制执行，用系统里的 `openssl`，不需要装新工具。若你更习惯 `mkcert`，它生成的根证书用法与之等价（把 `mkcert -install` 换成下面的“导入根证书”步骤即可）。
+
+**第 1 步：建一个私有根 CA（只做一次，之后复用它给多台 relay 签发）**
+
+```bash
+mkdir -p ~/sr-ca && cd ~/sr-ca
+# 根私钥：不要外发，权限收紧
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca-key.pem -out ca.pem -days 3650 \
+  -subj "/CN=shell-remote private CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+```
+
+**第 2 步：用实际访问的地址签发服务器证书**
+
+`ADDR` 必须填**你在浏览器里输入的地址**——用公网 IP 访问就填公网 IP，用域名访问就填域名。多写几个进 SAN 可以一次覆盖（下面的写法同时放 IP 与 DNS）。
+
+```bash
+ADDR=203.0.113.10                 # ← 改成你实际访问 relay 用的 IP 或域名
+cd ~/sr-ca
+openssl req -newkey rsa:2048 -nodes -keyout relay-key.pem -out relay.csr -subj "/CN=$ADDR"
+cat > relay-ext.cnf <<EOF
+subjectAltName=IP:$ADDR,DNS:$ADDR
+basicConstraints=CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+EOF
+openssl x509 -req -in relay.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+  -out relay-cert.pem -days 825 -extfile relay-ext.cnf
+openssl x509 -in relay-cert.pem -noout -subject -ext subjectAltName
+```
+
+**第 3 步：让 relay 用这张证书**
+
+```bash
+./shell-remote relay --bind 0.0.0.0:3000 --auth '你的密码' \
+  --tls-cert ~/sr-ca/relay-cert.pem --tls-key ~/sr-ca/relay-key.pem
+```
+
+证书路径会写进启动日志的 `HTTPS (self-signed) enabled … note=using certs at …`，可据此确认生效。
+
+**第 4 步：把根证书导入**发起访问的那台机器**的信任库**
+
+> 这一步改的是**你自己的电脑**，不是 relay 服务器，也不是线上服务。导入前请自己核对指纹，见下面的“核对指纹”。
+
+| 系统 / 浏览器 | 做法 | 生效范围 |
+|--------------|------|---------|
+| Windows（Chrome / Edge / IE） | 双击 `ca.pem` → 安装证书 → **本地计算机** → “受信任的根证书颁发机构” | 该机器的所有用户与该系统的 Chromium 系浏览器；Firefox 见下一行 |
+| macOS（Safari / Chrome） | 钥匙串访问 → 系统 → 导入 `ca.pem` → 双击 → 信任 → “始终信任” | 该机器的系统信任库 |
+| Linux + Chromium 系 | 拷到 `/usr/local/share/ca-certificates/sr-ca.crt` 后 `sudo update-ca-certificates` | 系统信任库，Chromium 会读取 |
+| Firefox（全平台） | 设置 → 隐私与安全 → 证书 → 查看证书 → 证书颁发机构 → 导入 | **只影响 Firefox**，用它自己的库 |
+
+**第 5 步：重启浏览器再打开会话页**。地址栏应显示正常的锁标（而不是“不安全”），此时打开网页视图才是“完整模式”。
+
+### 什么时候可以不走私有 CA
+
+relay 未给 `--tls-cert` 时会自动生成一张自签证书，持久化在 `~/.shell-remote/self-signed/`，SAN 覆盖 `localhost` + 本机主机名 + 本机全部 IPv4。理论上也可以**把这张叶证书本身当信任锚**导入（实测 Chrome 与 Firefox 都能接受，直接信任叶证书后 SW 注册成功）。
+
+但它有两个实际障碍，所以在多数场景下私有 CA 更省事：
+
+- SAN 只含**生成时**那台机器的地址。用公网 IP 或内网 NAT 之外的地址访问就对不上——证书里没有这个名字，浏览器直接不给例外之外的任何余地
+- 每台 relay 各生成一张，多设备时要在浏览器里逐个导入，且换机器/重装就要重来
+
+只有在“单台设备 + 用本机地址访问 + 只在一台电脑上打开”时，才建议直接导入 `~/.shell-remote/self-signed/relay-cert.pem`。
+
+### 核对指纹（导入前必做）
+
+自签证书的安全前提是“你导入的确实是这台 relay 的那张证书”。导入前把两边的 SHA-256 指纹对齐：
+
+```bash
+# 在 relay 机器上
+openssl x509 -in ~/sr-ca/relay-cert.pem -noout -fingerprint -sha256
+```
+
+浏览器里点地址栏的锁标/证书信息可以看到同一串指纹。两边一致再导入。指纹不一致说明连到了别的服务或证书被替换过。
+
+### 其他会影响完整模式的情况
+
+- **代理/网关终止 TLS**：如果前置 nginx、Caddy 或云负载均衡在**外层**做 HTTPS 终结再转发给 relay，那么浏览器看到的是**它**的证书，不是 relay 的。此时要么给外层配受信证书（`--tls-cert` 给 relay 就没有意义了），要么让外层直接透传 443 给 relay。在哪一层做 TLS，证书就要配在哪一层
+- **代理里跑着别的路径**：`/sr-web-sw.js` 必须由 relay 提供（不能被 SPA fallback 或缓存规则吃掉），否则报 `SW_HTTP_404`；响应类型必须是 `application/javascript`，否则报 `SW_MIME`
+- **自签证书的重启与迁移**：证书文件不变则重启不影响已建立的例外；但**换了证书文件**（重新生成、或把数据目录清掉）等于换了一张新证书，之前导入的信任或例外都不再匹配，浏览器会重新告警。迁移 relay 时把 `~/sr-ca/` 一起带走即可保持连续
+- **证书有效期**：上面命令给根 CA 3650 天、服务器证书 825 天（这是 Chrome 接受的最长有效期）。服务器证书过期后要重新签发（第 2 步），根 CA 不用动
+
+### 怎么判断是证书问题还是别的问题
+
+网页视图状态区会给出分类后的提示；控制台里也可以自己看一眼：
+
+| 现象 | 结论 |
+|------|------|
+| 控制台 `An SSL certificate error occurred when fetching the script.`，状态区提示证书 | 证书没被信任，或 SAN 与访问地址不符 → 按上节处理 |
+| 地址栏锁标正常但仍是静态模式 | 多半是 ro Token、旧 agent，或浏览器禁用了 SW（隐私/无痕模式）——状态区会写明 |
+| 状态区提示 HTTP 404 / 响应类型不对 | 前置代理拦了或改写了 `/sr-web-sw.js`，与证书无关 |
+| 只有 Firefox 报 `The operation is insecure.` | Firefox 对策略类失败只给这一句，无法细分；先按证书核对一遍，再排查 SW 是否被策略禁用 |
+
+### 复跑这些结论
+
+`tools/verify/verify_web_map_tls.js` 用临时 CA + 独立浏览器 profile 复跑上面全部判断，不改你机器上的任何信任设置：
+
+```bash
+cargo build --bin shell-remote
+xvfb-run -a node tools/verify/verify_web_map_tls.js
+```
+
+它覆盖：临时 CA 签发的 SAN 匹配证书下 SW 注册成功并激活（完整模式可用）；同一张证书未被信任时注册失败且状态区给证书提示（负例）；证书被信任但访问的 IP 不在 SAN 时的表现；以及只读 Token 的静态模式回退仍然工作。隔离方式是给 Chromium 独立 `HOME`（NSS 库）与独立 profile，不用 `--ignore-certificate-errors`、也不经 CDP 忽略证书错误。
 
 ## 安全说明
 
@@ -125,7 +254,7 @@ v2（完整模式）：
 - **同一浏览器多个标签页同时映射不同设备时，整页跳转只能尽力归属**（按 `pendingNav` → clientId → 最近活跃映射的顺序），可能落到另一个标签页的映射上。子资源与 `fetch` 按页面（clientId）准确归属，不受影响
 - 页面里的 `window.open` 弹窗与**顶层**跳转不经过映射（SW 明确不劫持顶层导航）
 - 写死目标 IP 的静态资源（`<img src="http://192.168.0.1/x.png">`）会被浏览器的混合内容策略拦截；相对地址与 `location.host` 的写法不受影响
-- 非受信证书的 https relay（默认自签）无法注册 SW → 自动回落 v1
+- 非受信证书的 https relay（默认自签）无法注册 SW → 完整模式不可用，见上文“自签名证书与完整模式”
 - 目标站自身注册 Service Worker 会被 shim 屏蔽（同源方案下的必然取舍）
 
 v1（静态模式）：
@@ -150,4 +279,11 @@ node tools/verify/test_webview.js
 ```bash
 cargo build --bin shell-remote
 xvfb-run -a node tools/verify/verify_web_map_ui.js
+```
+
+HTTPS 与证书信任（临时 CA + 独立浏览器信任库，不改本机设置）：SAN 匹配且被信任时完整模式可用、未受信时准确提示、SAN 不匹配的表现。
+
+```bash
+cargo build --bin shell-remote
+xvfb-run -a node tools/verify/verify_web_map_tls.js
 ```
