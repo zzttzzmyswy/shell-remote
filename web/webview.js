@@ -666,6 +666,48 @@
   // 给 SW 写 IndexedDB 的时间窗口：写完才回 ack，超时就用默认放行策略继续。
   var SW_ACK_TIMEOUT_MS = 2000;
 
+  /// SW 注册失败分类。
+  ///
+  /// 浏览器能给出的信息很有限，且各家不一样（实测，见 docs/web-map.md）：
+  ///   - Chromium 证书错误：`SecurityError`，文案含 “An SSL certificate error
+  ///     occurred when fetching the script.”——可以确定是证书；
+  ///   - Chromium 404：`TypeError` + “A bad HTTP response code (404)”；
+  ///   - Chromium MIME 不符：`SecurityError` + “unsupported MIME type”；
+  ///   - Chromium 脚本求值抛错：`TypeError` + “evaluation failed”；
+  ///   - Firefox 对 MIME/策略问题常常只给 `SecurityError: The operation is
+  ///     insecure.`，**无法区分**是不是证书。
+  ///
+  /// 因此只在文案确实指向证书时判 `SW_TLS`；其余安全类异常归 `SW_BLOCKED`，
+  /// 文案同时提到“证书或浏览器策略”而不武断归咎于证书。
+  /// 返回 `{code, detail}`；`detail` 是原始异常里最有信息量的那一句。
+  function classifySwError(err) {
+    var name = (err && err.name) || '';
+    var raw = String((err && err.message) || err || '');
+    var detail = swErrorDetail(raw);
+    if (/ssl certificate|certificate error|ssl_error|cert_[a-z_]*invalid/i.test(raw)) {
+      return { code: 'SW_TLS', detail: detail };
+    }
+    var http = /bad HTTP response code \((\d{3})\)/i.exec(raw);
+    if (http) return { code: 'SW_HTTP_' + http[1], detail: detail };
+    if (/unsupported MIME type/i.test(raw)) return { code: 'SW_MIME', detail: detail };
+    if (/evaluation failed|threw an exception during script evaluation/i.test(raw)) {
+      return { code: 'SW_EVAL', detail: detail };
+    }
+    if (name === 'SecurityError') return { code: 'SW_BLOCKED', detail: detail };
+    return { code: 'NO_SW', detail: detail };
+  }
+
+  /// 从浏览器的注册异常里取出「真正的原因」：Chromium 会把
+  /// `Failed to register a ServiceWorker for scope ('…') with script ('…'): ` 这层
+  /// 前缀加在前面，对用户没有信息量；URL 里的 `https:` 又含冒号，所以不能简单
+  /// 按第一个冒号切。Firefox 的文案本来就是一句完整的话，原样保留。
+  function swErrorDetail(raw) {
+    var s = String(raw || '').trim();
+    var m = /^(?:Failed to register a ServiceWorker\b)[\s\S]*?with script \('[^']*'\):\s*([\s\S]+)$/.exec(s);
+    if (m) return m[1].trim();
+    return s;
+  }
+
   /// 模式判定。三档：
   ///   - `v2`：agent 支持 TCP 管道 + rw token + 安全上下文有 SW；
   ///   - `v1`：agent 只支持 `web:proxy-v1`（v0.58 静态模式），或 v2 条件不满足
@@ -773,8 +815,16 @@
         return self.registration;
       })
       .catch(function (e) {
+        // 已经是我们自己的错误码（上面的 NO_SW）就原样透出。
+        // 注意：DOMException 也有 `code`，而且是**数字**（SecurityError=18），
+        // 不能拿 "有 code" 当判据，否则浏览器异常会被当成我们的码原样抛出。
+        if (e && typeof e.code === 'string' && e.code) throw e;
         self.ready = false;
-        throw fail('NO_SW', (e && e.message) || 'service worker registration failed');
+        var cls = classifySwError(e);
+        var err = fail(cls.code, cls.detail || 'service worker registration failed');
+        err.detail = cls.detail || '';
+        err.swError = e && e.name ? String(e.name) : '';
+        throw err;
       });
   };
 
@@ -913,8 +963,8 @@
         self.loading = false;
         var code = (err && err.code) || 'NETWORK';
         self.lastError = code;
-        self._setStatus(describeMapError(code), 'error');
-        return { ok: false, code: code };
+        self._setStatus(describeMapError(code, err && err.detail), 'error');
+        return { ok: false, code: code, detail: (err && err.detail) || '' };
       });
   };
 
@@ -995,15 +1045,57 @@
     return base + u.pathname.replace(/^\/+/, '') + u.search;
   }
 
-  function describeMapError(code) {
+  /// 失败文案。`detail` 是浏览器给的原始原因（可空），只在需要时拼上。
+  ///
+  /// 关键区别（MYS-2945）：证书问题**不能**与“浏览器不支持 Service Worker”
+  /// 混为一谈。用户点过“继续前往（不安全）”后页面是安全上下文，但 SW 脚本
+  /// 仍会被单独校验证书并拒绝——此时给出证书修复指引才有用。
+  ///
+  /// 另一处纠正：这些是**打开映射当时**的失败，不会自动换成静态模式，所以
+  /// 文案不能说“已回退静态模式”（实测此时 iframe 仍是 about:blank）。
+  function describeMapError(code, detail) {
     if (code === 'V2_READONLY') return MODE_REASON_TEXT['read-only'];
     if (code === 'V2_UNSUPPORTED') return '当前设备不支持网页映射 v2，已回退静态模式';
     if (code === 'V2_OFFLINE') return '设备 agent 离线，暂不可访问';
     if (code === 'V2_BAD_URL') return '地址无效（需要 http:// 或 https:// 绝对地址）';
     if (code === 'AUTH') return '鉴权失败：会话密钥或服务器口令无效';
-    if (code === 'NO_SW') return '当前环境无法注册 Service Worker，已回退静态模式';
+    if (code === 'SW_TLS') return swTlsText();
+    if (code === 'SW_BLOCKED') return swBlockedText(detail);
+    if (code === 'SW_MIME') {
+      return 'Service Worker 脚本的响应类型不对（需要 application/javascript），完整模式无法启用' +
+        suffix(detail);
+    }
+    if (/^SW_HTTP_/.test(code)) {
+      var st = code.slice('SW_HTTP_'.length);
+      return '取不到 Service Worker 脚本（HTTP ' + st + '），完整模式无法启用：' +
+        '请确认 relay 的 /sr-web-sw.js 未被前置代理拦截或改写';
+    }
+    if (code === 'SW_EVAL') {
+      return 'Service Worker 脚本在安装时抛错，完整模式无法启用' + suffix(detail);
+    }
+    if (code === 'NO_SW') return '当前环境无法注册 Service Worker，完整模式无法启用' + suffix(detail);
     if (code === 'NETWORK') return '请求失败：网络不稳定或设备已离线';
     return '加载失败（' + code + '）';
+  }
+
+  function suffix(detail) {
+    return detail ? '：' + detail : '';
+  }
+
+  /// 证书类失败的长文案：说清“为什么”和“怎么修”。见 docs/web-map.md 的
+  /// “自签名证书与完整模式”一节（同样的最短步骤）。
+  function swTlsText() {
+    return '当前 HTTPS 证书未被浏览器信任，Service Worker 无法注册，完整模式无法启用。' +
+      '点过「继续前往（不安全）」只是本次浏览放行，不等于信任证书：' +
+      '请让 relay 用实际访问的 IP/域名签发的证书，并把签发它的根证书导入系统/浏览器信任库后重新打开。' +
+      '步骤见 docs/web-map.md「自签名证书与完整模式」。';
+  }
+
+  function swBlockedText(detail) {
+    return '浏览器拒绝了 Service Worker 注册，完整模式无法启用。' +
+      '常见原因是 HTTPS 证书未被信任，或浏览器策略/隐私模式禁用 Service Worker' +
+      suffix(detail) + '。请核对地址栏的锁标；' +
+      '步骤见 docs/web-map.md「自签名证书与完整模式」。';
   }
 
   var api = {
@@ -1018,6 +1110,7 @@
     WebMapV2: WebMapV2,
     detectMode: detectMode,
     describeMapError: describeMapError,
+    classifySwError: classifySwError,
     entryUrl: entryUrl,
     MODE_REASON_TEXT: MODE_REASON_TEXT,
     normalizeInput: normalizeInput
